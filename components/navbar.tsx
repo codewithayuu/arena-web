@@ -198,7 +198,6 @@ export function Navbar() {
       className={`fixed inset-x-0 top-0 z-50 pointer-events-none transition-all duration-300 ${isScrolled ? "header-scrolled" : ""
         }`}
       style={{
-        transform: "translateZ(0)",
         "--hdr-s": isScrolled ? 1 : 0,
       } as React.CSSProperties}
     >
@@ -369,7 +368,7 @@ export function Navbar() {
                 animate={{ opacity: 1, y: 0, scale: 1 }}
                 exit={{ opacity: 0, y: -6, scale: 0.98 }}
                 transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-                className="glass-megamenu p-5 sm:p-6 text-white overflow-hidden"
+                className="relative glass-megamenu p-5 sm:p-6 text-white overflow-hidden"
               >
                 {/* TAB 1: PRACTICE MEGA MENU */}
                 {activeTab === "practice" && (
@@ -565,7 +564,13 @@ export function Navbar() {
                 animate={{ opacity: 1, y: 0, scale: 1 }}
                 exit={{ opacity: 0, y: -6, scale: 0.95 }}
                 transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
-                className="fixed top-14 right-3 sm:right-4 left-auto w-[min(280px,calc(100vw-1.5rem))] max-h-[calc(100dvh-4.5rem)] z-50 overflow-hidden !rounded-2xl glass-megamenu p-2 sm:p-2.5 text-white md:hidden pointer-events-auto flex flex-col origin-top-right shadow-2xl border border-white/10"
+                style={{
+                  position: "fixed",
+                  top: "3.75rem",
+                  right: "0.875rem",
+                  left: "auto",
+                }}
+                className="w-[min(280px,calc(100vw-1.75rem))] max-h-[calc(100dvh-4.5rem)] z-50 overflow-hidden !rounded-2xl glass-megamenu p-2 sm:p-2.5 text-white md:hidden pointer-events-auto flex flex-col origin-top-right shadow-2xl border border-white/10"
               >
                 {/* ─── LEVEL 0: ROOT MENU ─── */}
                 {!mobileDrill && (
