@@ -1,0 +1,616 @@
+---
+title: "ResultSet"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "ResultSet explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="the-cursor-model">The Cursor Model</h1>
+
+A `ResultSet` is a cursor, not a list. When `executeQuery` returns, the cursor is positioned **before** the first row, not on it. Calling `next()` advances the cursor to the next row and returns `true` if a row is there, `false` if the cursor has moved past the last row. That is why every JDBC tutorial starts with `while (rs.next())`: it pulls the cursor onto each row in turn and stops cleanly when there are no more.
+
+The mental picture is a pointer that walks down the rows the database is sending back. The current row is the one the cursor is sitting on. All the `getXxx` calls read columns from that current row. If you call `getString` before the first `next()`, you get a `SQLException` complaining about an invalid cursor position. Same thing if you keep reading after `next()` returned `false`.
+
+The diagram shows the four cursor positions for a query that returns three rows. The cursor starts in the orange "before" state, walks through the three rows on each `next()` call, then lands in the red "after" state when the rows run out. You almost always want a `while` loop driven by `next()`, because it handles empty results, single-row results, and many-row results with the same code.
+
+The loop in its simplest shape. The example loads a few products and prints each row.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class WalkRows {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            try (Statement setup = conn.createStatement()) {
+                setup.execute("CREATE TABLE products (id INT PRIMARY KEY, name VARCHAR(100), price DECIMAL(10,2))");
+                setup.execute("INSERT INTO products VALUES (1, 'Laptop', 999.00)");
+                setup.execute("INSERT INTO products VALUES (2, 'Mouse', 19.99)");
+                setup.execute("INSERT INTO products VALUES (3, 'Keyboard', 49.50)");
+            }
+
+            try (Statement stmt = conn.createStatement();
+                 ResultSet rs = stmt.executeQuery("SELECT id, name, price FROM products ORDER BY id")) {
+                while (rs.next()) {
+                    int id = rs.getInt(1);
+                    String name = rs.getString(2);
+                    double price = rs.getDouble(3);
+                    System.out.println(id + " " + name + " $" + price);
+                }
+            }
+        }
+    }
+}
+```
+
+The three rows come out in `id` order because we asked the database to sort them. The `while (rs.next())` loop runs exactly as many times as there are rows, then exits cleanly. The `try-with-resources` block on the `ResultSet` makes sure the cursor is closed even if an exception bubbles out of the loop, which releases the underlying server-side cursor handle on the database.
+
+A trap to watch for is calling `next()` more than once per row. Each `next()` advances the cursor, so an extra call skips a row. The pattern is always "one `next()` at the top of the loop, then all the `getXxx` calls for that row inside the body."
+
+<h1 id="reading-columns-by-index-vs-label">
+  Reading Columns by Index vs Label
+</h1>
+
+Every `getXxx` method has two overloads: one that takes a 1-based column index, and one that takes a column label as a `String`. Both pull the same value out, but they have different trade-offs.
+
+`getString(1)` is fast: the driver knows immediately which column to read. The downside is that the order in your code is now tied to the order in the SQL. If you change the `SELECT` to add a column or reorder the columns, the index numbers shift and every `getXxx(int)` call needs to be updated. That kind of bug is silent: the code keeps compiling and the wrong column comes out of `getString(2)`.
+
+`getString("name")` is slower because the driver has to look up which column the label refers to, but the code stays correct when the SQL changes. The label is whatever the column is called in the result set: either the column's actual name or, more commonly, the alias you set with `AS` in the `SELECT`. If you write `SELECT price AS unit_price FROM products`, the label is `unit_price`, not `price`.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class IndexVsLabel {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            try (Statement setup = conn.createStatement()) {
+                setup.execute("CREATE TABLE products (id INT, name VARCHAR(100), price DECIMAL(10,2))");
+                setup.execute("INSERT INTO products VALUES (1, 'Laptop', 999.00)");
+            }
+
+            try (Statement stmt = conn.createStatement();
+                 ResultSet rs = stmt.executeQuery("SELECT id, name, price AS unit_price FROM products")) {
+                while (rs.next()) {
+                    System.out.println("by index: " + rs.getInt(1) + " " + rs.getString(2) + " " + rs.getDouble(3));
+                    System.out.println("by label: " + rs.getInt("id") + " " + rs.getString("name") + " " + rs.getDouble("unit_price"));
+                }
+            }
+        }
+    }
+}
+```
+
+Both calls produce the same value because the rows and types match. The choice is about which kind of breakage you prefer. In practice, label-based access wins for application code because SQL changes are common and silent bugs are expensive. Index-based access is fine inside small helpers that own both the SQL and the row-reading logic in the same method.
+
+`getXxx(String label)` is slightly slower than `getXxx(int index)` because the driver has to map the label to an index for every call. The cost is microseconds per cell, so it does not matter for typical queries. It only shows up when you read millions of rows in a tight loop. Cache the index with `rs.findColumn("name")` once before the loop if it ever does.
+
+The column labels are case-insensitive in JDBC. `rs.getInt("ID")`, `rs.getInt("id")`, and `rs.getInt("Id")` all work. Asking for a label that does not exist in the result set throws `SQLException` with a message that says the column was not found.
+
+<h1 id="the-getxxx-methods">The getXxx Methods</h1>
+
+JDBC has a `getXxx` method for almost every SQL type. The table below shows the most common ones, what SQL type they read, and what Java type they return.
+
+| Method          | SQL types it handles                                        | Returns              |
+| --------------- | ----------------------------------------------------------- | -------------------- |
+| `getString`     | `VARCHAR`, `CHAR`, `TEXT`, and most others (via conversion) | `String`             |
+| `getInt`        | `INTEGER`, `SMALLINT`, `TINYINT`                            | `int`                |
+| `getLong`       | `BIGINT`                                                    | `long`               |
+| `getDouble`     | `DOUBLE`, `FLOAT`, `REAL`                                   | `double`             |
+| `getBigDecimal` | `DECIMAL`, `NUMERIC`                                        | `BigDecimal`         |
+| `getBoolean`    | `BOOLEAN`, `BIT`                                            | `boolean`            |
+| `getDate`       | `DATE`                                                      | `java.sql.Date`      |
+| `getTime`       | `TIME`                                                      | `java.sql.Time`      |
+| `getTimestamp`  | `TIMESTAMP`                                                 | `java.sql.Timestamp` |
+| `getBytes`      | `BINARY`, `VARBINARY`, `BLOB` (small)                       | `byte[]`             |
+| `getObject`     | any                                                         | `Object`             |
+
+Two choices in this table need a closer look. The first is `getBigDecimal` for money. SQL `DECIMAL` columns are exact, fixed-precision numbers, which is what you want for prices, totals, and tax amounts. Reading them with `getDouble` round-trips through binary floating point and can introduce rounding errors you do not notice until the totals start being off by a cent. Always read currency columns with `getBigDecimal`.
+
+```java
+import java.math.BigDecimal;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class MoneyReadCorrectly {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            try (Statement setup = conn.createStatement()) {
+                setup.execute("CREATE TABLE orders (id INT, total DECIMAL(10,2))");
+                setup.execute("INSERT INTO orders VALUES (1, 19.99), (2, 0.10), (3, 0.20)");
+            }
+
+            try (Statement stmt = conn.createStatement();
+                 ResultSet rs = stmt.executeQuery("SELECT total FROM orders")) {
+                BigDecimal sum = BigDecimal.ZERO;
+                while (rs.next()) {
+                    sum = sum.add(rs.getBigDecimal("total"));
+                }
+                System.out.println("sum: " + sum);
+            }
+        }
+    }
+}
+```
+
+`BigDecimal` preserves the exact `19.99 + 0.10 + 0.20`. Doing the same arithmetic with `double` can produce `20.290000000000003`, which is wrong for a currency total. `PreparedStatement` has the matching `setBigDecimal` for writes; `getBigDecimal` is the read side of the same pattern.
+
+The second is `getTimestamp` for date-times. SQL has three distinct temporal types: `DATE` (just a calendar date), `TIME` (just a wall-clock time), and `TIMESTAMP` (date plus time, sometimes with time zone). Use the matching getter. `getTimestamp` returns a `java.sql.Timestamp`, which is a thin extension of `java.util.Date` with sub-second precision. To convert into the modern `java.time` types, call `rs.getObject("created_at", java.time.LocalDateTime.class)` on JDBC 4.2 or newer.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
+import java.time.LocalDateTime;
+
+public class TimestampToModern {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            try (Statement setup = conn.createStatement()) {
+                setup.execute("CREATE TABLE orders (id INT, placed_at TIMESTAMP)");
+                setup.execute("INSERT INTO orders VALUES (1, TIMESTAMP '2026-05-13 10:30:00')");
+            }
+
+            try (Statement stmt = conn.createStatement();
+                 ResultSet rs = stmt.executeQuery("SELECT placed_at FROM orders")) {
+                while (rs.next()) {
+                    LocalDateTime placedAt = rs.getObject("placed_at", LocalDateTime.class);
+                    System.out.println("order placed at " + placedAt);
+                }
+            }
+        }
+    }
+}
+```
+
+`getObject("placed_at", LocalDateTime.class)` lets the driver hand you back the new immutable type directly. The older `getTimestamp` plus `.toLocalDateTime()` still works, and appears in legacy code, but the typed `getObject` overload is the better option in new code.
+
+`getObject` is slightly more expensive than the type-specific getters because the driver picks the conversion at runtime. The difference is negligible in row-by-row code but matters when profiling a hot loop that reads millions of cells.
+
+`getString` will convert almost anything in the database to a `String` representation. That is convenient for printing and debugging, but it hides type mismatches. If a column is supposed to be an `INTEGER` and you read it with `getString`, the database returns `"42"` and your code accepts it without complaint. Use the type-specific getter that matches the column.
+
+<h1 id="detecting-null-with-wasnull">Detecting NULL with wasNull</h1>
+
+JDBC has a small gotcha around `NULL` and primitives. `getString` returns `null` for a SQL `NULL`, which is intuitive. But `getInt`, `getDouble`, `getLong`, and `getBoolean` cannot return `null` because Java primitives have no null. Instead, they return the default value (`0`, `0.0`, `false`) for both a real zero and a `NULL`. The two are indistinguishable from the return value alone.
+
+The way to disambiguate is `rs.wasNull()`. After any `getXxx` call, `wasNull` returns `true` if the value just read was a SQL `NULL`, `false` otherwise. It refers to the most recent get, so you have to call it right after the column read, before doing anything else.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class NullDetection {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            try (Statement setup = conn.createStatement()) {
+                setup.execute("CREATE TABLE reviews (id INT, product_id INT, rating INT)");
+                setup.execute("INSERT INTO reviews VALUES (1, 100, 5)");
+                setup.execute("INSERT INTO reviews VALUES (2, 100, NULL)");
+                setup.execute("INSERT INTO reviews VALUES (3, 100, 0)");
+            }
+
+            try (Statement stmt = conn.createStatement();
+                 ResultSet rs = stmt.executeQuery("SELECT id, rating FROM reviews ORDER BY id")) {
+                while (rs.next()) {
+                    int id = rs.getInt("id");
+                    int rating = rs.getInt("rating");
+                    if (rs.wasNull()) {
+                        System.out.println("review " + id + ": no rating");
+                    } else {
+                        System.out.println("review " + id + ": rating " + rating);
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+Review 2 has a `NULL` rating; `getInt` returns `0`, but `wasNull()` is `true`, so we print "no rating". Review 3 has a real `0` rating; `getInt` also returns `0`, but `wasNull()` is `false`, so we treat it as a genuine score. Without the `wasNull` check, the two rows would look the same in Java.
+
+For nullable columns, the alternative is to use the boxed-type getters. `rs.getObject("rating", Integer.class)` returns either an `Integer` or `null`, which lets you skip the `wasNull` dance. This style makes the `null` visible in the Java type system; a `null Integer` cannot accidentally be treated like the number `0`.
+
+```java
+Integer rating = rs.getObject("rating", Integer.class);
+if (rating == null) {
+    System.out.println("no rating");
+} else {
+    System.out.println("rating " + rating);
+}
+```
+
+The same idea works for `getObject("price", BigDecimal.class)` or `getObject("placed_at", LocalDateTime.class)`. Use the boxed-type getter when the column is nullable; use the primitive getter plus `wasNull` for legacy code or when allocation cost matters in a tight loop.
+
+Boxed getters allocate an `Integer` or `Long` object per cell. For a query that reads ten million rows, that is ten million extra heap allocations. The primitive getter plus `wasNull` allocates nothing. The difference matters in batch processing, not in interactive code.
+
+<h1 id="scrolling-type_forward_only-vs-scrollable-result-sets">
+  Scrolling: TYPE_FORWARD_ONLY vs Scrollable Result Sets
+</h1>
+
+Every `ResultSet` we have produced so far has been **forward-only**. The cursor moves one step forward on each `next()` and that is it. You cannot go back, jump to a specific row, or move to the end. Forward-only is the default because it lets the driver stream rows from the server one at a time and never has to hold more than the current row in memory. It is also the only mode that every JDBC driver supports.
+
+JDBC defines two scrollable types in addition. `TYPE_SCROLL_INSENSITIVE` lets the cursor move forward, backward, to absolute positions, or by relative offsets, but the rows are a snapshot from the moment the query ran; later updates by other connections do not show up. `TYPE_SCROLL_SENSITIVE` is the same but tracks underlying changes, so a row that another connection updates after your query becomes visible the next time your cursor lands on it. Sensitive support varies widely by driver; H2 and PostgreSQL emulate it with extra work, and some drivers downgrade silently to insensitive.
+
+You pick the type when you create the `Statement` or `PreparedStatement`. The second argument is the type, and the third is the concurrency mode.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class ScrollAround {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            try (Statement setup = conn.createStatement()) {
+                setup.execute("CREATE TABLE products (id INT PRIMARY KEY, name VARCHAR(100))");
+                setup.execute("INSERT INTO products VALUES (1, 'Laptop'), (2, 'Mouse'), (3, 'Keyboard'), (4, 'Monitor'), (5, 'Webcam')");
+            }
+
+            try (Statement stmt = conn.createStatement(
+                         ResultSet.TYPE_SCROLL_INSENSITIVE,
+                         ResultSet.CONCUR_READ_ONLY);
+                 ResultSet rs = stmt.executeQuery("SELECT id, name FROM products ORDER BY id")) {
+
+                rs.last();
+                System.out.println("last:    " + rs.getInt("id") + " " + rs.getString("name"));
+
+                rs.first();
+                System.out.println("first:   " + rs.getInt("id") + " " + rs.getString("name"));
+
+                rs.absolute(3);
+                System.out.println("row 3:   " + rs.getInt("id") + " " + rs.getString("name"));
+
+                rs.relative(-1);
+                System.out.println("back 1:  " + rs.getInt("id") + " " + rs.getString("name"));
+
+                rs.previous();
+                System.out.println("prev:    " + rs.getInt("id") + " " + rs.getString("name"));
+            }
+        }
+    }
+}
+```
+
+(Output formatting: the labels line up because each is left-padded to the same width in the source.)
+
+The scrollable cursor lets us bounce around. `last()` jumps to the final row and is handy for "how many results did this query produce" without iterating. `first()` jumps to the start. `absolute(3)` is 1-based: it positions on the third row. `absolute(-1)` would be the last row, `absolute(-2)` the second-to-last. `relative(-1)` moves backward one row from wherever the cursor is now; `relative(2)` would move forward two. `previous()` is the inverse of `next()` and returns `false` when it walks off the front edge.
+
+The diagram lays out the three types side by side. Forward-only is the default mode that streams. The two scroll modes give you a richer API in exchange for keeping more state. Most application code wants forward-only with a `LIMIT/OFFSET` or keyset pagination at the SQL level rather than scrolling at the cursor level, because that approach also works when the result set is too large to fit in memory.
+
+Scrollable result sets either materialize the entire result on the client (`INSENSITIVE`) or maintain a server-side cursor that supports random access (`SENSITIVE`). Both are far more expensive than forward-only for large result sets. Use them only when you need to move the cursor backward; otherwise stay with the default.
+
+<h1 id="updatable-result-sets">Updatable Result Sets</h1>
+
+A `ResultSet` is read-only by default. That makes sense for queries that join across tables or aggregate rows, where "updating a row" has no obvious meaning. For straightforward `SELECT * FROM one_table WHERE ...` queries, JDBC offers an `updatable` mode that lets you edit rows through the cursor and have the driver issue the underlying `UPDATE`, `INSERT`, or `DELETE` for you.
+
+You opt in with `ResultSet.CONCUR_UPDATABLE` as the third argument to `createStatement`. The driver also needs the result set to be tied to one table and to include the primary key, otherwise it cannot figure out which row to update.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class UpdateThroughCursor {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            try (Statement setup = conn.createStatement()) {
+                setup.execute("CREATE TABLE products (id INT PRIMARY KEY, name VARCHAR(100), stock INT)");
+                setup.execute("INSERT INTO products VALUES (1, 'Laptop', 5), (2, 'Mouse', 0), (3, 'Keyboard', 12)");
+            }
+
+            try (Statement stmt = conn.createStatement(
+                         ResultSet.TYPE_SCROLL_SENSITIVE,
+                         ResultSet.CONCUR_UPDATABLE);
+                 ResultSet rs = stmt.executeQuery("SELECT id, name, stock FROM products")) {
+
+                while (rs.next()) {
+                    int stock = rs.getInt("stock");
+                    if (stock == 0) {
+                        rs.updateInt("stock", 10);
+                        rs.updateRow();
+                    }
+                }
+            }
+
+            try (Statement check = conn.createStatement();
+                 ResultSet rs = check.executeQuery("SELECT id, name, stock FROM products ORDER BY id")) {
+                while (rs.next()) {
+                    System.out.println(rs.getInt("id") + " " + rs.getString("name") + " stock=" + rs.getInt("stock"));
+                }
+            }
+        }
+    }
+}
+```
+
+The loop walks every product, finds the one with `stock = 0`, and refills it to 10. The mechanics are `updateXxx` to stage the new value in the cursor's row buffer, then `updateRow()` to push the changes to the database. Without `updateRow()`, the staged value is dropped when the cursor moves to the next row, which is a common source of "my update didn't save" bugs.
+
+You can also insert new rows. The cursor has a special **insert row** position you move to with `moveToInsertRow()`. Stage the new column values with `updateXxx`, then call `insertRow()` to commit. Move back to the regular cursor with `moveToCurrentRow()` if you want to keep iterating.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class InsertThroughCursor {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            try (Statement setup = conn.createStatement()) {
+                setup.execute("CREATE TABLE products (id INT PRIMARY KEY, name VARCHAR(100), stock INT)");
+                setup.execute("INSERT INTO products VALUES (1, 'Laptop', 5)");
+            }
+
+            try (Statement stmt = conn.createStatement(
+                         ResultSet.TYPE_SCROLL_SENSITIVE,
+                         ResultSet.CONCUR_UPDATABLE);
+                 ResultSet rs = stmt.executeQuery("SELECT id, name, stock FROM products")) {
+
+                rs.moveToInsertRow();
+                rs.updateInt("id", 2);
+                rs.updateString("name", "Mouse");
+                rs.updateInt("stock", 30);
+                rs.insertRow();
+                rs.moveToCurrentRow();
+            }
+
+            try (Statement check = conn.createStatement();
+                 ResultSet rs = check.executeQuery("SELECT id, name FROM products ORDER BY id")) {
+                while (rs.next()) {
+                    System.out.println(rs.getInt("id") + " " + rs.getString("name"));
+                }
+            }
+        }
+    }
+}
+```
+
+The `moveToInsertRow` pattern stages a fresh row, fills it column by column, and pushes it with `insertRow`. The cursor then sits in the insert position until you call `moveToCurrentRow`, which brings you back to wherever you were before. You can also delete the current row in place with `rs.deleteRow()`.
+
+Updatable result sets are convenient but have real limits. The query must come from a single base table, must include the primary key, and cannot contain `GROUP BY`, joins, or computed columns. The driver's generated `UPDATE` is one row at a time, with no batching. For changing many rows, a direct `UPDATE` statement, or a `PreparedStatement` in batch mode, is faster and more idiomatic. The cursor-update API is mostly useful for one-off edits in admin tools and small interactive scripts.
+
+| Concurrency                  | What you can do                                     | When to use                                              |
+| ---------------------------- | --------------------------------------------------- | -------------------------------------------------------- |
+| `CONCUR_READ_ONLY` (default) | Read columns only.                                  | Almost always.                                           |
+| `CONCUR_UPDATABLE`           | `updateXxx`, `updateRow`, `insertRow`, `deleteRow`. | Admin scripts, interactive editors, single-table tweaks. |
+
+<h1 id="holdability">Holdability</h1>
+
+A `ResultSet` has one more property to know about: **holdability**. It controls what happens to an open cursor when the transaction it belongs to is committed. The two values are `HOLD_CURSORS_OVER_COMMIT` and `CLOSE_CURSORS_AT_COMMIT`.
+
+With `CLOSE_CURSORS_AT_COMMIT`, a commit closes every open `ResultSet` on the connection. You cannot keep iterating after the commit; the cursor is gone. This is the default in most databases and matches the safer assumption that the transaction's snapshot is no longer valid once it ends.
+
+With `HOLD_CURSORS_OVER_COMMIT`, the result set survives the commit and you can keep reading from it. That is convenient for long-running readers that want to commit periodically without restarting the query, but the semantics of "what does this cursor see now" depend on the driver and on whether the underlying snapshot is preserved.
+
+You pick the value with the four-argument overload of `createStatement`. Most application code uses the connection's default and never touches this knob. The two situations where it matters are batch jobs that periodically commit while iterating, and database-specific tuning where a driver only supports one of the two values for a given cursor type. Knowing the option exists is enough for interview purposes; the default is correct for almost every real query.
+
+<h1 id="resultsetmetadata">ResultSetMetaData</h1>
+
+Sometimes you want to write code that handles any query, without knowing the columns up front. A reporting tool that prints arbitrary SQL, a CSV exporter, or a generic JDBC inspector all need to ask the result set "what columns do you have, and what types are they?" That information comes from `ResultSetMetaData`, which you get from `rs.getMetaData()`.
+
+The methods on `ResultSetMetaData` are 1-based, like the column index getters. The most common ones:
+
+| Method                    | Returns                                                            |
+| ------------------------- | ------------------------------------------------------------------ |
+| `getColumnCount()`        | Total number of columns in the result.                             |
+| `getColumnName(i)`        | Underlying column name in the table.                               |
+| `getColumnLabel(i)`       | Label to use with `getXxx(String)`, which is the alias if present. |
+| `getColumnTypeName(i)`    | Database-specific type name (`VARCHAR`, `DECIMAL`, etc.).          |
+| `getColumnDisplaySize(i)` | Suggested column width in characters for printing.                 |
+| `getColumnType(i)`        | JDBC type code (an `int` constant from `java.sql.Types`).          |
+| `isNullable(i)`           | Whether the column can hold `NULL`.                                |
+
+The classic use is a generic table printer. The function below takes any `ResultSet` and prints it like a spreadsheet, padding each cell to the column's display width.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.sql.Statement;
+
+public class GenericTablePrinter {
+
+    static void printTable(ResultSet rs) throws Exception {
+        ResultSetMetaData meta = rs.getMetaData();
+        int columns = meta.getColumnCount();
+
+        StringBuilder header = new StringBuilder();
+        for (int i = 1; i <= columns; i++) {
+            header.append(String.format("%-15s", meta.getColumnLabel(i)));
+        }
+        System.out.println(header);
+
+        StringBuilder types = new StringBuilder();
+        for (int i = 1; i <= columns; i++) {
+            types.append(String.format("%-15s", "(" + meta.getColumnTypeName(i) + ")"));
+        }
+        System.out.println(types);
+
+        while (rs.next()) {
+            StringBuilder row = new StringBuilder();
+            for (int i = 1; i <= columns; i++) {
+                String value = rs.getString(i);
+                row.append(String.format("%-15s", value == null ? "NULL" : value));
+            }
+            System.out.println(row);
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            try (Statement setup = conn.createStatement()) {
+                setup.execute("CREATE TABLE products (id INT, name VARCHAR(100), price DECIMAL(10,2))");
+                setup.execute("INSERT INTO products VALUES (1, 'Laptop', 999.00), (2, 'Mouse', 19.99)");
+            }
+
+            try (Statement stmt = conn.createStatement();
+                 ResultSet rs = stmt.executeQuery("SELECT id, name, price AS unit_price FROM products")) {
+                printTable(rs);
+            }
+        }
+    }
+}
+```
+
+The printer does not know what the query was. It just asks the metadata for column count, labels, and types, then walks the rows reading each cell as a string. That generic shape is what tools like database GUIs, REPLs, and CSV exporters do internally. H2 returns column labels in uppercase by default, which is why the header shows `ID`, `NAME`, `UNIT_PRICE`.
+
+The difference between `getColumnName` and `getColumnLabel` is worth pinning down. `getColumnName` returns the underlying column in the table, ignoring aliases. `getColumnLabel` returns the alias if one was set with `AS`, otherwise the column name. The label is what you pass to `rs.getString(String)`, so it is the one you usually want.
+
+<h1 id="streaming-large-results-with-setfetchsize">
+  Streaming Large Results with setFetchSize
+</h1>
+
+By default, many JDBC drivers fetch all rows of a query into client memory the moment `executeQuery` returns, even though you have not read any yet. That is fine for queries that return 10 rows. It is not fine for queries that return 10 million rows: the JVM either runs out of heap or spends so long allocating that the query feels frozen.
+
+`setFetchSize(int rows)` is the knob that tells the driver "give me this many rows at a time, not the whole result." The driver fetches a window of `n` rows, hands them out through `next()`, then fetches the next window when the cursor walks past the current one. Memory usage stays bounded by the fetch size instead of the result size.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class StreamLargeResult {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            try (Statement setup = conn.createStatement()) {
+                setup.execute("CREATE TABLE reviews (id INT, product_id INT, rating INT)");
+                try (java.sql.PreparedStatement insert = conn.prepareStatement(
+                        "INSERT INTO reviews VALUES (?, ?, ?)")) {
+                    for (int i = 1; i <= 10000; i++) {
+                        insert.setInt(1, i);
+                        insert.setInt(2, i % 100);
+                        insert.setInt(3, (i % 5) + 1);
+                        insert.addBatch();
+                    }
+                    insert.executeBatch();
+                }
+            }
+
+            try (Statement stmt = conn.createStatement()) {
+                stmt.setFetchSize(500);
+                try (ResultSet rs = stmt.executeQuery("SELECT id, rating FROM reviews")) {
+                    long sumRatings = 0;
+                    int count = 0;
+                    while (rs.next()) {
+                        sumRatings += rs.getInt("rating");
+                        count++;
+                    }
+                    System.out.println("scanned " + count + " rows, sum=" + sumRatings);
+                }
+            }
+        }
+    }
+}
+```
+
+The query scans 10,000 rows but never holds more than 500 in memory at a time. The exact behavior of `setFetchSize` is driver-specific. On Postgres, you also need `conn.setAutoCommit(false)` for streaming to kick in; on Oracle, the JDBC driver honors fetch size out of the box. H2 in-memory does not need it because the data is already in process, but the call is harmless and documents intent.
+
+A fetch size of zero means "driver default," which is usually "all rows." A common starting point is 100 to 1000 for streaming reads. Going too small means more round trips to the database; too large means more memory per window. The sweet spot depends on row width and network latency, but the order-of-magnitude default is what you want to start with and tune from measurements.
+
+Without `setFetchSize`, a query that returns a million rows allocates a million row objects on the client before your first `next()` returns. That can cost gigabytes of heap and seconds of GC pressure. With `setFetchSize(500)`, peak memory is bounded by 500 rows. Always set a fetch size on queries that might return many rows, especially in batch jobs and reports.
+
+The fetch size only matters for forward-only result sets. Scrollable types have to materialize more of the result anyway (insensitive types pull everything into a snapshot), so the fetch size knob does not help them stream.
+
+<h1 id="closing-the-resultset">Closing the ResultSet</h1>
+
+Every `ResultSet` holds a server-side cursor (or a chunk of memory if the result is fully materialized). Forgetting to close it leaks that resource until the underlying `Statement` or `Connection` closes, which on a long-lived connection means the leak compounds. The fix is `try-with-resources`: wrap the result set so it closes whether the body returns normally or throws.
+
+```java
+try (Statement stmt = conn.createStatement();
+     ResultSet rs = stmt.executeQuery("SELECT id, name FROM products")) {
+    while (rs.next()) {
+        System.out.println(rs.getInt("id") + " " + rs.getString("name"));
+    }
+}
+```
+
+Closing the `Statement` closes the result set, so technically wrapping just the `Statement` is enough. Wrapping the `ResultSet` too is defensive and makes the intent clear at every layer. The runtime cost of either approach is the same.
+
+One detail: running another `executeQuery` on the same `Statement` automatically closes the previous result set. If you store a `ResultSet` reference and run a second query through the same `Statement`, the first reference is invalidated. The fix is either separate `Statement` objects per query or to fully consume each result set before starting the next.
+
+<h1 id="putting-it-together">Putting It Together</h1>
+
+A small report that exercises most of the pieces: it queries the orders table, uses metadata to discover the columns, iterates with a streaming fetch size, reads typed values, handles a nullable column, and prints a tidy summary.
+
+```java
+import java.math.BigDecimal;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.sql.Statement;
+
+public class OrderReport {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            try (Statement setup = conn.createStatement()) {
+                setup.execute("CREATE TABLE orders (id INT PRIMARY KEY, customer VARCHAR(100), total DECIMAL(10,2), discount DECIMAL(10,2))");
+                try (PreparedStatement insert = conn.prepareStatement(
+                        "INSERT INTO orders VALUES (?, ?, ?, ?)")) {
+                    Object[][] rows = {
+                            {1, "Aarav", new BigDecimal("199.99"), null},
+                            {2, "Sara",  new BigDecimal("49.50"),  new BigDecimal("5.00")},
+                            {3, "Ravi",  new BigDecimal("12.00"),  null}
+                    };
+                    for (Object[] r : rows) {
+                        insert.setInt(1, (Integer) r[0]);
+                        insert.setString(2, (String) r[1]);
+                        insert.setBigDecimal(3, (BigDecimal) r[2]);
+                        insert.setBigDecimal(4, (BigDecimal) r[3]);
+                        insert.executeUpdate();
+                    }
+                }
+            }
+
+            try (Statement stmt = conn.createStatement()) {
+                stmt.setFetchSize(100);
+                try (ResultSet rs = stmt.executeQuery(
+                        "SELECT id, customer, total, discount FROM orders ORDER BY id")) {
+
+                    ResultSetMetaData meta = rs.getMetaData();
+                    System.out.println("columns: " + meta.getColumnCount());
+                    for (int i = 1; i <= meta.getColumnCount(); i++) {
+                        System.out.println("  " + meta.getColumnLabel(i) + " (" + meta.getColumnTypeName(i) + ")");
+                    }
+
+                    BigDecimal grand = BigDecimal.ZERO;
+                    while (rs.next()) {
+                        int id = rs.getInt("id");
+                        String customer = rs.getString("customer");
+                        BigDecimal total = rs.getBigDecimal("total");
+                        BigDecimal discount = rs.getObject("discount", BigDecimal.class);
+                        BigDecimal net = discount == null ? total : total.subtract(discount);
+                        grand = grand.add(net);
+                        System.out.println("order " + id + " " + customer + " net=" + net);
+                    }
+                    System.out.println("grand total: " + grand);
+                }
+            }
+        }
+    }
+}
+```
+
+Every concept this lesson covered shows up. The cursor walks the rows with `next()`. Column reads use labels for clarity. Currency uses `getBigDecimal` to preserve scale. The nullable `discount` column uses the boxed `getObject(..., BigDecimal.class)` getter so `null` stays visible. The fetch size keeps memory bounded. Metadata names the columns generically. `try-with-resources` closes everything on the way out, including the result set.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

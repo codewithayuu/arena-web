@@ -1,0 +1,410 @@
+---
+title: "Custom Exceptions"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "Custom Exceptions explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="why-build-your-own">Why Build Your Own</h1>
+
+The standard library's exceptions are general on purpose. `ValueError` says "the value was wrong," but it doesn't say what was wrong about it. A function that processes an order might raise `ValueError` for a bad price, for a missing customer, and for a sold-out item, and the caller has no way to tell those apart without parsing the error message string. Parsing error strings is brittle and one of the surest ways to write code that breaks on the next library update.
+
+A custom exception gives an error a typed identity. When you write `class OutOfStockError(Exception): pass`, you're telling Python "this is a specific kind of problem, distinct from every other kind." Callers can then write `except OutOfStockError:` and catch only that one kind, letting the rest propagate. The error type itself becomes part of the contract between the function that raises and the caller that handles.
+
+There are three concrete reasons to introduce a custom exception:
+
+- **Domain meaning.** `OutOfStockError` reads better than `Exception("item not available")`. A reader of the calling code knows exactly what went wrong without inspecting the message.
+- **Selective handling.** A caller can catch one specific failure (`InsufficientFundsError`) and let everything else propagate. That's impossible if every failure is a generic `Exception`.
+- **Context attachment.** A custom exception class can carry structured data: the product that was out of stock, the requested quantity, the customer's balance. Built-in exceptions only carry a message string.
+
+The cost is small. A custom exception class is often a single line. The payoff is code that names its failures clearly and can react to each one on its own terms.
+
+<h1 id="the-minimal-custom-exception">The Minimal Custom Exception</h1>
+
+Defining a custom exception is just defining a class that inherits from `Exception`. The body can be empty; the name and the inheritance are what give it its behavior.
+
+```python
+class OutOfStockError(Exception):
+    pass
+
+raise OutOfStockError("Wireless Mouse is sold out")
+```
+
+That's the whole thing. `OutOfStockError` inherits everything from `Exception`: the ability to be raised, the message handling, the traceback formatting. The `pass` body just means "no additional behavior beyond what `Exception` provides."
+
+You can catch it the same way you catch any built-in exception:
+
+```python
+class OutOfStockError(Exception):
+    pass
+
+def reserve_item(product_name, available):
+    if available == 0:
+        raise OutOfStockError(f"{product_name} is sold out")
+    return f"reserved 1 {product_name}"
+
+try:
+    print(reserve_item("Wireless Mouse", 0))
+except OutOfStockError as e:
+    print(f"can't reserve: {e}")
+```
+
+The `except OutOfStockError` clause catches only this specific class. If `reserve_item` later raised a different kind of error (`ValueError`, say, for a bad input), this `except` would let it propagate, which is usually what you want.
+
+Two conventions worth picking up right away. The class name ends with `Error` (PEP 8 calls this out: exception names should match the pattern of built-ins like `ValueError`, `TypeError`, `KeyError`). And the class inherits from `Exception`, not from `BaseException`. There's a reason for that second one, covered below.
+
+<h1 id="inherit-from-exception-not-baseexception">
+  Inherit From Exception, Not BaseException
+</h1>
+
+Python's exception hierarchy has two layers near the top. `BaseException` is the root of everything, and `Exception` is its immediate child. Almost every error you've seen (`ValueError`, `KeyError`, `TypeError`, `RuntimeError`) inherits from `Exception`. The other branch of `BaseException`, the one that isn't `Exception`, is reserved for things that should generally not be caught: `KeyboardInterrupt` (the user pressed Ctrl+C), `SystemExit` (the program is shutting down), `GeneratorExit` (internal generator cleanup).
+
+The takeaway: always inherit from `Exception` (or one of its subclasses), never from `BaseException` directly. If you inherit from `BaseException`, your custom error won't be caught by the common `except Exception:` clause that wraps most application code, which is almost never what you want.
+
+```python
+# right
+class CartError(Exception):
+    pass
+
+# wrong: do not do this
+class WeirdError(BaseException):
+    pass
+```
+
+The wrong version slips past any `except Exception:` handler in the surrounding code, which means a single missing handler can crash your entire program even when it has a generic "catch and log" block at the top. Stick to `Exception`.
+
+<h1 id="a-hierarchy-for-an-e-commerce-app">
+  A Hierarchy for an E-Commerce App
+</h1>
+
+A single custom exception is useful. A small hierarchy of related custom exceptions is where the design starts to pay off. The idea: pick one root class for your application's domain, group related errors under intermediate branches, and put the specific concrete errors at the leaves.
+
+For a shop, a reasonable starting layout looks like this:
+
+```python
+class ShopError(Exception):
+    """Base for all shop-related errors."""
+
+class CartError(ShopError):
+    """Problems with a customer's cart."""
+
+class InventoryError(ShopError):
+    """Problems with stock or warehouse state."""
+
+class PaymentError(ShopError):
+    """Problems while charging the customer."""
+
+class EmptyCartError(CartError):
+    pass
+
+class OutOfStockError(InventoryError):
+    pass
+
+class InsufficientFundsError(PaymentError):
+    pass
+```
+
+`ShopError` is the root: anything that fails because of the shop's own business rules is some kind of `ShopError`. Below it sit three branches, one for each broad area (carts, inventory, payments). At the leaves are the specific failures: an empty cart at checkout, an out-of-stock item, a customer whose card was declined for lack of funds.
+
+The arrows point from parent to child. Every leaf is also an instance of its parent branch, and every branch is also an instance of `ShopError`. That's the key property the hierarchy gives you.
+
+Why bother with the middle layer (`CartError`, `InventoryError`, `PaymentError`)? Because it gives callers three useful levels of granularity:
+
+- Catch one specific failure: `except OutOfStockError`.
+- Catch any inventory-related failure: `except InventoryError`.
+- Catch any shop-related failure: `except ShopError`.
+
+A high-level request handler might use the broadest one, logging anything that's a `ShopError` and returning a generic "please try again" response. A business-logic function might use the most specific one, because it knows exactly how to recover from an `OutOfStockError` (suggest a similar item) but not from anything else.
+
+```python
+def process_checkout(cart_total, balance, items_available):
+    if cart_total == 0:
+        raise EmptyCartError("cart has no items")
+    if not items_available:
+        raise OutOfStockError("one or more items are sold out")
+    if balance < cart_total:
+        raise InsufficientFundsError(f"need ${cart_total}, have ${balance}")
+    return "checkout complete"
+
+for args in [(0, 100, True), (50, 100, False), (50, 10, True), (50, 100, True)]:
+    try:
+        print(process_checkout(*args))
+    except ShopError as e:
+        print(f"{type(e).__name__}: {e}")
+```
+
+A single `except ShopError` catches all three failure types. The handler can still tell them apart by checking `type(e)` or by adding more specific `except` clauses before the broad one. The point is that one type-aware `except` swept up everything domain-specific without accidentally catching unrelated errors (like a `KeyError` from a typo in a dict lookup somewhere).
+
+<h1 id="adding-context-with-__init__">Adding Context With __init__</h1>
+
+A bare exception with a message string carries enough information to log, but not always enough to act on. If a payment fails because the card was declined, the caller might want to know the requested amount and the available balance to render a useful message. If an item is out of stock, the caller might want the product name and the quantity that was requested.
+
+You can attach that data by giving the exception class its own `__init__`. Inside, you pass the message up to `Exception` with `super().__init__(message)`, and you store the rest as attributes.
+
+```python
+class OutOfStockError(Exception):
+    def __init__(self, product, requested, available):
+        message = f"{product}: requested {requested}, only {available} in stock"
+        super().__init__(message)
+        self.product = product
+        self.requested = requested
+        self.available = available
+
+try:
+    raise OutOfStockError("Wireless Mouse", 3, 1)
+except OutOfStockError as e:
+    print(f"error: {e}")
+    print(f"product: {e.product}")
+    print(f"short by: {e.requested - e.available}")
+```
+
+Two things happen in `__init__`. The `super().__init__(message)` call hands the formatted message string to `Exception`, which stores it where the traceback machinery and the `str()` of the exception expect to find it. Without that call, `str(e)` would return an empty string and the traceback would print without a useful message. Then the three `self.attr = value` lines attach the structured data, so callers can read `e.product` or `e.available` directly without parsing the string.
+
+The pattern is the same one you'd use for any class with extra attributes: take the parameters, build a message, hand it up with `super().__init__(...)`, store the rest on `self`. The only thing that makes this an exception class rather than a regular class is the inheritance from `Exception`.
+
+A second example for payments:
+
+```python
+class InsufficientFundsError(Exception):
+    def __init__(self, customer, amount_due, balance):
+        super().__init__(f"{customer} needs ${amount_due}, has ${balance}")
+        self.customer = customer
+        self.amount_due = amount_due
+        self.balance = balance
+        self.shortfall = amount_due - balance
+
+try:
+    raise InsufficientFundsError("Alice", 50.00, 12.50)
+except InsufficientFundsError as e:
+    print(e)
+    print(f"shortfall: ${e.shortfall:.2f}")
+```
+
+The `shortfall` attribute is computed inside `__init__` rather than passed in, because it's derived from the other two values. The caller never has to compute it; the exception knows.
+
+> **Tip:** When you store extra attributes, prefer naming them after the concrete domain concepts (`product`, `requested`, `balance`) rather than generic words like `data` or `info`. The names show up in tracebacks and in any `except` block that introspects the exception, and clear names make the exception self-documenting.
+
+<h1 id="custom-__str__-for-readable-output">
+  Custom __str__ for Readable Output
+</h1>
+
+`Exception.__str__` returns whatever message string you passed to `super().__init__`. That's usually fine. But sometimes you want the printed form of the exception to look different from the message stored on the parent, or you want to format the structured attributes into a richer string.
+
+You can override `__str__` for that:
+
+```python
+class OutOfStockError(Exception):
+    def __init__(self, product, requested, available):
+        super().__init__(product)
+        self.product = product
+        self.requested = requested
+        self.available = available
+
+    def __str__(self):
+        return (
+            f"OUT OF STOCK: {self.product} "
+            f"(requested {self.requested}, available {self.available})"
+        )
+
+err = OutOfStockError("Wireless Mouse", 3, 1)
+print(err)
+print(repr(err))
+```
+
+`print(err)` calls `__str__`, which returns the custom formatted string. `repr(err)` uses the default `__repr__` inherited from `Exception`, which shows the class name and the arguments passed to `super().__init__`. The two views serve different purposes: `__str__` is what humans see in logs and tracebacks, and `__repr__` is what developers see in a debugger or REPL.
+
+You can override `__repr__` too if you want a more detailed developer-facing string, but it's rarely needed for exceptions; the default is usually good enough. Most of the customization happens in `__str__` or in the constructor itself.
+
+A subtle point: if you only call `super().__init__(self.product)` (passing just the product name) but your `__str__` builds a longer message from all three attributes, the message stored on the parent and the message returned by `str(self)` no longer match. The traceback machinery uses `__str__`, so the longer string is what shows up at the bottom of a traceback, but `e.args` will still contain just `(product,)`. Both behaviors are valid; just be deliberate about which one you want.
+
+<h1 id="calling-conventions-and-subclass-patterns">
+  Calling Conventions and Subclass Patterns
+</h1>
+
+When a custom exception has its own `__init__`, the rest of the codebase calls it with the parameters that `__init__` declares, not with a free-form message string. That's actually one of the wins: the call site can't accidentally forget the structured data, because the constructor requires it.
+
+```python
+class CartError(Exception):
+    pass
+
+class EmptyCartError(CartError):
+    def __init__(self, customer_id):
+        super().__init__(f"cart for customer {customer_id} is empty")
+        self.customer_id = customer_id
+
+def checkout(customer_id, cart):
+    if not cart:
+        raise EmptyCartError(customer_id)
+    return "ok"
+
+try:
+    checkout(42, [])
+except CartError as e:
+    print(f"error: {e}")
+    print(f"customer: {e.customer_id}")
+```
+
+The `raise EmptyCartError(customer_id)` call passes one positional argument, exactly what `__init__` wants. The `except CartError as e` clause catches it because `EmptyCartError` inherits from `CartError`. Inside the handler, `e.customer_id` reads the structured attribute the constructor stored.
+
+A common pattern for hierarchies: the intermediate branches stay empty (just `pass`), and only the leaf classes add their own `__init__` and attributes. That keeps the design simple: you define the structure at the top, and the data shape lives with the specific error that needs it.
+
+```python
+class ShopError(Exception):
+    pass
+
+class InventoryError(ShopError):
+    pass
+
+class OutOfStockError(InventoryError):
+    def __init__(self, product, requested, available):
+        super().__init__(f"{product}: requested {requested}, only {available} in stock")
+        self.product = product
+        self.requested = requested
+        self.available = available
+
+class DiscontinuedError(InventoryError):
+    def __init__(self, product, discontinued_on):
+        super().__init__(f"{product} was discontinued on {discontinued_on}")
+        self.product = product
+        self.discontinued_on = discontinued_on
+```
+
+`ShopError` and `InventoryError` are pure structural classes; they don't carry their own data. `OutOfStockError` and `DiscontinuedError` are concrete and each one knows what attributes it needs. Callers can still catch any inventory problem with `except InventoryError`, and they can still inspect the specific type with `type(e)` or with separate `except` blocks for each leaf.
+
+<h1 id="how-callers-use-the-hierarchy">How Callers Use the Hierarchy</h1>
+
+The reason to design a hierarchy is to give callers a useful menu of catch clauses. Different layers of your code will want different granularity, and the hierarchy lets each pick the level that fits.
+
+A specific business-logic function might want to handle one error type and let the rest bubble up:
+
+```python
+class ShopError(Exception):
+    pass
+
+class InventoryError(ShopError):
+    pass
+
+class OutOfStockError(InventoryError):
+    def __init__(self, product, available):
+        super().__init__(f"{product} sold out (have {available})")
+        self.product = product
+        self.available = available
+
+def reserve(product, quantity, available):
+    if available < quantity:
+        raise OutOfStockError(product, available)
+    return f"reserved {quantity} of {product}"
+
+def add_to_cart(product, quantity, available):
+    try:
+        result = reserve(product, quantity, available)
+    except OutOfStockError as e:
+        return f"Suggest similar: {e.product} is out, only {e.available} left"
+    return result
+
+print(add_to_cart("Wireless Mouse", 2, 5))
+print(add_to_cart("Wireless Mouse", 5, 1))
+```
+
+`add_to_cart` catches the very specific `OutOfStockError` because it has a meaningful response to that one failure (suggest a similar product). Any other `ShopError` it doesn't know how to handle propagates up to the caller.
+
+A high-level entry point, on the other hand, often wants to catch every domain error in one place:
+
+```python
+def handle_request(product, quantity, available):
+    try:
+        return add_to_cart(product, quantity, available)
+    except ShopError as e:
+        return f"order failed ({type(e).__name__}): {e}"
+    except Exception as e:
+        return f"unexpected error: {e}"
+
+print(handle_request("Wireless Mouse", 5, 1))
+```
+
+In this example, the inner `add_to_cart` already handled the `OutOfStockError` and returned a string, so the outer `except` never fired. But if any other `ShopError` had bubbled up (an `InsufficientFundsError`, say), the broad `except ShopError` would have caught it and produced a user-friendly message. And any non-`ShopError` exception would hit the generic `except Exception` for last-resort handling.
+
+The pattern is: catch broad at the edges (request handlers, top-level functions), catch specific in the business logic where you know exactly how to react. The hierarchy makes both styles possible from the same set of classes.
+
+<h1 id="naming-conventions-and-style">Naming Conventions and Style</h1>
+
+A handful of small conventions, all from PEP 8 or Python's standard library, will make your custom exceptions feel at home:
+
+- **End the class name with `Error`.** `OutOfStockError`, `InsufficientFundsError`, `EmptyCartError`. Built-ins follow the same pattern (`ValueError`, `KeyError`, `RuntimeError`), and matching it is what makes a class read as "a kind of error" at a glance. The only exceptions to the rule in the standard library are `Warning` subclasses and a handful of historical names like `StopIteration`.
+- **Inherit from `Exception` or one of its subclasses.** Never from `BaseException` directly. The reason is the one covered earlier: `BaseException` slips past `except Exception:` handlers.
+- **Use a CapWords (PascalCase) class name.** Like any class. `out_of_stock_error` or `OUT_OF_STOCK_ERROR` would be wrong.
+- **Pick a meaningful root for your application's domain.** `ShopError`, `OrderError`, `PaymentError`. Avoid a generic root name like $Lad$Lae$Laf$Lb0
+
+```python
+class ShopError(Exception):
+    """Base class for any failure inside the shop's business logic."""
+
+class CartError(ShopError):
+    """Raised when a cart is in an invalid state for the requested operation."""
+
+class EmptyCartError(CartError):
+    """Raised when checkout is attempted on a cart with no items."""
+```
+
+The docstrings are short, just enough to remove ambiguity for the next person who reads the code. They're also free documentation, because `help(EmptyCartError)` will show them.
+
+<h1 id="anti-patterns-to-avoid">Anti-Patterns to Avoid</h1>
+
+A few patterns look tempting but produce hard-to-maintain code:
+
+**Subclassing `BaseException`.** Already covered. Don't do it. Inherit from `Exception` (or a more specific built-in or a class in your own hierarchy).
+
+**One exception per code path.** It's a smell to define `InventoryReadFailedAtLine42Error`. The class should describe a kind of problem, not a location in code. Twenty narrowly scoped exceptions are usually worse than three or four well-named ones with structured attributes.
+
+**Reusing built-ins for domain errors.** Raising `ValueError("cart is empty")` works, but it leaks: any `except ValueError` in surrounding code catches your domain error along with everything else `ValueError` is used for. Define `EmptyCartError` instead.
+
+**No common ancestor.** If `OutOfStockError`, `InsufficientFundsError`, and `EmptyCartError` each inherit directly from `Exception`, the only way to "catch any shop error" is to list all three in the `except` clause. Add a shared parent (`ShopError`) and the catch-all becomes a single name.
+
+**Putting logic in `__init__`.** The constructor's job is to store the data and format the message. Don't do file I/O, network calls, or expensive lookups in there. If the exception is raised in a tight loop, the constructor runs every time, and slow constructors make error paths slower.
+
+**Forgetting to call `super().__init__(message)`.** Without it, `str(e)` returns an empty string and tracebacks are unhelpful. Always pass a useful message up to the parent, even if your subclass also overrides `__str__`.
+
+```python
+# wrong
+class OutOfStockError(Exception):
+    def __init__(self, product):
+        self.product = product
+        # missing super().__init__(...)
+
+err = OutOfStockError("Wireless Mouse")
+print(f"message: '{err}'")
+```
+
+The class catches and raises fine, but `str(err)` is empty because `Exception` was never told what the message is. Add `super().__init__(f"{product} is sold out")` and the message appears.
+
+<h1 id="a-brief-note-on-exceptiongroup">A Brief Note on ExceptionGroup</h1>
+
+Python 3.11 added `ExceptionGroup`, a built-in container for raising several exceptions at once. The use case is rare, but worth knowing about: it shows up when one operation runs multiple sub-operations in parallel (or in sequence with collection of errors) and several of them might fail independently. For an e-commerce app, you might use it when validating a whole cart and wanting to report every problem at once rather than the first one.
+
+```python
+class CartError(Exception):
+    pass
+
+class OutOfStockError(CartError):
+    pass
+
+class PriceMismatchError(CartError):
+    pass
+
+errors = [
+    OutOfStockError("Wireless Mouse is sold out"),
+    PriceMismatchError("Keyboard price changed from $89 to $99"),
+]
+
+# raise ExceptionGroup("cart validation failed", errors)
+```
+
+The `raise` line is commented out so the file runs, but it would raise both errors together. Callers catch them with `except*` (the star is new syntax, also 3.11+), which can match each sub-exception in the group separately. The mechanism is mostly used by libraries that fan out work to many concurrent tasks and need to report partial failures cleanly. For day-to-day custom exception design, raising one exception at a time is still the norm.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

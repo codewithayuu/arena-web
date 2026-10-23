@@ -1,0 +1,518 @@
+---
+title: "Synchronization"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Synchronization explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="why-shared-state-goes-wrong">Why Shared State Goes Wrong</h1>
+
+Threads don't break when they read. They break when they write. Two reads of the same field can happen in any order and the result is still the same value. Two writes that depend on the current value are where the trouble starts.
+
+The shape of the bug is almost always the same: a thread reads the current value, computes a new value, and writes the new value back. If another thread reads in between the first thread's read and write, both threads see the same starting value, and the second write throws away the first thread's update.
+
+Consider an e-commerce checkout. The product table has an `inventoryCount` for a hot-selling notebook. Two customers click "Buy" at the same instant. Two threads run the same decrement code. The starting count is 10. Both threads read 10. Both threads compute 9. Both threads write 9. One sale is invisible. The store ships one notebook and the warehouse is one short.
+
+```java
+public class LostUpdate {
+
+    static int inventoryCount = 10;
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread t1 = new Thread(() -> {
+            int current = inventoryCount;
+            // Simulate a tiny delay so the race is visible
+            try { Thread.sleep(10); } catch (InterruptedException e) {}
+            inventoryCount = current - 1;
+        });
+
+        Thread t2 = new Thread(() -> {
+            int current = inventoryCount;
+            try { Thread.sleep(10); } catch (InterruptedException e) {}
+            inventoryCount = current - 1;
+        });
+
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+
+        System.out.println("Final inventoryCount: " + inventoryCount);
+    }
+}
+```
+
+Two threads each decremented the same field, but only one decrement survived. The final value should be 8, not 9. The `Thread.sleep(10)` is there to force the interleaving common under real concurrent load. Remove it and the race is still there, just rarer.
+
+This pattern is called a **lost update** or a **read-modify-write race**. Any time a thread's write depends on its own read of the same memory, and another thread can write in between, you've one.
+
+The diagram tracks what the two threads and the field do over time. Both threads read before either writes, so both see the same starting value, and the second write overwrites the first without warning. The bug isn't in either thread on its own. It's in the gap between read and write.
+
+<h1 id="the-inventorycount-trap">The inventoryCount++ Trap</h1>
+
+Java makes this bug easy to write because the language has a short, friendly-looking syntax that hides the read-modify-write structure:
+
+```java
+inventoryCount++;
+```
+
+That one statement compiles to three bytecode operations: read the field, add 1, write the field. The JVM is free to schedule another thread between any two of those steps. The single-line look fools you into thinking it's a single action, but it's not.
+
+A more aggressive version of the race, with a thousand threads each running a thousand increments. If `++` were atomic, the final count would always be one million.
+
+```java
+public class IncrementRace {
+
+    static int inventoryCount = 0;
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread[] threads = new Thread[1000];
+        for (int i = 0; i < threads.length; i++) {
+            threads[i] = new Thread(() -> {
+                for (int j = 0; j < 1000; j++) {
+                    inventoryCount++;
+                }
+            });
+            threads[i].start();
+        }
+
+        for (Thread t : threads) {
+            t.join();
+        }
+
+        System.out.println("Expected: 1000000");
+        System.out.println("Actual:   " + inventoryCount);
+    }
+}
+```
+
+The exact number varies from run to run, and from machine to machine. It's almost never 1,000,000. Every missing increment is a place where two threads read the same value and one of their writes was lost. On a quiet single-core machine the result may come close to the expected total. On a multi-core machine with real parallelism, tens of thousands of updates are lost.
+
+The same trap shows up in less obvious places. An order id generator that uses `nextId++`. A cart total that does `total += price`. A page view counter. Anything that combines read, compute, and write into one short line is a candidate.
+
+<h1 id="atomicity-briefly">Atomicity, Briefly</h1>
+
+An **atomic operation** is one that no other thread can see in a partial state. Either the whole thing has happened, or none of it has. Nothing in between.
+
+A single field read or write of a primitive (other than `long` and `double`) is atomic at the JVM level. A whole sequence of read, compute, write isn't. Atomicity is the property you usually want when multiple threads share data, and the absence of it's what `synchronized` fixes.
+
+The word matters because almost every multithreading bug can be described as "this operation needed to be atomic and wasn't." Decrement inventory by one: needs to be atomic. Generate the next order id: needs to be atomic. Add a price to the cart total: needs to be atomic. Move a dollar from one account to another: needs to be atomic.
+
+Without atomicity, the world is full of half-finished operations that other threads can observe and act on. With atomicity, every operation looks complete or not-yet-started, never in progress.
+
+<h1 id="every-object-has-a-monitor">Every Object Has a Monitor</h1>
+
+Java's primary tool for making things atomic is the **intrinsic lock**, also called a **monitor**. Every object you create, every instance of every class, has one. You don't see it in the field list. You don't allocate it. It's part of the object's header, baked in by the JVM.
+
+A monitor is a lock. At any moment, either no thread holds it, or exactly one thread holds it. When a thread tries to acquire a monitor that's already held, the thread blocks (goes into the `BLOCKED` state) and waits until the holder releases it. Then exactly one of the waiting threads acquires it.
+
+The diagram shows the lock's two roles. Threads queue up to take it, and the lock decides who runs and who waits. Only one thread runs at a time inside the protected code; the rest sit in the `BLOCKED` state until they get their turn.
+
+You never call `lock()` or `unlock()` on the monitor directly. The `synchronized` keyword does both for you, acquiring the monitor on entry and releasing it on exit, so the lock-release pairing can't be forgotten. This is the difference between an intrinsic lock (managed by `synchronized`) and the explicit `Lock` interface.
+
+For class-level state, the monitor that matters is on the `Class` object, not on any single instance. This is why static synchronized methods lock on `SomeClass.class` while instance synchronized methods lock on `this`.
+
+<h1 id="the-synchronized-method-modifier">The synchronized Method Modifier</h1>
+
+Adding `synchronized` to a method declaration says "before this method body runs, acquire the monitor; after it returns, release the monitor." That's the whole contract. The JVM handles the acquire and release; your code runs in between.
+
+For an instance method, the monitor is the one on `this`. For a static method, the monitor is the one on the class object (`ClassName.class`). The choice is determined automatically by whether the method is `static` or not. You don't pick the lock; the method type picks it for you.
+
+The race-fixed version of the inventory counter:
+
+```java
+public class SafeInventory {
+
+    static int inventoryCount = 0;
+
+    static synchronized void decrement() {
+        inventoryCount--;
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        inventoryCount = 1000000;
+
+        Thread[] threads = new Thread[1000];
+        for (int i = 0; i < threads.length; i++) {
+            threads[i] = new Thread(() -> {
+                for (int j = 0; j < 1000; j++) {
+                    decrement();
+                }
+            });
+            threads[i].start();
+        }
+
+        for (Thread t : threads) {
+            t.join();
+        }
+
+        System.out.println("Expected: 0");
+        System.out.println("Actual:   " + inventoryCount);
+    }
+}
+```
+
+Same setup as before, same number of threads, same total decrements. The only change is that `decrement()` is `static synchronized`. The result is now consistent: every increment lands, every decrement lands, and the final count matches what arithmetic predicts.
+
+What `static synchronized` did here's acquire the monitor on `SafeInventory.class` before running `inventoryCount--` and release it after. Two threads can call `decrement()` at the same wall-clock moment, but only one of them is ever inside the method body. The other one waits at the door. Each thread reads, decrements, and writes without anyone else interleaving.
+
+Now the instance-method version. Consider an `OrderIdGenerator` that hands out sequential ids to new orders. If two threads call `nextId()` at once, they must get different numbers; otherwise, two orders would have the same id.
+
+```java
+public class OrderIdGenerator {
+
+    private int nextId = 1000;
+
+    public synchronized int nextId() {
+        int assigned = nextId;
+        nextId = nextId + 1;
+        return assigned;
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        OrderIdGenerator generator = new OrderIdGenerator();
+        java.util.Set<Integer> ids = java.util.Collections.synchronizedSet(new java.util.HashSet<>());
+
+        Thread[] threads = new Thread[10];
+        for (int i = 0; i < threads.length; i++) {
+            threads[i] = new Thread(() -> {
+                for (int j = 0; j < 1000; j++) {
+                    ids.add(generator.nextId());
+                }
+            });
+            threads[i].start();
+        }
+
+        for (Thread t : threads) {
+            t.join();
+        }
+
+        System.out.println("Unique ids assigned: " + ids.size());
+    }
+}
+```
+
+Ten threads, each requesting a thousand ids, with no duplicates. The `synchronized` on `nextId()` is the reason. Drop the keyword and the size starts to drop below 10,000 because two threads occasionally read the same `nextId` value and produce the same assigned id.
+
+The choice of `this` as the lock for the instance method is deliberate. Every `OrderIdGenerator` instance has its own monitor, so if you had two generators (one for customer orders, one for merchant orders), threads working with one wouldn't block threads working with the other. The monitor is per-instance, and `synchronized` instance methods lock the instance they're called on.
+
+`gen1` and `gen2` each have their own monitor. A thread holding `gen1`'s monitor doesn't block a thread holding `gen2`'s. This is a feature: it's how `synchronized` keeps the per-instance state of two different objects from blocking each other unnecessarily.
+
+<h1 id="static-vs-instance-synchronized">Static vs Instance Synchronized</h1>
+
+The same keyword on a static method locks something different. A `static synchronized` method acquires the monitor on the `Class` object, not on any instance, because there's no `this` for a static method.
+
+A common confusion: putting `synchronized` on a static method that touches a static field and on an instance method that touches an instance field, then assuming those two will block each other. They won't, because they hold different monitors.
+
+```java
+public class TwoLocks {
+
+    static int globalSold = 0;
+    int localSold = 0;
+
+    static synchronized void recordGlobalSale() {
+        globalSold++;
+    }
+
+    synchronized void recordLocalSale() {
+        localSold++;
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        TwoLocks store = new TwoLocks();
+
+        Thread global = new Thread(() -> {
+            for (int i = 0; i < 1000; i++) recordGlobalSale();
+        });
+
+        Thread local = new Thread(() -> {
+            for (int i = 0; i < 1000; i++) store.recordLocalSale();
+        });
+
+        global.start();
+        local.start();
+        global.join();
+        local.join();
+
+        System.out.println("globalSold = " + globalSold);
+        System.out.println("localSold  = " + store.localSold);
+    }
+}
+```
+
+`recordGlobalSale` holds the monitor on `TwoLocks.class`. `recordLocalSale` holds the monitor on the `store` instance. The two methods can run at exactly the same wall-clock moment without ever interfering, because they aren't asking for the same lock. They're touching different fields, so that's fine here. If both methods tried to update `globalSold`, the instance method wouldn't be safe, because its lock wouldn't keep the static method out.
+
+The rule, plainly: `synchronized` is only useful if every thread that touches a piece of state goes through the same lock. Putting `synchronized` on three methods that all touch the same `inventoryCount` field but lock different objects is worse than useless: it makes the code look safe while still racing.
+
+| Method type                    | Monitor held          | Use for                             |
+| ------------------------------ | --------------------- | ----------------------------------- |
+| `synchronized` instance method | `this` (the receiver) | Protecting per-instance state       |
+| `static synchronized` method   | `ClassName.class`     | Protecting class-level static state |
+
+If a class has both static and instance state, think carefully about which methods lock which monitor. The most common pattern is: instance methods lock `this`, static methods lock the class, and the two groups don't share mutable state. When they do, the method modifier alone is no longer enough.
+
+<h1 id="holding-the-monitor">Holding the Monitor</h1>
+
+"Holding the monitor" is a precise term. While a thread holds a monitor, the JVM gives it two guarantees about that protected region:
+
+1. **Mutual exclusion.** No other thread can enter any synchronized block or method that locks on the same monitor. Other threads attempting to do so go into the `BLOCKED` state.
+2. **Memory visibility.** When the thread releases the monitor and another thread acquires it, the second thread sees all writes that the first thread made while it held the monitor. Without this guarantee, a thread could write a value, release the monitor, and another thread that acquired the monitor afterward could still see a stale value from its own CPU cache.
+
+The visibility piece is easy to miss. It's what makes `synchronized` actually work in a multi-core world. CPUs cache memory aggressively, and one CPU's cached view of a field can lag behind another CPU's writes for a surprisingly long time. The acquire of a monitor forces the acquiring CPU to refresh its view; the release flushes the releasing CPU's writes back to main memory. The two combine to give every thread the same view of the protected fields.
+
+The diagram traces what happens around the acquire and release points. Thread A's writes inside the synchronized region are guaranteed to be visible to Thread B as soon as Thread B acquires the same monitor. This is the second half of synchronization, and it's the reason you can't get the same safety by making operations short.
+
+A thread that enters a synchronized method on object `cart` holds the monitor on `cart` until it leaves the method, whether the method returns normally, throws an exception, or finishes for any other reason. The release is automatic. You can't forget it. If an exception fires inside the method, the JVM still releases the monitor on the way out.
+
+Acquiring a monitor that's uncontended is cheap (a handful of nanoseconds on modern JVMs), but a monitor under contention is expensive. The thread that loses the race goes into `BLOCKED`, gets descheduled, and waits for the kernel to wake it up when the lock frees. Context switches cost microseconds, sometimes more. Heavy contention turns a method that "adds `synchronized`" into a bottleneck where threads spend more time waiting than working.
+
+<h1 id="reentrance-locking-what-you-already-hold">
+  Reentrance: Locking What You Already Hold
+</h1>
+
+A thread that already holds a monitor can enter another synchronized method on the same object without blocking. The monitor counts how many times the same thread has acquired it, and releases it only when the same thread has left as many times as it entered. This is called **reentrance** (sometimes "recursive locking"), and it's the only sensible behavior when synchronized methods call each other.
+
+Consider a `Cart` class with a `synchronized` method that calls another `synchronized` method on the same cart:
+
+```java
+public class ReentrantCart {
+
+    private double total = 0.0;
+    private int itemCount = 0;
+
+    public synchronized void addItem(double price) {
+        total += price;
+        itemCount++;
+        logAddition(price);
+    }
+
+    public synchronized void logAddition(double price) {
+        System.out.println("Added $" + price + ", total now $" + total + " across " + itemCount + " items");
+    }
+
+    public static void main(String[] args) {
+        ReentrantCart cart = new ReentrantCart();
+        cart.addItem(4.99);
+        cart.addItem(1.49);
+    }
+}
+```
+
+`addItem` acquires the monitor on `this`, then calls `logAddition`, which also wants the monitor on `this`. Because the same thread already holds the lock, the JVM increments an internal counter instead of blocking, and lets the call go through. When `logAddition` returns, the counter goes down by one but the lock is still held. When `addItem` returns, the counter hits zero and the lock is released.
+
+If the lock weren't reentrant, this code would deadlock on the very first call. The thread would block waiting for itself to release a lock it already holds, which would never happen. Reentrance is what keeps `synchronized` usable in normal object-oriented code where one method delegates to another.
+
+The same rule covers inheritance. A subclass's `synchronized` method that calls `super.someMethod()` (also `synchronized`) doesn't block. Recursive synchronized methods don't deadlock against themselves. Any callgraph that flows through the same object's synchronized methods stays serialized but never stalls.
+
+<h1 id="the-cart-total-race-and-the-fix">The Cart Total Race, and the Fix</h1>
+
+Inventory and order ids aren't the only places this pattern shows up. A cart total is just as vulnerable. If you let multiple threads add items to the same cart concurrently (a "second device adds an item while the first device is checking out" kind of race), the cart can end up with the wrong total even though every item was processed.
+
+The unsafe version:
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class UnsafeCart {
+
+    private double total = 0.0;
+    private final List<Double> prices = new ArrayList<>();
+
+    public void addItem(double price) {
+        prices.add(price);
+        total = total + price;
+    }
+
+    public double getTotal() {
+        return total;
+    }
+
+    public int size() {
+        return prices.size();
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        UnsafeCart cart = new UnsafeCart();
+
+        Thread[] threads = new Thread[10];
+        for (int i = 0; i < threads.length; i++) {
+            threads[i] = new Thread(() -> {
+                for (int j = 0; j < 1000; j++) {
+                    cart.addItem(1.00);
+                }
+            });
+            threads[i].start();
+        }
+
+        for (Thread t : threads) {
+            t.join();
+        }
+
+        System.out.println("Items added: " + cart.size());
+        System.out.println("Expected total: $10000.00");
+        System.out.println("Actual total:   $" + cart.getTotal());
+    }
+}
+```
+
+Two things went wrong here. The `total = total + price` line lost updates the same way the inventory counter did. And the unsynchronized `ArrayList` lost items too, because `ArrayList.add` is itself a read-modify-write on the internal size and array, and two threads calling `add` at the same time can corrupt that state in ways that range from "one item lost" to "internal array index out of bounds." On some runs you'll see the program crash with an exception from inside `ArrayList`.
+
+Now the synchronized version:
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class SafeCart {
+
+    private double total = 0.0;
+    private final List<Double> prices = new ArrayList<>();
+
+    public synchronized void addItem(double price) {
+        prices.add(price);
+        total = total + price;
+    }
+
+    public synchronized double getTotal() {
+        return total;
+    }
+
+    public synchronized int size() {
+        return prices.size();
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        SafeCart cart = new SafeCart();
+
+        Thread[] threads = new Thread[10];
+        for (int i = 0; i < threads.length; i++) {
+            threads[i] = new Thread(() -> {
+                for (int j = 0; j < 1000; j++) {
+                    cart.addItem(1.00);
+                }
+            });
+            threads[i].start();
+        }
+
+        for (Thread t : threads) {
+            t.join();
+        }
+
+        System.out.println("Items added: " + cart.size());
+        System.out.println("Expected total: $10000.00");
+        System.out.println("Actual total:   $" + cart.getTotal());
+    }
+}
+```
+
+Three methods, all synchronized on `this`. Every read, every write, every list mutation happens with the same lock held. No two threads are ever inside any of the three methods at the same time on the same cart. The total is right, the list size is right, and nothing inside `ArrayList` got corrupted.
+
+`getTotal()` and `size()` are also synchronized, even though they only read. The read needs the lock for two reasons: to make sure it sees the latest value of `total` (the memory visibility guarantee), and to make sure it doesn't sneak in between an `addItem`'s write to `prices` and its write to `total`, observing the size as one bigger than the total reflects. Without `synchronized` on the readers, the writes are still safe from each other, but the readers can see stale or inconsistent snapshots.
+
+The rule: if a piece of state is touched by multiple threads and even one of those threads writes, every access (read or write) must go through the same lock. Skipping `synchronized` on the readers introduces a subtle bug that passes most tests and fails under real load.
+
+<h1 id="what-synchronized-does-not-fix">What synchronized Does Not Fix</h1>
+
+The mental model "make code thread-safe by adding synchronized" gets you a long way, but it's not the whole story. Three places it stops being enough:
+
+**It doesn't compose.** Two synchronized methods on the same object are each thread-safe individually. Calling them as a pair from outside isn't. If a thread calls `cart.contains("Notebook")` and then `cart.add("Notebook")` based on the result, another thread can change the cart between those two calls. Each call is atomic; the pair isn't. The fix is usually to add a third synchronized method that does both steps as one atomic block, or to use a synchronized block to widen the lock.
+
+**It doesn't help across objects.** `synchronized` protects state behind one monitor. If your operation touches two different objects' state and both need to stay consistent (move a product from one cart to another, transfer dollars between accounts), one lock isn't enough. You need to acquire both locks, in a consistent order, which is where deadlock starts to matter.
+
+**It costs more than it looks.** Every method call that's `synchronized` pays for the acquire and release, even when no other thread is competing. Under contention, it's much more expensive. A common pattern is a single coarse lock that everything in a class acquires, which kills concurrency. Synchronized blocks let you make the lock narrower, and explicit locks let you change the lock's policy entirely.
+
+There's a fourth point that gets its own lesson: `synchronized` covers atomic read-modify-write and memory visibility, but for simple "publish a flag" cases where you only need visibility and not mutual exclusion, `volatile` is the lighter tool. Synchronized is a hammer; not every problem is a nail.
+
+A coarse `synchronized` method on a class that's hit by every thread becomes a global serialization point. Throughput stops scaling with cores, because only one thread is ever inside the method. If a class has truly shared state, that's the price. Often the shared state is one field, and the rest of the method is doing work that could safely run in parallel. Narrowing the locked region with a synchronized block is the usual first response.
+
+<h1 id="a-worked-example-concurrent-checkout">
+  A Worked Example: Concurrent Checkout
+</h1>
+
+A small store that exercises all three patterns at once: a shared inventory count, a sequential order id, and per-customer cart totals. Multiple threads check out at the same time, each placing an order.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class CheckoutDemo {
+
+    static class Store {
+        private int inventoryCount;
+        private int nextOrderId = 5000;
+        private double totalRevenue = 0.0;
+
+        public Store(int initialStock) {
+            this.inventoryCount = initialStock;
+        }
+
+        public synchronized boolean tryPurchase(String customer, double price) {
+            if (inventoryCount <= 0) {
+                return false;
+            }
+            inventoryCount--;
+            int orderId = nextOrderId;
+            nextOrderId++;
+            totalRevenue += price;
+            System.out.println("Order " + orderId + " for " + customer + " at $" + price);
+            return true;
+        }
+
+        public synchronized int getInventoryCount() {
+            return inventoryCount;
+        }
+
+        public synchronized double getTotalRevenue() {
+            return totalRevenue;
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        Store store = new Store(20);
+        List<Thread> threads = new ArrayList<>();
+
+        String[] customers = {"Ana", "Ben", "Cara", "Dev", "Eli", "Fae", "Gio", "Hana"};
+        for (String customer : customers) {
+            Thread t = new Thread(() -> {
+                for (int i = 0; i < 5; i++) {
+                    store.tryPurchase(customer, 4.99);
+                }
+            });
+            threads.add(t);
+            t.start();
+        }
+
+        for (Thread t : threads) {
+            t.join();
+        }
+
+        System.out.println("Final inventory: " + store.getInventoryCount());
+        System.out.println("Final revenue:   $" + store.getTotalRevenue());
+    }
+}
+```
+
+Eight threads each try to purchase five items, so they collectively try to buy 40 items from a stock of 20. With `synchronized` on `tryPurchase`, exactly 20 succeed, the order ids are unique and sequential from 5000 to 5019, the inventory ends at zero, and the revenue is $99.80 (20 items at $4.99 each).
+
+The customer order in the output will vary from run to run because the thread scheduler decides who gets in first. Three things are guaranteed: no two orders share an id, no inventory is sold that didn't exist, and the revenue is exactly the sum of the prices of the successful orders. That's atomicity at work across three pieces of shared state, with one monitor protecting all three.
+
+Take `synchronized` off `tryPurchase` and any of those guarantees can break. You'll see duplicate order ids. You'll see the inventory go negative when more than 20 sales sneak through. You'll see the revenue come out wrong. The single keyword is doing real work.
+
+<h1 id="when-synchronized-is-the-right-default">
+  When synchronized Is the Right Default
+</h1>
+
+Despite the limits we just discussed, `synchronized` is still the right starting point for shared mutable state in most code. It's easy to read, hard to misuse in the basic ways, automatically released on exit, and reentrant. Using explicit locks or atomic classes first usually means writing more code for benefits you don't need.
+
+In practice: identify the smallest piece of state that multiple threads share. Pick one object to be the lock for that state. Make every method that reads or writes the state synchronized on that object. Verify that no path touches the state without going through one of those methods.
+
+When that simple pattern starts hurting (the lock becomes a bottleneck, the operation needs to span two objects, the read path needs to be lock-free), you graduate to more advanced tools. But until then, `synchronized` is the answer to most "this code might be touched by more than one thread" questions, and it gives you correctness as the default.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

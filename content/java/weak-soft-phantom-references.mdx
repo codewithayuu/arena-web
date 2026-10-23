@@ -1,0 +1,617 @@
+---
+title: "Weak, Soft & Phantom References"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Weak, Soft & Phantom References explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+Most Java references you write every day are **strong** references. A field, a local variable, or an element of a list all hold a strong reference to the object they point at, and as long as the chain of strong references back to a GC root exists, the object stays alive. That's exactly what you want for the cart in front of the customer or the order being processed right now. It's the wrong behavior for a cache that should give up its entries when memory is tight, or a map of session data that should not keep a logged-out customer pinned in the heap forever. The `java.lang.ref` package gives you three weaker reference types (`SoftReference`, `WeakReference`, `PhantomReference`) and a queue mechanism (`ReferenceQueue`) for noticing when the garbage collector reclaims them. This lesson covers all of them, the reachability strength hierarchy that ties them together, the `WeakHashMap` collection that uses weak references internally, and the modern `Cleaner` API that has replaced `finalize()` for post-mortem cleanup.
+
+Reference types are the missing piece between "the GC could collect this if nothing held it" and "I want some control over how aggressively the GC collects it." Understanding them is what lets you build a product image cache that yields under memory pressure, a customer session map whose entries disappear when the session key is gone, and a wrapper around an off-heap byte buffer that gets cleaned up without ever using `finalize`.
+
+<h1 id="reachability-strength-the-hierarchy">
+  Reachability Strength: The Hierarchy
+</h1>
+
+Garbage collection isn't a binary "alive or dead" decision. Every object in the heap has a **reachability strength** that depends on the strongest reference chain that reaches it from a GC root (a thread stack, a static field, a JNI reference). The collector decides what to reclaim based on that strength.
+
+There are five levels, from strongest to weakest:
+
+| Strength           | When the object can be collected                                       |
+| ------------------ | ---------------------------------------------------------------------- |
+| Strongly reachable | Never (while a strong reference chain to a GC root exists)             |
+| Softly reachable   | When the JVM is approaching `OutOfMemoryError`, but not before         |
+| Weakly reachable   | On the next garbage collection cycle                                   |
+| Phantom reachable  | After the GC has decided the object is unreachable for everything else |
+| Unreachable        | Already eligible; memory will be reclaimed                             |
+
+An object is **strongly reachable** if any thread can reach it through only strong references. That's almost everything in a normal program. As soon as the last strong reference goes away, the object drops to the strongest of its remaining reference types. If a `SoftReference` still holds it, the object is softly reachable. If only a `WeakReference` holds it, it's weakly reachable. If only a `PhantomReference` holds it, it's phantom reachable. If nothing holds it, it's unreachable and ready to be reclaimed.
+
+The arrows in the diagram represent demotion. As stronger references get cleared, an object slides down the hierarchy. The three reference types are hooks into different levels of the same scale.
+
+One important detail. The strength of an object is determined by the **strongest** reference that reaches it. A product object held by both a `WeakReference` and a strong field in the active shopping cart is still strongly reachable; the weak reference is irrelevant. The GC only acts on the weak reference once every strong reference to the product is gone.
+
+<h1 id="the-referencet-base-class">The Reference&lt;T&gt; Base Class</h1>
+
+All three weaker reference types extend `java.lang.ref.Reference<T>`. The class is abstract; you don't instantiate it directly. It exposes two methods you'll use constantly:
+
+| Method         | Behavior                                                                                                           |
+| -------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `T get()`      | Returns the referenced object, or `null` if it has been collected. `PhantomReference.get()` always returns `null`. |
+| `void clear()` | Manually clears the reference (sets the internal pointer to null).                                                 |
+
+Every `Reference` can optionally be registered with a `ReferenceQueue<T>` at construction time. When the GC clears the reference, it appends the `Reference` object (not the referent) to the queue, which lets you wake up a worker thread and react. The queue is how `WeakHashMap` knows to drop dead entries, and how `Cleaner` runs your cleanup actions.
+
+The `Reference` object is not the referent. The `WeakReference<Product>` wrapper is itself a normal, strongly reachable Java object as long as a field points at it. What's weak is the link from the wrapper to the `Product` it wraps. The `Product` can be collected; the wrapper stays alive until the field referencing it is cleared.
+
+<h1 id="softreferencet-a-memory-sensitive-cache">
+  SoftReference&lt;T&gt;: A Memory-Sensitive Cache
+</h1>
+
+`SoftReference` is the "hold onto this until memory is tight" reference. The GC is allowed to clear soft references at its discretion, and is **required** to clear all soft references before throwing `OutOfMemoryError`. In between those two extremes, the JVM uses its own heuristics, but the practical behavior on HotSpot is "keep soft-reachable objects around in proportion to free heap, clear them aggressively as the heap fills up."
+
+A common use case is a cache for objects that are expensive to recreate but easy to recompute. A product image cache fits this pattern. Loading a high-resolution image from disk costs maybe 50 milliseconds. Keeping the bytes in memory costs maybe 500 KB. If you have 10,000 product images and only 200 MB of heap, you can't keep them all. But while there's free space, holding them costs nothing and saves the load time.
+
+```java
+import java.lang.ref.SoftReference;
+import java.util.HashMap;
+import java.util.Map;
+
+public class ProductImageCache {
+
+    record ProductImage(String productId, byte[] pixels) {}
+
+    private final Map<String, SoftReference<ProductImage>> cache = new HashMap<>();
+
+    public ProductImage get(String productId) {
+        SoftReference<ProductImage> ref = cache.get(productId);
+        if (ref != null) {
+            ProductImage image = ref.get();
+            if (image != null) {
+                return image;
+            }
+            cache.remove(productId);
+        }
+        ProductImage loaded = loadFromDisk(productId);
+        cache.put(productId, new SoftReference<>(loaded));
+        return loaded;
+    }
+
+    private ProductImage loadFromDisk(String productId) {
+        System.out.println("Loading " + productId + " from disk");
+        return new ProductImage(productId, new byte[500_000]);
+    }
+
+    public static void main(String[] args) {
+        ProductImageCache cache = new ProductImageCache();
+
+        cache.get("sneaker-001");
+        cache.get("sneaker-001");
+        cache.get("sneaker-001");
+
+        cache.get("tshirt-014");
+        cache.get("tshirt-014");
+    }
+}
+```
+
+The first call for each product reads from disk. Subsequent calls hit the cache and return the cached `ProductImage`. The cache itself is a `HashMap<String, SoftReference<ProductImage>>`, so the **keys** are strong references (the product IDs) but the **values** are soft references that the GC is free to clear when memory runs low. If a soft reference has been cleared, `ref.get()` returns `null`, we remove the dead entry and reload from disk.
+
+The behavior under memory pressure is easier to see when the JVM is squeezed. The following demonstration allocates a giant array on top of a populated cache and shows how the cache shrinks.
+
+```java
+import java.lang.ref.SoftReference;
+import java.util.ArrayList;
+import java.util.List;
+
+public class SoftReferenceDemo {
+
+    public static void main(String[] args) {
+        List<SoftReference<byte[]>> blobs = new ArrayList<>();
+
+        for (int i = 0; i < 100; i++) {
+            blobs.add(new SoftReference<>(new byte[1_000_000]));
+        }
+
+        int aliveBefore = countAlive(blobs);
+        System.out.println("Alive before pressure: " + aliveBefore);
+
+        try {
+            byte[] hog = new byte[(int) (Runtime.getRuntime().maxMemory() / 2)];
+            System.out.println("Allocated hog of size: " + hog.length);
+        } catch (OutOfMemoryError ignored) {
+            System.out.println("Hit OOM while allocating hog");
+        }
+
+        System.gc();
+        int aliveAfter = countAlive(blobs);
+        System.out.println("Alive after pressure: " + aliveAfter);
+    }
+
+    private static int countAlive(List<SoftReference<byte[]>> blobs) {
+        int alive = 0;
+        for (SoftReference<byte[]> ref : blobs) {
+            if (ref.get() != null) alive++;
+        }
+        return alive;
+    }
+}
+```
+
+**Output (numbers vary by heap size):**
+
+```text
+Alive before pressure: 100
+Allocated hog of size: 134217728
+Alive after pressure: 23
+```
+
+Before the allocation, every blob is alive. After the JVM has to find room for a 128 MB array, it clears most of the soft references because the heuristic decides the heap is under pressure. A handful survive because there's still some slack. If you allocated enough to actually run out of memory, the spec guarantees the JVM would clear **all** soft references before raising `OutOfMemoryError`.
+
+`SoftReference.get()` is roughly as cheap as a field read plus a null check, but every soft reference adds work to the GC's reachability scan. Don't wrap every object in a `SoftReference` "just in case." Use them for expensive-to-recreate values like decoded images, parsed JSON documents, or computed aggregates.
+
+A note on demos and `System.gc()`. The calls to `System.gc()` in these examples are **hints**, not commands. They're useful for showing behavior in a lesson where a predictable trigger is needed, and they're acceptable in throwaway demos. Production code should not call `System.gc()`; the collector decides when to run, and forcing it tends to make performance worse, not better.
+
+<h1 id="weakreferencet-collected-on-the-next-gc">
+  WeakReference&lt;T&gt;: Collected on the Next GC
+</h1>
+
+A `WeakReference` is much more aggressive. As soon as the GC notices that the only references to an object are weak, it clears them on the **next** garbage collection cycle. There's no waiting for memory pressure. If a weakly reachable `Product` exists at the start of a GC pass, by the end of that pass the weak reference returns `null`.
+
+That sounds harsh, but it's exactly the right behavior for one specific pattern: a map where the **values** depend on the lifecycle of some other strong reference. A common case is associating metadata with an object you don't own. If you build a `Map<Customer, ShoppingPreferences>` and the program also has other paths that drop customers from the active session list, you don't want the map to hold them in memory forever. The map should let go of an entry as soon as nothing else cares about the key.
+
+That's exactly what `WeakHashMap` does. The keys are wrapped in weak references, and when the key becomes weakly reachable, the entry is removed on the next GC.
+
+```java
+import java.util.WeakHashMap;
+
+public class CustomerSessionMap {
+
+    public static void main(String[] args) throws InterruptedException {
+        WeakHashMap<Customer, ShoppingPreferences> sessions = new WeakHashMap<>();
+
+        Customer ana = new Customer("ana");
+        Customer ben = new Customer("ben");
+
+        sessions.put(ana, new ShoppingPreferences("USD", true));
+        sessions.put(ben, new ShoppingPreferences("EUR", false));
+
+        System.out.println("Sessions: " + sessions.size());
+
+        ana = null;
+
+        System.gc();
+        Thread.sleep(100);
+
+        System.out.println("Sessions after dropping ana: " + sessions.size());
+        System.out.println("ben still cached: " + sessions.get(ben));
+    }
+
+    record Customer(String id) {}
+    record ShoppingPreferences(String currency, boolean wantsNewsletter) {}
+}
+```
+
+When the program sets `ana = null`, the only remaining reference to the `Customer("ana")` object is the weak key inside the map. After `System.gc()`, the GC clears the weak reference, the map removes the entry, and the size drops to one. The entry for `ben` stays, because we still hold a strong reference to that customer.
+
+Here's what's really happening internally. `WeakHashMap`'s entries are subclasses of `WeakReference`. Each entry registers itself with an internal `ReferenceQueue`. After every map operation (put, get, size, etc.), the map drains the queue and removes any entries whose keys have been cleared. So you don't have to wait for a get on the dead key to clean it up; the next operation on the map cleans up dead entries.
+
+There's a trap, though. With `String` keys, `WeakHashMap` often does not behave as intended.
+
+```java
+import java.util.WeakHashMap;
+
+public class WeakHashMapStringTrap {
+    public static void main(String[] args) throws InterruptedException {
+        WeakHashMap<String, String> sessions = new WeakHashMap<>();
+
+        String key = "checkout-token";
+        sessions.put(key, "active");
+
+        System.out.println("Before clearing: " + sessions.size());
+
+        key = null;
+
+        System.gc();
+        Thread.sleep(100);
+
+        System.out.println("After clearing: " + sessions.size());
+    }
+}
+```
+
+Setting the local `key` to `null` looks like the last strong reference is gone, but `"checkout-token"` is a **string literal**, which the compiler interned into the JVM's string pool. The string pool holds a strong reference to the literal forever, so the key stays strongly reachable and the entry never gets removed. The same trap applies to any string explicitly interned with `String.intern()`.
+
+For a weak map of strings, build the key with `new String("checkout-token")` (which avoids the pool) and keep the only strong reference outside the map. In practice, `WeakHashMap` is best used with object keys whose lifecycle the application controls, not with strings.
+
+The diagram traces the lifecycle. The customer object is held by both the strong local reference and the weak entry inside the `WeakHashMap`. As long as the strong reference exists, the customer is strongly reachable and the map entry is alive. Once the strong reference goes away, the customer becomes weakly reachable, the next GC clears the entry, and the map drops it.
+
+`WeakHashMap` is not a general-purpose thread-safe cache. For multi-threaded scenarios, look at libraries like Caffeine or Guava that build proper concurrent caches with weak (or soft, or strong) keys and values plus size-based eviction. `WeakHashMap` is the lightweight option when a single thread owns the map.
+
+<h1 id="referencequeuet-knowing-when-an-object-was-collected">
+  ReferenceQueue&lt;T&gt;: Knowing When an Object Was Collected
+</h1>
+
+A `WeakReference` or `SoftReference` will return `null` from `get()` after the referent has been collected, but that fact only surfaces the next time the reference is polled. For **notification** when the GC clears a reference, register it with a `ReferenceQueue` at construction.
+
+```java
+import java.lang.ref.ReferenceQueue;
+import java.lang.ref.WeakReference;
+
+public class WeakReferenceQueueDemo {
+
+    public static void main(String[] args) throws InterruptedException {
+        ReferenceQueue<Product> queue = new ReferenceQueue<>();
+
+        Product apple = new Product("apple", 1.99);
+        WeakReference<Product> ref = new WeakReference<>(apple, queue);
+
+        System.out.println("Before GC, ref.get() = " + ref.get());
+
+        apple = null;
+        System.gc();
+        Thread.sleep(100);
+
+        System.out.println("After GC, ref.get() = " + ref.get());
+
+        WeakReference<?> drained = (WeakReference<?>) queue.poll();
+        System.out.println("Drained from queue: " + (drained == ref));
+    }
+
+    record Product(String name, double price) {}
+}
+```
+
+The sequence is:
+
+1. We create a `Product` and a `WeakReference` wrapping it, registered with the queue.
+2. We drop the strong reference (`apple = null`) and ask for a GC.
+3. The GC clears the weak reference (so `ref.get()` is now `null`) and appends the `WeakReference` object to the queue.
+4. The application thread polls the queue and finds the same `WeakReference` we created.
+
+The queue returns the `Reference` wrapper, not the referent. The referent is gone; that's the whole point. The wrapper acts as a hook saying "the thing this was wrapping has been collected." The wrapper can be used as a key into a side table that holds cleanup actions, or, with a subclassed reference, fields stored on the subclass itself can be read.
+
+A clean pattern is to keep a side map of `WeakReference -> CleanupAction`, run a worker thread that loops on `queue.remove()` (blocking), and dispatch the cleanup action whenever a reference comes through.
+
+The diagram captures the lifecycle of a queued reference. The GC notices the object has no stronger references, clears the `Reference` (so `get()` will return `null`), and enqueues the `Reference` itself. A worker thread waiting on `queue.remove()` wakes up, finds the reference, and runs whatever cleanup the application has associated with it. This is the foundation that both `WeakHashMap` and `Cleaner` are built on.
+
+`ReferenceQueue.poll()` is non-blocking and returns `null` if the queue is empty. `ReferenceQueue.remove()` blocks the calling thread until something is enqueued, which suits a dedicated cleanup worker but not a request thread.
+
+<h1 id="phantomreferencet-post-mortem-cleanup-hooks">
+  PhantomReference&lt;T&gt;: Post-Mortem Cleanup Hooks
+</h1>
+
+`PhantomReference` is the strangest of the three. Its `get()` method **always** returns `null`, even before the referent has been collected. The referent can never be retrieved through a phantom reference. So what's it for?
+
+The answer is post-mortem cleanup. A phantom reference is enqueued only after the GC has decided the referent is unreachable for every other purpose (including finalization, if the class had a `finalize` method). When the phantom reference comes off the queue, it signals: "this object has been reclaimed, run any cleanup associated with it now."
+
+That distinction matters for resources outside the Java heap. If an object owned a native memory buffer, a file handle, or a socket allocated through JNI, the GC reclaiming the Java wrapper does not free the underlying resource. An explicit free or close action has to run. A phantom reference plus a `ReferenceQueue` plus a cleanup thread is the classical way to make sure that action runs once the wrapper is gone.
+
+```java
+import java.lang.ref.PhantomReference;
+import java.lang.ref.Reference;
+import java.lang.ref.ReferenceQueue;
+import java.util.HashMap;
+import java.util.Map;
+
+public class PhantomCleanupDemo {
+
+    static class NativeBuffer {
+        final long handle;
+        NativeBuffer(long handle) { this.handle = handle; }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        ReferenceQueue<NativeBuffer> queue = new ReferenceQueue<>();
+        Map<PhantomReference<NativeBuffer>, Long> cleanupHandles = new HashMap<>();
+
+        Thread cleaner = new Thread(() -> {
+            try {
+                while (true) {
+                    Reference<? extends NativeBuffer> ref = queue.remove();
+                    Long handle = cleanupHandles.remove(ref);
+                    System.out.println("Cleaning up native buffer handle=" + handle);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        cleaner.setDaemon(true);
+        cleaner.start();
+
+        NativeBuffer buffer = new NativeBuffer(0xABCDL);
+        PhantomReference<NativeBuffer> phantom = new PhantomReference<>(buffer, queue);
+        cleanupHandles.put(phantom, buffer.handle);
+
+        System.out.println("phantom.get() = " + phantom.get());
+
+        buffer = null;
+        System.gc();
+        Thread.sleep(200);
+
+        System.out.println("Done");
+    }
+}
+```
+
+Two things stand out. First, `phantom.get()` returns `null` even before the strong reference is dropped, because phantom references **never** expose the referent. Second, after the strong reference is dropped and a GC is triggered, the cleanup thread receives the phantom reference from the queue and runs the cleanup action keyed off the phantom itself. The Java wrapper for the buffer is gone, but the work to free the native resource still happens, in a controlled way, on an application-owned thread.
+
+There's one subtle requirement when using `PhantomReference` directly. Unlike `WeakReference` and `SoftReference`, the GC does **not** automatically clear a phantom reference when the referent is reclaimed. The phantom stays "active" on the queue until `clear()` is explicitly called (or until the phantom reference itself becomes unreachable). If that step is skipped, the referent is still considered phantom reachable, and the GC won't fully reclaim the memory associated with it. Modern JVMs (Java 9 and up) changed this, and `PhantomReference`s are cleared automatically, but very old JVMs may exhibit this issue in legacy code.
+
+Writing all this by hand is the old way. There's a much cleaner API that wraps the pattern up for you.
+
+<h1 id="cleaner-the-modern-replacement-for-finalize">
+  Cleaner: The Modern Replacement for finalize
+</h1>
+
+`finalize()` was Java's original mechanism for running cleanup code before an object is garbage collected. Application code overrode `Object.finalize()` in a subclass, the JVM called it on a finalizer thread after deciding the object was unreachable, and the cleanup released native resources. Finalizers ran at unpredictable times, could resurrect their own objects, blocked the GC if they were slow, and silently swallowed exceptions. `finalize` was deprecated in Java 9 and is being actively removed; new code should not use it.
+
+The replacement is `java.lang.ref.Cleaner`, introduced in Java 9. A `Cleaner` is a thin wrapper around the phantom-reference-plus-queue pattern shown above. You register a referent and a cleanup action; when the referent becomes phantom reachable, the cleaner runs the action on a dedicated daemon thread.
+
+Here's the off-heap byte buffer pattern done with `Cleaner`. The setup is much shorter than the manual version.
+
+```java
+import java.lang.ref.Cleaner;
+
+public class CleanerDemo {
+
+    private static final Cleaner cleaner = Cleaner.create();
+
+    static class OffHeapImage implements AutoCloseable {
+        private final String productId;
+        private final long bufferHandle;
+        private final Cleaner.Cleanable cleanable;
+
+        OffHeapImage(String productId, long bufferHandle) {
+            this.productId = productId;
+            this.bufferHandle = bufferHandle;
+            this.cleanable = cleaner.register(this, new BufferReleaseAction(productId, bufferHandle));
+        }
+
+        @Override
+        public void close() {
+            cleanable.clean();
+        }
+
+        private static class BufferReleaseAction implements Runnable {
+            private final String productId;
+            private final long bufferHandle;
+
+            BufferReleaseAction(String productId, long bufferHandle) {
+                this.productId = productId;
+                this.bufferHandle = bufferHandle;
+            }
+
+            @Override
+            public void run() {
+                System.out.println("Releasing off-heap buffer for product=" +
+                        productId + " handle=" + Long.toHexString(bufferHandle));
+            }
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        OffHeapImage image = new OffHeapImage("sneaker-001", 0xDEADBEEFL);
+        System.out.println("Holding image for product: " + image.productId);
+
+        image = null;
+        System.gc();
+        Thread.sleep(200);
+
+        System.out.println("Main thread exiting");
+    }
+}
+```
+
+The key parts:
+
+- `Cleaner.create()` creates a cleaner with its own daemon thread. You typically use one cleaner per library or per use case, not one per object.
+- `cleaner.register(this, action)` registers the current object and a cleanup `Runnable`. The cleaner stores them and watches the referent. When the GC determines the referent is phantom reachable, the cleaner runs the action on its thread.
+- The cleanup `Runnable` is given as a separate class (not a lambda capturing `this`). This is **critical**. If the cleanup action captures a reference back to the host object, the host object is strongly reachable through the cleaner's internal state, and it will never become phantom reachable. The cleanup never runs. Passing a static class or a method reference that doesn't close over `this` keeps the dependency one-way: cleaner holds action, action does not hold the host.
+- The host class implements `AutoCloseable` so callers can deterministically clean up with try-with-resources. The `Cleaner.Cleanable.clean()` method runs the action immediately (and only once, idempotently) and unregisters the action so the GC-driven path won't run it again.
+
+The relationship is "GC-driven cleanup as a safety net, deterministic cleanup as the primary path." Application code calls `close()` when it's done with the resource. If callers forget, the cleaner will eventually run the cleanup. The cleaner is not a reliable mechanism for correctness or resource bounds. Treat it as a backup.
+
+Each registered cleanup action holds a small amount of state plus a phantom reference. The cleaner thread is shared across registrations, so the per-object overhead is low. Don't register cleaners on millions of short-lived objects; the cleaner is built for longer-lived resources whose lifecycle doesn't fit manual management.
+
+The most common bug with `Cleaner` is the one already mentioned: writing the cleanup as a lambda that captures `this`. Here's the broken version next to the fixed one.
+
+**What's wrong with this code?**
+
+```java
+class BrokenOffHeapImage implements AutoCloseable {
+    private final long bufferHandle;
+    private final Cleaner.Cleanable cleanable;
+
+    BrokenOffHeapImage(long bufferHandle) {
+        this.bufferHandle = bufferHandle;
+        this.cleanable = cleaner.register(this, () -> {
+            System.out.println("Releasing handle=" + this.bufferHandle);
+        });
+    }
+
+    public void close() { cleanable.clean(); }
+    private static final Cleaner cleaner = Cleaner.create();
+}
+```
+
+The lambda `() -> System.out.println(... this.bufferHandle)` captures `this`. The cleaner holds the lambda, the lambda holds `this`, so the host object can never become phantom reachable through the cleaner's internal state. The cleanup will never fire unless the caller invokes `close()` explicitly.
+
+**Fix:**
+
+```java
+class FixedOffHeapImage implements AutoCloseable {
+    private final long bufferHandle;
+    private final Cleaner.Cleanable cleanable;
+
+    FixedOffHeapImage(long bufferHandle) {
+        this.bufferHandle = bufferHandle;
+        this.cleanable = cleaner.register(this, new ReleaseAction(bufferHandle));
+    }
+
+    public void close() { cleanable.clean(); }
+
+    private static class ReleaseAction implements Runnable {
+        private final long bufferHandle;
+        ReleaseAction(long bufferHandle) { this.bufferHandle = bufferHandle; }
+        public void run() {
+            System.out.println("Releasing handle=" + bufferHandle);
+        }
+    }
+
+    private static final Cleaner cleaner = Cleaner.create();
+}
+```
+
+The action is a static nested class that only holds the handle (a `long`), not a back-reference to the host. The host can now be reclaimed by the GC, and the cleanup runs as expected.
+
+<h1 id="a-quick-note-on-finalize">A Quick Note on finalize()</h1>
+
+`Object.finalize()` was the original cleanup hook. It was deprecated in Java 9 with a strong recommendation against any new use, and Java 18 marked it for removal. Don't override it. When reviewing legacy code that does, the bugs to watch for are:
+
+- **Unpredictable timing.** The GC decides when (and whether) to run finalizers. An object could sit in the finalizer queue for seconds or minutes.
+- **Resurrection.** A finalizer can store `this` in a static field, making the object reachable again. It's error-prone.
+- **Slow finalizers block the GC.** A slow finalize stalls every other finalizer behind it.
+- **Swallowed exceptions.** Exceptions from `finalize` are silently dropped.
+
+Migrate to `Cleaner` and `AutoCloseable`. The transition is mechanical: move the cleanup logic into a `Runnable`, register it with a `Cleaner` in the constructor, and add a `close()` method that delegates to `Cleanable.clean()`. Then deprecate or delete the `finalize` method.
+
+<h1 id="choosing-between-strong-soft-weak-and-phantom">
+  Choosing Between Strong, Soft, Weak, and Phantom
+</h1>
+
+The four flavors aren't interchangeable, and picking the wrong one is usually worse than picking none. A decision table follows.
+
+| Reference type | When the GC collects the referent                                      | Typical use case                                                                                                                                         | Common gotcha                                                                                                         |
+| -------------- | ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| Strong         | Never while a strong chain to a GC root exists                         | Almost everything. Active state, in-flight orders, the cart in front of the customer.                                                                    | Leaks. A forgotten strong reference (in a static field, a long-lived listener) pins memory forever.                   |
+| Soft           | When the JVM thinks memory is tight, definitely before OOM             | Memory-sensitive cache of expensive values (decoded images, parsed JSON, computed reports).                                                              | The clearing heuristic is unpredictable. Don't rely on `SoftReference` for a "bounded cache." Use a real LRU instead. |
+| Weak           | On the next GC cycle, no waiting                                       | Auxiliary maps keyed by objects you don't own (`WeakHashMap` for session/metadata). Listener registries where the source shouldn't keep listeners alive. | String literal keys are pinned by the intern pool. Inline `new Object()` keys vanish immediately.                     |
+| Phantom        | After the object is otherwise unreachable, only for queue notification | Post-mortem cleanup of native resources via `Cleaner`.                                                                                                   | `get()` always returns `null`. Without a `ReferenceQueue` plus a worker, phantom references do nothing useful.        |
+
+The shape of the rule:
+
+- **Default to strong.** Don't pick a weaker reference unless you have a specific reason.
+- **Use soft references for caches** of values that are expensive to recompute and where it's fine to lose them under memory pressure. For everything else (size-bounded caches, time-based eviction), use a proper cache library.
+- **Use weak references when the lifecycle is controlled elsewhere.** The map of metadata keyed by `Customer` works because something else owns the customer's lifetime; the map just rides along.
+- **Use phantom references only through `Cleaner`** for resources outside the Java heap. Writing raw phantom reference code is rarely appropriate in 2025; `Cleaner` exists for this reason.
+
+A common antipattern is using `SoftReference` as a "bounded cache" because the docs say soft references "go away under pressure." They do, but the JVM decides when, and the granularity is "all cache entries" rather than "the least recently used 10%." For LRU eviction or a fixed maximum size, build (or borrow) a proper LRU cache and skip the soft references entirely.
+
+<h1 id="putting-it-together-a-product-catalog-with-mixed-references">
+  Putting It Together: A Product Catalog with Mixed References
+</h1>
+
+Real systems often use more than one reference type at the same time, each for a different piece of state. Here's a sketch of a product catalog that uses three of them.
+
+```java
+import java.lang.ref.Cleaner;
+import java.lang.ref.SoftReference;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.WeakHashMap;
+
+public class ProductCatalog {
+
+    private static final Cleaner cleaner = Cleaner.create();
+
+    record Product(String id, String name, double price) {}
+
+    record Thumbnail(String productId, byte[] pixels) {}
+
+    static class ImageBuffer implements AutoCloseable {
+        private final String productId;
+        private final Cleaner.Cleanable cleanable;
+
+        ImageBuffer(String productId, long handle) {
+            this.productId = productId;
+            this.cleanable = cleaner.register(this, new ReleaseAction(productId, handle));
+        }
+
+        @Override
+        public void close() { cleanable.clean(); }
+
+        private static class ReleaseAction implements Runnable {
+            private final String productId;
+            private final long handle;
+            ReleaseAction(String productId, long handle) {
+                this.productId = productId;
+                this.handle = handle;
+            }
+            public void run() {
+                System.out.println("Freed buffer for " + productId + " handle=" + Long.toHexString(handle));
+            }
+        }
+    }
+
+    private final Map<String, Product> activeProducts = new HashMap<>();
+    private final Map<String, SoftReference<Thumbnail>> thumbnailCache = new HashMap<>();
+    private final WeakHashMap<Product, ImageBuffer> imageBuffers = new WeakHashMap<>();
+
+    public Product getProduct(String id) {
+        return activeProducts.computeIfAbsent(id,
+                key -> new Product(key, "Product " + key, 19.99));
+    }
+
+    public Thumbnail getThumbnail(String id) {
+        SoftReference<Thumbnail> ref = thumbnailCache.get(id);
+        if (ref != null) {
+            Thumbnail t = ref.get();
+            if (t != null) return t;
+        }
+        Thumbnail loaded = new Thumbnail(id, new byte[100_000]);
+        thumbnailCache.put(id, new SoftReference<>(loaded));
+        return loaded;
+    }
+
+    public ImageBuffer attachBuffer(Product product, long handle) {
+        ImageBuffer buf = new ImageBuffer(product.id(), handle);
+        imageBuffers.put(product, buf);
+        return buf;
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        ProductCatalog catalog = new ProductCatalog();
+
+        Product sneaker = catalog.getProduct("sneaker-001");
+        catalog.getThumbnail("sneaker-001");
+        catalog.attachBuffer(sneaker, 0xCAFEBABEL);
+
+        System.out.println("Catalog state: active=" + catalog.activeProducts.size() +
+                " thumbnails=" + catalog.thumbnailCache.size() +
+                " buffers=" + catalog.imageBuffers.size());
+    }
+}
+```
+
+The three maps use three different reference strategies:
+
+- `activeProducts` is a plain `HashMap`. Active products are pinned in memory because we always need them.
+- `thumbnailCache` uses `SoftReference` values. Thumbnails stay cached until memory is tight, then the JVM is free to drop them.
+- `imageBuffers` uses `WeakHashMap` keyed by `Product`. If a product is removed from `activeProducts` and the rest of the application stops holding it, the entry in `imageBuffers` goes away on the next GC, and the `ImageBuffer` wrapper goes with it. When the wrapper becomes phantom reachable, the `Cleaner` fires the buffer-release action.
+
+This sketch isn't meant as a literal template for a real catalog. The lesson is that each piece of state has a different lifecycle, and the reference types let you match the lifecycle to the right behavior without writing custom eviction logic for each one.
+
+<h1 id="pitfalls-worth-calling-out">Pitfalls Worth Calling Out</h1>
+
+A few last things to watch for.
+
+**Relying on `SoftReference` for predictable eviction.** Soft references are governed by the JVM's heuristic, which depends on free heap, GC algorithm, and JVM version. There's no way to predict when a soft reference will be cleared except for the OOM guarantee. For a cache that holds the top N items by recency or hit rate, use an LRU cache (`LinkedHashMap` with `removeEldestEntry`, or a real library like Caffeine), not soft references.
+
+**`WeakHashMap` with `String` keys.** As shown above, string literals are interned and pinned by the string pool. The pool holds a strong reference to every literal in source code, so a `WeakHashMap<String, T>` keyed by literals will never collect those entries. Even non-literal strings can end up interned if `String.intern()` is called by application code or a library. Use object keys with a controlled lifecycle.
+
+**Capturing `this` in a `Cleaner` action.** Use a static nested class or a method reference that demonstrably doesn't capture `this`. An IDE flagging a lambda that uses `this` is a smell when working with `Cleaner`.
+
+**Using `WeakHashMap` from multiple threads.** `WeakHashMap` is not thread-safe. Don't share it across threads without external synchronization. Concurrent caches with weak keys exist (Caffeine, Guava); use them.
+
+**Forgetting to drain the queue.** A `ReferenceQueue` that is set up but never read from accumulates references. The referents are still collected (their memory is freed), but the `Reference` wrappers themselves stay alive until `poll()` or `remove()` is called. That can leak a small amount of memory per registered reference. Either drain the queue from a dedicated thread or use `Cleaner`, which handles this automatically.
+
+**Assuming `System.gc()` will actually run.** It's a hint. The JVM is allowed to ignore it. In demos it usually does run, which is why tutorials use it. Production code logic should never depend on `System.gc()` having any effect.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,298 @@
+---
+title: "Server-Sent Events"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Server-Sent Events (SSE) explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+- **Poll frequently**, and you generate lots of requests, many of which return nothing.
+- **Poll less frequently**, and you reduce traffic, but updates arrive with more delay.
+
+Long polling improves this, but every response still closes the request and forces the browser to ask again.
+
+SSE removes the trade-off. The browser connects once, and the server pushes each update the moment it exists.
+
+<h1 id="2-what-are-server-sent-events">2. What Are Server-Sent Events?</h1>
+
+Server-Sent Events let a server continuously push updates to a client over HTTP.
+
+The client sends a normal HTTP request. Instead of returning a response and closing the connection, the server keeps the response open. Whenever new data becomes available, the server sends another event over that same connection, and the client receives it immediately.
+
+The key limitation is that SSE is **one-way**. The server can continuously send data to the client, but the client cannot send messages back over the same connection. If the client needs to send data to the server, it uses a separate HTTP request, such as a normal `POST`.
+
+For a dashboard, a feed, or a progress bar, that is fine: the server talks and the browser listens.
+
+<h1 id="3-how-an-sse-connection-works">3. How an SSE Connection Works</h1>
+
+In a browser, SSE is used through the `EventSource` API. The client connects to an endpoint exposed by the server:
+
+```javascript
+const events = new EventSource("/api/events");
+
+events.onmessage = (event) => {
+  console.log("message:", event.data);
+};
+
+events.addEventListener("notification", (event) => {
+  const notification = JSON.parse(event.data);
+  console.log("notification:", notification.message);
+});
+
+events.addEventListener("alert", (event) => {
+  const alert = JSON.parse(event.data);
+  console.log("alert:", alert.severity);
+});
+
+events.onerror = () => {
+  console.log("event stream error or reconnect");
+};
+
+// Call this when the page no longer needs the stream.
+// events.close();
+```
+
+The server responds with a special content type, `text/event-stream`. Instead of closing the response, it keeps the connection open and continues sending events over it.
+
+Here is a small Node.js endpoint that does this:
+
+```javascript
+const express = require("express");
+
+const app = express();
+const clients = new Set();
+
+app.get("/events", (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders?.();
+
+  clients.add(res);
+
+  res.write("retry: 3000\n: connected\n\n");
+
+  req.on("close", () => {
+    clients.delete(res);
+  });
+});
+
+function sendEvent(res, event) {
+  res.write(`id: ${event.id}\n`);
+  res.write(`event: ${event.type}\n`);
+  res.write(`data: ${JSON.stringify(event.data)}\n\n`);
+}
+
+function broadcast(event) {
+  for (const res of clients) {
+    sendEvent(res, event);
+  }
+}
+
+let id = 0;
+setInterval(() => {
+  broadcast({
+    id: ++id,
+    type: "heartbeat",
+    data: { time: Date.now() },
+  });
+}, 5000);
+
+app.listen(3000);
+```
+
+`EventSource` moves through three states:
+
+| State        | Value | Meaning                                  |
+| ------------ | ----- | ---------------------------------------- |
+| `CONNECTING` | 0     | Connecting or reconnecting               |
+| `OPEN`       | 1     | Stream is open                           |
+| `CLOSED`     | 2     | Stream was closed and will not reconnect |
+
+<h1 id="4-sse-events">4. SSE Events</h1>
+
+The SSE event format is intentionally simple. Each event is a few lines of text followed by a blank line:
+
+```text
+id: 123
+event: notification
+data: {"message":"Build finished"}
+
+id: 124
+event: alert
+data: {"severity":"high","text":"Error rate increased"}
+```
+
+Each event usually contains some **data**. That data might be plain text or JSON.
+
+Events can also have a **type**, which lets the client tell different kinds of updates apart. The same stream could carry notification events, order status events, and progress events, and the client registers a separate listener for each.
+
+Events can also have an **ID**. That becomes useful if the connection breaks and the client needs to continue from where it left off.
+
+| Field   | Purpose                                                                    |
+| ------- | -------------------------------------------------------------------------- |
+| `data`  | Event data. Multiple `data` lines are joined with newline characters       |
+| `event` | Event type. If omitted, the browser treats it as a generic `message` event |
+| `id`    | Position marker used for reconnecting through `Last-Event-ID`              |
+| `retry` | Reconnect delay in milliseconds suggested by the server                    |
+
+For multi-line data, repeat the `data` field:
+
+```text
+event: log
+id: 452
+data: first line
+data: second line
+data: third line
+```
+
+So although the protocol is simple, it already includes the features a long-lived streaming connection needs.
+
+<h1 id="5-automatic-reconnection">5. Automatic Reconnection</h1>
+
+One useful feature of SSE is automatic reconnection. If the connection drops, the browser automatically tries to reconnect, so you do not need to write basic retry logic yourself.
+
+By default, browsers wait about 3 seconds before reconnecting. The server can suggest a different delay with the `retry` field:
+
+```text
+retry: 5000
+event: ready
+data: {"status":"connected"}
+```
+
+But this raises another question: what happens to events sent while the client was disconnected?
+
+<h1 id="6-recovering-missed-events">6. Recovering Missed Events</h1>
+
+SSE handles this with a mechanism called **Last-Event-ID**.
+
+The server assigns an ID to each event, and the browser keeps track of the most recent one it received. If the connection drops, the browser reconnects and sends that ID in the `Last-Event-ID` header. The server uses it to work out where the stream left off.
+
+For example, if the client last received event 100, the server can replay events 101 onward.
+
+But SSE does not store those events for you. The browser remembers the last ID, and the server has to be able to look up what came after it. Reliable replay requires durable storage such as a database, cache, event log, or message broker.
+
+So Last-Event-ID helps resume the stream, but durability is still the application's responsibility.
+
+<h1 id="7-scaling-sse">7. Scaling SSE</h1>
+
+Now suppose there are multiple SSE servers behind a load balancer.
+
+When a client opens an SSE connection, the load balancer routes it to one server, and the connection stays there until it closes. So different users end up connected to different SSE servers.
+
+If a backend service generates an event for Bob, the system has to route that event to the server currently holding Bob's connection. The service that produced the event has no idea which server that is.
+
+A common solution is a shared messaging layer:
+
+1. Backend services publish events.
+2. The messaging system distributes them to every SSE server.
+3. The server holding the right connection pushes the event to the client.
+
+This keeps business services separate from the servers that manage long-lived connections.
+
+<h1 id="8-pubsub-behind-sse">8. Pub/Sub Behind SSE</h1>
+
+The messaging layer could be Redis Pub/Sub, Kafka, or another event system, depending on your requirements.
+
+- **Redis Pub/Sub** works well for fast, transient events where replay is not important. A server that is not subscribed at the moment a message is published never sees it.
+- **Kafka** is a better fit when you need durability, replay, or large-scale event processing. Events stay in the log, so a reconnecting client's `Last-Event-ID` can be served from it.
+
+Either way, the roles stay the same. Backend services produce events, the messaging layer distributes them, and SSE servers manage client connections and deliver updates. This separation makes the system easier to scale horizontally: add SSE servers for more connections without touching the producers.
+
+<h1 id="9-slow-clients-and-backpressure">9. Slow Clients and Backpressure</h1>
+
+Another challenge is slow clients. If the server produces events faster than a client can consume them, buffered data for that client keeps growing and can eventually consume significant memory.
+
+So SSE servers need a backpressure strategy: a rule for what to do when a client cannot keep up. Common options:
+
+- **Buffer temporarily**, up to a limit, to absorb short bursts.
+- **Drop older events** when the buffer is full.
+- **Send only the latest state**, when old values are no longer useful, such as a price or a progress percentage.
+- **Disconnect the client** and let it reconnect later, resuming from its `Last-Event-ID`.
+
+<h1 id="10-heartbeats-and-infrastructure">10. Heartbeats and Infrastructure</h1>
+
+SSE connections may stay quiet for long periods. Proxies, load balancers, and other infrastructure can close them as idle.
+
+A common solution is to send periodic heartbeats. Lines that start with `:` are comments, which the browser ignores, so they make good heartbeats:
+
+```text
+: heartbeat
+
+event: update
+data: {"status":"ok"}
+```
+
+Heartbeats carry no meaningful data. They keep the connection alive and help detect failures. Send them more often than the shortest idle timeout along the request path.
+
+The other concern is **response buffering**. SSE relies on streaming data through a long-lived HTTP response, but some proxies, CDNs, and middleware buffer response data before forwarding it. If that happens, an event the server sent immediately may reach the client several seconds later.
+
+So the entire HTTP path must support streaming correctly, with compatible idle timeouts and buffering disabled where needed. In Nginx, for example, teams commonly send the `X-Accel-Buffering: no` header, as the server example above does.
+
+<h1 id="11-deployments-and-connection-draining">
+  11. Deployments and Connection Draining
+</h1>
+
+Long-lived connections also affect deployments.
+
+If an SSE server with thousands of active clients shuts down immediately, all those clients disconnect and may reconnect at once. That creates a sudden traffic spike on the remaining servers.
+
+A better approach is **connection draining**:
+
+1. The load balancer stops sending new connections to the server being retired.
+2. Existing connections stay until they close naturally or reconnect elsewhere.
+3. Once the server has no active connections left, it shuts down safely.
+
+Because clients resume with `Last-Event-ID`, moving to another server does not lose events.
+
+<h1 id="12-when-to-use-sse">12. When to Use SSE</h1>
+
+SSE is a strong choice when you need frequent server-to-client updates without a fully bidirectional connection. Common use cases:
+
+- Notifications
+- Live dashboards and monitoring systems
+- Job progress
+- Sports scores
+- Social media feeds
+
+If both the browser and the server need to send frequent messages on the same connection, WebSockets are a better fit.
+
+<h1 id="13-sse-for-streaming-ai-responses">
+  13. SSE for Streaming AI Responses
+</h1>
+
+A popular modern use case for SSE is streaming in LLM applications.
+
+When a user sends a prompt, generating the full response may take several seconds. Instead of waiting for the entire answer, the server streams it as it is generated:
+
+```text
+data: {"text":"SSE keeps"}
+
+data: {"text":" one response"}
+
+data: {"text":" open."}
+
+data: [DONE]
+```
+
+This makes the application feel much more responsive, because the user starts seeing results almost immediately.
+
+It is a natural server-to-client streaming pattern: the client sends one request, and the server progressively sends the response back.
+
+<h1 id="summary">Summary</h1>
+
+Polling forces a choice between wasted requests and delayed updates. SSE lets the browser connect once while the server pushes events over a long-lived HTTP response with the `text/event-stream` content type. It is one-way: anything the browser sends goes through separate requests.
+
+Events are simple text with data, an optional type, and an optional ID. Browsers reconnect automatically and send `Last-Event-ID`, but replaying missed events needs durable storage on the server side.
+
+To scale, a messaging layer such as Redis Pub/Sub or Kafka routes each event to the server holding the client's connection. In production, plan for slow clients with a backpressure strategy, keep quiet connections alive with heartbeats, disable buffering along the path, and drain connections during deployments.
+
+SSE fits notifications, dashboards, job progress, feeds, and streaming AI responses: anywhere the server talks and the browser listens.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

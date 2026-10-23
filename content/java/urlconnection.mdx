@@ -1,0 +1,757 @@
+---
+title: "URLConnection"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "URLConnection explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+This lesson covers the full request lifecycle: opening the connection, picking the HTTP method, setting headers, applying timeouts, sending a request body, reading the response, and cleaning up. Almost every example wraps a real e-commerce task: charging a card, fetching a shipping rate, looking up an exchange rate, or posting an order webhook. By the end, you will see why `URLConnection` works but feels rough, and why the modern `HttpClient` API has largely replaced it for new code.
+
+<h1 id="opening-a-connection">Opening a Connection</h1>
+
+A `URL` describes a resource. A `URLConnection` is the live conversation with that resource. You go from one to the other with `url.openConnection()`. The call returns `URLConnection`, the abstract base, so for HTTP work you cast to `HttpURLConnection` to reach the HTTP-specific calls.
+
+```java
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URL;
+import java.net.URLConnection;
+
+public class OpenConnectionExample {
+    public static void main(String[] args) throws Exception {
+        URL url = URI.create("https://api.example-shop.com/health").toURL();
+
+        URLConnection raw = url.openConnection();
+        System.out.println("Returned type: " + raw.getClass().getName());
+
+        HttpURLConnection http = (HttpURLConnection) raw;
+        System.out.println("Casted, request method default: " + http.getRequestMethod());
+    }
+}
+```
+
+The actual class name printed depends on your JDK, but it will always be some subclass of `HttpURLConnection` (or `HttpsURLConnection` for HTTPS, which itself extends `HttpURLConnection`). The cast is safe for any `http://` or `https://` URL. For other protocols like `file://` or `jar://`, you would get a different `URLConnection` subclass.
+
+`openConnection()` does not actually open a TCP socket yet. It builds the object and configures it. The real network handshake happens lazily, on the first call that needs bytes on the wire, usually `getResponseCode()`, `getInputStream()`, or `connect()`. That lazy behavior matters for two reasons: you can still configure headers and timeouts after `openConnection()`, and a "connection" that you never read from never costs you a TCP handshake.
+
+`openConnection()` is cheap. The TCP connect, TLS handshake, and request send happen on the first call that forces them. If you skip the body read, you may still pay for the socket setup.
+
+<h1 id="the-request-lifecycle-at-a-glance">
+  The Request Lifecycle at a Glance
+</h1>
+
+Every HTTP call you make with `HttpURLConnection` follows the same shape. Build the URL, open the connection, configure it (method, headers, timeouts, optional body), then read the response. The diagram below traces a typical GET against an e-commerce inventory API.
+
+The labels on this diagram map one-to-one to method calls you will see in the rest of the lesson. The step at `getResponseCode` is where the actual network work happens. Everything before it just configures the request; everything after it processes the result.
+
+<h1 id="setting-the-http-method">Setting the HTTP Method</h1>
+
+HTTP verbs describe what you want to do with the resource. `GET` reads, `POST` creates, `PUT` replaces, `DELETE` removes. `HttpURLConnection` defaults to `GET`. For anything else, call `setRequestMethod` before you trigger the request.
+
+```java
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URL;
+
+public class RequestMethodExample {
+    public static void main(String[] args) throws Exception {
+        URL url = URI.create("https://api.example-shop.com/orders/42").toURL();
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+
+        conn.setRequestMethod("DELETE");
+        System.out.println("Method set to: " + conn.getRequestMethod());
+    }
+}
+```
+
+The method string is case-sensitive and must be one of `GET`, `POST`, `HEAD`, `OPTIONS`, `PUT`, `DELETE`, or `TRACE`. Anything else throws `ProtocolException`. The check happens at the moment you call `setRequestMethod`, not when you send.
+
+```java
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URL;
+import java.net.ProtocolException;
+
+public class InvalidMethodExample {
+    public static void main(String[] args) throws Exception {
+        URL url = URI.create("https://api.example-shop.com/orders").toURL();
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+
+        try {
+            conn.setRequestMethod("PATCH");
+        } catch (ProtocolException e) {
+            System.out.println("Rejected: " + e.getMessage());
+        }
+    }
+}
+```
+
+`PATCH` is a perfectly valid HTTP verb in the wider world, but `HttpURLConnection` does not list it in its allowed set. This is one of the reasons newer code uses `HttpClient`, which accepts any method string. Workarounds exist for `URLConnection` (reflection on the internal `method` field, or sending `X-HTTP-Method-Override`), but they are awkward.
+
+<h1 id="setting-request-headers">Setting Request Headers</h1>
+
+Headers attach metadata to the request: who you are, what content type you are sending, what content types you can accept back. `setRequestProperty(name, value)` sets a single header value. `addRequestProperty(name, value)` appends another value to the same header name, which matters for headers that legitimately repeat like `Set-Cookie` (on responses) or `Accept`.
+
+```java
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URL;
+
+public class RequestHeadersExample {
+    public static void main(String[] args) throws Exception {
+        URL url = URI.create("https://api.example-shop.com/products/123").toURL();
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+
+        conn.setRequestMethod("GET");
+        conn.setRequestProperty("Accept", "application/json");
+        conn.setRequestProperty("Authorization", "Bearer sk_test_4eC39HqLyjWDarjtT1zdp7dc");
+        conn.setRequestProperty("User-Agent", "example-shop-client/1.0");
+        conn.setRequestProperty("X-Request-Id", "req-7a91");
+
+        System.out.println("Accept: " + conn.getRequestProperty("Accept"));
+        System.out.println("User-Agent: " + conn.getRequestProperty("User-Agent"));
+    }
+}
+```
+
+Three rules to know. First, header names are case-insensitive on the wire, but `setRequestProperty` is case-sensitive in the way it stores them, so pick one casing per header and stick to it. Second, `setRequestProperty` replaces any previous value for the same name. Third, a few headers are restricted by default and ignored if you try to set them: `Host`, `Connection`, `Content-Length`, and `Transfer-Encoding`. The JVM manages those itself unless you set the system property `sun.net.http.allowRestrictedHeaders=true`, which most production code should not do.
+
+Header values are sent in plaintext (or encrypted plaintext over HTTPS). Adding ten 8-byte headers vs. one rarely matters. Adding a 10 KB cookie blob on every request does. Audit large headers if you see high baseline latency.
+
+<h1 id="timeouts-why-production-code-always-sets-them">
+  Timeouts: Why Production Code Always Sets Them
+</h1>
+
+The most common production bug with `HttpURLConnection` is forgetting to set timeouts. Without them, both the connect step and the read step block forever if the remote server is slow or unresponsive. A thread waiting on a hung connection sits there until the OS gives up, which on Linux can be more than two hours.
+
+Two methods set the limits:
+
+Both take milliseconds. A value of `0` means "no timeout, wait forever," which is the default. Setting both is non-negotiable for any code that runs in production.
+
+```java
+import java.net.HttpURLConnection;
+import java.net.SocketTimeoutException;
+import java.net.URI;
+import java.net.URL;
+
+public class TimeoutExample {
+    public static void main(String[] args) {
+        try {
+            URL url = URI.create("https://api.example-shop.com/shipping-rates").toURL();
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+
+            conn.setConnectTimeout(2_000);
+            conn.setReadTimeout(5_000);
+            conn.setRequestMethod("GET");
+            conn.setRequestProperty("Accept", "application/json");
+
+            int status = conn.getResponseCode();
+            System.out.println("Status: " + status);
+        } catch (SocketTimeoutException e) {
+            System.out.println("Timed out: " + e.getMessage());
+        } catch (Exception e) {
+            System.out.println("Other error: " + e.getClass().getSimpleName());
+        }
+    }
+}
+```
+
+**Output (when the server is responsive):**
+
+```text
+Status: 200
+```
+
+**Output (when the server is slow):**
+
+```text
+Timed out: Read timed out
+```
+
+Pick the numbers based on the API you are calling. A connect timeout of 2 to 5 seconds is reasonable for most services. The read timeout depends on the operation. A health check should return in under a second, so a 3 second read timeout is fine. A payment authorization that can sometimes take several seconds on the bank side needs more room, maybe 15 to 30 seconds, but never `0`.
+
+A thread blocked on a no-timeout HTTP call costs about 1 MB of stack plus an OS file descriptor. In a thread-per-request server, a hung downstream service can exhaust your thread pool inside an hour. Always set both timeouts.
+
+**What's wrong with this code?**
+
+```java
+URL url = URI.create("https://api.example-shop.com/charge").toURL();
+HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+conn.setRequestMethod("POST");
+int status = conn.getResponseCode();
+```
+
+No timeouts. If `api.example-shop.com` stops responding (network blip, overloaded server, slow DB on their side), this call blocks the thread indefinitely. Under load, you run out of threads.
+
+**Fix:**
+
+```java
+URL url = URI.create("https://api.example-shop.com/charge").toURL();
+HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+conn.setConnectTimeout(3_000);
+conn.setReadTimeout(10_000);
+conn.setRequestMethod("POST");
+int status = conn.getResponseCode();
+```
+
+A connect timeout of 3 seconds and a read timeout of 10 seconds. If the call exceeds either, you get a `SocketTimeoutException` instead of a hung thread.
+
+<h1 id="a-first-full-get-fetching-an-exchange-rate">
+  A First Full GET: Fetching an Exchange Rate
+</h1>
+
+With method, headers, and timeouts under control, we can run a full GET request end to end. Consider an e-commerce site that prices products in USD but displays totals in the customer's local currency. Every checkout calls an exchange-rate API to convert the cart total.
+
+```java
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+
+public class FetchExchangeRateExample {
+    public static void main(String[] args) throws Exception {
+        URL url = URI.create("https://api.example-fx.com/v1/rates?base=USD&target=EUR").toURL();
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+
+        conn.setRequestMethod("GET");
+        conn.setRequestProperty("Accept", "application/json");
+        conn.setConnectTimeout(2_000);
+        conn.setReadTimeout(5_000);
+
+        int status = conn.getResponseCode();
+        System.out.println("Status: " + status);
+
+        StringBuilder body = new StringBuilder();
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                body.append(line);
+            }
+        }
+
+        System.out.println("Body: " + body);
+        conn.disconnect();
+    }
+}
+```
+
+Four pieces matter here. `getResponseCode()` is what triggers the actual network call; until that line runs, no socket has been opened. `getInputStream()` returns the body as a raw byte stream, so we wrap it in an `InputStreamReader` with an explicit `UTF_8` charset, then a `BufferedReader` for line-by-line reading. The try-with-resources block closes the reader when we are done. Finally, `conn.disconnect()` releases the connection.
+
+The explicit `StandardCharsets.UTF_8` matters. If you wrap the stream with `new InputStreamReader(stream)` without a charset, you get the platform default, which on some Windows systems is `windows-1252` and on most Linux containers is `UTF-8`. JSON bodies are required by RFC 8259 to be UTF-8, so being explicit avoids the surprise.
+
+<h1 id="getinputstream-vs-geterrorstream">
+  getInputStream() vs getErrorStream()
+</h1>
+
+For 2xx and 3xx responses, you read the body from `getInputStream()`. For 4xx and 5xx responses, calling `getInputStream()` throws `IOException`. The error body lives on a separate stream called `getErrorStream()`.
+
+The diagram below shows the split.
+
+In practice, you branch on the status code and pick the right stream. The pattern looks like this for a shipping rate lookup that may return `404 Not Found` for an unsupported destination country.
+
+```java
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+
+public class ShippingRateExample {
+    public static void main(String[] args) throws Exception {
+        URL url = URI.create("https://api.example-shipping.com/rates?country=ZZ").toURL();
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+
+        conn.setRequestMethod("GET");
+        conn.setRequestProperty("Accept", "application/json");
+        conn.setConnectTimeout(2_000);
+        conn.setReadTimeout(5_000);
+
+        int status = conn.getResponseCode();
+        System.out.println("Status: " + status);
+
+        InputStream stream = (status >= 200 && status < 400)
+                ? conn.getInputStream()
+                : conn.getErrorStream();
+
+        StringBuilder body = new StringBuilder();
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(stream, StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                body.append(line);
+            }
+        }
+
+        System.out.println("Body: " + body);
+        conn.disconnect();
+    }
+}
+```
+
+This is the version you would ship. A small ternary picks the right stream, and the rest of the code is identical. Note that `getErrorStream()` returns `null` if there was no error body (some servers return 4xx with an empty body), so production code should guard with `if (stream != null)` before reading.
+
+**What's wrong with this code?**
+
+```java
+HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+conn.setRequestMethod("GET");
+int status = conn.getResponseCode();
+
+try (BufferedReader reader = new BufferedReader(
+        new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+    // read body, parse error message
+}
+```
+
+If `status` is 500, `getInputStream()` throws `IOException("Server returned HTTP response code: 500 for URL: ...")`. The intended error message inside the response body is on `getErrorStream()`, not `getInputStream()`.
+
+**Fix:**
+
+```java
+InputStream stream = (status >= 200 && status < 400)
+        ? conn.getInputStream()
+        : conn.getErrorStream();
+
+if (stream != null) {
+    try (BufferedReader reader = new BufferedReader(
+            new InputStreamReader(stream, StandardCharsets.UTF_8))) {
+        // read body, parse error message
+    }
+}
+```
+
+Branch on the status code and pick the right stream. Guard against `getErrorStream()` returning `null` for empty error bodies.
+
+<h1 id="reading-response-status-and-headers">
+  Reading Response Status and Headers
+</h1>
+
+`getResponseCode()` returns the integer status (200, 404, 500, etc.). `getResponseMessage()` returns the reason phrase that follows the code on the status line ("OK", "Not Found", "Internal Server Error"). Both are cached after the first call, so it is safe to call them multiple times.
+
+For headers, `getHeaderField(name)` returns the first value of a response header, or `null` if the header is not present. `getHeaderFields()` returns an unmodifiable `Map<String, List<String>>` of every header, which is useful for logging or for headers that legitimately repeat.
+
+```java
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URL;
+import java.util.List;
+import java.util.Map;
+
+public class ReadHeadersExample {
+    public static void main(String[] args) throws Exception {
+        URL url = URI.create("https://api.example-shop.com/products/123").toURL();
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+
+        conn.setRequestMethod("GET");
+        conn.setConnectTimeout(2_000);
+        conn.setReadTimeout(5_000);
+
+        int status = conn.getResponseCode();
+        String reason = conn.getResponseMessage();
+        System.out.println("Status: " + status + " " + reason);
+
+        System.out.println("Content-Type: " + conn.getHeaderField("Content-Type"));
+        System.out.println("Server: " + conn.getHeaderField("Server"));
+
+        System.out.println("All response headers:");
+        for (Map.Entry<String, List<String>> entry : conn.getHeaderFields().entrySet()) {
+            System.out.println("  " + entry.getKey() + " = " + entry.getValue());
+        }
+
+        conn.disconnect();
+    }
+}
+```
+
+The entry with a `null` key looks strange but is intentional: it holds the raw HTTP status line, which has no header name. The `getHeaderField(String)` overload (with a name argument) ignores it, so this only matters when you iterate `getHeaderFields()`.
+
+`getHeaderField(name)` is case-insensitive for the name lookup, which matches the HTTP specification. `conn.getHeaderField("content-type")` and `conn.getHeaderField("Content-Type")` return the same value.
+
+<h1 id="sending-a-request-body-post-with-form-data">
+  Sending a Request Body: POST with Form Data
+</h1>
+
+For methods that send a body, two extra calls are required. `setDoOutput(true)` tells the connection that you intend to write a body. Then you write your bytes to the stream returned by `getOutputStream()`. The connection sends them as the request body and uses their length to set the `Content-Length` header for you.
+
+The first example posts a classic HTML form payload. Consider an order confirmation webhook that an old partner system can only consume as `application/x-www-form-urlencoded`.
+
+```java
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URL;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+
+public class PostFormExample {
+    public static void main(String[] args) throws Exception {
+        URL url = URI.create("https://partner.example-logistics.com/webhook/order").toURL();
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+
+        conn.setRequestMethod("POST");
+        conn.setDoOutput(true);
+        conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
+        conn.setRequestProperty("Accept", "application/json");
+        conn.setConnectTimeout(3_000);
+        conn.setReadTimeout(10_000);
+
+        String form = "orderId=" + URLEncoder.encode("ORD-1042", StandardCharsets.UTF_8)
+                + "&status=" + URLEncoder.encode("shipped", StandardCharsets.UTF_8)
+                + "&trackingNumber=" + URLEncoder.encode("1Z999AA10123456784", StandardCharsets.UTF_8);
+
+        byte[] payload = form.getBytes(StandardCharsets.UTF_8);
+
+        try (OutputStream out = conn.getOutputStream()) {
+            out.write(payload);
+        }
+
+        int status = conn.getResponseCode();
+        System.out.println("Status: " + status);
+        conn.disconnect();
+    }
+}
+```
+
+Three details to zoom in on. `URLEncoder.encode` percent-encodes the values so spaces, ampersands, and Unicode characters do not break the form. The `Content-Type` header advertises `charset=UTF-8`, which matches what `URLEncoder` produces. And `setDoOutput(true)` switches the connection into "I am sending a body" mode, which on its own also flips the default method from `GET` to `POST` if you have not set it.
+
+**What's wrong with this code?**
+
+```java
+HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+conn.setRequestMethod("POST");
+conn.setRequestProperty("Content-Type", "application/json");
+
+try (OutputStream out = conn.getOutputStream()) {
+    out.write(payload);
+}
+```
+
+`setDoOutput(true)` is missing. `getOutputStream()` throws `ProtocolException: cannot write to a URLConnection if doOutput=false`. You can also forget the method altogether and the connection will default to GET, which most servers will reject for a body-bearing request.
+
+**Fix:**
+
+```java
+HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+conn.setRequestMethod("POST");
+conn.setDoOutput(true);
+conn.setRequestProperty("Content-Type", "application/json");
+
+try (OutputStream out = conn.getOutputStream()) {
+    out.write(payload);
+}
+```
+
+`setDoOutput(true)` opens the output side of the connection. Set it before any header that depends on the body, and definitely before `getOutputStream()`.
+
+<h1 id="sending-a-request-body-post-with-json">
+  Sending a Request Body: POST with JSON
+</h1>
+
+JSON is the format most modern APIs accept. The only differences from the form example are the `Content-Type` header and the body payload itself.
+
+This is the classic e-commerce flow: your checkout service hits the payment provider's authorization endpoint to charge a card.
+
+```java
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+
+public class ChargeCardExample {
+    public static void main(String[] args) throws Exception {
+        URL url = URI.create("https://api.example-payments.com/v1/charges").toURL();
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+
+        conn.setRequestMethod("POST");
+        conn.setDoOutput(true);
+        conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+        conn.setRequestProperty("Accept", "application/json");
+        conn.setRequestProperty("Authorization", "Bearer sk_test_4eC39HqLyjWDarjtT1zdp7dc");
+        conn.setConnectTimeout(3_000);
+        conn.setReadTimeout(15_000);
+
+        String body = """
+                {
+                  "amount": 5499,
+                  "currency": "USD",
+                  "source": "tok_visa",
+                  "description": "Order ORD-1042: 2 items"
+                }
+                """;
+
+        byte[] payload = body.getBytes(StandardCharsets.UTF_8);
+
+        try (OutputStream out = conn.getOutputStream()) {
+            out.write(payload);
+        }
+
+        int status = conn.getResponseCode();
+        InputStream stream = (status >= 200 && status < 400)
+                ? conn.getInputStream()
+                : conn.getErrorStream();
+
+        StringBuilder response = new StringBuilder();
+        if (stream != null) {
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(stream, StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    response.append(line);
+                }
+            }
+        }
+
+        System.out.println("Status: " + status);
+        System.out.println("Body:   " + response);
+        conn.disconnect();
+    }
+}
+```
+
+The body is built with Java's text block syntax (`"""..."""`) which keeps the JSON readable. For real code you would use a JSON library like Jackson or Gson to serialize a typed object, but the body is just bytes to `HttpURLConnection`. The wire-level concern is the `Content-Type: application/json` header that tells the server how to parse those bytes.
+
+A read timeout of 15 seconds is on the generous side here. Card authorizations route through the issuing bank, which can occasionally take 10+ seconds during weekend peaks. Tune the value to the slowest you have observed on the 99th percentile, then add a small margin.
+
+Each HTTP call is one TCP round trip at minimum, plus TLS handshake on the first connection to a host. Over the public internet that's 30 to 200 ms before any bytes flow. Keep-alive makes the second call to the same host much cheaper.
+
+<h1 id="character-sets-and-encoding-gotchas">
+  Character Sets and Encoding Gotchas
+</h1>
+
+HTTP is byte-oriented. Text has to be encoded into bytes on the way out and decoded back into characters on the way in. The character set must be consistent on both ends, or you get garbled output (mojibake), wrong byte counts, or 400 errors from picky servers.
+
+Three places to be explicit.
+
+**1. When you turn a Java `String` into bytes for the request body:**
+
+```java
+byte[] payload = body.getBytes(StandardCharsets.UTF_8);
+```
+
+Do not rely on `body.getBytes()` without an argument. That uses the platform default charset, which differs between developer laptops, CI runners, and production containers.
+
+**2. When you advertise the body's encoding to the server:**
+
+```java
+conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+```
+
+The `charset` parameter tells the server how to decode your bytes. Match it to whatever you used in step 1.
+
+**3. When you decode the response body bytes back into a Java `String`:**
+
+```java
+new InputStreamReader(stream, StandardCharsets.UTF_8)
+```
+
+Same rule. Always pass an explicit charset to `InputStreamReader`. The server may declare its charset in `Content-Type` on the response; if you trust that, parse it out, but defaulting to UTF-8 is correct for almost every modern JSON or text API.
+
+Java 17 introduced a small win: `Charset.defaultCharset()` is now `UTF-8` on most platforms by default. That helps reduce the platform variance, but explicit is still safer because older JDKs and certain JVM flags still produce different defaults.
+
+```java
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+
+public class EncodingExample {
+    public static void main(String[] args) throws Exception {
+        URL url = URI.create("https://api.example-shop.com/customers").toURL();
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+
+        conn.setRequestMethod("POST");
+        conn.setDoOutput(true);
+        conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+
+        String body = "{\"name\":\"RenÃ©e OâBrien\",\"city\":\"SÃ£o Paulo\"}";
+        byte[] payload = body.getBytes(StandardCharsets.UTF_8);
+        System.out.println("Payload length in bytes: " + payload.length);
+        System.out.println("Payload length in chars: " + body.length());
+
+        try (OutputStream out = conn.getOutputStream()) {
+            out.write(payload);
+        }
+
+        System.out.println("Status: " + conn.getResponseCode());
+        conn.disconnect();
+    }
+}
+```
+
+The byte count and character count differ because `Ã©`, `â`, and `Ã£` use more than one byte each in UTF-8. The `Content-Length` header that `HttpURLConnection` sets uses the byte count, which is what the server expects.
+
+<h1 id="disconnecting-and-connection-reuse-keep-alive">
+  Disconnecting and Connection Reuse (Keep-Alive)
+</h1>
+
+`HttpURLConnection.disconnect()` looks like it closes the underlying TCP socket. It doesn't always. By default, the JVM maintains a small pool of open HTTP connections and reuses them for subsequent requests to the same host, port, and protocol. This is HTTP keep-alive, and it is a major performance win because it avoids the cost of a fresh TCP handshake (and TLS handshake for HTTPS) on every call.
+
+For the pool to actually keep the connection alive, you must fully drain the response body, even on errors. If you stop reading mid-stream, the JVM cannot know whether more bytes are coming on the wire, so it closes the socket to be safe. Slow, broken code can disable keep-alive across the whole process.
+
+Two practical habits.
+
+**Habit one: always drain the response body.** The safest pattern is a read-loop run to completion inside a try-with-resources. For error responses, drain `getErrorStream()` too, even if you only log a few characters of it.
+
+**Habit two: be careful with the `http.keepAlive` system property.** It defaults to `true`. Some debugging guides recommend setting it to `false`, which forces every request to open a fresh socket. That is a fine setting for a one-off test, but a disaster in production. The default values for the pool (`http.maxConnections=5` per host, `keepAliveDuration` of about 5 seconds) are conservative; you can tune them up with system properties, but most apps just live with the defaults.
+
+```java
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+
+public class KeepAliveDemoExample {
+    public static void main(String[] args) throws Exception {
+        URL url = URI.create("https://api.example-shop.com/health").toURL();
+
+        for (int i = 1; i <= 3; i++) {
+            long start = System.nanoTime();
+
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setConnectTimeout(2_000);
+            conn.setReadTimeout(5_000);
+
+            int status = conn.getResponseCode();
+
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+                while (reader.readLine() != null) {
+                    // drain
+                }
+            }
+
+            conn.disconnect();
+
+            long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+            System.out.println("Request " + i + ": status=" + status + ", elapsed=" + elapsedMs + "ms");
+        }
+    }
+}
+```
+
+**Output (sample, depends on network):**
+
+```text
+Request 1: status=200, elapsed=312ms
+Request 2: status=200, elapsed=41ms
+Request 3: status=200, elapsed=38ms
+```
+
+The first request pays the full TCP plus TLS cost. The second and third reuse the pooled socket and only pay the round-trip for the HTTP request/response. The gap is the visible effect of keep-alive.
+
+Skipping `disconnect()` is usually fine because the connection will be returned to the pool whenever the streams are fully drained and closed. But on error paths where you might forget to close the streams, the connection leaks. Always close your streams.
+
+<h1 id="a-production-quality-get-helper">A Production-Quality GET Helper</h1>
+
+Putting the lifecycle together, here is a small utility that does a GET, returns the status code and body, and handles error streams. It is the kind of helper you would extract once and reuse from a dozen call sites in an e-commerce service.
+
+```java
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
+
+public class HttpGetHelperExample {
+
+    record Response(int status, String body) {}
+
+    static Response get(String urlString, Map<String, String> headers,
+                       int connectTimeoutMs, int readTimeoutMs) throws IOException {
+        URL url = URI.create(urlString).toURL();
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("GET");
+        conn.setConnectTimeout(connectTimeoutMs);
+        conn.setReadTimeout(readTimeoutMs);
+
+        for (Map.Entry<String, String> h : headers.entrySet()) {
+            conn.setRequestProperty(h.getKey(), h.getValue());
+        }
+
+        try {
+            int status = conn.getResponseCode();
+            InputStream stream = (status >= 200 && status < 400)
+                    ? conn.getInputStream()
+                    : conn.getErrorStream();
+
+            String body = "";
+            if (stream != null) {
+                StringBuilder sb = new StringBuilder();
+                try (BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(stream, StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        sb.append(line);
+                    }
+                }
+                body = sb.toString();
+            }
+            return new Response(status, body);
+        } finally {
+            conn.disconnect();
+        }
+    }
+
+    public static void main(String[] args) throws IOException {
+        Map<String, String> headers = new HashMap<>();
+        headers.put("Accept", "application/json");
+        headers.put("User-Agent", "example-shop-client/1.0");
+
+        Response resp = get(
+                "https://api.example-shop.com/products/123",
+                headers,
+                2_000,
+                5_000);
+
+        System.out.println("Status: " + resp.status());
+        System.out.println("Body:   " + resp.body());
+    }
+}
+```
+
+A few design choices: the helper takes a `Map<String, String>` for headers so callers can build them up programmatically. The status code branches the stream choice. The `try` block contains the work; the `finally` block calls `disconnect()` so it runs even on exception. The record returns the status and body as a single typed value instead of two outputs.
+
+This is roughly the minimum useful wrapper around `HttpURLConnection`. Real production code adds retry logic, response-time metrics, request IDs, body-size limits, and JSON parsing on top of this skeleton. Once you find yourself building all of that, the modern `HttpClient` becomes a better alternative because it gives you many of those pieces out of the box.
+
+<h1 id="why-urlconnection-is-considered-legacy">
+  Why URLConnection Is Considered Legacy
+</h1>
+
+`URLConnection` and `HttpURLConnection` have been in Java since 1.1, and they show their age. A few of the rough edges:
+
+- The API is mutable and stateful. Headers, method, and body all live on the connection object, which complicates testing and mocking.
+- `PATCH` is not allowed without reflection hacks.
+- There is no built-in JSON support; you bring your own serializer.
+- There is no streaming response API beyond plain `InputStream`. Server-sent events, chunked uploads, and HTTP/2 multiplexing are awkward or impossible.
+- HTTP/2 is not supported. `HttpURLConnection` speaks HTTP/1.1 only, which leaves head-of-line blocking and per-request connection overhead on the table.
+- Asynchronous requests require manual thread management.
+- The error-vs-input stream split is error-prone.
+
+Java 11 introduced `java.net.http.HttpClient` as the modern replacement. It supports HTTP/2 by default, has async via `CompletableFuture`, allows any HTTP method including `PATCH`, supports `BodyPublishers` and `BodyHandlers` for typed serialization, and has a fluent builder API. For any new code, prefer `HttpClient`. Use `HttpURLConnection` only when you are maintaining older code that already depends on it or when you cannot add a dependency-free alternative.
+
+That said, `URLConnection` is not deprecated, and a huge amount of existing code still uses it. Understanding it is useful when you read a legacy codebase, debug a flaky third-party library, or need a quick one-off HTTP call from a tiny utility that already pulls in `java.net`.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

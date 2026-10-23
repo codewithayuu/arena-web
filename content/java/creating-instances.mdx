@@ -1,0 +1,769 @@
+---
+title: "Creating Instances Dynamically"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Creating Instances Dynamically explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="why-dynamic-instantiation-matters">
+  Why Dynamic Instantiation Matters
+</h1>
+
+The classic place this shows up is a framework. Spring reads its configuration, sees that you want a `CartService` bean, and has to build one without the framework's own source code ever mentioning `CartService`. JUnit finds a test class by scanning the classpath, then needs an instance to run the test methods on. Jackson deserializes a JSON payload into a `Product` object that the JSON library has never heard of. In every case, the class name arrives as a string at runtime, and the framework has to translate that string into a real object.
+
+You will not be writing a full dependency injection container in this lesson. We will build a small generic factory that takes a class name plus some constructor arguments and returns a fresh instance. That is enough to understand what happens inside the framework.
+
+The pipeline is always the same: turn a name into a `Class`, find the constructor you want, then invoke it. This lesson is about the third arrow.
+
+<h1 id="finding-the-constructor">Finding the Constructor</h1>
+
+Before you can invoke a constructor, you have to find a `Constructor` object that represents it. The `Class` API exposes two pairs of methods for this, and the difference between them matters.
+
+`Class.getConstructor(Class<?>... parameterTypes)` returns the public constructor whose parameter types exactly match the ones you pass in. `Class.getDeclaredConstructor(Class<?>... parameterTypes)` returns any constructor declared on the class itself, no matter the visibility. Both throw `NoSuchMethodException` when nothing matches.
+
+A small `Product` class with three constructors, and a program that fetches each one by signature:
+
+```java
+import java.lang.reflect.Constructor;
+
+public class FindingConstructors {
+
+    public static class Product {
+        public String name;
+        public double price;
+
+        public Product() {
+            this.name = "Unnamed";
+            this.price = 0.0;
+        }
+
+        public Product(String name, double price) {
+            this.name = name;
+            this.price = price;
+        }
+
+        private Product(String name) {
+            this.name = name;
+            this.price = 9.99;
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Constructor<Product> noArg =
+                Product.class.getConstructor();
+        Constructor<Product> twoArg =
+                Product.class.getConstructor(String.class, double.class);
+        Constructor<Product> privateOne =
+                Product.class.getDeclaredConstructor(String.class);
+
+        System.out.println("noArg parameters: " + noArg.getParameterCount());
+        System.out.println("twoArg parameters: " + twoArg.getParameterCount());
+        System.out.println("privateOne parameters: " + privateOne.getParameterCount());
+    }
+}
+```
+
+Three details on this example. First, the parameter types are passed as `Class` objects, not as values. `String.class` describes the type `String`. Second, primitive types use their `.class` literal too, so `double` becomes `double.class`, not `Double.class`. They are different types and they will not match a `double` parameter through autoboxing. Third, `getConstructor` could not have returned the private one-argument constructor because `getConstructor` only sees public constructors. The example uses `getDeclaredConstructor` for that one.
+
+Looking up a constructor is not free. Each `getDeclaredConstructor` call performs a security check and scans the class metadata. For a factory called thousands of times per second, cache the `Constructor` object in a static field and reuse it.
+
+<h1 id="invoking-the-constructor">Invoking the Constructor</h1>
+
+Once you have a `Constructor` object, you build a new instance with `newInstance(Object... args)`. The arguments line up positionally with the parameters you used to look the constructor up.
+
+```java
+import java.lang.reflect.Constructor;
+
+public class InvokingConstructors {
+
+    public static class Product {
+        public String name;
+        public double price;
+
+        public Product(String name, double price) {
+            this.name = name;
+            this.price = price;
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Constructor<Product> ctor =
+                Product.class.getConstructor(String.class, double.class);
+
+        Product first = ctor.newInstance("Headphones", 49.99);
+        Product second = ctor.newInstance("Notebook", 4.50);
+
+        System.out.println(first.name + " costs $" + first.price);
+        System.out.println(second.name + " costs $" + second.price);
+    }
+}
+```
+
+`newInstance` returns whatever type the `Constructor` was parameterized with. Because the variable is declared as `Constructor<Product>`, the return type is `Product`, no cast needed. With the raw `Constructor` type, a cast would be required.
+
+The varargs signature accepts `Object`, so primitive arguments go through autoboxing on the call site. The literal `49.99` is passed, but `newInstance` receives a `Double`, and the reflection machinery unboxes it back to a primitive `double` when it invokes the constructor. The same unboxing applies to `int`, `long`, `boolean`, and the rest of the primitives.
+
+What happens when arguments do not line up? The reflection layer throws `IllegalArgumentException`.
+
+```java
+import java.lang.reflect.Constructor;
+
+public class BadArguments {
+
+    public static class Product {
+        public String name;
+        public double price;
+
+        public Product(String name, double price) {
+            this.name = name;
+            this.price = price;
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Constructor<Product> ctor =
+                Product.class.getConstructor(String.class, double.class);
+
+        try {
+            Product bad = ctor.newInstance("Headphones");
+            System.out.println(bad.name);
+        } catch (IllegalArgumentException e) {
+            System.out.println("Wrong arg count: " + e.getMessage());
+        }
+    }
+}
+```
+
+The compiler cannot catch this because `newInstance` takes `Object...`, which accepts anything. The check happens at runtime. The same applies to type mismatches: passing a `String` where a `double` is expected throws `IllegalArgumentException` with a message like "argument type mismatch."
+
+<h1 id="a-tiny-generic-factory">A Tiny Generic Factory</h1>
+
+The pieces can be pulled together into a small factory that builds instances by class name. Three classes, three sample inputs, one factory method.
+
+```java
+import java.lang.reflect.Constructor;
+
+public class GenericFactory {
+
+    public static class Product {
+        public String name;
+        public double price;
+
+        public Product(String name, double price) {
+            this.name = name;
+            this.price = price;
+        }
+
+        @Override
+        public String toString() {
+            return "Product[" + name + ", $" + price + "]";
+        }
+    }
+
+    public static class Order {
+        public String customer;
+        public int itemCount;
+
+        public Order(String customer, int itemCount) {
+            this.customer = customer;
+            this.itemCount = itemCount;
+        }
+
+        @Override
+        public String toString() {
+            return "Order[" + customer + ", " + itemCount + " items]";
+        }
+    }
+
+    public static class Cart {
+        public String owner;
+
+        public Cart(String owner) {
+            this.owner = owner;
+        }
+
+        @Override
+        public String toString() {
+            return "Cart[" + owner + "]";
+        }
+    }
+
+    static Object build(String className, Class<?>[] paramTypes, Object[] args) throws Exception {
+        Class<?> type = Class.forName(className);
+        Constructor<?> ctor = type.getDeclaredConstructor(paramTypes);
+        return ctor.newInstance(args);
+    }
+
+    public static void main(String[] args) throws Exception {
+        Object product = build(
+                "GenericFactory$Product",
+                new Class<?>[] { String.class, double.class },
+                new Object[] { "Headphones", 49.99 });
+
+        Object order = build(
+                "GenericFactory$Order",
+                new Class<?>[] { String.class, int.class },
+                new Object[] { "Asha", 3 });
+
+        Object cart = build(
+                "GenericFactory$Cart",
+                new Class<?>[] { String.class },
+                new Object[] { "Asha" });
+
+        System.out.println(product);
+        System.out.println(order);
+        System.out.println(cart);
+    }
+}
+```
+
+The `build` method has no compile-time knowledge of `Product`, `Order`, or `Cart`. It accepts a class name, the parameter types of the constructor to use, and the matching arguments, and it returns an `Object`. The caller has to know what the result actually is. That is the trade-off frameworks make: static type checking is lost on this single call, in exchange for handling classes the framework was never built to know about.
+
+The inner-class names look a bit odd because Java uses `Outer$Inner` for nested classes in the binary name format that `Class.forName` expects. For top-level classes the form is `"shop.Product"`.
+
+<h1 id="why-classnewinstance-is-deprecated-since-java-9">
+  Why Class.newInstance() Is Deprecated Since Java 9
+</h1>
+
+For years, the shortcut for "build an instance of this class" was `someClass.newInstance()`, a method on `Class` itself. It looked clean: no `Constructor` object, no array of types, just one call. It had two design flaws, and Java 9 deprecated it.
+
+The first flaw is that `Class.newInstance()` only works for a public no-argument constructor. If the class has only a private or package-private no-arg constructor, the call throws `IllegalAccessException`. If the class has no no-arg constructor at all, it throws `InstantiationException`. There is no way to pass arguments. The mechanism that handles overloaded or argument-taking constructors is `Constructor.newInstance`, which the deprecated method did not use.
+
+The second flaw is harder to spot. If the no-arg constructor throws a **checked exception**, `Class.newInstance()` rethrows it directly without wrapping it. The caller's method signature does not declare that exception, but it gets thrown anyway. The compiler is fooled; the runtime is not. This breaks the checked-exception contract that the rest of Java enforces.
+
+The fix: use `getDeclaredConstructor().newInstance()`, which wraps any constructor exception in an `InvocationTargetException` so the caller sees a consistent signature.
+
+```java
+public class DeprecationDemo {
+
+    public static class Cart {
+        public Cart() {
+            System.out.println("Cart created");
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        // Deprecated since Java 9. Compiles with a warning. Avoid in new code.
+        @SuppressWarnings("deprecation")
+        Cart legacy = Cart.class.newInstance();
+
+        // The replacement. Works the same here, but composes with the
+        // arg-taking and private-constructor cases too.
+        Cart modern = Cart.class.getDeclaredConstructor().newInstance();
+
+        System.out.println(legacy != null);
+        System.out.println(modern != null);
+    }
+}
+```
+
+Both calls work for this simple class. The compiler flags the first one with a deprecation warning because the method is annotated `@Deprecated(since = "9")`. The new pattern is one line longer and gives the full power of the `Constructor` API: visibility control, parameter matching, and uniform exception wrapping.
+
+The diagram contrasts the two paths. Use the modern form. Treat `Class.newInstance()` as a legacy API that only appears in old code.
+
+<h1 id="reaching-private-constructors">Reaching Private Constructors</h1>
+
+A common pattern is a class with a private constructor, used to enforce a factory method or a singleton. Reflection can call that constructor anyway, but only after asking the `Constructor` object to bypass the access check.
+
+```java
+import java.lang.reflect.Constructor;
+
+public class PrivateConstructorAccess {
+
+    public static class CouponCode {
+        public String code;
+
+        private CouponCode(String code) {
+            this.code = code;
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Constructor<CouponCode> ctor =
+                CouponCode.class.getDeclaredConstructor(String.class);
+
+        try {
+            CouponCode failed = ctor.newInstance("SAVE10");
+            System.out.println(failed.code);
+        } catch (IllegalAccessException e) {
+            System.out.println("Blocked: " + e.getClass().getSimpleName());
+        }
+
+        ctor.setAccessible(true);
+        CouponCode ok = ctor.newInstance("SAVE10");
+        System.out.println("Built: " + ok.code);
+    }
+}
+```
+
+The first call fails with `IllegalAccessException` because the constructor is private and the calling code is not allowed to see it. The `setAccessible(true)` call tells the reflection layer to skip the visibility check. The second call then succeeds.
+
+Two warnings about `setAccessible`. First, it can fail with `InaccessibleObjectException` if a module system policy forbids it. Most application code is not in a module that has restricted access, so this rarely surfaces in beginner contexts, but it can when reaching into JDK internals. Second, breaking encapsulation is a tool, not a habit. Use it for serializers, mockers, and frameworks that need it. Application code rarely should.
+
+<h1 id="exceptions-to-expect">Exceptions to Expect</h1>
+
+`Constructor.newInstance` can throw several different exceptions, and each one means something specific. Knowing which is which makes debugging faster.
+
+| Exception                     | When you get it                                                                                               |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `NoSuchMethodException`       | Thrown by `getConstructor` / `getDeclaredConstructor` when no constructor matches the parameter types passed. |
+| `InstantiationException`      | The class is abstract or an interface; there is no constructor to call.                                       |
+| `IllegalAccessException`      | The constructor is not accessible from the calling code, and `setAccessible(true)` has not been called.       |
+| `IllegalArgumentException`    | The number or types of arguments do not match the constructor. Subclass of `RuntimeException`.                |
+| `InvocationTargetException`   | The constructor ran and threw an exception. The original exception is wrapped inside.                         |
+| `ExceptionInInitializerError` | A static initializer of the class failed during class loading.                                                |
+
+The two most confusing are `InstantiationException` and `InvocationTargetException`.
+
+`InstantiationException` means "I cannot create this kind of thing at all," which happens for abstract classes and interfaces. The reflection layer never tries to run a body.
+
+```java
+import java.lang.reflect.Constructor;
+
+public class AbstractClassError {
+
+    public static abstract class Payment {
+        public Payment() { }
+    }
+
+    public static void main(String[] args) {
+        try {
+            Constructor<Payment> ctor = Payment.class.getDeclaredConstructor();
+            Payment fail = ctor.newInstance();
+            System.out.println(fail);
+        } catch (InstantiationException e) {
+            System.out.println("Cannot instantiate abstract class");
+        } catch (Exception e) {
+            System.out.println("Other: " + e.getClass().getSimpleName());
+        }
+    }
+}
+```
+
+The same exception comes up when calling `newInstance` on an interface's `Class` object. Interfaces cannot be instantiated either; a proxy or a concrete implementation is required, and proxies are a separate topic.
+
+`InvocationTargetException` means the constructor body itself threw something. Reflection caught it and wrapped it so the caller's `throws` clause does not have to declare the constructor's specific exceptions. Use `getCause()` to peel off the wrapper.
+
+```java
+import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
+
+public class ConstructorThrew {
+
+    public static class Product {
+        public String name;
+        public double price;
+
+        public Product(String name, double price) {
+            if (price < 0) {
+                throw new IllegalArgumentException("price cannot be negative");
+            }
+            this.name = name;
+            this.price = price;
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Constructor<Product> ctor =
+                Product.class.getDeclaredConstructor(String.class, double.class);
+
+        try {
+            Product bad = ctor.newInstance("Notebook", -1.0);
+            System.out.println(bad);
+        } catch (InvocationTargetException e) {
+            Throwable real = e.getCause();
+            System.out.println("Constructor threw: "
+                    + real.getClass().getSimpleName()
+                    + " - " + real.getMessage());
+        }
+    }
+}
+```
+
+The interesting exception is the `IllegalArgumentException` thrown inside the constructor. The reflection layer hands it back wrapped in `InvocationTargetException`. Always call `getCause()` when logging or rethrowing, otherwise error messages talk about the wrapper, not the real problem.
+
+Catching and unwrapping `InvocationTargetException` allocates a stack trace twice (once for the cause, once for the wrapper). In a hot path, this is real overhead. Frameworks that build many instances often cache constructors and use `MethodHandle` to bypass the wrapper.
+
+<h1 id="type-safe-creation-with-classt">
+  Type-Safe Creation with Class&lt;T&gt;
+</h1>
+
+Working with `Class<?>` and `Object` is painful because every caller has to cast. When the factory is parameterized on the type, the API gets cleaner. The `Class.cast` method gives a checked cast that throws `ClassCastException` if the runtime type does not match, without the usual unchecked-cast warning.
+
+```java
+import java.lang.reflect.Constructor;
+
+public class TypedFactory {
+
+    public static class Product {
+        public String name;
+        public double price;
+
+        public Product(String name, double price) {
+            this.name = name;
+            this.price = price;
+        }
+
+        @Override
+        public String toString() {
+            return "Product[" + name + ", $" + price + "]";
+        }
+    }
+
+    static <T> T build(Class<T> type, Class<?>[] paramTypes, Object[] args) throws Exception {
+        Constructor<?> ctor = type.getDeclaredConstructor(paramTypes);
+        Object raw = ctor.newInstance(args);
+        return type.cast(raw);
+    }
+
+    public static void main(String[] args) throws Exception {
+        Product item = build(
+                Product.class,
+                new Class<?>[] { String.class, double.class },
+                new Object[] { "Headphones", 49.99 });
+
+        System.out.println(item);
+    }
+}
+```
+
+The method signature `<T> T build(Class<T> type, ...)` ties the input class to the return type. The caller no longer has to cast at the call site, and the compiler treats the result as `Product` directly. `type.cast(raw)` is the runtime check that ties the static type to the actual object; if the reflection layer somehow returned the wrong thing (which it should not, given the construction), the cast would fail loudly instead of letting a wrong type leak into the caller.
+
+A more direct alternative is `Constructor<T>` instead of `Constructor<?>`:
+
+```java
+import java.lang.reflect.Constructor;
+
+public class TypedConstructor {
+
+    public static class Cart {
+        public String owner;
+
+        public Cart(String owner) {
+            this.owner = owner;
+        }
+    }
+
+    static <T> T build(Class<T> type, Class<?>[] paramTypes, Object[] args) throws Exception {
+        Constructor<T> ctor = type.getDeclaredConstructor(paramTypes);
+        return ctor.newInstance(args);
+    }
+
+    public static void main(String[] args) throws Exception {
+        Cart cart = build(
+                Cart.class,
+                new Class<?>[] { String.class },
+                new Object[] { "Asha" });
+
+        System.out.println(cart.owner);
+    }
+}
+```
+
+`type.getDeclaredConstructor` is declared to return `Constructor<T>` when called on a `Class<T>`, and `Constructor<T>.newInstance` returns `T`. No cast, no `Class.cast` call. This is the version most frameworks use internally.
+
+<h1 id="creating-arrays-reflectively">Creating Arrays Reflectively</h1>
+
+Arrays are objects, but they are not built with constructors. There is no `int[].class.getConstructor(int.class)` that returns a one-arg constructor. Java has a separate API for them in `java.lang.reflect.Array`.
+
+`Array.newInstance(Class<?> componentType, int length)` builds a one-dimensional array. The component type is the element type, not the array type. `Array.get` and `Array.set` read and write elements regardless of whether the array is `int[]`, `String[]`, or anything else.
+
+```java
+import java.lang.reflect.Array;
+
+public class ReflectiveArray {
+
+    public static void main(String[] args) {
+        Object stockLevels = Array.newInstance(int.class, 4);
+        Array.setInt(stockLevels, 0, 10);
+        Array.setInt(stockLevels, 1, 25);
+        Array.setInt(stockLevels, 2, 0);
+        Array.setInt(stockLevels, 3, 7);
+
+        System.out.println("length: " + Array.getLength(stockLevels));
+        System.out.println("stock[1]: " + Array.getInt(stockLevels, 1));
+
+        // The runtime type is the real int[].
+        int[] real = (int[]) stockLevels;
+        System.out.println("sum: " + (real[0] + real[1] + real[2] + real[3]));
+    }
+}
+```
+
+The variable holding the new array is typed as `Object` because `Array.newInstance` does not know the array type at compile time. The runtime type is still `int[]`, so the cast on the last few lines is safe. `Array.setInt` and `Array.getInt` are the primitive-specialized accessors; there are matching versions for every primitive plus a generic `Array.get` and `Array.set` that take `Object`.
+
+Multi-dimensional arrays use the varargs overload `Array.newInstance(Class<?> componentType, int... dimensions)`. Each integer in the dimensions array is the length of one dimension.
+
+```java
+import java.lang.reflect.Array;
+
+public class ReflectiveMultiArray {
+
+    public static void main(String[] args) {
+        // A 3-rows-by-2-columns grid of product ratings.
+        Object grid = Array.newInstance(int.class, 3, 2);
+
+        int[][] real = (int[][]) grid;
+        real[0][0] = 5;
+        real[0][1] = 4;
+        real[1][0] = 3;
+        real[1][1] = 5;
+        real[2][0] = 4;
+        real[2][1] = 2;
+
+        System.out.println("rows: " + real.length);
+        System.out.println("cols: " + real[0].length);
+        System.out.println("rating[2][1]: " + real[2][1]);
+    }
+}
+```
+
+The component type passed to `Array.newInstance` is still `int`, not `int[]`. The dimensions tell the reflection layer how many levels of array to wrap around it. For a 3D array, pass three integers; for a 4D, four.
+
+The generic `Array.get` returns `Object` and works for any array, primitive or not.
+
+```java
+import java.lang.reflect.Array;
+
+public class GenericArrayGet {
+
+    public static void main(String[] args) {
+        Object products = Array.newInstance(String.class, 3);
+        Array.set(products, 0, "Notebook");
+        Array.set(products, 1, "Pen");
+        Array.set(products, 2, "Headphones");
+
+        for (int i = 0; i < Array.getLength(products); i++) {
+            String name = (String) Array.get(products, i);
+            System.out.println(i + ": " + name);
+        }
+    }
+}
+```
+
+`Array.get` boxes primitive elements, so `Array.get(intArray, 0)` returns an `Integer`. For tight inner loops over primitive arrays, use `getInt`, `getLong`, and friends to avoid the boxing cost.
+
+`Array.get` on an `int[]` boxes every read into an `Integer`. In a loop of a million elements, that is a million temporary `Integer` allocations. Use `Array.getInt` when the array is known to be primitive.
+
+<h1 id="records-and-the-canonical-constructor">
+  Records and the Canonical Constructor
+</h1>
+
+Records (Java 16+) have a single canonical constructor whose parameter list matches the record components in order. Reflection treats it like any other constructor; you look it up with `getDeclaredConstructor` and invoke it with `newInstance`.
+
+```java
+import java.lang.reflect.Constructor;
+
+public class RecordInstantiation {
+
+    public record Order(String customer, int itemCount, double total) { }
+
+    public static void main(String[] args) throws Exception {
+        Constructor<Order> ctor = Order.class.getDeclaredConstructor(
+                String.class, int.class, double.class);
+
+        Order order = ctor.newInstance("Asha", 3, 89.97);
+        System.out.println(order);
+    }
+}
+```
+
+The parameter types are the component types in declaration order: `String`, `int`, `double`. The canonical constructor is always public if the record itself is public, so `setAccessible` is rarely needed. The record's `toString` is auto-generated, which is why the print line shows the bracket format.
+
+If the record declares an explicit compact constructor with validation, `newInstance` runs that validation. A bad argument trips the same `InvocationTargetException` path described earlier.
+
+```java
+import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
+
+public class RecordValidation {
+
+    public record Order(String customer, int itemCount) {
+        public Order {
+            if (itemCount < 0) {
+                throw new IllegalArgumentException("itemCount must be non-negative");
+            }
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Constructor<Order> ctor = Order.class.getDeclaredConstructor(
+                String.class, int.class);
+
+        try {
+            Order bad = ctor.newInstance("Asha", -2);
+            System.out.println(bad);
+        } catch (InvocationTargetException e) {
+            System.out.println("Failed: " + e.getCause().getMessage());
+        }
+    }
+}
+```
+
+The compact constructor runs as part of the canonical constructor. Reflection sees the thrown exception and wraps it in `InvocationTargetException`, same as for any other class. Records are not a special case for instantiation; they happen to have a fixed constructor shape.
+
+<h1 id="faster-paths-and-alternatives">Faster Paths and Alternatives</h1>
+
+`Constructor.newInstance` is fast enough for most applications. Dependency injection containers, deserializers, and test runners all build instances this way without any noticeable cost. There are workloads where it matters.
+
+`java.lang.invoke.MethodHandle` is a lower-level API that the JVM can optimize more aggressively. Look up a method handle for the constructor once, store it, and invoke it on the hot path. The first call is more expensive than `Constructor.newInstance`, but repeated calls can be as fast as `new` after the JIT warms up.
+
+```java
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
+
+public class MethodHandleExample {
+
+    public static class Product {
+        public String name;
+        public double price;
+
+        public Product(String name, double price) {
+            this.name = name;
+            this.price = price;
+        }
+
+        @Override
+        public String toString() {
+            return name + " $" + price;
+        }
+    }
+
+    public static void main(String[] args) throws Throwable {
+        MethodHandles.Lookup lookup = MethodHandles.lookup();
+        MethodHandle ctor = lookup.findConstructor(
+                Product.class,
+                MethodType.methodType(void.class, String.class, double.class));
+
+        Product first = (Product) ctor.invoke("Notebook", 4.50);
+        Product second = (Product) ctor.invoke("Pen", 1.20);
+
+        System.out.println(first);
+        System.out.println(second);
+    }
+}
+```
+
+The handle is built from a `MethodType` describing the constructor signature. `void.class` as the return type is the convention because Java constructors do not return anything from the JVM's perspective. The cast at the call site is because `invoke` returns `Object`. The `MethodHandle` path is used in serialization libraries or ORM frameworks that build millions of objects.
+
+For the simplest "build me a new one, no arguments" use case, a plain `Supplier<T>` lambda is often the simplest answer.
+
+```java
+import java.util.function.Supplier;
+
+public class SupplierFactory {
+
+    public static class Cart {
+        public String owner = "anonymous";
+
+        @Override
+        public String toString() {
+            return "Cart[" + owner + "]";
+        }
+    }
+
+    public static void main(String[] args) {
+        Supplier<Cart> factory = Cart::new;
+
+        Cart first = factory.get();
+        Cart second = factory.get();
+
+        System.out.println(first);
+        System.out.println(second);
+    }
+}
+```
+
+`Cart::new` is a constructor reference. The compiler builds a `Supplier<Cart>` whose `get()` invokes the no-arg constructor. No reflection, no exception handling, fully type-checked. The constraint is that the class has to be known at compile time, which defeats the purpose of dynamic instantiation. Use lambdas when the set of types is fixed and known; use reflection when it is not.
+
+A constructor reference call (`Cart::new`) compiles down to roughly the same bytecode as `new Cart()`. There is no reflection overhead. Prefer it when the class is known at compile time.
+
+<h1 id="putting-it-all-together">Putting It All Together</h1>
+
+A realistic factory caches its constructors and provides a typed entry point. The full pattern in one place:
+
+```java
+import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
+import java.util.HashMap;
+import java.util.Map;
+
+public class CachingFactory {
+
+    public static class Product {
+        public String name;
+        public double price;
+
+        public Product(String name, double price) {
+            this.name = name;
+            this.price = price;
+        }
+
+        @Override
+        public String toString() {
+            return "Product[" + name + ", $" + price + "]";
+        }
+    }
+
+    private static final Map<String, Constructor<?>> CACHE = new HashMap<>();
+
+    static <T> T build(Class<T> type, Class<?>[] paramTypes, Object[] args) {
+        String key = type.getName() + signature(paramTypes);
+        try {
+            @SuppressWarnings("unchecked")
+            Constructor<T> ctor = (Constructor<T>) CACHE.computeIfAbsent(key, k -> {
+                try {
+                    Constructor<?> c = type.getDeclaredConstructor(paramTypes);
+                    c.setAccessible(true);
+                    return c;
+                } catch (NoSuchMethodException e) {
+                    throw new IllegalStateException("No matching constructor on " + type.getName(), e);
+                }
+            });
+            return ctor.newInstance(args);
+        } catch (InvocationTargetException e) {
+            throw new RuntimeException("Constructor of " + type.getName() + " threw", e.getCause());
+        } catch (InstantiationException e) {
+            throw new IllegalStateException(type.getName() + " is abstract", e);
+        } catch (IllegalAccessException e) {
+            throw new IllegalStateException("Cannot access constructor of " + type.getName(), e);
+        }
+    }
+
+    static String signature(Class<?>[] paramTypes) {
+        StringBuilder sb = new StringBuilder("(");
+        for (int i = 0; i < paramTypes.length; i++) {
+            if (i > 0) sb.append(",");
+            sb.append(paramTypes[i].getName());
+        }
+        return sb.append(")").toString();
+    }
+
+    public static void main(String[] args) {
+        Product first = build(
+                Product.class,
+                new Class<?>[] { String.class, double.class },
+                new Object[] { "Headphones", 49.99 });
+
+        Product second = build(
+                Product.class,
+                new Class<?>[] { String.class, double.class },
+                new Object[] { "Pen", 1.20 });
+
+        System.out.println(first);
+        System.out.println(second);
+        System.out.println("cache size: " + CACHE.size());
+    }
+}
+```
+
+Two instances built, one cached constructor reused across both. The cache key combines the class name and the parameter signature, so different overloads cache separately. Each exception type translates into a meaningful runtime exception with the original cause attached. This is the shape of code that lives at the bottom of a dependency injection container.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,276 @@
+---
+title: "Database Partitioning"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Database Partitioning explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+From the application's point of view, it can still look like one table. The application keeps querying the `orders` table the same way it did before. Internally, though, the database stores different rows in different partitions. One partition might hold orders from January, another orders from February, and another orders from March.
+
+The application talks to `orders` and never needs to know that three physical pieces sit underneath it. Together, those partitions still represent the same logical table. The database simply organizes the rows into smaller groups behind the scenes, and it decides which partition a new row belongs to when that row is inserted.
+
+<h1 id="2-horizontal-partitioning">2. Horizontal Partitioning</h1>
+
+The most common type of partitioning is **horizontal partitioning**, which divides a table by rows.
+
+Suppose the `orders` table contains 100 million rows. We might divide those rows based on order date. Orders from 2024 go into one partition, orders from 2025 into another, and orders from 2026 into a third.
+
+Every partition has the same columns. The only difference between them is which rows they contain.
+
+This is different from **vertical partitioning**, where we divide the columns of a table instead. For example, a `users` table might keep frequently read columns like name and email in one table and move a large, rarely read column like a profile bio into another.
+
+|                     | Horizontal partitioning       | Vertical partitioning                                  |
+| ------------------- | ----------------------------- | ------------------------------------------------------ |
+| What gets split     | Rows                          | Columns                                                |
+| Each piece contains | All columns, a subset of rows | All rows, a subset of columns                          |
+| Typical example     | Orders split by year          | Large or rarely used columns moved to a separate table |
+
+When engineers talk about database partitioning in large-scale systems, they usually mean horizontal partitioning, and that is what the rest of this chapter focuses on.
+
+Once we decide to split rows, the next question is how the database should decide which partition a row belongs to. There are three common strategies.
+
+<h1 id="3-range-partitioning">3. Range Partitioning</h1>
+
+With **range partitioning**, rows are assigned to partitions based on ranges of a value.
+
+Dates are the most common example. Suppose we partition an `events` table by month. Events from January go into the January partition, events from February go into the February partition, and so on.
+
+Here is what that looks like in PostgreSQL. The parent table declares the partition key, and each partition declares the range of values it accepts.
+
+```sql
+CREATE TABLE events (
+    event_id   BIGINT,
+    user_id    BIGINT,
+    event_type TEXT,
+    created_at TIMESTAMPTZ NOT NULL
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE events_2026_01 PARTITION OF events
+    FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+
+CREATE TABLE events_2026_02 PARTITION OF events
+    FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
+```
+
+The lower bound of each range is inclusive and the upper bound is exclusive, so an event at midnight on February 1 lands in the February partition, not January. Inserts go to `events` as usual, and the database routes each row to the right partition.
+
+Ranges do not have to be dates. We could also partition by a numeric value. For example, customer IDs from 1 to 1,000,000 could go into one partition, and the next million into another.
+
+Range partitioning is useful when queries frequently ask for a specific range of values, such as "orders from last week" or "events in March". It works especially well for time-series data, where recent data is read and written constantly while older data can be managed separately.
+
+<h1 id="4-list-partitioning">4. List Partitioning</h1>
+
+Sometimes the partition key is not a continuous value like a date. It is a category. **List partitioning** handles this by explicitly assigning specific values to each partition.
+
+Suppose we have users from several regions. We might create one partition for the United States, one for Europe, one for India, and one for the rest of the world. Each row goes into a partition based on the value of its `region` column.
+
+A single partition can accept several values, which is how the Europe partition collects rows from many countries. The last partition acts as a catch-all for any value that is not listed elsewhere, so a user from a new country still has somewhere to go.
+
+List partitioning is useful when the partition key has a small number of known categories. But the distribution of those categories matters. If 80% of the users belong to one region, that partition will be much larger than the others, and most of the benefit of splitting the table disappears.
+
+<h1 id="5-hash-partitioning">5. Hash Partitioning</h1>
+
+Range and list partitioning both group rows by their values. That keeps related data together, but it gives us no control over how evenly the rows spread out. **Hash partitioning** takes the opposite approach.
+
+The database applies a hash function to the partition key, and the result decides which partition receives the row. For example, we might hash `customer_id` and spread the results across eight partitions.
+
+The partition numbers in the diagram are only an illustration, since the actual result depends on the hash function. The point is that a good hash function scatters keys unpredictably, so rows tend to spread evenly across all eight partitions.
+
+That also means nearby values do not end up together. Customer 1000 and customer 1001 might be stored in completely different partitions. A query for "customers 1000 to 2000" has to look at every partition, because the database cannot tell from the range which partitions hold those rows.
+
+So hash partitioning is useful when even distribution matters more than keeping related ranges together.
+
+The table below puts the three strategies side by side.
+
+|                               | Range                           | List                          | Hash                  |
+| ----------------------------- | ------------------------------- | ----------------------------- | --------------------- |
+| How rows are assigned         | By value range                  | By explicit list of values    | By hash of the key    |
+| Typical key                   | Date, timestamp, numeric ID     | Region, country, category     | User ID, customer ID  |
+| Keeps related values together | Yes                             | Yes                           | No                    |
+| Even distribution             | Depends on the data             | Depends on the data           | Usually even          |
+| Good for                      | Time-series data, range queries | Small set of known categories | Spreading load evenly |
+
+Choosing a strategy is only half the decision. The real payoff from partitioning comes when a query can skip partitions entirely.
+
+<h1 id="6-partition-pruning">6. Partition Pruning</h1>
+
+One of the biggest benefits of partitioning is **partition pruning**.
+
+Suppose we have five years of order data divided into monthly partitions. That is 60 partitions. Now we run a query for orders from September 2026:
+
+```sql
+SELECT *
+FROM orders
+WHERE created_at >= '2026-09-01'
+  AND created_at <  '2026-10-01';
+```
+
+The database knows the range of each partition. It can see that only the September 2026 partition could contain matching rows. So instead of scanning all 60 partitions, it reads only that one and ignores the rest.
+
+That is partition pruning. The fewer partitions the database needs to inspect, the less data it has to read. In this example, the query touches roughly one sixtieth of the table.
+
+Pruning only happens when the query filters on the partition key. If the same query filtered on `customer_id` instead of `created_at`, the database would have no way to rule out any partition, and it would check all 60. This makes the choice of partition key one of the most important decisions in the whole design.
+
+<h1 id="7-choosing-the-partition-key">7. Choosing the Partition Key</h1>
+
+A good partition key matches the way the data is commonly accessed.
+
+Suppose an `events` table is almost always queried by timestamp, for example "events from the last 24 hours". Partitioning by time works well here, because each query usually touches only one or two partitions.
+
+Now imagine we partition the same table by `user_id` instead, while most queries still ask for events from the last 24 hours across all users. Those recent events are scattered across every partition, since every user can generate events at any time. The database has to inspect all of them. The table is still partitioned, but pruning gives us almost nothing.
+
+|                               | Partition by `created_at`        | Partition by `user_id`        |
+| ----------------------------- | -------------------------------- | ----------------------------- |
+| Common query                  | Events from the last 24 hours    | Events from the last 24 hours |
+| Partitions the query can skip | Almost all of them               | None                          |
+| Result                        | Reads a small slice of the table | Reads every partition         |
+
+The right key depends on the workload, not on the table. If the most common query were "all events for user 42", partitioning by `user_id` would be the better choice. So before picking a key, look at which columns appear in the `WHERE` clause of the queries that run most often.
+
+<h1 id="8-partitioning-and-indexes">8. Partitioning and Indexes</h1>
+
+Partitioning does not replace indexing. The two work at different levels and are often used together.
+
+Suppose we partition an `orders` table by month and frequently search for orders by `customer_id`. Each monthly partition can have its own index on `customer_id`.
+
+Now we query the orders for customer 42 during September. The database first prunes away every month except September. Then it uses the `customer_id` index inside the September partition to find the matching rows directly.
+
+Two optimizations are combined here. Partition pruning reduces the amount of data the database needs to consider. The index then locates the matching rows inside the selected partition without scanning it. Each partition's index is also smaller than one index across the whole table, so it is more likely to fit in memory.
+
+There is one constraint worth knowing. Because each partition has its own indexes, some databases limit what a unique constraint can enforce. In PostgreSQL, for example, a primary key or unique constraint on a partitioned table must include the partition key columns, since the database can only check uniqueness within each partition.
+
+<h1 id="9-partitioning-makes-old-data-easier-to-manage">
+  9. Partitioning Makes Old Data Easier to Manage
+</h1>
+
+Partitioning also helps with **data lifecycle management**, which means deciding what happens to data as it ages.
+
+Suppose we store application logs and keep only the last twelve months. Every month, the oldest month of logs needs to go. Without partitioning, that means a large `DELETE`:
+
+```sql
+DELETE FROM app_logs
+WHERE created_at < '2025-10-01';
+```
+
+If that removes 100 million rows, the database has to find and delete each one. That generates a large volume of transaction log, consumes I/O and CPU, and can run for a long time. In some databases, the deleted rows also leave dead space behind that needs cleanup afterward.
+
+If each month is stored in its own partition, we can remove the whole month at once:
+
+```sql
+ALTER TABLE app_logs DETACH PARTITION app_logs_2025_09;
+DROP TABLE app_logs_2025_09;
+```
+
+Instead of deleting rows one by one, the database removes the partition's underlying files. This is usually much faster, because the cost no longer depends on the number of rows.
+
+The same idea helps with archiving. A detached partition does not have to be dropped. It can be moved to cheaper storage, exported to a data warehouse, or kept read-only while recent partitions continue to receive writes.
+
+<h1 id="10-partitioning-and-maintenance">10. Partitioning and Maintenance</h1>
+
+Smaller partitions also make routine maintenance easier.
+
+Instead of rebuilding an index across a table with billions of rows, the database can often work on one partition at a time. Each operation is smaller, finishes sooner, and affects less of the table while it runs.
+
+A few other tasks benefit in the same way:
+
+- **Statistics.** The query planner relies on statistics about the data. These can often be collected per partition, so a busy recent partition can be analyzed more often than old ones.
+- **Backups.** Backups can be organized around partitions. An old partition that no longer changes only needs to be backed up once.
+- **Cold data.** If only recent data changes frequently, older partitions need much less maintenance. They can be left alone while effort goes into the partitions that are still active.
+
+This matters most for append-heavy workloads such as logs, events, transactions, and time-series data. In those tables, new rows arrive constantly, old rows rarely change, and the split between "active" and "historical" partitions is clear.
+
+So far, partitioning has looked like a clean improvement. But it only works well when the partitions themselves are well designed.
+
+<h1 id="11-uneven-partitions">11. Uneven Partitions</h1>
+
+Partitioning can still create problems if the data is not distributed well.
+
+Suppose we partition users by region. One partition contains 10 million rows. Another contains 20 million. But one large region contains 600 million rows.
+
+That one partition holds over 95% of the data. Queries for users in Region C scan a partition almost as large as the original table, so they get little benefit from partitioning. Maintenance on that partition, such as rebuilding its indexes, is also far more expensive than on the others.
+
+This is why partition boundaries need to be chosen carefully, based on how the data is actually distributed. Sometimes a large partition needs to be split further as the dataset grows. Region C could be divided into its own sub-partitions, for example by country or by a hash of the user ID, while the smaller regions stay as they are.
+
+<h1 id="12-too-many-partitions">12. Too Many Partitions</h1>
+
+The opposite mistake is also possible: creating far too many partitions.
+
+Suppose we partition a table by minute. That is 525,600 partitions per year. After two years, the table has more than a million partitions.
+
+At that point, the costs start to outweigh the benefits:
+
+- The database has to track metadata for every partition.
+- Planning a query becomes more expensive, because the planner has more partitions to reason about.
+- Creating new partitions ahead of time and cleaning up old ones becomes an operational task of its own.
+- Each partition holds so little data that splitting it this finely gives almost no practical benefit.
+
+So partition granularity matters. The right size depends on how much data arrives and how the application queries it.
+
+| Granularity | Partitions per year | Fits workloads like                        |
+| ----------- | ------------------- | ------------------------------------------ |
+| Hourly      | 8,760               | Very high-volume event or metrics data     |
+| Daily       | 365                 | High-volume logs with short retention      |
+| Monthly     | 12                  | Orders, transactions, moderate-volume logs |
+| Yearly      | 1                   | Low-volume data kept for many years        |
+
+A useful check is to look at the most common query. If it asks for "the last 7 days", daily partitions let the database read 7 partitions. Hourly partitions would mean 168 of them for the same query, with little extra pruning benefit.
+
+<h1 id="13-partitioning-vs-sharding">13. Partitioning vs Sharding</h1>
+
+Partitioning and sharding are closely related ideas, but they are not always the same thing.
+
+- **Partitioning** means dividing a dataset into smaller pieces. Those pieces may all live inside one database server.
+- **Sharding** usually means distributing those pieces across multiple independent database servers.
+
+|                       | Partitioning                                              | Sharding                                                  |
+| --------------------- | --------------------------------------------------------- | --------------------------------------------------------- |
+| Where the pieces live | Usually on one database server                            | On multiple database servers                              |
+| Who routes queries    | The database itself                                       | The application, a proxy, or the database's routing layer |
+| Main benefit          | Faster queries and easier data management on large tables | Scaling storage and write capacity beyond one machine     |
+
+Partitioning keeps everything on one server, so it cannot add more CPU, memory, or disk. It makes a large table easier to work with. Sharding adds machines, so it can grow capacity, but it also brings cross-server queries and distributed coordination.
+
+In practice, a system may use both. The data is sharded across several servers, and the tables inside each shard are internally partitioned.
+
+Here, each shard is a separate database server holding half of the users. Inside each shard, the `events` table is partitioned by month, so both sharding and partitioning benefits apply at the same time.
+
+<h1 id="14-when-should-you-use-partitioning">
+  14. When Should You Use Partitioning?
+</h1>
+
+Partitioning becomes useful when a table grows large enough that its size starts causing query or operational problems.
+
+It works especially well when the data has a natural grouping. Time is the most common example. Logs, metrics, events, orders, and transactions are usually queried by time range, and old data in these tables is rarely updated.
+
+Partitioning also helps when large amounts of old data need to be deleted or archived on a regular schedule.
+
+Small tables usually do not need partitioning. A table with a few million rows and good indexes is often fast enough, and adding partitions brings extra design work, more objects to manage, and new rules around keys and constraints.
+
+So before partitioning a table, ask:
+
+1. Is the table actually large enough to cause a problem?
+2. Do the most common queries filter on a natural partition key?
+3. Can partition pruning eliminate a meaningful share of the data for those queries?
+4. Will partitioning make maintenance or data retention easier?
+
+If the answers are yes, partitioning is likely to help. If most of them are no, better indexes or query tuning may solve the problem with less complexity.
+
+<h1 id="summary">Summary</h1>
+
+Database partitioning splits one logical table into smaller physical pieces called partitions. The application still queries a single table, while the database decides which partition each row belongs to.
+
+Horizontal partitioning divides rows and is what most people mean by partitioning. The three common strategies are range partitioning for dates and numeric ranges, list partitioning for known categories, and hash partitioning for even distribution.
+
+The main performance benefit is partition pruning. When a query filters on the partition key, the database reads only the partitions that can contain matching rows. This makes the partition key the most important design decision, and it should match the way the data is queried most often. Partitioning works alongside indexes rather than replacing them.
+
+Partitioning also simplifies data management. Old data can be dropped or archived one partition at a time instead of through large `DELETE` operations, and maintenance can run on one partition at a time.
+
+It has its own pitfalls. Uneven partitions leave one piece nearly as large as the original table, and too many partitions add metadata and planning overhead with little benefit.
+
+Partitioning is different from sharding. Partitioning usually stays within one database server, while sharding spreads data across many servers. Large systems often use both.
+
+<CommentsSection />
+
+</LessonCard>

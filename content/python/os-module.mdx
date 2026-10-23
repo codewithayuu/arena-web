@@ -1,0 +1,520 @@
+---
+title: "os Module"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "os Module explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="where-you-are-and-where-you-go-getcwd-and-chdir">
+  Where You Are and Where You Go: getcwd and chdir
+</h1>
+
+Every running Python process has a current working directory. Relative paths get resolved against it, so `open("orders.csv")` looks for the file in that directory and nowhere else. `os.getcwd()` returns it as a string, and `os.chdir(path)` changes it.
+
+```python
+import os
+
+print(os.getcwd())
+
+os.chdir("/tmp")
+print(os.getcwd())
+```
+
+Changing the working directory affects every relative path the process uses after the call, which makes scripts harder to reason about when the directory shifts mid-run. A common rule: read `os.getcwd()` if you need it, but build absolute paths with `os.path.join` or `pathlib.Path` instead of changing the working directory. The one place `chdir` earns its keep is in CLI tools that mimic shell behavior (e.g., a `cd` command in a custom REPL).
+
+> **Cost:** `os.chdir` is global state. Two threads that both call `chdir` race against each other, and any function that resolves a relative path after the call sees the new directory. Prefer absolute paths in library code.
+
+<h1 id="listing-a-directory-listdir-vs-scandir">
+  Listing a Directory: listdir vs scandir
+</h1>
+
+The two built-in ways to read the contents of a directory are `os.listdir(path)` and `os.scandir(path)`. They look similar at first glance and behave very differently under the hood.
+
+`os.listdir(path)` returns a plain list of names (strings), with no extra information:
+
+```python
+import os
+
+names = os.listdir("/Users/maria/store/orders")
+for name in names:
+    print(name)
+```
+
+The names are just strings. If you want to know whether each one is a file or a directory, or how big it is, you have to make another system call for each name (typically `os.path.isfile` or `os.stat`). That second round of calls is where the cost adds up.
+
+`os.scandir(path)` returns an iterator of `DirEntry` objects. Each `DirEntry` carries the name, the full path, and cached file-type information from the directory listing itself, so checking `entry.is_file()` or `entry.is_dir()` usually needs no extra system call.
+
+```python
+import os
+
+with os.scandir("/Users/maria/store/orders") as entries:
+    for entry in entries:
+        kind = "dir " if entry.is_dir() else "file"
+        print(f"{kind}  {entry.name}")
+```
+
+Two things to notice. First, `scandir` is used as a context manager (`with os.scandir(...) as entries`). The iterator holds an open directory handle on most platforms, and the `with` block guarantees it gets closed. Second, the entries arrive one at a time as you iterate, which means you can stop early without paying for the rest.
+
+> **Cost:** `os.listdir` returns names only; pairing it with `os.stat` in a loop makes a fresh system call for every entry. `os.scandir` returns the metadata already cached from the directory listing, so a loop over `scandir` is typically 3-5x faster for "find all files larger than X" or "find files matching pattern". For a directory with a few entries the difference doesn't matter; for one with tens of thousands of entries it absolutely does.
+
+Here's the same task two ways. List every CSV in a daily-orders folder along with its size:
+
+```python
+import os
+
+orders_dir = "/Users/maria/store/orders"
+
+# Slow path: listdir + os.path.getsize per entry
+for name in os.listdir(orders_dir):
+    if name.endswith(".csv"):
+        full_path = os.path.join(orders_dir, name)
+        size = os.path.getsize(full_path)
+        print(f"{name}: {size} bytes")
+```
+
+```python
+import os
+
+orders_dir = "/Users/maria/store/orders"
+
+# Fast path: scandir caches the stat info
+with os.scandir(orders_dir) as entries:
+    for entry in entries:
+        if entry.is_file() and entry.name.endswith(".csv"):
+            print(f"{entry.name}: {entry.stat().st_size} bytes")
+```
+
+Both produce the same output. The second version makes fewer system calls because `entry.is_file()` reads the cached type and `entry.stat()` reuses the cached stat result on platforms that support it.
+
+<h1 id="creating-and-removing-directories">
+  Creating and Removing Directories
+</h1>
+
+`os.mkdir(path)` makes a single directory. It fails if the parent doesn't exist or if the directory already exists:
+
+```python
+import os
+
+os.mkdir("/Users/maria/store/exports")
+```
+
+If `/Users/maria/store` exists but `exports` does not, this succeeds and the new directory is empty. If you try to create a nested path like `/Users/maria/store/exports/2026/05` and any of `2026` or `05` doesn't already exist, `os.mkdir` raises `FileNotFoundError`.
+
+`os.makedirs(path, exist_ok=False)` is the recursive version. It creates every missing directory in the path. The `exist_ok` flag controls what happens if the final directory already exists.
+
+```python
+import os
+
+# Creates store/exports/2026/05 even if 2026 and 05 don't exist yet
+os.makedirs("/Users/maria/store/exports/2026/05", exist_ok=True)
+```
+
+Without `exist_ok=True`, running this a second time raises `FileExistsError`. With it, the call succeeds silently. For directories that act as caches or output folders (where "already exists" is fine), `exist_ok=True` is the idiomatic choice.
+
+**What's wrong with this code?**
+
+```python
+import os
+
+os.mkdir("/Users/maria/store/exports/daily")
+```
+
+If `/Users/maria/store/exports` doesn't exist yet, this raises:
+
+```text
+FileNotFoundError: [Errno 2] No such file or directory: '/Users/maria/store/exports/daily'
+```
+
+`os.mkdir` only creates the leaf directory. The fix is `os.makedirs` for nested paths:
+
+```python
+import os
+
+os.makedirs("/Users/maria/store/exports/daily", exist_ok=True)
+```
+
+`os.rmdir(path)` removes a single empty directory. It will not remove a directory that contains anything:
+
+```python
+import os
+
+os.rmdir("/Users/maria/store/exports/daily")
+```
+
+If the directory has any files or subdirectories inside, this fails:
+
+```text
+OSError: [Errno 66] Directory not empty: '/Users/maria/store/exports/daily'
+```
+
+That's a deliberate safety check. Deleting a whole tree of files is destructive enough that Python forces you to ask for it explicitly. The high-level tool for "delete this directory and everything inside it" is `shutil.rmtree`.
+
+`os.removedirs(path)` is the mirror of `os.makedirs`: it removes the leaf directory, then walks back up and removes each parent that becomes empty as a result. It still won't delete non-empty directories. If `exports/2026/05` is empty and `exports/2026` becomes empty after removing it, both go. If `exports/2026` still has another sibling like `04`, only `05` gets removed.
+
+```python
+import os
+
+# Removes 05, then 2026 if empty, then exports if empty
+os.removedirs("/Users/maria/store/exports/2026/05")
+```
+
+`removedirs` is useful for tidying up after a deeply nested temporary path, but most code reaches for `shutil.rmtree` when bulk deletion is the actual goal.
+
+<h1 id="removing-and-renaming-files">Removing and Renaming Files</h1>
+
+`os.remove(path)` deletes a file. `os.unlink(path)` is an alias for it; the two names are interchangeable, and many codebases use `unlink` because that's the underlying system call name.
+
+```python
+import os
+
+os.remove("/Users/maria/store/exports/old-summary.csv")
+```
+
+The call raises `FileNotFoundError` if the path doesn't exist, `IsADirectoryError` if the path is a directory (use `rmdir` for that), and `PermissionError` if the process doesn't have write permission on the parent directory.
+
+`os.rename(src, dst)` moves a file or directory from `src` to `dst`. If `dst` already exists, behavior is platform-specific: on POSIX systems the existing file gets overwritten, on Windows the call raises `FileExistsError`. Since cross-platform code can't rely on either behavior, Python adds `os.replace(src, dst)`, which always overwrites if `dst` exists, regardless of platform.
+
+```python
+import os
+
+# rename can fail on Windows if the target exists
+os.rename("orders-temp.csv", "orders-2026-05-14.csv")
+
+# replace is the safer cross-platform choice
+os.replace("orders-temp.csv", "orders-2026-05-14.csv")
+```
+
+Both calls are atomic on a single filesystem, which means the rename either fully happens or doesn't happen at all. Code that "writes to a temporary name first, then renames into place" relies on this property to avoid leaving half-written files visible to other readers.
+
+```python
+import os
+import json
+
+orders = [{"id": 101, "total": 49.99}, {"id": 102, "total": 19.99}]
+
+# Atomic write: build the file under a temp name, then rename
+temp_path = "/Users/maria/store/exports/orders.json.tmp"
+final_path = "/Users/maria/store/exports/orders.json"
+
+with open(temp_path, "w") as f:
+    json.dump(orders, f)
+
+os.replace(temp_path, final_path)
+```
+
+A reader that opens `orders.json` either sees the old version or the new version, never a partially written one. Without this pattern, a crash mid-write could leave the consumer reading half a JSON file.
+
+<h1 id="walking-a-tree-oswalk">Walking a Tree: os.walk</h1>
+
+`os.walk(top)` is the function that has no clean equivalent in `pathlib`. It recursively traverses a directory tree, yielding one tuple per directory it visits.
+
+Each tuple is `(dirpath, dirnames, filenames)`:
+
+- `dirpath` is the path to the current directory being visited (a string).
+- `dirnames` is a list of subdirectory names directly inside `dirpath` (no leading paths).
+- `filenames` is a list of file names directly inside `dirpath` (no leading paths).
+
+```python
+import os
+
+for dirpath, dirnames, filenames in os.walk("/Users/maria/store/orders"):
+    print(f"In {dirpath}")
+    print(f"  subdirs: {dirnames}")
+    print(f"  files:   {filenames}")
+```
+
+Here's what's happening visually:
+
+The numbers in parentheses show the yield order with the default `topdown=True`. The root directory yields first, then each subdirectory in turn, and so on depth-first. With `topdown=False`, the deepest leaves yield first and the root yields last, which is the order you want when removing files because parent directories become empty only after their children are gone.
+
+To build the full path of a file inside the walk, join `dirpath` with the file name:
+
+```python
+import os
+
+for dirpath, dirnames, filenames in os.walk("/Users/maria/store/orders"):
+    for name in filenames:
+        if name.endswith(".csv"):
+            full_path = os.path.join(dirpath, name)
+            print(full_path)
+```
+
+That's the canonical pattern for "find every CSV under this tree", and it's what makes `os.walk` worth knowing even when you've adopted `pathlib` everywhere else. `pathlib.Path.rglob("*.csv")` does roughly the same job, but `os.walk` gives you the directory boundaries explicitly, which matters for the next trick.
+
+<h3 id="pruning-the-walk-by-mutating-dirnames">
+  Pruning the Walk by Mutating dirnames
+</h3>
+
+Here's the trick that `pathlib` doesn't offer: when `topdown=True`, mutating the `dirnames` list in place tells `os.walk` which subdirectories to descend into next. Anything you remove from `dirnames` is skipped entirely.
+
+```python
+import os
+
+# Walk a product image directory but skip any thumbnail subdirs
+image_root = "/Users/maria/store/images/products"
+
+for dirpath, dirnames, filenames in os.walk(image_root):
+    # Mutate dirnames in place to skip thumbnails
+    dirnames[:] = [d for d in dirnames if d != "thumbnails"]
+
+    for name in filenames:
+        if name.endswith((".jpg", ".png")):
+            print(os.path.join(dirpath, name))
+```
+
+The line `dirnames[:] = [...]` is the important one. Assigning `dirnames = [...]` would make `dirnames` point to a new list, which `os.walk` doesn't see. Slice-assignment with `dirnames[:]` mutates the same list the walker is holding, and the walker checks that list to decide which directories to enter next.
+
+Common reasons to prune:
+
+- Skip hidden directories (`.git`, `.cache`, `.venv`).
+- Skip large generated subtrees you don't need (`node_modules`, `__pycache__`).
+- Skip directories you don't have permission to read.
+
+```python
+import os
+
+skip = {".git", "__pycache__", "node_modules", ".venv"}
+
+for dirpath, dirnames, filenames in os.walk("/Users/maria/store"):
+    dirnames[:] = [d for d in dirnames if d not in skip]
+    for name in filenames:
+        if name.endswith(".py"):
+            print(os.path.join(dirpath, name))
+```
+
+The walker only descends into directories whose names survive the filter. Anything pruned is invisible to the rest of the traversal.
+
+> **Cost:** `os.walk` uses `os.scandir` under the hood, so it inherits the cached `DirEntry` performance for type checks. The cost you control is how many directories you let it enter. Pruning `dirnames` is the difference between a 200ms scan and a 30-second one when a `node_modules` happens to be in the tree.
+
+<h1 id="file-metadata-osstat-and-friends">
+  File Metadata: os.stat and Friends
+</h1>
+
+`os.stat(path)` returns a `stat_result` object with file metadata: size, timestamps, permissions, owner, and a few other fields. It's the same data the `ls -l` shell command surfaces.
+
+```python
+import os
+
+info = os.stat("/Users/maria/store/orders/2026-05-14.csv")
+print(f"Size:     {info.st_size} bytes")
+print(f"Modified: {info.st_mtime}")
+print(f"Created:  {info.st_ctime}")
+print(f"Mode:     {oct(info.st_mode)}")
+```
+
+The timestamps are floats representing seconds since the Unix epoch (1970-01-01). To turn one into a readable date, pass it to `datetime.fromtimestamp`:
+
+```python
+import os
+from datetime import datetime
+
+info = os.stat("/Users/maria/store/orders/2026-05-14.csv")
+modified = datetime.fromtimestamp(info.st_mtime)
+print(modified.isoformat(timespec="seconds"))
+```
+
+A note about `st_ctime`: on Linux it's the inode change time (when permissions or ownership changed), not the file creation time. On macOS and Windows it's closer to the creation time. If you need true creation time, prefer `st_birthtime` on macOS or `Path(path).stat().st_ctime` on Windows, and accept that on Linux this information typically isn't recorded by the filesystem.
+
+For one-off questions, `os.path` has shortcut functions that read a single field of `stat` for you:
+
+| Function              | Returns                                         |
+| --------------------- | ----------------------------------------------- |
+| `os.path.exists(p)`   | `True` if `p` exists (file or directory)        |
+| `os.path.isfile(p)`   | `True` if `p` is a regular file                 |
+| `os.path.isdir(p)`    | `True` if `p` is a directory                    |
+| `os.path.getsize(p)`  | Size in bytes                                   |
+| `os.path.getmtime(p)` | Modification time as a float                    |
+| `os.path.getctime(p)` | "Creation" time as a float (platform-dependent) |
+
+Each one is a thin wrapper around `os.stat`. If you need more than one field, call `os.stat` once and read several attributes off the result instead of making the system call repeatedly.
+
+```python
+import os
+
+path = "/Users/maria/store/orders/2026-05-14.csv"
+
+# Inefficient: three system calls for the same file
+if os.path.exists(path):
+    size = os.path.getsize(path)
+    mtime = os.path.getmtime(path)
+
+# Better: one system call, read three fields
+try:
+    info = os.stat(path)
+    size = info.st_size
+    mtime = info.st_mtime
+except FileNotFoundError:
+    pass
+```
+
+The difference is small for a single file. It matters when the same check runs for 50,000 files in a walk.
+
+A common e-commerce use case is cleaning up old export folders. Here's a script that lists every order-export directory older than 90 days:
+
+```python
+import os
+import time
+
+exports_root = "/Users/maria/store/exports"
+cutoff = time.time() - (90 * 86400)
+
+with os.scandir(exports_root) as entries:
+    for entry in entries:
+        if entry.is_dir() and entry.stat().st_mtime < cutoff:
+            print(f"Old export folder: {entry.path}")
+```
+
+`entry.stat()` returns the same kind of `stat_result` as `os.stat`, but reuses the metadata cached by `scandir` where possible.
+
+<h1 id="building-paths-with-ospath">Building Paths with os.path</h1>
+
+The `os.path` submodule has a handful of functions for assembling and dissecting path strings. They predate `pathlib` and are the right tool when you're talking to code that wants strings.
+
+<h3 id="ospathjoin">os.path.join</h3>
+
+`os.path.join` glues path components together using the right separator for the platform (`/` on POSIX, `\` on Windows). Never concatenate paths with `+` or f-strings; `os.path.join` handles the trailing-slash edge case correctly.
+
+```python
+import os
+
+print(os.path.join("/Users/maria/store", "exports", "2026", "05.csv"))
+print(os.path.join("store", "exports"))
+```
+
+One subtle behavior: if any component starts with a separator, `os.path.join` throws away everything before it and treats that component as the new root.
+
+```python
+import os
+
+print(os.path.join("/Users/maria/store", "/etc/passwd"))
+```
+
+That's almost never what you want. If you're joining user-supplied components, validate them first or use `pathlib.Path` which raises an error on absolute child components when used with `/`.
+
+<h3 id="ospathsplit-splitext-basename-dirname">
+  os.path.split, splitext, basename, dirname
+</h3>
+
+These four split a path into pieces:
+
+| Function              | What it returns                                                                      |
+| --------------------- | ------------------------------------------------------------------------------------ |
+| `os.path.split(p)`    | `(head, tail)` where `tail` is the last component and `head` is everything before it |
+| `os.path.splitext(p)` | `(root, ext)` where `ext` is the extension including the dot, or `""`                |
+| `os.path.basename(p)` | Just the last component (same as `split(p)[1]`)                                      |
+| `os.path.dirname(p)`  | Everything before the last component (same as `split(p)[0]`)                         |
+
+```python
+import os
+
+path = "/Users/maria/store/exports/2026/05.csv"
+
+print(os.path.split(path))
+print(os.path.splitext(path))
+print(os.path.basename(path))
+print(os.path.dirname(path))
+```
+
+`splitext` is useful for grouping files by type. Here's a one-liner that builds a count of files by extension under a tree:
+
+```python
+import os
+from collections import Counter
+
+counts = Counter()
+for dirpath, dirnames, filenames in os.walk("/Users/maria/store"):
+    for name in filenames:
+        _, ext = os.path.splitext(name)
+        counts[ext.lower()] += 1
+
+for ext, count in counts.most_common():
+    print(f"{ext or '(no extension)'}: {count}")
+```
+
+<h3 id="ospathabspath-and-ospathexpanduser">
+  os.path.abspath and os.path.expanduser
+</h3>
+
+`os.path.abspath(p)` turns a relative path into an absolute one by resolving it against the current working directory. It also collapses `..` and `.` segments.
+
+```python
+import os
+
+print(os.path.abspath("orders/2026-05-14.csv"))
+print(os.path.abspath("../store/orders"))
+print(os.path.abspath("./exports/./daily/../weekly"))
+```
+
+`os.path.abspath` does not check whether the path actually exists; it just normalizes the string. For "give me the real filesystem path with symlinks resolved" use `os.path.realpath` instead.
+
+`os.path.expanduser(p)` expands a leading `~` (or `~user`) into the user's home directory. Most CLI tools accept paths like `~/store/exports/orders.csv`, and `expanduser` is what turns that into a usable path.
+
+```python
+import os
+
+print(os.path.expanduser("~/store/exports/orders.csv"))
+print(os.path.expanduser("~/store/orders"))
+```
+
+If the path doesn't start with `~`, `expanduser` returns it unchanged. Calling it on every user-supplied path is safe and idiomatic.
+
+<h1 id="permissions-oschmod">Permissions: os.chmod</h1>
+
+`os.chmod(path, mode)` changes the permission bits on a file or directory. The `mode` argument is an integer, almost always written in octal (the `0o` prefix). The three trios of bits control read, write, and execute permission for the owner, the group, and everyone else.
+
+```python
+import os
+
+# Owner: read+write, group: read, others: read  (0o644)
+os.chmod("/Users/maria/store/exports/orders.csv", 0o644)
+
+# Owner: read+write+execute, group: read+execute, others: read+execute  (0o755)
+os.chmod("/Users/maria/store/scripts/run-export.sh", 0o755)
+```
+
+The most common modes in everyday code are:
+
+| Mode    | Meaning                                                                                                    |
+| ------- | ---------------------------------------------------------------------------------------------------------- |
+| `0o644` | Owner can read/write; group and others read only. Standard for data files.                                 |
+| `0o755` | Owner can read/write/execute; group and others can read/execute. Standard for executables and directories. |
+| `0o600` | Owner can read/write; no one else has any access. Standard for private keys, credentials.                  |
+| `0o700` | Owner has full access; no one else has any. Standard for private directories.                              |
+
+These bits map directly to the POSIX permission model. On Windows the call is mostly a no-op for permissions: only the read-only bit is supported, and other bits get silently ignored. Code that ships cross-platform should treat `os.chmod` as "best-effort tightening", not a security guarantee. For real access control on Windows you'd reach for `icacls` or the `win32security` module.
+
+```python
+import os
+import stat
+
+# Constants version: same as 0o644 but easier to read
+mode = stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH
+os.chmod("/Users/maria/store/exports/orders.csv", mode)
+```
+
+The `stat` module exposes named constants (`S_IRUSR` = read by user, `S_IWUSR` = write by user, etc.) that bitwise-OR together to form the same value as the octal literal. Use whichever form your team finds clearer.
+
+To read the current mode, use `os.stat(path).st_mode` and mask off the permission bits:
+
+```python
+import os
+import stat
+
+info = os.stat("/Users/maria/store/exports/orders.csv")
+permissions = stat.S_IMODE(info.st_mode)
+print(oct(permissions))
+```
+
+`stat.S_IMODE` keeps only the permission bits and discards the file-type bits (which encode whether it's a file, directory, symlink, etc.).
+
+<h1 id="environment-paths-osenviron-and-expandvars">
+  Environment Paths: os.environ and expandvars
+</h1>
+
+`os.environ` is a dict-like object that exposes the process's environment variables. Reading and writing it is the standard way to pick up configuration from the shell.
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,266 @@
+---
+title: "Database Basics"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Database Basics explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+Most applications eventually need to remember things across runs: products in a catalog, items in a customer's cart, orders that were placed yesterday. A database is the durable store that holds this data and lets many parts of the program (and many users) read and write it at once. This lesson covers the database concepts you need before you write any Python: what tables and rows look like, what keys and indexes do, what a transaction is, and how Python actually talks to a database through DB-API drivers.
+
+<h1 id="why-a-database-not-a-file">Why a Database, Not a File</h1>
+
+Files work for small, single-user data. Save the cart to `cart.json`, reload it next time, done. The trouble starts the moment more than one thing touches the data at once. Two requests trying to write the same JSON file at the same time will clobber each other. A 10 GB file of orders can't be searched without reading the whole thing. There's no built-in way to ask "how many orders did Alice place last week?" without writing the query logic yourself.
+
+A database solves these specific problems. It coordinates concurrent access so two writers don't corrupt each other. It indexes data so lookups by customer or by date are fast even at millions of rows. It provides a query language (SQL, usually) that expresses "give me all orders from Alice in the last 7 days" in one line. And it gives you transactions, which let a multi-step change either complete fully or not at all, so a half-charged order with no shipment never happens.
+
+The cost is that you now have a separate system to install, configure, and connect to. For a single-user toy script, that's overkill. For anything that more than one person uses, or that grows beyond a few thousand records, the cost pays back quickly.
+
+<h1 id="relational-vs-non-relational">Relational vs Non-Relational</h1>
+
+Databases come in two broad families. The lessons in this section focus on relational databases (the kind you query with SQL), because that's what most Python apps use first, but it helps to know where the line sits.
+
+A **relational database** stores data in tables. Each table has a fixed set of columns, each row in the table follows that shape, and tables can reference each other through keys. PostgreSQL, MySQL, SQLite, and SQL Server are all relational. They all speak SQL, with small dialect differences.
+
+A **non-relational database** (often called NoSQL) drops one or more of those rules. A document store like MongoDB holds JSON-like documents that don't have to share the same shape. A key-value store like Redis just maps a key to a blob. A wide-column store like Cassandra is built for very large, write-heavy workloads. Each one is good at a specific shape of data and gives up some of what SQL offers.
+
+| Family           | Examples                  | Good At                              | Trade-Off                                              |
+| ---------------- | ------------------------- | ------------------------------------ | ------------------------------------------------------ |
+| Relational (SQL) | PostgreSQL, MySQL, SQLite | Structured data, joins, transactions | Schema is rigid; scaling out across machines is harder |
+| Document         | MongoDB, CouchDB          | Flexible shapes, nested objects      | Cross-document joins and transactions are limited      |
+| Key-Value        | Redis, DynamoDB           | Very fast lookup by key              | No queries beyond the key                              |
+| Wide-Column      | Cassandra, HBase          | Massive write throughput             | Limited query flexibility                              |
+
+For an e-commerce app, the catalog, customers, orders, and inventory all map cleanly onto a relational database. That's what we'll use in the rest of this section. Document and key-value stores show up in other parts of the same system (a session cache, a search index, a recommendation store), but the source of truth is almost always a relational database.
+
+<h1 id="tables-rows-and-columns">Tables, Rows, and Columns</h1>
+
+A relational database arranges data into tables. A table is the same shape as a spreadsheet: named columns across the top, rows of data below. Each column has a type (integer, text, decimal, date, boolean), and every row in the table follows the same column layout.
+
+A `products` table for a shop might look like this:
+
+| id  | name                | price | in_stock |
+| --- | ------------------- | ----- | -------- |
+| 101 | Wireless Mouse      | 29.99 | 42       |
+| 102 | HDMI Cable          | 9.99  | 250      |
+| 103 | Mechanical Keyboard | 89.00 | 0        |
+
+The table has four columns, each with a type that's fixed for the whole column. `id` is an integer. `name` is text. `price` is a decimal. `in_stock` is an integer count. Each row is one product. The shape is rigid: you can't add a `color` to row 102 without adding a `color` column to the whole table.
+
+That rigidity has a purpose. Because every row has the same shape, the database can store the data efficiently, index any column, and run queries that scan or filter the whole table fast. The same rigidity is also why schema design (deciding what columns each table has) is a real part of building an app.
+
+A second table for `customers` might look like this:
+
+| id  | name | email            |
+| --- | ---- | ---------------- |
+| 1   | Ria  | ria@example.com  |
+| 2   | Alex | alex@example.com |
+| 3   | Mei  | mei@example.com  |
+
+And an `orders` table holds one row per order, referring to the customer who placed it:
+
+| id   | customer_id | total  | status    |
+| ---- | ----------- | ------ | --------- |
+| 5001 | 1           | 89.97  | placed    |
+| 5002 | 2           | 14.99  | shipped   |
+| 5003 | 1           | 249.00 | delivered |
+
+The `customer_id` column in `orders` is how the order points at the customer. Order 5001 was placed by customer 1 (Ria); order 5003 was also placed by Ria. The same person can have many orders without their name being copied into the orders table.
+
+<h1 id="primary-keys">Primary Keys</h1>
+
+Every table needs a way to identify a single row uniquely. That's a **primary key**. In the `products` table above, `id` is the primary key: 101 means exactly one product, 102 means exactly one other, and no two rows ever share the same `id`. In `customers`, `id` plays the same role.
+
+Primary keys serve three purposes:
+
+- They guarantee uniqueness. The database refuses to insert a second row with the same primary key.
+- They give the database a fast lookup path. Finding "the product with id 101" is one of the fastest operations a database can do.
+- They give other tables a stable handle to refer to. The `orders.customer_id` column doesn't store the customer's name (which might change) or email (which might also change). It stores the customer's `id`, which is fixed for life.
+
+Primary keys are almost always integers that the database assigns automatically (`SERIAL` in PostgreSQL, `AUTOINCREMENT` in SQLite, `AUTO_INCREMENT` in MySQL). You insert a new row without specifying `id`, and the database picks the next number. UUIDs (`a4f1c8d2-...`) are another option, which trade a little space and lookup speed for the ability to generate keys without talking to the database first. For an e-commerce app, integer auto-increment keys are the default starting point.
+
+```sql
+CREATE TABLE products (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    price REAL NOT NULL,
+    in_stock INTEGER NOT NULL DEFAULT 0
+);
+```
+
+The `PRIMARY KEY` clause is what tells the database `id` is the unique handle. `NOT NULL` on the other columns means they must have a value; you can't insert a product without a name. `DEFAULT 0` on `in_stock` means if you don't specify it, the database fills in zero.
+
+<h1 id="foreign-keys">Foreign Keys</h1>
+
+A **foreign key** is a column in one table that points at the primary key of another table. `orders.customer_id` is a foreign key referring to `customers.id`. The database can enforce this link: an insert into `orders` with `customer_id = 999` is rejected if no customer has `id = 999`. That guarantee is called **referential integrity**, and it's part of why relational databases are popular for data that needs to stay consistent.
+
+```sql
+CREATE TABLE orders (
+    id INTEGER PRIMARY KEY,
+    customer_id INTEGER NOT NULL,
+    total REAL NOT NULL,
+    status TEXT NOT NULL,
+    FOREIGN KEY (customer_id) REFERENCES customers(id)
+);
+```
+
+The `FOREIGN KEY` clause names the local column and the column it points at. With the constraint in place, the database refuses orphan rows (an order with a `customer_id` that doesn't exist) and can also be told what to do when the referenced row is deleted: cascade the delete to orders, set `customer_id` to null, or refuse the delete. Different databases enable foreign-key checks by default to different degrees; SQLite requires `PRAGMA foreign_keys = ON` for each connection to enforce them.
+
+A diagram of the three tables and how they connect:
+
+The arrows show foreign-key links. An order knows which customer placed it. An `order_items` row (each line of a multi-product order) knows which order it belongs to and which product it's for. This is the shape almost every e-commerce data model lands on.
+
+<h1 id="indexes">Indexes</h1>
+
+Without help, a query like `SELECT * FROM orders WHERE customer_id = 7` makes the database read every row in the `orders` table and check each one. For a small table that's fine. For a table with a million rows, that's slow on every request.
+
+An **index** is a separate data structure (usually a B-tree) that the database maintains alongside a table. It lets the database jump straight to the rows that match a given column value instead of scanning everything. Indexing `orders.customer_id` turns "find every order for customer 7" from a full-table scan into a quick lookup.
+
+```sql
+CREATE INDEX idx_orders_customer ON orders(customer_id);
+```
+
+That one line tells the database to build and maintain an index on `customer_id`. From then on, queries that filter or join on `customer_id` use the index automatically.
+
+Indexes aren't free. Every insert into `orders` now also updates the index, which costs a bit of time and disk space. The trade is almost always worth it for columns filtered or joined on often, and almost never worth it for columns rarely queried. Primary keys are indexed automatically. Foreign keys often deserve an explicit index too. Most other indexes get added as queries reveal them to be slow.
+
+An index makes reads on the indexed column much faster (typically O(log n) instead of O(n)) but makes writes slightly slower because the index has to be updated on every insert, update, and delete of the indexed column. For an OLTP workload with many small writes, only add indexes that are needed.
+
+<h1 id="transactions-and-acid">Transactions and ACID</h1>
+
+A single change to a database is usually safe on its own. The interesting case is a sequence of changes that need to either all succeed or all fail together. Charging a customer's card and creating an order row are two operations. If the card is charged but the order row never gets written (a crash between the two, say), the customer paid for nothing. If the order is written but the card charge fails, the shop owes a product without payment.
+
+A **transaction** wraps a group of operations so they happen as a unit. You start a transaction, do the work, then either commit (apply everything) or roll back (undo everything). If anything inside the transaction raises an error, you roll back, and the database looks like none of it ever happened.
+
+```sql
+BEGIN;
+UPDATE accounts SET balance = balance - 50.00 WHERE id = 1;
+INSERT INTO orders (customer_id, total, status) VALUES (1, 50.00, 'placed');
+COMMIT;
+```
+
+If the `INSERT` fails for any reason (the customer was deleted, the disk filled up, the network dropped), the `UPDATE` is rolled back too and the balance returns to what it was. The whole thing either happens or doesn't.
+
+Relational databases describe their guarantees with the acronym **ACID**, four properties that any transaction system tries to provide:
+
+| Letter | Property    | What It Means                                                                                                                                 |
+| ------ | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| A      | Atomicity   | All operations in the transaction succeed, or none do. No half-done states.                                                                   |
+| C      | Consistency | The transaction takes the database from one valid state to another. Constraints (primary keys, foreign keys, NOT NULL) hold before and after. |
+| I      | Isolation   | Concurrent transactions don't see each other's partial work. From each transaction's view, it's the only one running.                         |
+| D      | Durability  | Once a transaction commits, its effects survive crashes, power loss, and restarts.                                                            |
+
+The idea matters more than the exact letters: a transaction makes multi-step changes safe in the presence of failures and other concurrent work.
+
+The flow of a typical transaction:
+
+The transaction starts with `BEGIN`. Each statement runs against a view of the database that no one else can see. At the end, either `COMMIT` makes the changes permanent and visible to everyone, or `ROLLBACK` throws all of them away. Most database drivers in Python wrap this with a "start a transaction when the connection opens, commit on `.commit()`, roll back on `.rollback()`" pattern.
+
+<h1 id="how-python-talks-to-a-database">How Python Talks to a Database</h1>
+
+Python doesn't know how to talk to PostgreSQL or MySQL on its own. The actual conversation happens through a **driver** (also called an adapter), which is a Python package that knows the wire protocol the specific database uses. PostgreSQL has `psycopg` (versions 2 and 3) and `asyncpg`. MySQL has `mysql-connector-python` and `PyMySQL`. SQL Server has `pyodbc`. SQLite is special: a working driver ships with Python under the name `sqlite3`, so there's nothing to install.
+
+The drivers all do roughly the same job, but if every one had a different API, switching databases would mean rewriting your data layer. Python's solution is **DB-API 2.0**, defined in [PEP 249](https://peps.python.org/pep-0249/). It's a specification that every compliant driver follows, so the code that connects, queries, and reads results looks almost identical regardless of which database is underneath.
+
+The DB-API model has two main objects:
+
+- **Connection.** Represents the link to the database. You create one with `driver.connect(...)`. It holds state for the current session, including the open transaction.
+- **Cursor.** A handle for running statements and reading results. You create one from the connection with `conn.cursor()`. The cursor's `execute(sql, params)` runs a statement, and methods like `fetchone()`, `fetchall()`, and `fetchmany(n)` read the rows back.
+
+A typical interaction follows this loop:
+
+Your code creates a connection, opens a cursor, executes a SQL statement on the cursor, fetches the resulting rows back into Python, and finally commits (or rolls back) on the connection. The cursor is cheap; many can be opened on one connection. The connection is more expensive and is typically reused or pooled.
+
+The bare-minimum shape of a Python-talks-to-database session, using the standard library's `sqlite3` so it runs without anything to install:
+
+```python
+import sqlite3
+
+conn = sqlite3.connect("shop.db")
+cur = conn.cursor()
+
+cur.execute("CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY, name TEXT, price REAL)")
+cur.execute("INSERT INTO products (id, name, price) VALUES (?, ?, ?)", (101, "Wireless Mouse", 29.99))
+conn.commit()
+
+cur.execute("SELECT id, name, price FROM products WHERE id = ?", (101,))
+row = cur.fetchone()
+print(row)
+
+cur.close()
+conn.close()
+```
+
+The pattern is the same across every DB-API driver: `connect`, `cursor`, `execute`, `fetch`, `commit`, `close`. PostgreSQL with `psycopg` looks almost identical:
+
+```python
+import psycopg
+
+conn = psycopg.connect("dbname=shop user=app password=secret host=localhost")
+cur = conn.cursor()
+
+cur.execute("SELECT id, name, price FROM products WHERE id = %s", (101,))
+row = cur.fetchone()
+print(row)
+
+cur.close()
+conn.close()
+```
+
+The two notable differences are the connection string and the placeholder syntax (`?` for SQLite, `%s` for psycopg). Each driver picks its own placeholder style: `qmark` (`?`), `format` (`%s`), `named` (`:name`), `numeric` (`:1`), or `pyformat` (`%(name)s`). DB-API doesn't pick one; the driver does. Check the driver's docs once, then stick with that style for the rest of the project.
+
+The `?` and `%s` are not string-interpolation placeholders. They are **parameter placeholders** that the driver substitutes safely, escaping the values to prevent SQL injection. The rule from day one is: never build SQL by formatting strings with f-strings or `%`, always pass values as the second argument to `execute`.
+
+```python
+# wrong, opens the door to SQL injection
+product_id = "101 OR 1=1"
+cur.execute(f"SELECT * FROM products WHERE id = {product_id}")
+
+# right, the driver escapes the value
+cur.execute("SELECT * FROM products WHERE id = ?", (product_id,))
+```
+
+The "wrong" form executes whatever SQL the value contains, which means a malicious user can break out of the intended query. The "right" form sends the value separately and the database treats it as data, not code.
+
+In DB-API docs, the term **paramstyle** refers to the placeholder convention the driver supports. `sqlite3.paramstyle == "qmark"` means `?`. `psycopg.paramstyle == "pyformat"` means `%s` or `%(name)s`. This attribute is available on any driver.
+
+<h1 id="sqlite-for-learning-postgres-or-mysql-for-production">
+  SQLite for Learning, Postgres or MySQL for Production
+</h1>
+
+The lessons that follow use SQLite for examples because it needs nothing installed, runs anywhere Python runs, and supports enough SQL to teach the core ideas. The same code patterns carry directly over to PostgreSQL and MySQL with the small adjustments mentioned above. Knowing which database to use at which stage is part of the skill.
+
+| Database            | Good For                                                                                 | Watch Out For                                                                   |
+| ------------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| **SQLite**          | Single-user apps, local dev, embedded use (CLI tools, mobile apps), tests                | Single writer at a time; no network access; limited concurrency                 |
+| **PostgreSQL**      | Production web apps, anything that needs strong correctness, complex queries, extensions | Operational overhead (you have to run a server)                                 |
+| **MySQL / MariaDB** | Production web apps, simple replication, large hosting ecosystem                         | Slightly weaker SQL features than Postgres; historically loose with constraints |
+| **SQL Server**      | Enterprise environments, .NET shops, integration with Microsoft tooling                  | License cost; less common in open-source projects                               |
+
+A common path: build the prototype on SQLite because it's friction-free, then move to PostgreSQL when the app needs to run on a real server with multiple workers. The Python data layer barely changes; the SQL barely changes; the deployment changes a lot.
+
+<h1 id="raw-sql-or-an-orm">Raw SQL or an ORM?</h1>
+
+The next two lessons write SQL directly through `sqlite3` and other DB-API drivers. There's an alternative, which is to use an **ORM** (object-relational mapper) like SQLAlchemy or Django's ORM. An ORM lets you describe tables as Python classes and rows as Python objects, and it writes the SQL for you when you call methods on those objects.
+
+A rough sketch with SQLAlchemy for contrast:
+
+```python
+# raw SQL
+cur.execute("SELECT id, name FROM products WHERE price > ?", (50,))
+rows = cur.fetchall()
+
+# ORM (sketch, not runnable)
+expensive = session.query(Product).filter(Product.price > 50).all()
+```
+
+The two styles produce the same SQL underneath. The ORM is more Pythonic to read in a large application and handles a lot of bookkeeping (relationships, change tracking, schema migrations) for you. Raw SQL is more transparent, has no learning curve beyond the SQL itself, and gives exact control over what runs.
+
+For this section, raw SQL via DB-API is the foundation. The patterns transfer to an ORM directly: an ORM is a layer on top of a DB-API driver, not a replacement for understanding what's underneath. Most Python codebases use a mix: an ORM for routine CRUD, raw SQL for the queries that need precise tuning.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

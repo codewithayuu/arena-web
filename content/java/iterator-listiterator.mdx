@@ -1,0 +1,421 @@
+---
+title: "Iterator & ListIterator"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Iterator & ListIterator explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="iterable-vs-iterator">Iterable vs Iterator</h1>
+
+These two interfaces look similar at a glance, but they play different roles. Mixing them up causes a lot of confusion.
+
+`Iterable<T>` is the interface that says "this can be walked with a `for-each` loop." It has one method that matters: `iterator()`. That method returns a fresh `Iterator<T>`, which is the cursor that actually does the walking. Every standard collection (`ArrayList`, `HashSet`, `LinkedList`, and so on) implements `Iterable`.
+
+`Iterator<T>` is the cursor itself. It holds the position inside the collection and exposes three methods: `hasNext()` to ask if there's another element, `next()` to return the next element and advance the cursor, and `remove()` to delete the last element returned.
+
+So the `for-each` loop is sugar over `Iterable.iterator()` followed by repeated calls to `hasNext()` and `next()`. Both versions below do the same thing:
+
+```java
+import java.util.*;
+
+public class ForEachDesugared {
+    public static void main(String[] args) {
+        List<String> cart = List.of("Notebook", "Pen", "Eraser");
+
+        // For-each version
+        for (String item : cart) {
+            System.out.println(item);
+        }
+
+        System.out.println("---");
+
+        // Desugared version
+        Iterator<String> it = cart.iterator();
+        while (it.hasNext()) {
+            String item = it.next();
+            System.out.println(item);
+        }
+    }
+}
+```
+
+The `for-each` form is shorter to read, but the desugared form is what's actually running. Every behavior covered below is a property of that cursor.
+
+An iterator is an arrow that starts before the first element and moves forward one slot on every `next()` call.
+
+The cursor sits between elements, not on them. `next()` returns the element on the right of the cursor and moves the cursor past it. `hasNext()` asks whether there's still something to the right.
+
+<h1 id="the-iterator-methods-hasnext-next-remove">
+  The Iterator Methods: hasNext, next, remove
+</h1>
+
+`Iterator<T>` exposes three methods. Two are about reading, one is about modifying.
+
+`hasNext()` returns `true` if calling `next()` would return an element, and `false` if the cursor has reached the end. It does not move the cursor. It can be called any number of times before `next()`, and the answer stays the same until something else changes the iterator's state.
+
+`next()` returns the next element and advances the cursor. If there's nothing left, it throws `NoSuchElementException`. The typical loop pattern always pairs `hasNext()` with `next()`:
+
+```java
+import java.util.*;
+
+public class IteratorBasics {
+    public static void main(String[] args) {
+        List<String> cart = new ArrayList<>(List.of("Notebook", "Pen", "Eraser"));
+        Iterator<String> it = cart.iterator();
+
+        while (it.hasNext()) {
+            String item = it.next();
+            System.out.println("Reading: " + item);
+        }
+
+        // What happens if we call next() one more time?
+        try {
+            it.next();
+        } catch (NoSuchElementException e) {
+            System.out.println("Hit the end: " + e.getClass().getSimpleName());
+        }
+    }
+}
+```
+
+The fourth call to `next()` has nothing to return, so it throws. The `hasNext()` guard in a normal loop prevents this, which is why the two methods almost always appear together.
+
+`remove()` is the surprising one. It does not take an argument. Instead, it deletes the element that was most recently returned by `next()`. So the pattern is: call `next()` to read an element, decide whether to keep or drop it, and if dropping, call `remove()` right after.
+
+Two rules go with it. First, `next()` must be called at least once before `remove()`. Calling `remove()` on a fresh iterator throws `IllegalStateException`. Second, `remove()` can only be called once per `next()`. Calling it twice in a row throws the same exception.
+
+A practical use: walk an order's line items and drop any with zero quantity, the kind of cleanup that happens before showing the cart to a customer.
+
+```java
+import java.util.*;
+
+public class DropEmptyItems {
+    record LineItem(String name, int quantity) {}
+
+    public static void main(String[] args) {
+        List<LineItem> order = new ArrayList<>(List.of(
+            new LineItem("Notebook", 2),
+            new LineItem("Pen", 0),
+            new LineItem("Eraser", 1),
+            new LineItem("Highlighter", 0)
+        ));
+
+        Iterator<LineItem> it = order.iterator();
+        while (it.hasNext()) {
+            LineItem item = it.next();
+            if (item.quantity() == 0) {
+                it.remove();
+            }
+        }
+
+        System.out.println(order);
+    }
+}
+```
+
+The iterator visits all four items in order. For `"Pen"` and `"Highlighter"`, the quantity is zero, so `remove()` drops them. The remaining list has only the two items the customer wants. Items were removed from the list while iterating it, and nothing broke. That's the purpose of `Iterator.remove()`: it is the one safe way to modify a collection during a walk.
+
+`Iterator.remove()` on an `ArrayList` is O(n) per call because the underlying array has to shift left to close the gap. Removing many items from a big `ArrayList` this way can add up. On a `LinkedList`, `remove()` is O(1) because the iterator already holds the node.
+
+<h1 id="fail-fast-iterators-and-concurrentmodificationexception">
+  Fail-Fast Iterators and ConcurrentModificationException
+</h1>
+
+The reason `Iterator.remove()` exists is that no other path can safely modify a collection during iteration. Any attempt produces a specific exception.
+
+```java
+import java.util.*;
+
+public class ConcurrentMod {
+    public static void main(String[] args) {
+        List<String> cart = new ArrayList<>(List.of("Notebook", "Pen", "Eraser"));
+
+        for (String item : cart) {
+            if (item.equals("Pen")) {
+                cart.remove(item); // modifies the list directly, not through the iterator
+            }
+        }
+    }
+}
+```
+
+`ConcurrentModificationException` is thrown when the underlying collection is structurally modified during iteration through any path other than the iterator's own `remove()`. Structural means changing the size or rearranging the elements: adding, removing, clearing. Updating an element in place (replacing one object with another at the same index without changing size) is not structural and won't trigger it.
+
+Internally, most non-concurrent collections (`ArrayList`, `HashMap`, `HashSet`, and so on) keep an internal counter called `modCount` that increments every time the collection is structurally changed. When an iterator is created, it records the current value of that counter. Every call to `next()` (and on `ArrayList`, also `hasNext()` in some paths) compares the saved value against the current one. If they don't match, the iterator throws.
+
+The name for this behavior is **fail-fast**. The iterator gives up the moment it notices the collection has been modified outside its control. The goal isn't to protect against concurrent threads, it's to surface bugs early in single-threaded code that would otherwise produce wrong results (skip elements, visit elements twice, return stale data).
+
+A common misconception: fail-fast is sometimes mistaken for thread-safety. It isn't. The check is best-effort. Two threads modifying the same `ArrayList` may or may not trigger it, and even if they do, the exception happens after the damage. For real thread-safety, use the concurrent collections, which use a different model called **weakly consistent** iterators. Those don't throw on concurrent modification, but they may or may not reflect changes that happened after the iterator was created. The trade-off is consistency vs. safety, and the choice depends on the use case.
+
+The fix for the buggy code above is to use the iterator's own `remove()`:
+
+```java
+import java.util.*;
+
+public class CleanRemove {
+    public static void main(String[] args) {
+        List<String> cart = new ArrayList<>(List.of("Notebook", "Pen", "Eraser"));
+
+        Iterator<String> it = cart.iterator();
+        while (it.hasNext()) {
+            String item = it.next();
+            if (item.equals("Pen")) {
+                it.remove();
+            }
+        }
+
+        System.out.println(cart);
+    }
+}
+```
+
+`Iterator.remove()` updates both the list and the iterator's internal `modCount` snapshot together, so the fail-fast check stays happy.
+
+There's an even shorter form for "remove everything matching a condition", introduced in Java 8: `Collection.removeIf`. It takes a predicate and deletes every matching element in one call, with no visible iterator at all.
+
+```java
+import java.util.*;
+
+public class RemoveIfDemo {
+    record LineItem(String name, int quantity) {}
+
+    public static void main(String[] args) {
+        List<LineItem> order = new ArrayList<>(List.of(
+            new LineItem("Notebook", 2),
+            new LineItem("Pen", 0),
+            new LineItem("Eraser", 1),
+            new LineItem("Highlighter", 0)
+        ));
+
+        order.removeIf(item -> item.quantity() == 0);
+
+        System.out.println(order);
+    }
+}
+```
+
+Same result as the explicit-iterator version earlier, just three lines shorter. Use `removeIf` when the rule is a simple predicate. Use `Iterator.remove()` for more control: removing only the first match, stopping early, or interleaving the removal with other work inside the loop.
+
+<h1 id="listiterator-bidirectional-walking-and-positional-edits">
+  ListIterator: Bidirectional Walking and Positional Edits
+</h1>
+
+`ListIterator<E>` is a richer cursor that's only available on `List` implementations. It does everything `Iterator` does, plus three things `Iterator` can't: walk backward, report its position, and modify the list through `set` and `add`.
+
+Get one by calling `list.listIterator()` (starts at the beginning) or `list.listIterator(index)` (starts at the given index, so the next call to `next()` returns the element at that index).
+
+The full method list:
+
+| Method            | What it does                                                       |
+| ----------------- | ------------------------------------------------------------------ |
+| `hasNext()`       | True if there's an element to the right of the cursor.             |
+| `next()`          | Returns the element to the right, moves the cursor past it.        |
+| `hasPrevious()`   | True if there's an element to the left of the cursor.              |
+| `previous()`      | Returns the element to the left, moves the cursor back over it.    |
+| `nextIndex()`     | Index that `next()` would return. Equals `list.size()` at the end. |
+| `previousIndex()` | Index that `previous()` would return. Equals `-1` at the start.    |
+| `remove()`        | Removes the element last returned by `next()` or `previous()`.     |
+| `set(E e)`        | Replaces the element last returned by `next()` or `previous()`.    |
+| `add(E e)`        | Inserts a new element at the cursor's current position.            |
+
+The cursor model is the same as before: an arrow sitting between elements. The difference is that the arrow can move both ways.
+
+A common place for backward iteration is navigation history. A customer browses pages on a storefront: home, products, cart, checkout. The user clicks back, and the app walks through the visited pages in reverse.
+
+```java
+import java.util.*;
+
+public class NavigationHistory {
+    public static void main(String[] args) {
+        List<String> history = new ArrayList<>(List.of(
+            "Home", "Products", "Cart", "Checkout"
+        ));
+
+        // Walk forward.
+        ListIterator<String> it = history.listIterator();
+        System.out.println("Forward:");
+        while (it.hasNext()) {
+            System.out.println("  Visited: " + it.next());
+        }
+
+        // The cursor is now at the end. Walk backward.
+        System.out.println("Backward:");
+        while (it.hasPrevious()) {
+            System.out.println("  Back to: " + it.previous());
+        }
+    }
+}
+```
+
+One iterator object did both walks. After the forward loop, the cursor sits past `"Checkout"` at index 4. The first call to `previous()` returns `"Checkout"` and moves the cursor back to index 3. The backward walk continues until `hasPrevious()` returns `false` at index 0.
+
+A small detail: calling `next()` then `previous()` returns the same element. The cursor moved forward over `"Home"`, then moved back over it. After both calls, the cursor is in the same spot it started.
+
+```java
+import java.util.*;
+
+public class NextThenPrevious {
+    public static void main(String[] args) {
+        List<String> pages = new ArrayList<>(List.of("Home", "Products"));
+        ListIterator<String> it = pages.listIterator();
+
+        System.out.println("next()     -> " + it.next());
+        System.out.println("previous() -> " + it.previous());
+        System.out.println("nextIndex      = " + it.nextIndex());
+        System.out.println("previousIndex  = " + it.previousIndex());
+    }
+}
+```
+
+The cursor is back at the start. `nextIndex()` reports `0` (the slot the next forward call would read), and `previousIndex()` reports `-1` (there's nothing to the left).
+
+`set` replaces the last-returned element in place. It does not change the list's size, so it does not count as a structural modification. `add` inserts a new element at the cursor's position, which does change the size, but it goes through the iterator and the iterator updates its own state, so the fail-fast check stays happy.
+
+```java
+import java.util.*;
+
+public class ListIteratorMutation {
+    public static void main(String[] args) {
+        List<String> cart = new ArrayList<>(List.of("Notebook", "Pen", "Eraser"));
+        ListIterator<String> it = cart.listIterator();
+
+        while (it.hasNext()) {
+            String item = it.next();
+            if (item.equals("Pen")) {
+                it.set("Gel Pen");      // replace in place
+                it.add("Pen Refill");   // insert after the replaced element
+            }
+        }
+
+        System.out.println(cart);
+    }
+}
+```
+
+When `next()` returns `"Pen"`, the cursor is just past it. `set("Gel Pen")` replaces `"Pen"` with `"Gel Pen"` at index 1. `add("Pen Refill")` inserts at the cursor (index 2), which pushes `"Eraser"` to index 3 and moves the cursor to index 3 as well. The next call to `hasNext()` returns `true` because `"Eraser"` is still ahead, and the loop visits it normally.
+
+One rule to remember: after `add`, `set` or `remove` is not allowed until another `next()` or `previous()` runs. The iterator no longer has a "last returned element" because the most recent action was an insertion, not a read.
+
+<h1 id="iterator-vs-listiterator-when-to-use-which">
+  Iterator vs ListIterator: When to Use Which
+</h1>
+
+A quick reference for picking the right cursor:
+
+| Capability                    | `Iterator<E>`     | `ListIterator<E>`                  |
+| ----------------------------- | ----------------- | ---------------------------------- |
+| Works on any `Collection`     | Yes               | No, `List` only                    |
+| Forward walk                  | Yes               | Yes                                |
+| Backward walk                 | No                | Yes (`hasPrevious`, `previous`)    |
+| Report current index          | No                | Yes (`nextIndex`, `previousIndex`) |
+| Remove last-returned element  | Yes (`remove`)    | Yes (`remove`)                     |
+| Replace last-returned element | No                | Yes (`set`)                        |
+| Insert at current position    | No                | Yes (`add`)                        |
+| Start from an arbitrary index | No (always start) | Yes (`listIterator(index)`)        |
+
+For walking forward through any collection and possibly removing some elements, `Iterator` (or just a `for-each` plus `removeIf`) is enough. For walking backward, modifying elements in place, inserting mid-list, or reporting positions, `ListIterator` is required, which also means the collection must be a `List`.
+
+A `Set` (any of them: `HashSet`, `TreeSet`, `LinkedHashSet`) does not have a stable index, so there's no `ListIterator` for sets. The same goes for `Map.keySet()` and friends. For positional access to a set's contents, copy it into a `List` first.
+
+`LinkedList.listIterator(index)` is O(n) because it walks from the closer end of the list to find the starting index. `ArrayList.listIterator(index)` is O(1). Building iterators at random indices often is another reason to prefer `ArrayList`.
+
+<h1 id="making-your-own-class-iterable">Making Your Own Class Iterable</h1>
+
+Any class can plug into the `for-each` loop by implementing `Iterable<T>`. The interface has one required method: `iterator()`, which returns a fresh `Iterator<T>` each time it's called.
+
+Consider modeling a customer's order history: a list of past orders that callers walk over without exposing the underlying storage. Making `OrderHistory` implement `Iterable<Order>` lets a `for-each` loop work on it directly, and keeps the internal list private.
+
+```java
+import java.util.*;
+
+public class OrderHistoryDemo {
+    record Order(String id, double total) {}
+
+    static class OrderHistory implements Iterable<Order> {
+        private final List<Order> orders = new ArrayList<>();
+
+        public void add(Order o) {
+            orders.add(o);
+        }
+
+        @Override
+        public Iterator<Order> iterator() {
+            return orders.iterator();
+        }
+    }
+
+    public static void main(String[] args) {
+        OrderHistory history = new OrderHistory();
+        history.add(new Order("A-101", 29.99));
+        history.add(new Order("A-102", 14.50));
+        history.add(new Order("A-103", 42.00));
+
+        for (Order o : history) {
+            System.out.println(o.id() + " - $" + o.total());
+        }
+    }
+}
+```
+
+The `for-each` loop calls `history.iterator()`, which delegates to the internal `ArrayList`'s iterator. The caller doesn't know or care what storage is used. Switching the internal storage from `ArrayList` to `LinkedList`, or from a list to a database-backed cursor, would not require changing the loop.
+
+A custom `Iterator` from scratch is needed when delegation isn't enough. Say `OrderHistory` should expose orders in reverse chronological order (most recent first) without actually reversing the underlying list. The custom iterator walks the list back-to-front:
+
+```java
+import java.util.*;
+
+public class ReverseOrderHistory {
+    record Order(String id, double total) {}
+
+    static class OrderHistory implements Iterable<Order> {
+        private final List<Order> orders = new ArrayList<>();
+
+        public void add(Order o) {
+            orders.add(o);
+        }
+
+        @Override
+        public Iterator<Order> iterator() {
+            return new Iterator<>() {
+                private int cursor = orders.size() - 1;
+
+                @Override
+                public boolean hasNext() {
+                    return cursor >= 0;
+                }
+
+                @Override
+                public Order next() {
+                    if (!hasNext()) {
+                        throw new NoSuchElementException();
+                    }
+                    return orders.get(cursor--);
+                }
+            };
+        }
+    }
+
+    public static void main(String[] args) {
+        OrderHistory history = new OrderHistory();
+        history.add(new Order("A-101", 29.99));
+        history.add(new Order("A-102", 14.50));
+        history.add(new Order("A-103", 42.00));
+
+        for (Order o : history) {
+            System.out.println(o.id() + " - $" + o.total());
+        }
+    }
+}
+```
+
+The cursor starts at the last index and decrements on each `next()`. `hasNext()` returns `true` while the cursor is non-negative. Calling `next()` after the cursor goes below zero throws `NoSuchElementException`, which matches the contract every other Java iterator follows.
+
+Two things to remember when writing a custom iterator. First, throw `NoSuchElementException` when `next()` runs off the end. Callers assume this is the failure mode, and tools like `Iterator.forEachRemaining` rely on it. Second, `remove()` has a default implementation that throws `UnsupportedOperationException`, which is usually appropriate when the iterator doesn't need to support deletion. Only override `remove()` if removing makes sense for the data structure.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,308 @@
+---
+title: "timeit Module"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "timeit Module explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="why-not-just-timetime">Why Not Just time.time()?</h1>
+
+The natural approach to timing code is wrapping it in `time.time()` calls:
+
+```python
+import time
+
+start = time.time()
+result = [x ** 2 for x in range(10_000)]
+elapsed = time.time() - start
+print(f"{elapsed:.6f} seconds")
+```
+
+That looks fine, but the approach falls apart for comparing two implementations. Three problems show up.
+
+The first is that one run is not representative. CPU caches, garbage collection, and other system activity all introduce noise. Two consecutive runs of the same code can differ by a factor of two or more for short snippets. A stable number requires many runs and a statistic across them, which leads to writing the same loop that every developer writes:
+
+```python
+import time
+
+times = []
+for _ in range(1000):
+    start = time.time()
+    result = [x ** 2 for x in range(10_000)]
+    times.append(time.time() - start)
+
+print(f"min: {min(times):.6f}, mean: {sum(times)/len(times):.6f}")
+```
+
+This works but is verbose and easy to get wrong (timing the wrong thing, forgetting to disable garbage collection, using a low-resolution clock).
+
+The second problem is the clock itself. `time.time()` returns wall-clock time, which is fine for seconds-long measurements but coarse for microsecond-level ones. Python provides `time.perf_counter()` for high-resolution timing, but it is an extra fact to remember. `timeit` uses the right clock automatically.
+
+The third is methodology. Garbage collection can fire in the middle of the timed code and add an unrelated 5 milliseconds to one run. Setup work (creating test data) should not be timed but ends up timed without care. `timeit` solves both issues out of the box: it disables garbage collection during measurement (unless instructed otherwise) and separates a setup string from the timed statement.
+
+That is the case for `timeit`. It exists because hand-rolled timing loops are wrong in subtle ways and `timeit` is right by default.
+
+```python
+import timeit
+
+# Same operation, measured correctly.
+elapsed = timeit.timeit("[x ** 2 for x in range(10_000)]", number=1000)
+print(f"{elapsed:.4f} seconds for 1000 runs")
+```
+
+The number reported is the total time for all 1000 runs. Divide by `number` for per-run time. That is deliberate: small per-run numbers are noisier than aggregates, and `timeit` is designed to work with the aggregate.
+
+<h1 id="the-command-line-form">The Command-Line Form</h1>
+
+The fastest way to use `timeit` is from a shell, with no Python file at all:
+
+```text
+python -m timeit "sum(range(1000))"
+```
+
+`timeit` picks a `number` (loops per round) automatically by ramping up until each round takes a fraction of a second, then runs 5 rounds and reports the fastest one. The reason it reports the best, not the mean, is that the minimum represents the code's performance without interference; higher numbers usually mean another process took a CPU slice. The minimum is the closest measurement to interference-free.
+
+Setup code can be supplied with `-s`. The setup runs once per round but is not timed:
+
+```text
+python -m timeit -s "prices = list(range(10_000))" "sum(prices)"
+```
+
+Here the cost of building the `prices` list is excluded from the timed code, so the measurement reflects only the `sum`. Without `-s`, the timing would include list construction plus summation, which mixes two operations into one number.
+
+Two flags worth knowing:
+
+- `-n <count>` overrides the auto-tuned number of loops per round.
+- `-r <count>` overrides the number of rounds (default 5).
+
+```text
+python -m timeit -n 100000 -r 7 -s "items = ['a'] * 1000" "len(items)"
+```
+
+That runs 100,000 iterations per round, 7 rounds, and reports the best.
+
+One detail to know: shell quoting. The statement is a single string argument, so spaces inside it need quotes. On most shells, wrap the whole thing in double quotes and use single quotes inside, or vice versa. When nested quotes become difficult, the programmatic API in the next section is usually cleaner.
+
+`timeit` runs the snippet many times to get a stable measurement. If the snippet allocates a 100MB list, that allocation happens `number * repeat` times. That is intentional (each run starts from a clean state) but means the timed code should stay small.
+
+<h1 id="the-programmatic-api">The Programmatic API</h1>
+
+For anything more than a one-liner, call `timeit` from Python. Two entry points cover almost every use:
+
+```python
+import timeit
+
+# Run a statement N times, return total elapsed in seconds.
+total = timeit.timeit(
+    stmt="sum(prices)",
+    setup="prices = list(range(10_000))",
+    number=1000,
+)
+print(f"{total:.4f} seconds for 1000 runs")
+print(f"{total / 1000 * 1e6:.2f} microseconds per run")
+```
+
+`timeit.timeit` accepts:
+
+| Parameter | What it does                                                    |
+| --------- | --------------------------------------------------------------- |
+| `stmt`    | The code to time, as a string (default: `"pass"`).              |
+| `setup`   | Code to run once before timing (default: `"pass"`).             |
+| `number`  | How many times to execute `stmt` (default: 1,000,000).          |
+| `globals` | Namespace to run `stmt` and `setup` in (default: a fresh dict). |
+| `timer`   | Custom timing function (default: `time.perf_counter`).          |
+
+The `globals` parameter is easy to miss. By default, `stmt` and `setup` run in an empty namespace, so application functions and imports are not visible. To time code that uses local definitions, pass `globals=globals()`:
+
+```python
+import timeit
+
+def cart_total(prices):
+    return sum(prices)
+
+prices = list(range(10_000))
+
+total = timeit.timeit(
+    stmt="cart_total(prices)",
+    number=10_000,
+    globals=globals(),
+)
+print(f"{total / 10_000 * 1e6:.2f} microseconds per run")
+```
+
+Without `globals=globals()`, the statement raises `NameError: name 'cart_total' is not defined`, which is a confusing error on first encounter. The fix is one keyword argument.
+
+`timeit.repeat` is the variant that runs multiple rounds and returns a list of times:
+
+```python
+import timeit
+
+times = timeit.repeat(
+    stmt="sum(prices)",
+    setup="prices = list(range(10_000))",
+    number=1000,
+    repeat=5,
+)
+print(f"min: {min(times):.4f}, mean: {sum(times)/len(times):.4f}")
+```
+
+Use `repeat` to see variance, run statistical tests, or take the minimum manually. The documentation specifically advises taking `min(times)` rather than the mean, for the same reason `timeit` at the command line reports best-of: the minimum represents clean-run performance.
+
+For multi-line setup or statements, pass a string with newlines:
+
+```python
+import timeit
+
+setup = """
+from collections import defaultdict
+orders = [("priya", 9.99), ("aanya", 14.99), ("priya", 4.99)] * 1000
+"""
+
+stmt = """
+totals = defaultdict(float)
+for name, amount in orders:
+    totals[name] += amount
+"""
+
+elapsed = timeit.timeit(stmt=stmt, setup=setup, number=100)
+print(f"{elapsed / 100 * 1000:.3f} ms per run")
+```
+
+The setup creates the test data once per round, and the statement does the aggregation. Triple-quoted strings keep the code readable even when there are several lines.
+
+<h1 id="comparing-implementations">Comparing Implementations</h1>
+
+The most common use of `timeit` is comparing two ways to do the same thing. The pattern is straightforward: time each one separately, with the same setup, and print the ratio.
+
+```python
+import timeit
+
+setup = "data = list(range(10_000))"
+
+a = timeit.timeit("[x * 2 for x in data]", setup=setup, number=1000)
+b = timeit.timeit("list(map(lambda x: x * 2, data))", setup=setup, number=1000)
+c = timeit.timeit(
+    """
+result = []
+for x in data:
+    result.append(x * 2)
+""",
+    setup=setup,
+    number=1000,
+)
+
+print(f"list comprehension: {a*1000:.2f} ms")
+print(f"map + lambda:       {b*1000:.2f} ms")
+print(f"for + append:       {c*1000:.2f} ms")
+```
+
+Three things this comparison reveals. The list comprehension is fastest because it avoids the per-iteration function-call overhead of `map(lambda x: ...)` and the per-iteration method-lookup of `result.append`. The `for` loop is faster than `map` here because `lambda` adds a real call overhead; with a built-in function (`list(map(str, data))`), `map` would often win.
+
+A few habits worth picking up:
+
+- Use the same `setup` for both alternatives. Different setups change the input and invalidate the comparison.
+- Run each alternative with the same `number`. The total wall time is not directly comparable; per-iteration time is what matters, and it depends on both.
+- Run the comparison twice to confirm the ratio is stable. If one run says list comprehension is 1.5x faster and the next says 0.8x, the measurement is noise. Increase `number`.
+- Be clear about what is being measured. For sub-microsecond operations, measurement overhead and noise dominate, and the "winner" may not be meaningful at all.
+
+Two specific anti-patterns to avoid.
+
+Avoid timing a single iteration. `number=1` runs `stmt` once, which means whatever happens to be in cache or scheduled at that instant dominates the number. `timeit`'s default is a million iterations for a reason: the law of large numbers gives a stable measurement.
+
+Avoid comparing cold-start times. The first run of a function is often slower because it triggers JIT-style optimizations, fills caches, or loads modules. `timeit` runs many iterations, so the first one's cold start is amortized into noise. If cold-start performance is the actual concern (a script that runs once), `timeit` is not appropriate; measure end-to-end with `time` on the command line.
+
+Comparing two implementations with `timeit` typically takes a fraction of a second to a few seconds, even for million-iteration runs of microsecond-level code. The investment pays off many times over: a one-line change to the inner loop of a hot function can cut total runtime by 20 percent on a real workload.
+
+<h1 id="when-timeit-is-the-wrong-tool">When timeit Is the Wrong Tool</h1>
+
+`timeit` is purpose-built for microbenchmarks: small, isolated pieces of code measured for relative performance. For anything else, use a different tool.
+
+**Whole-program profiling.** For "where does the program spend its time?", `cProfile` is the answer, not `timeit`. `timeit` measures one snippet; `cProfile` measures every function call across the whole program and identifies which ones matter. Use `cProfile` to identify the hot spot, then `timeit` to compare optimizations of that hot spot.
+
+**Long-running or I/O-bound code.** `timeit` is designed for code that runs in microseconds to milliseconds. For seconds-long operations, `time.perf_counter()` directly is fine and easier. For I/O-bound operations, the variance comes from external systems and no amount of looping smooths it out.
+
+**Operations under a microsecond.** At sub-microsecond levels, measurement overhead can equal or exceed the operation. The numbers come back ordered, but the ordering may reflect measurement bias rather than real performance differences. Either accept the noise or design a different benchmark.
+
+**Comparing memory or other resource costs.** `timeit` only measures time. For memory, use `tracemalloc` or `memory_profiler`. For CPU-vs-wall-clock-vs-memory breakdowns, `scalene` is purpose-built.
+
+A small decision flow:
+
+The shape: `timeit` for small comparative measurements, profilers for whole-program analysis, raw `perf_counter` for one-off larger blocks.
+
+<h1 id="reading-timeit-output-correctly">Reading timeit Output Correctly</h1>
+
+A common mistake is staring at `timeit` output and drawing the wrong conclusion. Two patterns to watch for.
+
+The output reports best-of-N, not average. The minimum represents what the code can do when nothing else is competing for CPU. The mean and median are influenced by background processes, garbage collection, and OS scheduling. Comparing two snippets compares their best cases, which is the closest available to a fair test. For statistics over runs, use `timeit.repeat` and compute them manually, but understand that "best of" is the standard reporting convention for good reason.
+
+`timeit` auto-tunes `number` to make each round take roughly 0.2 seconds. A snippet timed at "10,000 loops, best of 5: 20 usec per loop" was actually run 50,000 times (10,000 per round, 5 rounds). The "per loop" number is the total round time divided by `number`. The displayed loop count varies between snippets because faster snippets need more loops to hit the 0.2s threshold. That is not a bug; it is how `timeit` keeps per-loop measurements stable.
+
+A quick check on any benchmark: re-run it. If the per-loop number moves by less than 5 to 10 percent, the measurement is stable. If it jumps around more than that, increase `number` (or set `-n` higher on the command line) until it settles. Past that, the gain from more loops is small.
+
+<h1 id="quiz">Quiz</h1>
+
+<h1 id="quiz-questions">Quiz Questions</h1>
+
+**Question 1: Why is a single pair of time.time() calls a weak method for comparing two short Python snippets?**
+
+- [x] It gives one wall-clock sample, which is noisy for tiny snippets.
+- [ ] It disables garbage collection, so allocations look too cheap.
+- [ ] It runs setup code separately from the timed statement.
+- [ ] It always uses Python bytecode counts instead of seconds.
+
+**Question 2: In the programmatic API, what does timeit.timeit(stmt, setup, number=1000) return?**
+
+- [x] A float containing total seconds for all 1000 executions.
+- [ ] A float containing average seconds for one execution.
+- [ ] A list of per-run timings, one value for each execution.
+- [ ] A tuple containing elapsed time and the statement result.
+
+**Question 3: What is the purpose of the -s option in python -m timeit?**
+
+- [x] It supplies setup code that runs outside the timed loop.
+- [ ] It selects seconds instead of milliseconds in the report.
+- [ ] It sets the number of repeated timing rounds to run.
+- [ ] It saves every timing result into a local Python file.
+
+**Question 4: Why does the command-line timeit tool report the fastest timing round rather than the mean?**
+
+- [x] The minimum is usually closest to a run without interference.
+- [ ] The mean cannot be computed for repeated timing results.
+- [ ] The fastest round includes setup time more accurately.
+- [ ] The minimum cancels the cost of Python function calls.
+
+**Question 5: When is cProfile a better tool than timeit?**
+
+- [ ] When comparing two tiny expressions in isolation.
+- [ ] When measuring one operation many times in a loop.
+- [x] When finding where a larger program spends time.
+- [ ] When excluding setup code from a small benchmark.
+
+**Question 6: What is the exact output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 7: What is the exact output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 8: What is the exact output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+<QuizCard />
+
+<CommentsSection />
+
+</LessonCard>

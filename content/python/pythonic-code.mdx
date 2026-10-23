@@ -1,0 +1,634 @@
+---
+title: "Pythonic Code (Idioms & Anti-patterns)"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "Pythonic Code explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="what-pythonic-means">What "Pythonic" Means</h1>
+
+A snippet is Pythonic when a fluent Python reader can scan it once and understand intent without translating idioms in their head. The opposite is code that works but reads like it was ported line-by-line from another language: manual index variables, `len(x) == 0` checks, `dict.has_key`-style guards, `type(x) == list` comparisons. The code runs, but every line costs the reader a small tax.
+
+Python ships a half-joking style guide that captures the philosophy. Open a REPL and type:
+
+```python
+>>> import this
+The Zen of Python, by Tim Peters
+
+Beautiful is better than ugly.
+Explicit is better than implicit.
+Simple is better than complex.
+Complex is better than complicated.
+Flat is better than nested.
+Sparse is better than dense.
+Readability counts.
+...
+```
+
+The twenty aphorisms in the Zen aren't rules you can mechanically apply. They're tiebreakers. When two implementations both work, the Zen tells you which one to prefer: the readable one, the explicit one, the one with fewer special cases. Most "Pythonic vs non-Pythonic" arguments come down to which line in the Zen you're optimizing for.
+
+A small example to make this concrete. Two functions that count in-stock products:
+
+```python
+# Non-Pythonic: C-style index loop
+def count_in_stock(products):
+    count = 0
+    for i in range(len(products)):
+        if products[i]["stock"] > 0:
+            count = count + 1
+    return count
+
+# Pythonic: direct iteration plus sum over a generator
+def count_in_stock(products):
+    return sum(1 for product in products if product["stock"] > 0)
+```
+
+Both return the same number. The second one tells the reader "I'm counting products that satisfy a condition" in a single line. The first one makes the reader run a small simulation in their head.
+
+<h1 id="eafp-vs-lbyl">EAFP vs LBYL</h1>
+
+There are two general styles for handling the case where an operation might not work: check first (LBYL, "Look Before You Leap") or just try it and catch the failure (EAFP, "Easier to Ask Forgiveness than Permission"). Python's culture leans heavily toward EAFP, and the language is built to support it.
+
+LBYL: check that the key exists before reading it.
+
+```python
+cart = {"apple": 2, "milk": 1}
+
+# LBYL
+if "bread" in cart:
+    quantity = cart["bread"]
+else:
+    quantity = 0
+```
+
+EAFP: try the read, handle the miss.
+
+```python
+# EAFP
+try:
+    quantity = cart["bread"]
+except KeyError:
+    quantity = 0
+```
+
+For a single dict lookup, neither version is dramatic, and most Python code just uses `cart.get("bread", 0)`. The difference matters more when the check and the action can race or when "looking" is expensive.
+
+The diagram makes the structural difference visible. LBYL branches on a predicate before doing the work. EAFP does the work and only branches if it fails. EAFP wins in three situations: when the check is racy (the value might change between the check and the use), when the check duplicates work the operation will do anyway (re-walking a dict, re-parsing a string), and when the failure case is rare so the exception cost doesn't matter.
+
+```python
+# Reading a customer file: LBYL has a TOCTOU race
+import os
+path = "customer.json"
+
+# LBYL: file could disappear between check and open
+if os.path.exists(path):
+    with open(path) as handle:
+        data = handle.read()
+
+# EAFP: one operation, no race
+try:
+    with open(path) as handle:
+        data = handle.read()
+except FileNotFoundError:
+    data = ""
+```
+
+EAFP isn't a blanket rule. If the predicate is cheap and the operation has side effects you can't undo, check first. The point is that Python treats exceptions as a normal control-flow tool, not a panic button.
+
+> **Cost:** Raising an exception isn't free. In a hot loop where most iterations fail, EAFP can be slower than LBYL because each raise allocates a traceback. For the common case where failures are rare, the cost is negligible.
+
+<h1 id="truthiness-and-idiomatic-boolean-checks">
+  Truthiness and Idiomatic Boolean Checks
+</h1>
+
+Every Python object has a truth value. The language defines a small set of "falsy" values, and everything else is truthy. The falsy set: `False`, `None`, `0`, `0.0`, `0j`, empty containers (`""`, `[]`, `()`, `{}`, `set()`), and any object whose `__bool__` returns `False` (or whose `__len__` returns `0`).
+
+That lets you write conditions against the value itself instead of testing properties of it.
+
+```python
+# Non-Pythonic
+if len(cart_items) == 0:
+    print("Your cart is empty.")
+
+if customer_name != "" and customer_name is not None:
+    print(f"Hi, {customer_name}")
+
+# Pythonic
+if not cart_items:
+    print("Your cart is empty.")
+
+if customer_name:
+    print(f"Hi, {customer_name}")
+```
+
+The Pythonic version is shorter and matches how you'd say it out loud: "if there's no cart", "if there's a customer name." It also picks up edge cases for free. `if customer_name:` is false for `None`, the empty string, and any other empty-ish input, which is usually what you want.
+
+There's one trap. `if value:` and `if value is not None:` are not the same. If `value` could legitimately be `0`, `0.0`, `""`, or `[]` and you only want to skip `None`, use the explicit comparison.
+
+```python
+# Wrong: discount of 0 is a valid value, but this branch skips it
+def apply_discount(price, discount):
+    if discount:
+        return price * (1 - discount)
+    return price
+
+# Right: only fall back when the caller passed nothing
+def apply_discount(price, discount):
+    if discount is not None:
+        return price * (1 - discount)
+    return price
+```
+
+PEP 8 also says: compare to `None`, `True`, and `False` with `is`, not `==`. There's only one `None` in any running Python program, so identity is the correct check.
+
+```python
+# Non-Pythonic
+if result == None: ...
+if flag == True: ...
+
+# Pythonic
+if result is None: ...
+if flag: ...
+```
+
+<h1 id="unpacking">Unpacking</h1>
+
+Unpacking is one of the features that makes Python feel different from other languages. Instead of indexing into a sequence, you let Python assign the pieces to named variables in a single expression.
+
+Basic tuple unpacking:
+
+```python
+product = ("headphones", 59.99, 12)
+
+# Non-Pythonic
+name = product[0]
+price = product[1]
+stock = product[2]
+
+# Pythonic
+name, price, stock = product
+```
+
+Swapping values without a temp variable:
+
+```python
+a, b = 1, 2
+a, b = b, a  # a is now 2, b is now 1
+```
+
+Starred assignment captures "the rest" into a list. You can put the star at the front, middle, or end:
+
+```python
+prices = [29.99, 14.99, 9.99, 49.99, 19.99]
+
+first, *rest = prices
+# first = 29.99, rest = [14.99, 9.99, 49.99, 19.99]
+
+*early, last = prices
+# early = [29.99, 14.99, 9.99, 49.99], last = 19.99
+
+first, *middle, last = prices
+# first = 29.99, middle = [14.99, 9.99, 49.99], last = 19.99
+```
+
+Functions accept and forward arguments using `*args` (positional) and `**kwargs` (keyword). The most common use is forwarding arguments to another function without listing every parameter:
+
+```python
+def log_call(func, *args, **kwargs):
+    print(f"Calling {func.__name__}")
+    return func(*args, **kwargs)
+
+def add_to_cart(name, price, quantity=1):
+    return {"name": name, "price": price, "quantity": quantity}
+
+item = log_call(add_to_cart, "milk", price=3.49, quantity=2)
+```
+
+Dictionaries unpack with `**` into another dict or into keyword arguments:
+
+```python
+defaults = {"quantity": 1, "gift_wrap": False}
+overrides = {"quantity": 3}
+
+# Merge two dicts (right wins on conflict)
+options = {**defaults, **overrides}
+# options = {"quantity": 3, "gift_wrap": False}
+
+# Or, since Python 3.9
+options = defaults | overrides
+```
+
+<h1 id="iterating-pythonically">Iterating Pythonically</h1>
+
+Loops are where non-Pythonic habits show up most often. Python wants you to iterate over the thing directly, not over its indices.
+
+The four iteration helpers that replace most manual index tracking:
+
+| Helper           | Use when                                           |
+| ---------------- | -------------------------------------------------- |
+| `enumerate(seq)` | You need both the index and the item               |
+| `zip(a, b)`      | You're walking two or more sequences in lockstep   |
+| `dict.items()`   | You need both keys and values from a dict          |
+| `reversed(seq)`  | You want to iterate from the end back to the start |
+
+Side-by-side examples:
+
+```python
+products = ["headphones", "cable", "case"]
+
+# Non-Pythonic: manual index
+for i in range(len(products)):
+    print(f"{i}: {products[i]}")
+
+# Pythonic: enumerate
+for i, product in enumerate(products):
+    print(f"{i}: {product}")
+```
+
+```python
+names = ["headphones", "cable"]
+prices = [59.99, 9.99]
+
+# Non-Pythonic
+for i in range(len(names)):
+    print(f"{names[i]}: ${prices[i]}")
+
+# Pythonic
+for name, price in zip(names, prices):
+    print(f"{name}: ${price}")
+```
+
+```python
+cart = {"apple": 2, "milk": 1, "bread": 3}
+
+# Non-Pythonic
+for name in cart:
+    quantity = cart[name]
+    print(f"{name} x{quantity}")
+
+# Pythonic
+for name, quantity in cart.items():
+    print(f"{name} x{quantity}")
+```
+
+```python
+order_ids = [101, 102, 103, 104]
+
+# Non-Pythonic
+for i in range(len(order_ids) - 1, -1, -1):
+    print(order_ids[i])
+
+# Pythonic
+for order_id in reversed(order_ids):
+    print(order_id)
+```
+
+`enumerate` also takes a `start` argument when you want one-based numbering:
+
+```python
+for line_number, product in enumerate(products, start=1):
+    print(f"{line_number}. {product}")
+```
+
+There's also a question of when to build a list versus when to stream. If you're consuming the result once and never again, a generator expression keeps you from allocating a full list in memory:
+
+```python
+prices = [29.99, 14.99, 9.99, 49.99, 19.99]
+
+# Builds a full list first (fine for small inputs)
+total = sum([price for price in prices if price > 10])
+
+# Streams: no intermediate list
+total = sum(price for price in prices if price > 10)
+```
+
+For five items it doesn't matter. For a million-row CSV, the second version reads one row at a time and never holds the full list.
+
+> **Cost:** A list comprehension allocates O(n) memory upfront. A generator expression allocates O(1) and yields items one at a time. Use the comprehension when you need the list again (sort, slice, len). Use the generator when you only need to iterate once.
+
+<h1 id="comprehensions-vs-map-and-filter">Comprehensions vs map and filter</h1>
+
+For most transformations, Python prefers a comprehension over `map` or `filter`. The short version is that comprehensions read left-to-right in the same way you'd describe the operation in English.
+
+```python
+prices = [29.99, 14.99, 9.99]
+
+# map + lambda
+final_prices = list(map(lambda price: price * 1.1, prices))
+
+# Comprehension
+final_prices = [price * 1.1 for price in prices]
+```
+
+```python
+# filter + lambda
+expensive = list(filter(lambda price: price > 20, prices))
+
+# Comprehension
+expensive = [price for price in prices if price > 20]
+```
+
+`map` and `filter` still have niches. If you're passing a named function (not a lambda) and don't need a list at the end, `map(func, iterable)` is fine and lazy. But the moment you reach for `lambda`, a comprehension is usually clearer.
+
+<h1 id="context-managers-for-resources">Context Managers for Resources</h1>
+
+Anything that has to be released after use, files, locks, network connections, database cursors, belongs inside a `with` block. The block guarantees the cleanup runs even if the body raises.
+
+```python
+# Non-Pythonic: manual close, leaks the handle on exceptions
+handle = open("orders.csv")
+data = handle.read()
+handle.close()
+
+# Pythonic
+with open("orders.csv") as handle:
+    data = handle.read()
+```
+
+If `handle.read()` raises in the first version, `handle.close()` never runs and the file descriptor leaks. The `with` version closes the file whether the body succeeds or raises.
+
+You can open multiple resources in one `with`:
+
+```python
+with open("orders.csv") as src, open("orders.json", "w") as dst:
+    dst.write(transform(src.read()))
+```
+
+The takeaway here: if a function returns something with a `close()` method, your first instinct should be `with`.
+
+<h1 id="standard-library-helpers-over-manual-checks">
+  Standard-Library Helpers Over Manual Checks
+</h1>
+
+Half of the non-Pythonic dict code in the wild reinvents something the standard library already does in one line.
+
+`dict.get(key, default)` returns the default when the key is missing:
+
+```python
+cart = {"apple": 2, "milk": 1}
+
+# Non-Pythonic
+if "bread" in cart:
+    quantity = cart["bread"]
+else:
+    quantity = 0
+
+# Pythonic
+quantity = cart.get("bread", 0)
+```
+
+`dict.setdefault(key, default)` is `get` plus "insert the default if missing." Useful when you're grouping items:
+
+```python
+orders = [
+    {"customer": "priya", "item": "headphones"},
+    {"customer": "aanya", "item": "cable"},
+    {"customer": "priya", "item": "case"},
+]
+
+# Non-Pythonic
+by_customer = {}
+for order in orders:
+    if order["customer"] not in by_customer:
+        by_customer[order["customer"]] = []
+    by_customer[order["customer"]].append(order["item"])
+
+# Pythonic
+by_customer = {}
+for order in orders:
+    by_customer.setdefault(order["customer"], []).append(order["item"])
+```
+
+`collections.defaultdict` is even cleaner when every miss should produce the same default:
+
+```python
+from collections import defaultdict
+
+by_customer = defaultdict(list)
+for order in orders:
+    by_customer[order["customer"]].append(order["item"])
+```
+
+`collections.Counter` replaces hand-rolled frequency tables:
+
+```python
+from collections import Counter
+
+cart_items = ["apple", "milk", "apple", "bread", "apple", "milk"]
+
+# Non-Pythonic
+counts = {}
+for item in cart_items:
+    if item in counts:
+        counts[item] += 1
+    else:
+        counts[item] = 1
+
+# Pythonic
+counts = Counter(cart_items)
+# Counter({'apple': 3, 'milk': 2, 'bread': 1})
+
+print(counts.most_common(2))
+# [('apple', 3), ('milk', 2)]
+```
+
+`Counter` also supports addition, subtraction, and intersection, which is handy for inventory math:
+
+```python
+on_hand = Counter({"apple": 10, "milk": 5})
+incoming = Counter({"apple": 4, "bread": 6})
+new_stock = on_hand + incoming
+# Counter({'apple': 14, 'bread': 6, 'milk': 5})
+```
+
+The point here is recognizing the pattern: any time you're writing `if key in d` followed by initialization, one of these helpers probably already does it.
+
+> **Cost:** `defaultdict` adds the key on every miss, even from a read like `print(d["missing"])`. If you only want to read without inserting, use plain `dict` plus `.get(key, default)`.
+
+<h1 id="pathlib-over-ospath-strings">pathlib Over os.path Strings</h1>
+
+The `os.path` module treats paths as strings, which means every operation is a function call that takes strings and returns strings. `pathlib`, added in Python 3.4, gives you a `Path` object with methods, and most operations chain.
+
+```python
+# Non-Pythonic (string-based)
+import os
+
+base = "/var/data"
+orders_dir = os.path.join(base, "orders")
+path = os.path.join(orders_dir, "2026-05-14.csv")
+
+if os.path.exists(path):
+    with open(path) as handle:
+        data = handle.read()
+
+# Pythonic (pathlib)
+from pathlib import Path
+
+base = Path("/var/data")
+path = base / "orders" / "2026-05-14.csv"
+
+if path.exists():
+    data = path.read_text()
+```
+
+`Path` overloads `/` for joining, so you write paths the way they look on disk. The object has methods for reading (`read_text`, `read_bytes`), writing (`write_text`, `write_bytes`), checking (`exists`, `is_file`, `is_dir`), listing (`iterdir`, `glob`), and inspecting (`name`, `stem`, `suffix`, `parent`).
+
+```python
+path = Path("orders/2026-05-14.csv")
+path.name     # '2026-05-14.csv'
+path.stem     # '2026-05-14'
+path.suffix   # '.csv'
+path.parent   # PosixPath('orders')
+```
+
+A common task, listing all CSVs in a folder, becomes one line:
+
+```python
+for csv_path in Path("orders").glob("*.csv"):
+    print(csv_path.read_text())
+```
+
+For new code, `pathlib` is the default. Keep `os.path` around only for two cases: working with code that already uses strings everywhere, or interacting with libraries whose APIs only accept strings (most modern libraries accept either).
+
+<h1 id="f-strings-for-formatting">f-strings for Formatting</h1>
+
+Python has had three string-formatting styles. f-strings (Python 3.6+) replace both of the older ones for almost every use.
+
+```python
+name = "Priya"
+total = 79.97
+
+# Old: %-formatting
+message = "Hi %s, your total is $%.2f" % (name, total)
+
+# Older: str.format
+message = "Hi {}, your total is ${:.2f}".format(name, total)
+
+# Pythonic: f-string
+message = f"Hi {name}, your total is ${total:.2f}"
+```
+
+f-strings let you embed any expression, not just names:
+
+```python
+items = ["apple", "milk", "bread"]
+print(f"You have {len(items)} items in your cart.")
+# You have 3 items in your cart.
+
+prices = [29.99, 14.99, 9.99]
+print(f"Total: ${sum(prices):.2f}")
+# Total: $54.97
+```
+
+Python 3.8 added `=` for quick debug output. `f"{name=}"` expands to `name='Priya'`, which saves writing the label twice when you're debugging:
+
+```python
+name = "Priya"
+total = 79.97
+print(f"{name=}, {total=}")
+# name='Priya', total=79.97
+```
+
+Use the older styles only when you have to: `%`-formatting is still common in logging (`logging.info("user %s logged in", user)` defers the formatting until the record is actually emitted), and `str.format` is occasionally useful for templates loaded from a file. For everything else, reach for f-strings first.
+
+<h1 id="common-anti-patterns">Common Anti-patterns</h1>
+
+A handful of patterns keep showing up in code review even on otherwise solid Python.
+
+**Comparing types with `==`.** Use `isinstance` instead. It handles subclasses correctly and is the convention.
+
+```python
+# Anti-pattern
+if type(value) == list:
+    ...
+
+# Pythonic
+if isinstance(value, list):
+    ...
+```
+
+If you legitimately need an exact type and not a subclass, the explicit `type(value) is list` is at least clearer than `==`, but cases where you need that are rare.
+
+**Manual indexing in loops.** Already covered above. Use `enumerate`, `zip`, or `dict.items()` instead of `range(len(...))`.
+
+**String concatenation in a loop.** Each `+=` on a string allocates a new string, so a loop that concatenates n strings does O(n^2) work in the worst case. Use `str.join` instead.
+
+```python
+products = ["headphones", "cable", "case"]
+
+# Anti-pattern: O(n^2) in the worst case
+result = ""
+for name in products:
+    result += name + ", "
+result = result.rstrip(", ")
+
+# Pythonic: O(n)
+result = ", ".join(products)
+```
+
+> **Cost:** CPython has an optimization that sometimes turns `s += x` in a loop into an in-place append, but it's fragile and disappears the moment you do anything else with `s`. `str.join` is reliably O(n) and has no surprise cliffs.
+
+**Mutating a list while iterating over it.** The iterator's internal index doesn't notice your deletions, so items get skipped or revisited.
+
+```python
+prices = [29.99, 14.99, 9.99, 49.99, 19.99]
+
+# Anti-pattern: 14.99 gets skipped because the index keeps moving
+for price in prices:
+    if price < 20:
+        prices.remove(price)
+
+# Pythonic: build a new list
+prices = [price for price in prices if price >= 20]
+```
+
+If you need to mutate the original list object (other code holds a reference), use slice assignment:
+
+```python
+prices[:] = [price for price in prices if price >= 20]
+```
+
+**Bare `except:` clauses.** A bare `except` catches every exception, including `KeyboardInterrupt` and `SystemExit`, which you almost never want to swallow.
+
+```python
+# Anti-pattern: hides every error, including Ctrl-C
+try:
+    process_order()
+except:
+    pass
+
+# Pythonic: catch what you actually expect
+try:
+    process_order()
+except ValueError:
+    log.warning("Bad order payload")
+except OSError as exc:
+    log.error("IO failed: %s", exc)
+```
+
+If you really do want to catch every "normal" exception (in a logging or supervisor layer), use `except Exception:`. That still lets `KeyboardInterrupt` propagate.
+
+**`from module import *`.** Star imports drag everything from a module into your namespace, including things you didn't know existed. They shadow your own names without warning and break tools that try to figure out what's defined where.
+
+```python
+# Anti-pattern: which names does this actually add?
+from numpy import *
+
+# Pythonic: list what you actually use
+from numpy import array, mean, std
+import numpy as np
+```
+
+Star imports are tolerable in two places: a package's `__init__.py` that re-exports a curated `__all__`, and an interactive REPL where you don't care. In application code, they're noise.
+
+The decision tree above is the quick lookup for the iteration anti-patterns. Most code reviews where someone wrote `for i in range(len(x)):` end with one of those four answers.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

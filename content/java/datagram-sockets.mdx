@@ -1,0 +1,603 @@
+---
+title: "Datagram Sockets (UDP)"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Datagram Sockets (UDP) explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="why-udp-exists">Why UDP Exists</h1>
+
+TCP is the safe default. It guarantees that bytes arrive in order, retransmits lost segments, and slows itself down when the network is congested. You pay for those guarantees in latency and overhead: a three-way handshake before the first byte, an ACK for every segment, and the kernel holding onto data until it gets acknowledged.
+
+For a checkout flow, that's exactly what you want. Losing a "place order" request would be a disaster. For a real-time price ticker that updates every 100ms, none of those guarantees help. If a single price update gets lost, the next one is on its way already. Retransmitting yesterday's price is worse than skipping it. The same logic applies to fire-and-forget cart-event metrics that feed an analytics pipeline: if 0.1% of the events get dropped on the floor, the dashboard is still accurate to three decimal places.
+
+UDP is the protocol to use when the data is one of:
+
+- **Telemetry** that arrives often, where stale samples are worthless. Real-time price ticks, inventory broadcasts, click-stream metrics.
+- **Best-effort pings** where the sender doesn't care about a reply. Heartbeats, "I'm still alive" beacons.
+- **Real-time media** where retransmission would arrive too late to matter. Voice, video, gaming.
+- **DNS** and other small request-response patterns where one round trip is the whole conversation.
+- **Multicast**, which TCP can't do at all. One sender, many receivers.
+
+The cost of those benefits is that the application has to handle every failure mode itself. If you need at-least-once delivery, you build it. If you need ordering, you build it. If you need congestion control, you build it. Most UDP applications are fine without any of those because the data is either replaceable, low-stakes, or used in a context (multicast, media) where TCP simply doesn't fit.
+
+The diagram is a quick decision tree. If you need a reliable stream of bytes between two endpoints, TCP is still the answer. If the data is cheap and the network is mostly behaving, UDP gets out of the way. If one sender needs to reach many receivers without setting up a connection to each one, UDP multicast is the only built-in option.
+
+<h1 id="tcp-vs-udp-a-side-by-side">TCP vs UDP: A Side-by-Side</h1>
+
+Before we touch any code, it helps to see exactly which guarantees you give up. The following table compares the two protocols on the dimensions that matter most for an application developer.
+
+| Property           | TCP                                    | UDP                                            |
+| ------------------ | -------------------------------------- | ---------------------------------------------- |
+| Connection         | Three-way handshake before first byte  | No connection; each packet stands alone        |
+| Delivery           | Guaranteed (retransmits lost segments) | Best-effort (packets can be dropped)           |
+| Ordering           | In-order at the receiver               | Arrives in whatever order the network produces |
+| Flow control       | Yes (receiver slows the sender)        | None; sender can flood the receiver            |
+| Congestion control | Yes (slows on packet loss)             | None; application's problem                    |
+| Message boundaries | Stream of bytes; no boundaries         | Discrete messages (datagrams)                  |
+| Max payload        | Unlimited; the stream chunks itself    | 65,507 bytes per datagram                      |
+| Header overhead    | 20 bytes                               | 8 bytes                                        |
+| Java API           | `Socket`, `ServerSocket`               | `DatagramSocket`, `DatagramPacket`             |
+
+The "message boundaries" row is a critical difference. TCP doesn't preserve send boundaries: if you call `write` three times with 100 bytes each, the receiver might see one `read` returning 300 bytes, or three `read`s returning 100 bytes each, or five `read`s of various sizes. UDP preserves boundaries exactly. One `send` produces one packet, and one `receive` returns one packet. If two `send` calls produce two packets, the receiver makes two `receive` calls, period.
+
+That single property changes how you write the code. With TCP you frame messages yourself, usually with a length prefix or a delimiter. With UDP, the framing is free: each datagram is one message.
+
+<h1 id="datagramsocket-the-endpoint">DatagramSocket: The Endpoint</h1>
+
+A `DatagramSocket` is one end of a UDP conversation. There are two ways to create it, and the difference is whether you care about your own port.
+
+If you're acting as a server (someone else needs to send packets to you), bind to a known port:
+
+```java
+import java.net.DatagramSocket;
+
+public class UdpServerBind {
+    public static void main(String[] args) throws Exception {
+        try (DatagramSocket socket = new DatagramSocket(9876)) {
+            System.out.println("Listening on UDP port " + socket.getLocalPort());
+            // We would call socket.receive(...) here in a real server.
+        }
+    }
+}
+```
+
+`new DatagramSocket(9876)` asks the kernel to bind this socket to UDP port 9876. The constructor throws `BindException` if another process already owns that port, which is the same error you'd get from a TCP `ServerSocket`. Note that TCP port 9876 and UDP port 9876 are different ports: the two protocols have separate port spaces, so a TCP server on 9876 and a UDP server on 9876 can coexist on the same machine.
+
+If you're a client (you only need to send packets and maybe receive replies), let the kernel pick an ephemeral port:
+
+```java
+import java.net.DatagramSocket;
+
+public class UdpClientEphemeral {
+    public static void main(String[] args) throws Exception {
+        try (DatagramSocket socket = new DatagramSocket()) {
+            System.out.println("Ephemeral port: " + socket.getLocalPort());
+        }
+    }
+}
+```
+
+**Output (the actual port will vary):**
+
+```text
+Ephemeral port: 54321
+```
+
+`new DatagramSocket()` with no arguments binds to a random free port in the OS's ephemeral range, usually somewhere between 32,768 and 60,999 on Linux or 49,152 and 65,535 on Windows. The kernel picks one, you don't have to think about it, and the port disappears when you close the socket.
+
+Both forms implement `AutoCloseable`, so try-with-resources is the right pattern. Forgetting to close a socket leaks a file descriptor, which only becomes visible on a long-running service.
+
+A `DatagramSocket` holds a kernel file descriptor and a small kernel receive buffer (default around 200 KB). Open one per logical sender or receiver and keep it open. Do not open and close a socket per packet; the syscalls add up.
+
+<h1 id="datagrampacket-the-message">DatagramPacket: The Message</h1>
+
+A `DatagramPacket` is two things in one object: it's a byte buffer plus addressing information. The exact role depends on whether you're sending or receiving.
+
+For sending, you populate the packet with the payload bytes, the destination address, and the destination port, then pass it to `socket.send`.
+
+For receiving, you give the packet an empty buffer (and nothing else), pass it to `socket.receive`, and after the call returns the packet contains the bytes you got, the length the kernel actually filled in, and the sender's address and port.
+
+The diagram shows the round-trip role of the packet object. On the outbound side, the application fills the packet completely. On the inbound side, the application only provides the buffer, and `receive` fills in everything else.
+
+<h3 id="sending-a-packet">Sending a Packet</h3>
+
+Here is the smallest possible send. We turn a string into bytes, build a packet pointed at the destination, and call `send`.
+
+```java
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+
+public class SendOnePacket {
+    public static void main(String[] args) throws Exception {
+        try (DatagramSocket socket = new DatagramSocket()) {
+            byte[] payload = "cart-add user=42 item=headphones".getBytes();
+            InetAddress dest = InetAddress.getByName("127.0.0.1");
+            DatagramPacket packet = new DatagramPacket(payload, payload.length, dest, 9876);
+            socket.send(packet);
+            System.out.println("Sent " + payload.length + " bytes to " + dest + ":9876");
+        }
+    }
+}
+```
+
+Four arguments build the outbound packet: the payload, the number of bytes from the payload to send (almost always `payload.length`), the destination address, and the destination port. `socket.send` is a single syscall that hands the kernel the bytes and the address. The call returns as soon as the kernel queues the packet for the network card, which is usually microseconds. There is no acknowledgement and no confirmation. If no one is listening on `9876`, the packet still leaves the machine; the receiver might send back an ICMP "port unreachable", but the sending application will not see it.
+
+<h3 id="receiving-a-packet">Receiving a Packet</h3>
+
+The receiver is the more interesting half. Allocate a buffer, build a packet around it, and call `receive`, which blocks until a datagram arrives.
+
+```java
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+
+public class ReceiveOnePacket {
+    public static void main(String[] args) throws Exception {
+        try (DatagramSocket socket = new DatagramSocket(9876)) {
+            byte[] buffer = new byte[2048];
+            DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+
+            System.out.println("Waiting for a packet on port 9876...");
+            socket.receive(packet);
+
+            String text = new String(packet.getData(), 0, packet.getLength());
+            System.out.println("From " + packet.getAddress() + ":" + packet.getPort());
+            System.out.println("Length: " + packet.getLength());
+            System.out.println("Payload: " + text);
+        }
+    }
+}
+```
+
+**Output (after running `SendOnePacket` against it):**
+
+```text
+Waiting for a packet on port 9876...
+From /127.0.0.1:54321
+Length: 32
+Payload: cart-add user=42 item=headphones
+```
+
+Three details. First, the buffer is 2048 bytes, but the actual datagram was 32 bytes. After `receive` returns, `packet.getLength()` is the real length the kernel wrote, not the buffer size. Always slice with `getData()`, `getLength()` and never trust `buffer.length` as the message length.
+
+Second, `getAddress()` and `getPort()` come back populated with the sender's address and port. That is how a UDP server replies to a client without needing a separate "connection". Read the source from the inbound packet and use it as the destination for the response.
+
+Third, `receive` is blocking. It does not return until either a packet arrives, the socket is closed, or a timeout fires.
+
+<h1 id="a-worked-example-cart-event-metrics">
+  A Worked Example: Cart Event Metrics
+</h1>
+
+UDP is well-suited to "tell me what just happened, figure it out later" workloads. Cart events are a good fit: each event is small, the analytics pipeline is fed by many clients, and dropping a tiny fraction is acceptable. A client that fires off five cart events and a server that prints them:
+
+The client:
+
+```java
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.time.Instant;
+
+public class CartMetricsClient {
+    public static void main(String[] args) throws Exception {
+        InetAddress dest = InetAddress.getByName("127.0.0.1");
+        int port = 9876;
+
+        String[] events = {
+            "cart.add user=42 item=headphones qty=1",
+            "cart.add user=42 item=cable qty=2",
+            "cart.remove user=42 item=cable qty=1",
+            "cart.add user=99 item=mug qty=1",
+            "checkout.start user=42 total=51.19"
+        };
+
+        try (DatagramSocket socket = new DatagramSocket()) {
+            for (String event : events) {
+                String line = Instant.now() + " " + event;
+                byte[] payload = line.getBytes();
+                DatagramPacket packet =
+                    new DatagramPacket(payload, payload.length, dest, port);
+                socket.send(packet);
+                System.out.println("Sent: " + line);
+            }
+        }
+    }
+}
+```
+
+**Output (timestamps will vary):**
+
+```text
+Sent: 2026-05-13T12:00:00.123Z cart.add user=42 item=headphones qty=1
+Sent: 2026-05-13T12:00:00.124Z cart.add user=42 item=cable qty=2
+Sent: 2026-05-13T12:00:00.124Z cart.remove user=42 item=cable qty=1
+Sent: 2026-05-13T12:00:00.125Z cart.add user=99 item=mug qty=1
+Sent: 2026-05-13T12:00:00.125Z checkout.start user=42 total=51.19
+```
+
+The client opens one socket and reuses it for all five packets. It doesn't wait for any reply because there isn't one. The whole loop finishes in microseconds because each `send` only queues the packet locally.
+
+The server:
+
+```java
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+
+public class CartMetricsServer {
+    public static void main(String[] args) throws Exception {
+        try (DatagramSocket socket = new DatagramSocket(9876)) {
+            System.out.println("Cart metrics server on UDP 9876");
+            byte[] buffer = new byte[1500];
+
+            while (true) {
+                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                socket.receive(packet);
+                String event = new String(packet.getData(), 0, packet.getLength());
+                System.out.println("[" + packet.getAddress().getHostAddress()
+                        + ":" + packet.getPort() + "] " + event);
+            }
+        }
+    }
+}
+```
+
+**Output (after running the client):**
+
+```text
+Cart metrics server on UDP 9876
+[127.0.0.1:54321] 2026-05-13T12:00:00.123Z cart.add user=42 item=headphones qty=1
+[127.0.0.1:54321] 2026-05-13T12:00:00.124Z cart.add user=42 item=cable qty=2
+[127.0.0.1:54321] 2026-05-13T12:00:00.124Z cart.remove user=42 item=cable qty=1
+[127.0.0.1:54321] 2026-05-13T12:00:00.125Z cart.add user=99 item=mug qty=1
+[127.0.0.1:54321] 2026-05-13T12:00:00.125Z checkout.start user=42 total=51.19
+```
+
+The server creates a fresh `DatagramPacket` inside the loop. That's the safe pattern when references to packets might be kept after the loop, because the packet's length field is updated by each `receive` call and the previous iteration's length should not leak into the next one. Reusing one packet object also works if `setLength(buffer.length)` is called before each `receive` to reset the cap.
+
+The buffer is 1500 bytes, which is the Ethernet MTU. For a metrics stream of short text lines, 1500 is plenty.
+
+The sequence diagram makes a subtle point. The client sent the "cable add" before the "cable remove", but the network is allowed to deliver them in any order. For metrics aggregation that doesn't matter because the analytics pipeline groups by user and timestamp anyway. For other workloads (like a financial trade feed) it does matter, and you'd need to add sequence numbers and reorder at the receiver.
+
+At very high rates the kernel's receive buffer (default ~200 KB on Linux, configurable via `socket.setReceiveBufferSize`) can fill up faster than the application drains it. New packets get dropped without notification. For 100,000+ events per second, raise the receive buffer and make sure the receive loop does not do heavyweight work inline.
+
+<h1 id="payload-size-limits-and-mtu">Payload Size Limits and MTU</h1>
+
+UDP's theoretical maximum payload is 65,507 bytes. That's the 65,535-byte IP datagram maximum, minus the 20-byte IP header, minus the 8-byte UDP header. The kernel will let you send any size up to that limit.
+
+In practice, you almost never want to send anywhere near that size. The reason is path MTU, the largest IP packet that can traverse the network without being fragmented. On most networks the MTU is 1500 bytes (Ethernet), and on the public internet it's effectively the same. Any UDP datagram larger than about 1472 bytes (1500 minus 20-byte IP header minus 8-byte UDP header) gets fragmented by IP into multiple smaller packets.
+
+Fragmentation is where things go wrong. IP fragments are reassembled at the receiver only if every fragment arrives. If even one fragment is lost or arrives too late, the whole datagram is discarded. Loss rates compound: if each fragment has a 1% drop probability and a datagram is split into 10 fragments, the chance the whole datagram makes it is 0.99^10, about 90%. The same datagram sent as a single 1400-byte packet would have a 99% success rate. Worse, some middleboxes drop fragments entirely.
+
+The practical rule: keep UDP payloads under about 1400 bytes to stay safely below typical MTUs. If your data is bigger, either fragment it yourself with sequence numbers and reassemble at the receiver (which means you've reinvented some of TCP), or use TCP.
+
+The diagram shows what happens to an oversized datagram. The 5000-byte payload becomes a 5008-byte UDP packet (with the 8-byte UDP header), which IP splits into four fragments. If any single fragment is lost, the receiver throws away the whole thing.
+
+<h1 id="common-pitfalls">Common Pitfalls</h1>
+
+UDP has a small API but a few foot-guns. Three of them are worth dwelling on.
+
+<h3 id="pitfall-1-buffer-too-small-silent-truncation">
+  Pitfall 1: Buffer too small (silent truncation)
+</h3>
+
+If your receive buffer is smaller than the incoming datagram, UDP drops the excess bytes on the floor. There's no exception, no error code, no length mismatch warning. The packet looks correctly received, except half of it is missing.
+
+**What's wrong with this code?**
+
+```java
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+
+public class TruncatedReceive {
+    public static void main(String[] args) throws Exception {
+        try (DatagramSocket socket = new DatagramSocket(9876)) {
+            byte[] tiny = new byte[16];
+            DatagramPacket packet = new DatagramPacket(tiny, tiny.length);
+            socket.receive(packet);
+            System.out.println("Got: " + new String(packet.getData(), 0, packet.getLength()));
+        }
+    }
+}
+```
+
+If a sender pushes the 32-byte message `cart-add user=42 item=headphones`, the buffer is only 16 bytes. The output is:
+
+```text
+Got: cart-add user=42
+```
+
+The second half of the message is gone. The kernel truncates without warning and `packet.getLength()` reports 16, the buffer size. Compare this to TCP, which would return the rest of the bytes on the next `read`. With UDP, those bytes are unrecoverable.
+
+**Fix:** size the buffer for the largest message your protocol allows.
+
+```java
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+
+public class SafeReceive {
+    public static void main(String[] args) throws Exception {
+        try (DatagramSocket socket = new DatagramSocket(9876)) {
+            // 65,507 covers any UDP datagram. 1500 is enough if you control both ends.
+            byte[] buffer = new byte[65_507];
+            DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+            socket.receive(packet);
+            System.out.println("Got " + packet.getLength() + " bytes");
+        }
+    }
+}
+```
+
+For trusted internal traffic where you control message sizes, 1500 (or 2048 as a round number above MTU) is fine. For untrusted input, 65,507 is the only size that guarantees you never truncate.
+
+<h3 id="pitfall-2-reusing-a-packet-without-resetting-length">
+  Pitfall 2: Reusing a packet without resetting length
+</h3>
+
+If you reuse the same `DatagramPacket` across multiple `receive` calls, the packet's length field gets updated to the actual received length each time, which then caps the next call. The fix is to reset the length explicitly.
+
+**What's wrong with this code?**
+
+```java
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+
+public class StickyLength {
+    public static void main(String[] args) throws Exception {
+        try (DatagramSocket socket = new DatagramSocket(9876)) {
+            byte[] buffer = new byte[2048];
+            DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+
+            socket.receive(packet);
+            System.out.println("First:  " + packet.getLength() + " bytes");
+
+            socket.receive(packet);
+            System.out.println("Second: " + packet.getLength() + " bytes");
+        }
+    }
+}
+```
+
+Imagine the first message is 32 bytes and the second is 100 bytes. Output:
+
+```text
+First:  32 bytes
+Second: 32 bytes
+```
+
+The second receive only got 32 bytes because the packet's length field was 32 after the first call, and `receive` uses that as the new buffer cap. The remaining 68 bytes of the second message are truncated.
+
+**Fix:** reset the length before every `receive`, or build a fresh packet each iteration.
+
+```java
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+
+public class ResetLength {
+    public static void main(String[] args) throws Exception {
+        try (DatagramSocket socket = new DatagramSocket(9876)) {
+            byte[] buffer = new byte[2048];
+            DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+
+            for (int i = 0; i < 2; i++) {
+                packet.setLength(buffer.length);  // reset the cap
+                socket.receive(packet);
+                System.out.println("Got " + packet.getLength() + " bytes");
+            }
+        }
+    }
+}
+```
+
+`packet.setLength(buffer.length)` reopens the full buffer to the next receive. Without it, every receive after the first one is capped by whatever the previous receive happened to write, with no warning. This bug works fine in testing where all messages are the same size and breaks in production when one customer sends a smaller payload.
+
+<h3 id="pitfall-3-forgetting-udp-is-unreliable">
+  Pitfall 3: Forgetting UDP is unreliable
+</h3>
+
+The worst UDP bugs aren't bugs in the protocol, they're bugs in assumptions. Code that works perfectly on a developer's laptop, with localhost loopback and zero packet loss, can lose a meaningful fraction of its messages once it crosses a real network.
+
+**What's wrong with this code?**
+
+```java
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+
+public class TrustingUdp {
+    public static void main(String[] args) throws Exception {
+        try (DatagramSocket socket = new DatagramSocket()) {
+            byte[] order = "order place id=12345 total=99.99".getBytes();
+            DatagramPacket packet = new DatagramPacket(
+                order, order.length, InetAddress.getByName("payments.example.com"), 9876);
+            socket.send(packet);
+            System.out.println("Order placed");
+        }
+    }
+}
+```
+
+This code prints "Order placed" even when the datagram never reaches its destination. UDP `send` doesn't tell you whether the packet arrived. For an order placement, that's catastrophic: the user sees a success message and the payments service never knows there was an order.
+
+**Fix:** use TCP for anything that must arrive, or build an acknowledgement protocol on top of UDP. The "ack on top of UDP" pattern looks like this:
+
+```java
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.net.SocketTimeoutException;
+
+public class UdpWithAck {
+    public static void main(String[] args) throws Exception {
+        try (DatagramSocket socket = new DatagramSocket()) {
+            socket.setSoTimeout(500);  // 500 ms
+
+            byte[] payload = "ping seq=1".getBytes();
+            InetAddress dest = InetAddress.getByName("127.0.0.1");
+            DatagramPacket out = new DatagramPacket(payload, payload.length, dest, 9876);
+
+            byte[] buffer = new byte[512];
+            DatagramPacket reply = new DatagramPacket(buffer, buffer.length);
+
+            int attempts = 0;
+            while (attempts < 3) {
+                socket.send(out);
+                try {
+                    socket.receive(reply);
+                    System.out.println("Ack: " + new String(reply.getData(), 0, reply.getLength()));
+                    return;
+                } catch (SocketTimeoutException e) {
+                    attempts++;
+                    System.out.println("Timeout, retry " + attempts);
+                }
+            }
+            System.out.println("Gave up after 3 attempts");
+        }
+    }
+}
+```
+
+`setSoTimeout(500)` makes `receive` throw `SocketTimeoutException` if no packet arrives within 500ms. The sender retries up to three times. Writing a lot of this code amounts to half-reimplementing TCP, and TCP is probably the better answer.
+
+Every retry sends another datagram, which doubles bandwidth use under loss. If many clients retry simultaneously after a network burp, the result is a "thundering herd" that prolongs the outage. Production applications use exponential backoff and jitter on the retry delays.
+
+<h1 id="multicast-one-sender-many-receivers">
+  Multicast: One Sender, Many Receivers
+</h1>
+
+UDP can do something TCP cannot: send a single packet that gets delivered to many receivers at once. This is multicast. Instead of sending one packet to each recipient (unicast), the sender ships one packet to a special group address, and the network duplicates it to every subscriber.
+
+For an e-commerce site, a natural use case is broadcasting flash-sale price changes. When the marketing team flips the price of a hot item, every shopping client that subscribed to the price feed sees the new price at almost the same time, without the publisher having to track who's listening.
+
+`MulticastSocket` is the subclass of `DatagramSocket` that adds group-membership APIs. Subscribers call `joinGroup(...)` to start receiving packets sent to the group address. The publisher sends to the group address like any other UDP destination.
+
+Multicast addresses live in the IPv4 range 224.0.0.0 to 239.255.255.255. The 239.0.0.0/8 block is reserved for private use, like 10.0.0.0/8 is for unicast, so we'll use 239.1.2.3 in the example.
+
+The publisher:
+
+```java
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+
+public class FlashSalePublisher {
+    public static void main(String[] args) throws Exception {
+        InetAddress group = InetAddress.getByName("239.1.2.3");
+        int port = 7777;
+
+        String[] updates = {
+            "FLASH headphones $29.99",
+            "FLASH cable $4.50",
+            "FLASH mug $7.99"
+        };
+
+        try (DatagramSocket socket = new DatagramSocket()) {
+            for (String update : updates) {
+                byte[] payload = update.getBytes();
+                DatagramPacket packet =
+                    new DatagramPacket(payload, payload.length, group, port);
+                socket.send(packet);
+                System.out.println("Broadcast: " + update);
+                Thread.sleep(100);
+            }
+        }
+    }
+}
+```
+
+The publisher is just a plain `DatagramSocket`; multicast publishing doesn't need anything special on the sender side. The destination address happens to be a multicast group address.
+
+The subscriber:
+
+```java
+import java.net.DatagramPacket;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.MulticastSocket;
+import java.net.NetworkInterface;
+
+public class FlashSaleSubscriber {
+    public static void main(String[] args) throws Exception {
+        InetAddress group = InetAddress.getByName("239.1.2.3");
+        int port = 7777;
+
+        try (MulticastSocket socket = new MulticastSocket(port)) {
+            NetworkInterface netIf = NetworkInterface.getByName("lo0");
+            socket.joinGroup(new InetSocketAddress(group, port), netIf);
+            System.out.println("Listening for flash-sale updates on " + group + ":" + port);
+
+            byte[] buffer = new byte[1500];
+            for (int i = 0; i < 3; i++) {
+                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                socket.receive(packet);
+                String update = new String(packet.getData(), 0, packet.getLength());
+                System.out.println("Got: " + update);
+            }
+
+            socket.leaveGroup(new InetSocketAddress(group, port), netIf);
+        }
+    }
+}
+```
+
+**Output (with the publisher running):**
+
+```text
+Listening for flash-sale updates on /239.1.2.3:7777
+Got: FLASH headphones $29.99
+Got: FLASH cable $4.50
+Got: FLASH mug $7.99
+```
+
+The subscriber uses `MulticastSocket(port)` to bind to the group's port, then calls `joinGroup` with a `SocketAddress` and a `NetworkInterface`. The interface argument matters: on a machine with multiple network cards, you have to pick which one will listen for the group. `lo0` is the loopback interface name on macOS; on Linux it's `lo`. For production code, you'd usually pick the interface that carries internal traffic.
+
+After `joinGroup`, every packet sent to the group on that port arrives at this socket. `leaveGroup` cleans up at the end. Without it the OS keeps the membership until the socket closes, which works but doesn't tell upstream routers to stop forwarding traffic.
+
+Multicast does not traverse the public internet by default; routers and firewalls usually drop it. It is a tool for internal networks, like a data center pushing price updates to a fleet of pricing-cache servers, or a LAN doing service discovery without a central registry. For multicast across the internet, use a pub-sub broker instead.
+
+Multicast scales for the sender (one send goes to many receivers), but each receiver still pays its full per-packet cost. A broadcast at 10,000 messages per second to 100 subscribers is 1,000,000 packets per second total across the cluster. Use multicast for many-receivers, not for many-messages.
+
+<h1 id="timeouts-and-closing">Timeouts and Closing</h1>
+
+`receive` blocks forever by default. For most real services, the receive loop should wake up periodically to flush buffers, check shutdown flags, or fail over to a backup. `setSoTimeout(milliseconds)` makes `receive` throw `SocketTimeoutException` if nothing arrives in the given window.
+
+```java
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.SocketTimeoutException;
+
+public class TimeoutReceive {
+    public static void main(String[] args) throws Exception {
+        try (DatagramSocket socket = new DatagramSocket(9876)) {
+            socket.setSoTimeout(2000);
+            byte[] buffer = new byte[1500];
+            DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+
+            try {
+                socket.receive(packet);
+                System.out.println("Got " + packet.getLength() + " bytes");
+            } catch (SocketTimeoutException e) {
+                System.out.println("No packet in 2 seconds");
+            }
+        }
+    }
+}
+```
+
+**Output (when no packet arrives):**
+
+```text
+No packet in 2 seconds
+```
+
+A timeout doesn't close the socket. After catching `SocketTimeoutException`, you can call `receive` again and the next packet (if any) will be delivered normally. The socket only closes when you call `close()` explicitly or when try-with-resources finishes.
+
+Calling `close()` from another thread is a clean way to shut down a server: the blocking `receive` returns immediately with a `SocketException` saying the socket is closed, and the receive loop exits.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,241 @@
+---
+title: "sqlite3 Module"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "sqlite3 Module explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="when-sqlite-is-the-right-fit">When SQLite Is the Right Fit</h1>
+
+SQLite isn't a stripped-down database. It is a fully ACID-compliant SQL engine that happens to run inside the application process instead of as a separate server. That design fits a specific shape of workload and is a bad fit for a different one.
+
+SQLite fits when:
+
+- One process owns the data. A CLI tool, a desktop app, a personal script, an embedded device, a single-worker web service.
+- The data sits in one file. Easy to back up, copy, ship, or attach to a bug report.
+- Zero setup is required. The driver ships with Python; no install, no service to start.
+- The workload is read-heavy or has occasional writes. Reads scale well; concurrent writes do not.
+- A fast, throwaway database is needed for tests. The `:memory:` mode gives a fresh database in microseconds.
+
+It is the wrong tool when:
+
+- Multiple workers or servers need to write at the same time. SQLite serializes writes through one process and falls over if the file is shared across machines.
+- The database needs to live on a separate server from the app. SQLite reads and writes through the local filesystem.
+- PostgreSQL-style features like rich JSON operators, advanced full-text search, or extensive replication are required.
+
+The rule of thumb: if the data fits on one machine and one process reaches it, SQLite is fine. The moment a second process needs to write, switch to PostgreSQL or MySQL. The Python code from this lesson carries over with small changes, so the upgrade isn't expensive when needed.
+
+<h1 id="connecting-to-a-database">Connecting to a Database</h1>
+
+A SQLite connection is created with `sqlite3.connect(path)`. The path is the filename for an on-disk database; the string `":memory:"` makes a brand-new in-memory database that vanishes when the connection closes.
+
+```python
+import sqlite3
+
+conn = sqlite3.connect("shop.db")
+print(conn)
+conn.close()
+```
+
+If `shop.db` doesn't exist, SQLite creates an empty file in the current working directory. If it exists, the connection opens the existing database. Either way, the call returns a `Connection` object that holds the state of the session: the open transaction, the row factory, and a few configuration knobs covered later in this lesson.
+
+For tests and scratch work, the in-memory variant is the friendliest:
+
+```python
+import sqlite3
+
+conn = sqlite3.connect(":memory:")
+cur = conn.cursor()
+cur.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL)")
+cur.execute("INSERT INTO products VALUES (101, 'Wireless Mouse', 29.99)")
+conn.commit()
+
+cur.execute("SELECT * FROM products")
+print(cur.fetchall())
+
+conn.close()
+```
+
+Each `sqlite3.connect(":memory:")` call gives back a fresh, isolated database. Two `:memory:` connections inside the same process see two unrelated databases. That property makes `:memory:` ideal for tests: each test gets a clean slate, and there's no cleanup to do.
+
+A connection should be closed when no longer needed, either by calling `conn.close()` explicitly or by using it as a context manager. The context-manager form doesn't close the connection; it commits or rolls back the active transaction.
+
+`sqlite3.connect(path)` does not raise when the file is missing. It creates a new file. To open an existing database and fail when it isn't there, check `os.path.exists(path)` first or pass `f"file:{path}?mode=rw"` with `uri=True`.
+
+<h1 id="cursors-execute-and-fetch">Cursors: Execute and Fetch</h1>
+
+The connection itself doesn't run SQL. A cursor runs statements on its behalf. A cursor is a small object that tracks one statement at a time and the rows produced by it.
+
+```python
+import sqlite3
+
+conn = sqlite3.connect(":memory:")
+cur = conn.cursor()
+
+cur.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL)")
+cur.execute("INSERT INTO products VALUES (101, 'Wireless Mouse', 29.99)")
+cur.execute("INSERT INTO products VALUES (102, 'HDMI Cable', 9.99)")
+conn.commit()
+
+cur.execute("SELECT id, name, price FROM products ORDER BY id")
+for row in cur:
+    print(row)
+
+conn.close()
+```
+
+A few details to know about this pattern.
+
+First, `execute(sql, params=())` runs one SQL statement. The optional second argument is a tuple (or dict) of parameter values for any placeholders in the SQL. Parameter substitution is the safe, escaping-aware way to plug values in.
+
+Second, after a `SELECT`, the cursor itself becomes iterable. `for row in cur` walks the result set one row at a time. This is the memory-friendly way to read a large result, because the database hands rows over as needed instead of all at once.
+
+Third, the row is a tuple. The first item is the first column in the `SELECT`, the second is the second, and so on. Row factories allow `row["name"]` instead of `row[1]`.
+
+For one-off statements, `execute` can also be called directly on the connection. SQLite creates a cursor, runs the statement, and returns the cursor.
+
+```python
+import sqlite3
+
+conn = sqlite3.connect(":memory:")
+conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL)")
+conn.execute("INSERT INTO products VALUES (?, ?, ?)", (101, "Wireless Mouse", 29.99))
+conn.commit()
+
+result = conn.execute("SELECT name FROM products WHERE id = ?", (101,))
+print(result.fetchone())
+conn.close()
+```
+
+The connection-level `execute` is fine for short scripts. For anything longer, opening an explicit cursor keeps the code self-explanatory and allows reusing the same cursor for related statements.
+
+<h1 id="parameters-and-named-bindings">Parameters: ? and Named Bindings</h1>
+
+SQLite uses the `qmark` placeholder style. Every `?` in the SQL is filled in, in order, from the tuple passed as the second argument to `execute`.
+
+```python
+cur.execute(
+    "INSERT INTO products (id, name, price) VALUES (?, ?, ?)",
+    (103, "Mechanical Keyboard", 89.00),
+)
+```
+
+Three placeholders, three values, in the same order. A common error: a single-value tuple has to include the trailing comma, or Python parses the parentheses as a plain group, not a tuple.
+
+```python
+cur.execute("SELECT name FROM products WHERE id = ?", (101,))   # correct
+cur.execute("SELECT name FROM products WHERE id = ?", (101))    # wrong: this is just int 101 in parens
+```
+
+The second form raises `sqlite3.ProgrammingError: parameters are of unsupported type` because `(101)` is an integer, not a one-tuple. A list works fine for readability: `[101]`.
+
+SQLite also accepts named parameters with the `:name` syntax. The second argument becomes a dict.
+
+```python
+cur.execute(
+    "INSERT INTO products (id, name, price) VALUES (:id, :name, :price)",
+    {"id": 104, "name": "USB-C Hub", "price": 39.99},
+)
+```
+
+Named parameters get useful when the SQL has many placeholders or when the values come from a dict. Most code uses positional `?` for short queries and switches to `:name` when the query gets long.
+
+**Never** interpolate values into the SQL string with f-strings or `%`. That's how SQL injection bugs happen. The placeholder form sends values as data; the f-string form sends them as code.
+
+```python
+# wrong
+name = "Wireless Mouse'); DROP TABLE products;--"
+cur.execute(f"SELECT * FROM products WHERE name = '{name}'")
+
+# right
+cur.execute("SELECT * FROM products WHERE name = ?", (name,))
+```
+
+The wrong form is a classic SQL injection: the value contains SQL syntax that ends the string and runs an extra statement. The right form treats the entire value as a single string literal, and the database stores or compares it as one piece of data.
+
+<h1 id="bulk-inserts-with-executemany">Bulk Inserts with executemany</h1>
+
+Inserting one row at a time in a loop works, but every `execute` carries some overhead. With many rows to insert at once, `executemany(sql, rows)` is the better tool. It takes the same SQL once and a list of parameter tuples, and runs the statement once per tuple in one round trip to the engine.
+
+```python
+import sqlite3
+
+conn = sqlite3.connect(":memory:")
+cur = conn.cursor()
+cur.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL)")
+
+products = [
+    (101, "Wireless Mouse", 29.99),
+    (102, "HDMI Cable", 9.99),
+    (103, "Mechanical Keyboard", 89.00),
+    (104, "USB-C Hub", 39.99),
+]
+cur.executemany("INSERT INTO products VALUES (?, ?, ?)", products)
+conn.commit()
+
+cur.execute("SELECT COUNT(*) FROM products")
+print(cur.fetchone())
+conn.close()
+```
+
+`executemany` keeps the per-row overhead low and lets the engine batch the writes. The performance difference is small at four rows and noticeable at four thousand.
+
+Inserting 100,000 rows one at a time with `execute` in a loop can take many seconds because every call is its own statement preparation and commit. The same insert with `executemany` inside one transaction often finishes in under a second. The two big levers are (1) `executemany`, and (2) commit at the end, not after each row.
+
+`executemany` only works for statements that don't return rows (`INSERT`, `UPDATE`, `DELETE`, `REPLACE`). It can't be used to bulk-`SELECT`.
+
+<h1 id="fetching-results-fetchone-fetchall-fetchmany">
+  Fetching Results: fetchone, fetchall, fetchmany
+</h1>
+
+After executing a `SELECT`, the cursor holds a pointer into the result set. Rows are read from it with one of three methods.
+
+`fetchone()` returns the next row (or `None` when the result is exhausted). Use it when the query is expected to return at most one row, or when walking results one at a time.
+
+```python
+cur.execute("SELECT name, price FROM products WHERE id = ?", (101,))
+row = cur.fetchone()
+print(row)
+```
+
+`fetchall()` returns every remaining row as a list. It's convenient for small result sets but loads everything into memory at once.
+
+```python
+cur.execute("SELECT id, name FROM products ORDER BY id")
+rows = cur.fetchall()
+print(rows)
+```
+
+`fetchmany(size)` returns up to `size` rows at a time. It strikes a balance between the two: rows arrive in chunks, holding only one batch in memory at a time. Useful when the result is too big for `fetchall` but fewer round trips than `fetchone` are desired.
+
+```python
+cur.execute("SELECT id, name FROM products ORDER BY id")
+while True:
+    batch = cur.fetchmany(2)
+    if not batch:
+        break
+    print(batch)
+```
+
+The cursor itself is also iterable, as shown earlier. Iterating the cursor reads one row at a time and is functionally equivalent to a `fetchone` loop. For large result sets, iterating (or `fetchmany`) fits best. For small result sets, `fetchall` is fine and easier to read.
+
+`fetchall()` on a million-row result will pull every row into a Python list before the code sees the first one. That's the worst memory case. Switching to iteration (`for row in cur`) or `fetchmany(1000)` keeps memory roughly constant.
+
+| Method            | Returns                    | Use When                                                    |
+| ----------------- | -------------------------- | ----------------------------------------------------------- |
+| `fetchone()`      | One row, or `None`         | The query returns at most one row, or row-by-row processing |
+| `fetchmany(size)` | List of up to `size` rows  | The result is large; read in chunks                         |
+| `fetchall()`      | List of all remaining rows | The result is small enough to fit in memory comfortably     |
+| `for row in cur`  | Iterator over rows         | Same as `fetchmany(1)` with idiomatic syntax                |
+
+<h1 id="row-factories-from-tuples-to-dict-like-rows">
+  Row Factories: From Tuples to Dict-Like Rows
+</h1>
+
+By default, each row is a tuple. That's compact, but indexing by position (`row[1]` for the name) reads worse than indexing by column (`row["name"]`). The `Connection.row_factory` attribute controls how each row is returned, and `sqlite3.Row` is a built-in factory that allows column access by name or by position.
+
+<CommentsSection />
+
+</LessonCard>

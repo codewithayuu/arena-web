@@ -1,0 +1,255 @@
+---
+title: "Consensus Algorithms Overview"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Consensus Algorithms explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+Termination is a **liveness** guarantee. In plain English, it says, "eventually do something."
+
+The FLP result explains why consensus is hard.
+
+In a fully asynchronous network, no consensus algorithm that follows fixed rules can guarantee progress if even one node may crash.
+
+That sounds abstract, so make it concrete.
+
+**Asynchronous** means there is no known limit on how long a message can take or how long a node can pause. A silent node might be crashed. It might also just be slow. From the outside, those two cases can look identical.
+
+That leaves the algorithm with a painful choice:
+
+- Wait for the silent node, and risk waiting forever if it crashed.
+- Stop waiting, and risk making a decision without a node that was only slow.
+
+FLP proves there is no perfect fixed-rule escape from that dilemma in the pure asynchronous model.
+
+Production systems handle this by making practical assumptions:
+
+- A majority of voting nodes eventually becomes reachable.
+- Message delays eventually become reasonable again.
+- Clocks are used for timeouts and retries, not for deciding important facts.
+- Nodes save enough state to recover after restarts.
+
+Under those assumptions, protocols such as Paxos and Raft avoid wrong decisions during failures and make progress again when the system stabilizes.
+
+That distinction matters. A healthy consensus system may stop accepting writes during a bad network partition. What it must never do is commit two conflicting histories.
+
+<h1 id="2-the-common-pattern">2. The Common Pattern</h1>
+
+Consensus systems that handle crashes tend to use the same building blocks.
+
+- A **quorum** is the minimum number of votes needed to make a decision, usually a majority.
+- An **epoch** or **term** is a leadership generation. It helps nodes reject old messages.
+- A **leader** or **primary** orders writes through one node during normal operation.
+- A **replicated log** stores the agreed sequence of commands.
+- **Durable state** means each node saves votes and log entries to disk so it can remember them after a crash.
+
+Consensus relies on a simple majority trick: any two majorities overlap.
+
+In a five-node cluster, any majority has at least one node in common with any other majority. That shared node carries information from old decisions into new ones.
+
+This is why consensus clusters usually use an odd number of voting nodes. Three voters tolerate one failure. Five tolerate two.
+
+Four voters still require three votes for a majority. That means four voters tolerate only one failure, the same as three voters. But now any two failures break the cluster, and every write needs one more confirmation. The fourth voter raises cost without improving fault tolerance.
+
+<h1 id="3-paxos">3. Paxos</h1>
+
+Paxos is the classic consensus algorithm. Leslie Lamport introduced it in the late 1980s, and many later distributed systems borrowed ideas from it.
+
+Basic Paxos chooses one value. It explains the work using three roles:
+
+- A **proposer** suggests a value and drives the process.
+- **Acceptors** vote on proposals and remember their promises.
+- **Learners** find out which value was chosen.
+
+In real systems, one server often plays all three roles. The separate names are mostly there to make the algorithm easier to explain.
+
+Paxos has two phases:
+
+1. **Prepare / Promise:** A proposer asks acceptors to ignore older proposal numbers. Acceptors also report any value they have already accepted.
+2. **Accept / Accepted:** The proposer asks acceptors to accept a value. If it learned about an older accepted value, it must carry that value forward.
+
+That second rule is what keeps Paxos safe. A new proposer cannot casually overwrite a value that may already have been chosen by a majority.
+
+Paxos is proven, but it leaves many engineering details to the implementation.
+
+Basic Paxos chooses one value. Real systems need a sequence of values, such as entries in a log. Multi-Paxos handles that by using a stable leader and running Paxos over log positions. Once the leader is established, normal writes can skip much of the prepare work.
+
+**Where it shows up:** Google Chubby and Spanner use Paxos-style algorithms. Many systems also use Paxos variants internally, often with their own optimizations.
+
+**Main trade-off:** Paxos is deeply studied and proven, but it is hard to explain, hard to implement, and easy to get wrong in ways that are hard to notice.
+
+<h1 id="4-raft">4. Raft</h1>
+
+Raft was designed to provide the same kind of replicated-log consensus as Multi-Paxos, but with a clearer structure.
+
+It separates the problem into three parts:
+
+- **Leader election:** choose one leader for a term.
+- **Log replication:** have the leader append entries and copy them to followers.
+- **Safety:** prevent a node with an incomplete log from becoming leader.
+
+Every Raft node is a follower, candidate, or leader. Time is divided into terms. A term is like a leadership generation.
+
+If a node sees a higher term, it steps down. This prevents old leaders from continuing to act as if they are still in charge.
+
+During normal operation:
+
+1. The client sends a write to the leader.
+2. The leader appends the command to its log.
+3. The leader sends the entry to followers.
+4. Once a majority stores the entry, the leader commits it.
+5. Followers apply committed entries in log order.
+
+A few Raft concepts show up throughout the algorithm:
+
+- A **term** is a leadership generation.
+- The **leader** puts writes in order.
+- The **commit index** marks the highest log entry known to be committed.
+- The **log matching** rule says replicas with the same index and term agree on all earlier entries.
+- A **randomized election timeout** reduces repeated split votes.
+
+Raft is popular because the full protocol is easier to teach, test, and operate than Paxos. Production Raft still has hard parts: disk writes, snapshots, membership changes, slow followers, timeout tuning, and client retries.
+
+**Where it shows up:** etcd, Consul, CockroachDB, TiKV, YugabyteDB, RabbitMQ quorum queues, and Kafka's KRaft metadata quorum all use Raft or Raft-inspired replication.
+
+**Main trade-off:** Raft is usually the best choice when you need to understand or implement consensus. Even then, prefer a mature library or service over writing your own protocol.
+
+<h1 id="5-viewstamped-replication">5. Viewstamped Replication</h1>
+
+Viewstamped Replication (VR), introduced by Oki and Liskov in 1988 and later revised, is another leader-based protocol for keeping replicas in the same order.
+
+VR uses different names for familiar ideas:
+
+- A **view** is similar to a Raft term.
+- The **primary** is the leader.
+- **Backups** are followers.
+- A **view change** is a leader election.
+- An **operation number** is a log index.
+
+During normal operation, the primary orders client requests and copies them to backups. A request commits after a quorum confirms it. If the primary fails, replicas run a view change to select a new primary and preserve committed operations.
+
+VR matters because it shows that many consensus ideas are not unique to Paxos or Raft. Quorums, epochs, leaders, and replicated logs appear again and again because they solve the same failure cases.
+
+**Where it shows up:** VR is mainly historical and academic, but its ideas influenced later protocols, including Raft.
+
+<h1 id="6-zab">6. ZAB</h1>
+
+ZAB, the ZooKeeper Atomic Broadcast protocol, is the algorithm behind Apache ZooKeeper.
+
+ZooKeeper is a coordination service. It stores small amounts of critical metadata and provides building blocks for leader election, service discovery, configuration, and locks.
+
+ZAB is usually described as atomic broadcast rather than plain single-value consensus. In simple terms, it makes sure ZooKeeper replicas apply state changes in the same order.
+
+Key ideas:
+
+- Writes go through the ZooKeeper leader.
+- Each transaction gets a `zxid`, built from an epoch and a counter.
+- Followers confirm proposals.
+- A transaction commits after a quorum confirms it.
+- During leader recovery, followers catch up before normal writes resume.
+
+ZooKeeper nodes play one of three roles. The **leader** orders writes and proposes transactions. **Followers** vote, store state, and can serve reads. **Observers** are non-voting replicas used to scale reads.
+
+Observers are useful because adding voting members makes each decision more expensive. A five-voter cluster needs three confirmations. A seven-voter cluster needs four. Observers receive updates without changing the voting quorum.
+
+**Where it shows up:** ZooKeeper is still used in parts of the Hadoop ecosystem, HBase, and systems built around ZooKeeper's coordination building blocks. Kafka removed ZooKeeper mode entirely in Kafka 4.0, so current Kafka clusters use KRaft, a Raft-based metadata quorum, instead.
+
+**Main trade-off:** ZooKeeper gives mature coordination tools, but operating it well still requires care around quorum sizing, session timeouts, disk latency, and client behavior.
+
+<h1 id="7-byzantine-fault-tolerance">7. Byzantine Fault Tolerance</h1>
+
+Paxos, Raft, VR, and ZAB assume **crash faults**. A node may stop, restart, or miss messages, but it does not lie.
+
+Byzantine fault-tolerant algorithms handle a harsher world. A Byzantine node can behave in any bad way:
+
+- Send different messages to different peers.
+- Claim false state.
+- Sign conflicting votes if the algorithm allows it.
+- Try to make honest nodes disagree.
+
+This matters when the participants do not fully trust each other, such as public blockchains or some permissioned systems run by multiple organizations.
+
+BFT costs more because the algorithm must outvote bad behavior, not just tolerate silence.
+
+| Failure Model                 | Nodes Needed to Tolerate f Faults | Typical Use                                   |
+| ----------------------------- | --------------------------------- | --------------------------------------------- |
+| **Crash fault tolerance**     | `2f + 1`                          | Internal databases and coordination services  |
+| **Byzantine fault tolerance** | `3f + 1`                          | Blockchains and untrusted multi-party systems |
+
+The extra nodes are needed because Byzantine nodes can lie.
+
+With crash faults, a failed node is silent. It does not help, but it also does not send a wrong answer. That is why `2f + 1` nodes are enough to tolerate `f` crashes.
+
+With Byzantine faults, the algorithm has to survive two problems at the same time:
+
+- Some nodes may not respond.
+- Some nodes may respond with lies.
+
+So the system needs enough honest replies to outnumber the bad ones. That is why Byzantine fault tolerance typically needs `3f + 1` nodes to tolerate `f` bad nodes.
+
+Another way to think about it: any two large voting groups must overlap in at least one honest node. That honest overlap prevents two conflicting decisions from both looking valid.
+
+PBFT is the classic practical BFT protocol. Tendermint brought BFT consensus into proof-of-stake blockchain systems. HotStuff simplified parts of BFT consensus and influenced later blockchain designs.
+
+Company-owned infrastructure rarely needs BFT. If you control the nodes and the operators, crash-fault-tolerant consensus is usually the right model. Use authentication, authorization, auditing, and isolation to reduce the chance of compromised nodes instead of paying the BFT cost on every decision.
+
+<h1 id="8-choosing-an-approach">8. Choosing an Approach</h1>
+
+Start by asking whether an existing system can handle the consensus problem for you.
+
+In production, prefer a proven component:
+
+| Need                                         | Practical Choice                                     |
+| -------------------------------------------- | ---------------------------------------------------- |
+| Kubernetes cluster data                      | etcd                                                 |
+| Service discovery and key-value coordination | Consul or etcd                                       |
+| ZooKeeper-style coordination building blocks | ZooKeeper                                            |
+| Strongly consistent distributed SQL          | A database that already embeds Raft or Paxos         |
+| Ordered replicated cluster data inside Kafka | KRaft (the only metadata mode from Kafka 4.0 onward) |
+| Untrusted validators                         | A mature BFT or blockchain framework                 |
+
+If you are building a new internal replicated service and truly need embedded consensus, Raft is usually the best starting point. It has clear documentation, good test material, and many production implementations to learn from.
+
+Paxos is useful background, especially when reading papers or older systems. For a fresh implementation, Paxos usually gives you more freedom than you want. In consensus, unclear choices often become bugs.
+
+Use consensus for small, critical decisions. Do not route every user request through one global consensus group unless the business rule truly demands it. High-scale systems usually shard data and run many independent consensus groups.
+
+The cheapest consensus is often the consensus you do not write yourself.
+
+<h1 id="9-performance-and-scaling">9. Performance and Scaling</h1>
+
+Consensus adds latency because a write must reach a quorum before it commits.
+
+In one datacenter, this may only add a few milliseconds. Across regions, physics dominates. A leader in one region waiting for votes from another region pays cross-region round-trip time.
+
+How many writes the group can handle is usually limited by:
+
+- Leader CPU
+- Disk sync latency
+- Network bandwidth
+- Follower lag
+- Size and frequency of log entries
+
+Consensus usually scales by splitting work across many independent groups.
+
+Inside one group, **batching** commits many operations per network round trip. **Pipelining** keeps multiple replication requests in flight instead of waiting for one to finish before sending the next.
+
+**Snapshots** replace old log entries with a smaller saved state and speed up recovery. **Non-voting replicas** scale reads without increasing quorum size. To scale beyond what one group can do, **sharding** or **multi-Raft** spreads data across many independent consensus groups.
+
+This is why systems such as CockroachDB and TiKV use many Raft groups instead of one global group. Each shard has strong consistency locally, while the whole cluster scales by spreading shards across machines.
+
+<h1 id="summary">Summary</h1>
+
+Consensus is the machinery behind strongly consistent distributed systems. It lets nodes agree on leaders, log entries, transactions, and critical cluster data despite crashes and network delays.
+
+The key safety rule is simple: healthy nodes must not decide conflicting values. Progress depends on practical assumptions, such as having a reachable majority and eventually reasonable network delays.
+
+Paxos is important background but difficult to implement correctly. Raft packages the same core ideas into a clearer replicated-log algorithm. VR and ZAB use similar leader, epoch, quorum, and log patterns. BFT algorithms handle malicious or unpredictable behavior at higher cost.
+
+In practice, use a mature consensus implementation rather than writing one. Apply consensus where it protects critical state, not where it becomes a bottleneck on every request.
+
+<CommentsSection />
+
+</LessonCard>

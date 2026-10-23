@@ -1,0 +1,417 @@
+---
+title: "NIO Package"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "NIO Package explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="why-nio-exists">Why NIO Exists</h1>
+
+The `java.io` API you've used so far is **stream-oriented**. A `FileInputStream` produces bytes one at a time, a `BufferedReader` produces characters one at a time, and the calling thread is parked inside the read until the kernel has data to hand back. For a single file on local disk that's fine. The model starts to bend in three places:
+
+- **Bulk transfers.** Copying a 2 GB log file byte-by-byte through a Java `InputStream` is slow, even with a buffered wrapper, because each `read()` crosses the boundary between Java code and a native call. NIO can ask the OS to move a block of bytes straight from one channel to another, with no per-byte loop in Java.
+- **One thread per connection.** A traditional socket server uses one thread per client because every `socket.read()` blocks. A hundred idle clients means a hundred parked threads, each holding a 1 MB stack. NIO lets a single thread watch many channels with a `Selector` and only do work on the ones that are ready.
+- **Random access on files.** `FileInputStream` reads forward. To jump to byte 8192, you have to read and discard the first 8191 bytes (or use the awkward `RandomAccessFile` class). A `FileChannel` exposes a position you can set, plus memory-mapped views of regions of a file.
+
+The release history matters because the docs still split along these lines:
+
+| Release         | What was added                                                                                           |
+| --------------- | -------------------------------------------------------------------------------------------------------- |
+| Java 1.4 (2002) | Original NIO: `Buffer`, `Channel`, `Selector`, `FileChannel`, `SocketChannel`, charset encoders/decoders |
+| Java 7 (2011)   | NIO.2: `Path`, `Paths`, `Files`, `WatchService`, `AsynchronousFileChannel`, file attribute APIs          |
+| Java 11+        | Convenience methods on `Files` and `Path`, small additions like `Files.readString`                       |
+
+People still casually say "NIO" for the 1.4 stuff and "NIO.2" for the Java 7 additions. The two live in the same `java.nio.*` package family and mix freely in code.
+
+"NIO is faster than `java.io`" is folklore. For small files, `Files.readAllBytes(path)` and a wrapped `FileInputStream` perform within noise of each other. NIO wins clearly on large bulk transfers, on memory-mapped files, and on servers that hold many idle connections. Use it because of the model, not because of a generic speed promise.
+
+The high-level picture below contrasts the two APIs.
+
+The diagram is rough but captures the shift. With `java.io`, the app talks to a one-way stream, which pulls or pushes one byte at a time. With `java.nio`, the app fills (or drains) a buffer, then hands the whole buffer to a channel, which is a two-way pipe to the file or socket.
+
+<h1 id="the-three-core-abstractions">The Three Core Abstractions</h1>
+
+NIO is built around three concepts. Two of them (channels and buffers) you'll use every time you touch the API. The third (selectors) is for non-blocking network servers, not file I/O.
+
+| Abstraction  | What it is                                                                      | Where you'll meet it                          |
+| ------------ | ------------------------------------------------------------------------------- | --------------------------------------------- |
+| **Channel**  | A two-way connection to a file, socket, pipe, or other I/O source               | `FileChannel`, `SocketChannel`, etc.          |
+| **Buffer**   | A fixed-size container of primitives that channels read into and write out of   | `ByteBuffer`, `CharBuffer`, `IntBuffer`, etc. |
+| **Selector** | An object that watches many non-blocking channels and tells you which are ready | `Selector` with `SelectableChannel`           |
+
+The channel-buffer-process triangle is the one mental model to keep in mind. A channel never reads "from a file into nothing"; it always reads into a buffer. A channel never writes "out of nothing"; it always writes from a buffer. Your code is the third corner. It either prepares data in a buffer and asks the channel to drain it, or it asks the channel to fill a buffer and then reads from it.
+
+The three arrows tell the whole story. Your code interacts with the buffer using `put` and `get`. The buffer interacts with the channel through the channel's `read(buffer)` and `write(buffer)` methods. The channel interacts with the operating system through native calls. Streams collapsed the middle two arrows into one; NIO splits them on purpose so the buffer can be reused, shared, or memory-mapped.
+
+Selectors aren't part of file I/O at all. A `Selector` lets one thread block on many network channels at once and wake up when any of them has bytes ready. That's the foundation of high-concurrency servers (Netty, async HTTP libraries, the JDK's own HTTP/2 client). File channels are always blocking on regular files, so selectors don't apply there. Selectors are mentioned here only so the picture is complete.
+
+<h1 id="channels-two-way-pipes">Channels: Two-Way Pipes</h1>
+
+A `Channel` is the NIO replacement for an `InputStream` or `OutputStream`. The differences:
+
+- A channel can be **read from and written to** through the same object (when the underlying resource supports it). `InputStream` and `OutputStream` are separate, one-way types.
+- A channel transfers data in **chunks via a `ByteBuffer`**. There is no "read one byte" method.
+- A channel can be **non-blocking** (for sockets) or run **asynchronously** (for files), in addition to the default blocking mode.
+
+The five channel types in the JDK cover most needs:
+
+| Channel                   | Backed by               | Direction                      | Selectable for non-blocking?   |
+| ------------------------- | ----------------------- | ------------------------------ | ------------------------------ |
+| `FileChannel`             | A file                  | Read and write                 | No (files are always blocking) |
+| `SocketChannel`           | A TCP client connection | Read and write                 | Yes                            |
+| `ServerSocketChannel`     | A TCP listening port    | Accept                         | Yes                            |
+| `DatagramChannel`         | A UDP socket            | Read and write                 | Yes                            |
+| `AsynchronousFileChannel` | A file (Java 7+)        | Read and write, callback-style | N/A (uses completion handlers) |
+
+Channels are usually created via a static factory or by opening another resource:
+
+```java
+import java.io.IOException;
+import java.nio.channels.FileChannel;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+public class OpenAFileChannel {
+    public static void main(String[] args) throws IOException {
+        Path orderLog = Path.of("orders.log");
+
+        try (FileChannel channel = FileChannel.open(orderLog,
+                                                    StandardOpenOption.CREATE,
+                                                    StandardOpenOption.WRITE)) {
+            System.out.println("Channel open. Size = " + channel.size());
+        }
+    }
+}
+```
+
+`FileChannel.open` returns an open channel that the try-with-resources block will close. The `StandardOpenOption` values control whether the file is created, truncated, opened for read or write, and so on. Here we're only noting that a channel exists and that you open one before doing anything with NIO file I/O.
+
+`SocketChannel` and friends are the network side of the same model. A `SocketChannel.read(buffer)` fills a buffer from a TCP connection. The Networking section covers them in detail.
+
+<h1 id="buffers-where-data-actually-sits">Buffers: Where Data Actually Sits</h1>
+
+A `Buffer` is a fixed-size container of one primitive type. Channels do not read into "memory" abstractly; they read into a specific buffer that you allocated and handed to them.
+
+The buffer hierarchy mirrors the primitive types:
+
+| Type           | Holds    | Common use                                     |
+| -------------- | -------- | ---------------------------------------------- |
+| `ByteBuffer`   | `byte`   | Almost always. Everything underneath is bytes. |
+| `CharBuffer`   | `char`   | Decoded text, paired with a `CharsetDecoder`.  |
+| `ShortBuffer`  | `short`  | Binary protocols with 16-bit fields.           |
+| `IntBuffer`    | `int`    | Binary protocols, image pixel data.            |
+| `LongBuffer`   | `long`   | Binary protocols with 64-bit fields.           |
+| `FloatBuffer`  | `float`  | Graphics, scientific data.                     |
+| `DoubleBuffer` | `double` | Scientific data.                               |
+
+`ByteBuffer` is the workhorse. You usually allocate a `ByteBuffer`, hand it to a channel, and then either interpret the bytes yourself or call `asCharBuffer()` / `asIntBuffer()` to view the same memory as another type.
+
+```java
+import java.nio.ByteBuffer;
+
+public class FirstBuffer {
+    public static void main(String[] args) {
+        ByteBuffer buffer = ByteBuffer.allocate(64);
+
+        System.out.println("Capacity: " + buffer.capacity());
+        System.out.println("Position: " + buffer.position());
+        System.out.println("Limit:    " + buffer.limit());
+    }
+}
+```
+
+`ByteBuffer.allocate(64)` reserves 64 bytes on the Java heap. The buffer starts empty (position 0) with its limit equal to capacity, meaning "the whole thing is writeable".
+
+<h1 id="position-limit-capacity-and-mark">
+  Position, Limit, Capacity, and Mark
+</h1>
+
+Every buffer carries four integers that describe its state. Getting the model right makes the rest of NIO obvious; getting it wrong is the most common source of NIO bugs.
+
+| Field      | Meaning                                                                        |
+| ---------- | ------------------------------------------------------------------------------ |
+| `capacity` | Total number of elements the buffer holds. Fixed at allocation. Never changes. |
+| `limit`    | The first index that should **not** be read or written. Always `<= capacity`.  |
+| `position` | The next index that **will** be read or written. Always `<= limit`.            |
+| `mark`     | A remembered position you can return to with `reset()`. Starts undefined.      |
+
+The invariant the JDK enforces is `0 <= mark <= position <= limit <= capacity`. Every operation that bumps the position checks against the limit, and any violation throws `BufferOverflowException` (on writes) or `BufferUnderflowException` (on reads).
+
+The visual model is a tape with a write head:
+
+The green cells (indexes 0 to 2) have been written. Position points at index 3, the next slot the buffer will write into. Limit is 8, so writes can continue through index 7. After three `put` calls, the state is exactly this.
+
+One operation is central to using buffers: `flip()`. The idea is that a buffer has two modes: **write mode** (you're putting data in) and **read mode** (you're getting data out). The same buffer is used for both, and `flip()` is what switches gears.
+
+Before `flip()`, write mode:
+
+- `position` = how much you've written
+- `limit` = capacity (you could keep writing until the end)
+
+After `flip()`, read mode:
+
+- `limit` = old position (only read up to where you stopped writing)
+- `position` = 0 (start reading from the beginning)
+
+In write mode, the buffer holds five bytes of data and three empty slots; position is 5, limit is 8. In read mode after `flip()`, position is rewound to 0 and limit is pulled in to 5. Now `get()` calls read the five data bytes and stop. Without `flip()`, a read would walk into the uninitialized bytes 5, 6, 7.
+
+The full life cycle of a buffer usually looks like this:
+
+```java
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+
+public class BufferLifecycle {
+    public static void main(String[] args) {
+        ByteBuffer buffer = ByteBuffer.allocate(16);
+        System.out.println("After allocate: pos=" + buffer.position()
+                           + ", lim=" + buffer.limit()
+                           + ", cap=" + buffer.capacity());
+
+        // 1. PUT: write five bytes into the buffer
+        buffer.put("Hello".getBytes(StandardCharsets.UTF_8));
+        System.out.println("After put:      pos=" + buffer.position()
+                           + ", lim=" + buffer.limit());
+
+        // 2. FLIP: switch from write mode to read mode
+        buffer.flip();
+        System.out.println("After flip:     pos=" + buffer.position()
+                           + ", lim=" + buffer.limit());
+
+        // 3. GET: read each byte back
+        StringBuilder out = new StringBuilder();
+        while (buffer.hasRemaining()) {
+            out.append((char) buffer.get());
+        }
+        System.out.println("Read back: " + out);
+        System.out.println("After get:      pos=" + buffer.position()
+                           + ", lim=" + buffer.limit());
+
+        // 4. CLEAR: back to write mode, ready to reuse
+        buffer.clear();
+        System.out.println("After clear:    pos=" + buffer.position()
+                           + ", lim=" + buffer.limit());
+    }
+}
+```
+
+That trace is the canonical buffer lifecycle. `allocate` sets up an empty 16-byte buffer in write mode. `put("Hello".getBytes(...))` writes five bytes, pushing position to 5. `flip()` swings the limit down to 5 and rewinds position to 0. The `while (hasRemaining())` loop reads until position catches up to limit. `clear()` resets to write mode for reuse.
+
+A note on terminology: `clear()` does **not** zero out the data. It only resets the three integers. The bytes "Hello" are still physically in the buffer; the next `put` will overwrite them. If you actually need zeros, you have to write them yourself or allocate a fresh buffer.
+
+A few related methods round out the API:
+
+| Method           | What it does                                                                                      |
+| ---------------- | ------------------------------------------------------------------------------------------------- |
+| `flip()`         | Switch from write mode to read mode. `limit = position; position = 0`.                            |
+| `clear()`        | Switch from read mode to write mode, throwing away unread data. `position = 0; limit = capacity`. |
+| `rewind()`       | Re-read from the beginning. `position = 0`, limit unchanged.                                      |
+| `compact()`      | Like `clear()`, but copies unread data to the front first. Useful when a read was partial.        |
+| `mark()`         | Save the current position into `mark`.                                                            |
+| `reset()`        | Set `position = mark`. Throws if mark is undefined.                                               |
+| `hasRemaining()` | `true` if `position < limit`.                                                                     |
+| `remaining()`    | `limit - position`.                                                                               |
+
+Each `put` and `get` is O(1) and does no allocation. The allocation happens once at `allocate(capacity)`. The buffer is a fixed-size piece of memory; resizing means creating a new, larger buffer and copying.
+
+<h1 id="direct-vs-heap-buffers">Direct vs Heap Buffers</h1>
+
+When you call `ByteBuffer.allocate(n)`, the buffer's backing memory is a regular Java `byte[]` on the heap. Garbage collection moves it around, and the JVM owns it. When you call `ByteBuffer.allocateDirect(n)`, the JVM allocates a region of memory **outside** the Java heap and gives the buffer a pointer to it. That memory is not subject to GC and can be passed straight to the OS without an intermediate copy.
+
+| Property        | Heap buffer (`allocate`)                                    | Direct buffer (`allocateDirect`)              |
+| --------------- | ----------------------------------------------------------- | --------------------------------------------- |
+| Backing memory  | Java `byte[]` on the heap                                   | Native memory, outside the heap               |
+| GC moves it?    | Yes                                                         | No                                            |
+| Allocation cost | Cheap                                                       | Higher (system call to reserve native memory) |
+| Per-byte access | Fast                                                        | Similar, sometimes slightly slower            |
+| I/O cost        | Java may copy to a native staging buffer before the syscall | OS reads/writes the buffer directly           |
+| Best for        | Short-lived, small buffers                                  | Long-lived buffers used for many transfers    |
+
+The reason direct buffers exist is that operating system I/O calls cannot safely target heap memory. The garbage collector might relocate the array mid-syscall. So when you ask a `FileChannel` to read into a heap-backed `ByteBuffer`, the JVM may first copy the data into an internal direct buffer and then copy out to your heap buffer. A direct buffer skips that intermediate copy.
+
+```java
+import java.nio.ByteBuffer;
+
+public class HeapVsDirect {
+    public static void main(String[] args) {
+        ByteBuffer heap = ByteBuffer.allocate(1024);
+        ByteBuffer direct = ByteBuffer.allocateDirect(1024);
+
+        System.out.println("heap.isDirect()   = " + heap.isDirect());
+        System.out.println("direct.isDirect() = " + direct.isDirect());
+
+        System.out.println("heap.hasArray()   = " + heap.hasArray());
+        System.out.println("direct.hasArray() = " + direct.hasArray());
+    }
+}
+```
+
+The heap buffer has a backing `byte[]` you can get at via `array()`. The direct buffer doesn't; the memory is off-heap and there's no Java array view of it.
+
+Direct buffers are expensive to allocate, so allocating one per request is wasteful. The recommended pattern is to pool them: allocate a few large ones at startup and reuse them across many channel operations. Heap buffers are fine to create and throw away; direct buffers should be treated like file handles.
+
+A guideline: allocate direct buffers when you'll use the same buffer for many large I/O operations (a server's read buffer, a log-writer's chunk buffer). Allocate heap buffers when the data is small, the buffer is short-lived, or you need a `byte[]` view to interop with other Java APIs.
+
+<h1 id="charsets-and-the-byteschars-boundary">
+  Charsets and the Bytes/Chars Boundary
+</h1>
+
+NIO buffers are typed (`ByteBuffer`, `CharBuffer`, etc.), so the bytes-to-chars conversion that used to be hidden inside `InputStreamReader` is explicit. The `java.nio.charset` package provides `Charset`, `CharsetEncoder`, and `CharsetDecoder` for that conversion.
+
+```java
+import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+
+public class CharsetExample {
+    public static void main(String[] args) {
+        Charset utf8 = StandardCharsets.UTF_8;
+
+        // Encode: chars -> bytes
+        ByteBuffer bytes = utf8.encode("Hello cart");
+        System.out.println("Encoded byte count: " + bytes.remaining());
+
+        // Decode: bytes -> chars
+        CharBuffer chars = utf8.decode(bytes);
+        System.out.println("Decoded: " + chars);
+    }
+}
+```
+
+`StandardCharsets.UTF_8` is a constant for the most common encoding. `encode` takes a `CharSequence` and returns a `ByteBuffer` already flipped into read mode. `decode` takes a `ByteBuffer` in read mode and returns a `CharBuffer`. For one-shot conversions, those two methods are all you need; for streaming conversions (decode as bytes arrive from a network), use `newDecoder()` / `newEncoder()` and feed them chunks.
+
+When you read bytes from a channel and want a string, you go through a charset. There's no equivalent of `Reader` in the channel API. You read into a `ByteBuffer`, flip it, and decode it to a `CharBuffer` or a `String`. `Files.readString(path)` hides this for you in the everyday case; the explicit path is what's happening underneath.
+
+<h1 id="blocking-vs-non-blocking-io-conceptual">
+  Blocking vs Non-Blocking I/O (Conceptual)
+</h1>
+
+By default, channels block just like streams do. A `FileChannel.read(buffer)` parks the thread until bytes are available, exactly like `FileInputStream.read()`. The difference is that **socket-like channels** can be switched into a non-blocking mode where `read` returns immediately with whatever bytes are ready (possibly zero), instead of waiting.
+
+| Mode         | `read()` behavior                                                           | Where it applies                                       |
+| ------------ | --------------------------------------------------------------------------- | ------------------------------------------------------ |
+| Blocking     | Waits until at least one byte is available                                  | All channels by default                                |
+| Non-blocking | Returns immediately; result is bytes read so far, possibly 0                | Socket-like channels only                              |
+| Asynchronous | Returns immediately; you receive a `Future` or a callback when it completes | `AsynchronousFileChannel`, `AsynchronousSocketChannel` |
+
+Non-blocking I/O is what makes high-concurrency servers possible. One thread can register many sockets with a `Selector`, call `selector.select()`, and be woken up only when one of them has data. That replaces the one-thread-per-connection model with one thread per **CPU core** for tens of thousands of connections.
+
+`FileChannel` itself can't be set to non-blocking on a regular file (the OS doesn't expose that knob), but `AsynchronousFileChannel` provides the equivalent for files via callbacks. A price feed that streams updates into a file could use `AsynchronousFileChannel.write(buffer, position, attachment, handler)` and let the callback fire when the write completes, while the calling thread moves on.
+
+The takeaway is that NIO **enables** non-blocking and async models; it doesn't force you into them. For ordinary file I/O on local disk, blocking channels are the right default and behave very much like streams.
+
+<h1 id="nio2-what-java-7-added">NIO.2: What Java 7 Added</h1>
+
+Java 7 layered a second wave of APIs on top of the original NIO. The most common pieces:
+
+| Type / Method             | What it does                                                             |
+| ------------------------- | ------------------------------------------------------------------------ |
+| `Path`                    | An abstract file or directory path. Replaces `File` for new code.        |
+| `Paths` / `Path.of`       | Factories that build a `Path` from a string                              |
+| `Files`                   | Utility class with `readString`, `write`, `copy`, `delete`, `walk`, etc. |
+| `WatchService`            | Lets you subscribe to filesystem events (create, modify, delete)         |
+| `AsynchronousFileChannel` | File channel that reads and writes via callbacks or `Future`             |
+| `FileSystem`              | Pluggable filesystem abstraction (zip files appear as a filesystem)      |
+| File attribute views      | Typed access to permissions, owner, timestamps                           |
+
+The shift NIO.2 introduced is that you rarely need to drop down to channels and buffers for everyday file work. A method like `Files.readString(Path)` reads a small text file in one line, internally using a channel and a buffer. That's the API for most everyday work. Channels remain there for the cases where you need streaming reads, memory mapping, or precise control over how data moves.
+
+A preview of what the NIO.2 side looks like:
+
+```java
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public class Nio2Teaser {
+    public static void main(String[] args) throws IOException {
+        Path file = Path.of("welcome.txt");
+
+        Files.writeString(file, "Welcome to AlgoStore!\n");
+
+        String contents = Files.readString(file);
+        System.out.print(contents);
+
+        long size = Files.size(file);
+        System.out.println("File size: " + size + " bytes");
+    }
+}
+```
+
+No channel, no buffer, no flip. The `Files` class wraps both for you. That's the everyday face of NIO.
+
+<h1 id="when-to-choose-javaio-vs-javanio">
+  When to Choose java.io vs java.nio
+</h1>
+
+A rough decision table to consider. None of these are absolute, but they capture how teams pick.
+
+| Situation                                          | Pick                                                            | Why                                              |
+| -------------------------------------------------- | --------------------------------------------------------------- | ------------------------------------------------ |
+| Read or write a small text or binary file          | `Files.readString` / `Files.write`                              | One line, no boilerplate                         |
+| Walk a directory tree                              | `Files.walk` (NIO.2)                                            | Lazy stream, follows symlinks if asked           |
+| Watch a directory for changes                      | `WatchService` (NIO.2)                                          | OS-level events instead of polling               |
+| Read a multi-GB file sequentially                  | Either, often `Files.lines` or a `BufferedReader` over a stream | Both work; pick what reads cleanest              |
+| Copy a large file fast                             | `FileChannel.transferTo`                                        | OS-level transfer, often zero-copy               |
+| Memory-map a file (random access into a huge file) | `FileChannel.map`                                               | Only NIO supports this                           |
+| Write a binary protocol with fixed-width fields    | `ByteBuffer` directly                                           | Typed `put`/`get` for primitives, endian control |
+| Build a non-blocking network server                | `Selector` + `SocketChannel`                                    | The whole point of selectors                     |
+| Quick one-off scripts and CLI tools                | Either                                                          | The convenience methods on `Files` usually win   |
+| You already have an `InputStream` from a library   | `java.io`                                                       | Don't fight the API you were handed              |
+
+The summary in one sentence: use `Path` and `Files` for everyday file work, drop down to channels and buffers when you need streaming or memory-mapped I/O, and use selectors for non-blocking network servers. Mixing them is fine; `Files.newByteChannel(path, ...)` returns a `SeekableByteChannel` you can use with either API.
+
+<h1 id="a-tiny-end-to-end-example-read-a-file-via-a-channel">
+  A Tiny End-to-End Example: Read a File via a Channel
+</h1>
+
+To make the channel-buffer interaction concrete, consider a minimal program that reads a small file using `FileChannel` directly. In normal code you'd use `Files.readString`; this example shows all the moving pieces of NIO in one place.
+
+```java
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+public class ReadFileViaChannel {
+    public static void main(String[] args) throws IOException {
+        Path file = Path.of("welcome.txt");
+        Files.writeString(file, "Welcome to AlgoStore!\n");
+
+        ByteBuffer buffer = ByteBuffer.allocate(64);
+
+        try (FileChannel channel = FileChannel.open(file, StandardOpenOption.READ)) {
+            int bytesRead = channel.read(buffer);
+            System.out.println("Bytes read: " + bytesRead);
+
+            buffer.flip();
+            String contents = StandardCharsets.UTF_8.decode(buffer).toString();
+            System.out.print(contents);
+        }
+    }
+}
+```
+
+Reading from beginning to end:
+
+1. `Path.of("welcome.txt")` builds a NIO `Path` for the file.
+2. `Files.writeString` creates the file with our text. This is a NIO.2 convenience that internally opens a channel, writes a buffer, and closes the channel.
+3. `ByteBuffer.allocate(64)` reserves 64 bytes on the heap. Position is 0, limit is 64.
+4. `FileChannel.open(file, READ)` opens a read-only channel inside try-with-resources, so it closes automatically.
+5. `channel.read(buffer)` fills the buffer with bytes from the file. It returns 22 and advances position to 22 inside the buffer.
+6. `buffer.flip()` switches to read mode: position back to 0, limit set to 22.
+7. `StandardCharsets.UTF_8.decode(buffer)` decodes the 22 bytes into a `CharBuffer`, then `.toString()` turns it into a `String`.
+
+Every NIO file program is some variation of this six-step shape: open a channel, fill or drain a buffer, decode or interpret the bytes, close the channel. The full power lives in what step 5 can do: positional reads, scatter-gather, memory mapping, and zero-copy transfers.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

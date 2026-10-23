@@ -1,0 +1,743 @@
+---
+title: "Atomic Classes"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Atomic Classes explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+Here, the focus is on the lock-free, single-variable case where atomics are well-suited.
+
+<h1 id="why-atomics-exist">Why Atomics Exist</h1>
+
+Consider an online store that needs a globally unique order ID for every order it accepts. Each request handler runs on a thread from a thread pool, and the store gets hundreds of orders per second during a sale. The naive code looks innocent.
+
+```java
+public class GlobalOrderIdNaive {
+    private static int nextOrderId = 0;
+
+    public static int nextId() {
+        nextOrderId = nextOrderId + 1;
+        return nextOrderId;
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread t1 = new Thread(() -> {
+            for (int i = 0; i < 100_000; i++) nextId();
+        });
+        Thread t2 = new Thread(() -> {
+            for (int i = 0; i < 100_000; i++) nextId();
+        });
+
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+
+        System.out.println("Final order id: " + nextOrderId);
+    }
+}
+```
+
+The expected total is `200000`. The actual number is somewhere lower and changes on every run. The line `nextOrderId = nextOrderId + 1` looks like one step but it's three: read the field, add one, write the new value back. Two threads can read the same value, both add one, both write the same result, and a whole increment disappears.
+
+You could wrap the body in `synchronized` and the result would be correct. But for a single-field update, taking a lock is a heavy hammer. The thread that loses the race for the lock is parked, the OS scheduler gets involved, and you pay the cost of context switches that have nothing to do with adding one to an integer. Atomic classes do the same job with a hardware instruction instead of a lock.
+
+```java
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class GlobalOrderIdAtomic {
+    private static final AtomicInteger nextOrderId = new AtomicInteger(0);
+
+    public static int nextId() {
+        return nextOrderId.incrementAndGet();
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread t1 = new Thread(() -> {
+            for (int i = 0; i < 100_000; i++) nextId();
+        });
+        Thread t2 = new Thread(() -> {
+            for (int i = 0; i < 100_000; i++) nextId();
+        });
+
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+
+        System.out.println("Final order id: " + nextOrderId.get());
+    }
+}
+```
+
+The total is exact every time. The single call `incrementAndGet()` is what changed. It reads, adds one, and writes, and the JVM guarantees no other thread can sneak between those steps. No `synchronized` block, no lock object.
+
+Two threads enter `incrementAndGet`, and the CPU funnels them through a single hardware instruction that updates the value. One thread succeeds on the first try. The other tries again, very fast, and succeeds on the next attempt. Nobody is parked, nobody waits on a lock. The total is exact, and the program never sleeps.
+
+<h1 id="compare-and-swap-the-building-block">
+  Compare-and-Swap, the Building Block
+</h1>
+
+Every atomic operation rests on one primitive: **compare-and-swap**, abbreviated CAS. The idea is straightforward. You give the CPU three things: a memory location, the value you think is there, and the value you want to put there. The CPU does both the compare and the swap as one indivisible step. If the location still holds the value you expected, the CPU writes the new value and reports success. If anything else is there, the CPU does nothing and reports failure.
+
+The Java surface for this is `AtomicInteger.compareAndSet(int expected, int update)`. Here it is in isolation.
+
+```java
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class CasBasics {
+    public static void main(String[] args) {
+        AtomicInteger stock = new AtomicInteger(10);
+
+        boolean firstTry = stock.compareAndSet(10, 9);
+        System.out.println("First swap (10 -> 9) succeeded? " + firstTry);
+        System.out.println("Stock after first swap: " + stock.get());
+
+        boolean secondTry = stock.compareAndSet(10, 8);
+        System.out.println("Second swap (10 -> 8) succeeded? " + secondTry);
+        System.out.println("Stock after second swap: " + stock.get());
+    }
+}
+```
+
+The second `compareAndSet` expected `10`, but the value was already `9`. The second call fails.
+
+```java
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class CasBasicsFixed {
+    public static void main(String[] args) {
+        AtomicInteger stock = new AtomicInteger(10);
+
+        boolean firstTry = stock.compareAndSet(10, 9);
+        System.out.println("First swap (10 -> 9) succeeded? " + firstTry);
+        System.out.println("Stock after first swap: " + stock.get());
+
+        boolean secondTry = stock.compareAndSet(10, 8);
+        System.out.println("Second swap (10 -> 8) succeeded? " + secondTry);
+        System.out.println("Stock after second swap: " + stock.get());
+    }
+}
+```
+
+The first swap expected `10` and found `10`, so it wrote `9` and returned `true`. The second swap expected `10` and found `9`, so it didn't touch the value and returned `false`. The stock stayed at `9`.
+
+On its own, one `compareAndSet` looks underwhelming. The power comes from the **CAS loop**: read the current value, compute the new one, try to swap, and if the swap fails, start over. The loop is bounded by how often other threads beat you to it. In low contention, you usually succeed on the first try. In high contention, you spin a few times. Either way, you never block.
+
+The cycle in the diagram is the CAS loop. The only path that exits is the success leg. The retry leg goes back to read, recompute, and try again with the freshest value. This is what `incrementAndGet()` is doing internally: a tight CAS loop that adds one.
+
+On x86 hardware, CAS compiles to `lock cmpxchg`. On ARM, it's a load-linked / store-conditional pair. The JVM picks the right instruction for the platform, and the operation is roughly as cheap as a memory-barrier read. No kernel call, no lock acquisition, no thread parking.
+
+A single CAS is fast, but a CAS that keeps failing is not. Under heavy contention from many threads on one variable, threads can spin through dozens of retries before they succeed. At that point, a plain `synchronized` block that parks contending threads can outperform the atomic.
+
+<h1 id="whats-wrong-with-get-then-set">What's Wrong with get then set?</h1>
+
+Writing an "atomic" increment by hand using `get` and `set` assumes the pair is safe because both methods sit on an atomic class. It isn't. Each call is individually atomic, but the pair isn't.
+
+**What's wrong with this code?**
+
+```java
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class BrokenIncrement {
+    private static final AtomicInteger counter = new AtomicInteger(0);
+
+    public static void increment() {
+        counter.set(counter.get() + 1);
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread t1 = new Thread(() -> {
+            for (int i = 0; i < 100_000; i++) increment();
+        });
+        Thread t2 = new Thread(() -> {
+            for (int i = 0; i < 100_000; i++) increment();
+        });
+
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+
+        System.out.println("Counter: " + counter.get());
+    }
+}
+```
+
+**Output (a typical run):**
+
+```text
+Counter: 142891
+```
+
+The number is wrong, in the same way as the very first plain-`int` example. The `counter.set(counter.get() + 1)` line is three operations: read with `get()`, add one, write with `set()`. Between the read and the write, another thread can do the same thing. Both threads read `5`, both compute `6`, both write `6`, and one increment vanishes.
+
+**Fix:**
+
+```java
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class FixedIncrement {
+    private static final AtomicInteger counter = new AtomicInteger(0);
+
+    public static void increment() {
+        counter.incrementAndGet();
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread t1 = new Thread(() -> {
+            for (int i = 0; i < 100_000; i++) increment();
+        });
+        Thread t2 = new Thread(() -> {
+            for (int i = 0; i < 100_000; i++) increment();
+        });
+
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+
+        System.out.println("Counter: " + counter.get());
+    }
+}
+```
+
+`incrementAndGet` is a single CAS-based step. Internally it loops, but each loop iteration is one atomic compare-and-swap, so the increment is never lost. The lesson: using an `AtomicInteger` doesn't make all sequences of calls atomic, only individual calls. Any time you read-modify-write, use the bundled method (`incrementAndGet`, `getAndAdd`, `updateAndGet`), not `get` followed by `set`.
+
+<h1 id="the-atomicinteger-and-atomiclong-surface">
+  The AtomicInteger and AtomicLong Surface
+</h1>
+
+`AtomicInteger` is the most commonly used atomic. `AtomicLong` is the same shape with a `long` instead. Both expose a focused set of operations, and most of the lesson's later content uses these methods as building blocks. Here's the surface that matters.
+
+| Method                                         | What it does                                         | Return value      |
+| ---------------------------------------------- | ---------------------------------------------------- | ----------------- |
+| `get()`                                        | Read the current value                               | The current value |
+| `set(int v)`                                   | Write `v` unconditionally                            | `void`            |
+| `incrementAndGet()`                            | Add 1, return the new value                          | New value         |
+| `getAndIncrement()`                            | Add 1, return the previous value                     | Previous value    |
+| `decrementAndGet()`                            | Subtract 1, return the new value                     | New value         |
+| `addAndGet(int delta)`                         | Add `delta`, return the new value                    | New value         |
+| `getAndAdd(int delta)`                         | Add `delta`, return the previous value               | Previous value    |
+| `compareAndSet(int expected, int update)`      | CAS, returns whether the swap happened               | `boolean`         |
+| `updateAndGet(IntUnaryOperator f)`             | Apply `f`, retry on contention, return the new value | New value         |
+| `accumulateAndGet(int x, IntBinaryOperator f)` | Apply `f(current, x)`, retry, return new value       | New value         |
+
+The "get-and-X" vs "X-and-get" naming is the same idea you've seen with `i++` vs `++i`. "Get-and-increment" returns the old value (post-increment); "increment-and-get" returns the new one (pre-increment). Use whichever fits the call site.
+
+The following program exercises several of these on an order-ID counter.
+
+```java
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class CounterMethods {
+    public static void main(String[] args) {
+        AtomicInteger orderId = new AtomicInteger(1000);
+
+        System.out.println("Start: " + orderId.get());
+        System.out.println("getAndIncrement returned: " + orderId.getAndIncrement());
+        System.out.println("After: " + orderId.get());
+
+        System.out.println("incrementAndGet returned: " + orderId.incrementAndGet());
+        System.out.println("After: " + orderId.get());
+
+        System.out.println("addAndGet(10) returned: " + orderId.addAndGet(10));
+        System.out.println("After: " + orderId.get());
+
+        boolean ok = orderId.compareAndSet(1012, 2000);
+        System.out.println("CAS 1012 -> 2000 ok? " + ok);
+        System.out.println("After: " + orderId.get());
+
+        boolean miss = orderId.compareAndSet(1012, 3000);
+        System.out.println("CAS 1012 -> 3000 ok? " + miss);
+        System.out.println("After: " + orderId.get());
+    }
+}
+```
+
+**Output:**
+
+```text
+Start: 1000
+getAndIncrement returned: 1000
+After: 1001
+incrementAndGet returned: 1002
+After: 1002
+addAndGet(10) returned: 1012
+After: 1012
+CAS 1012 -> 2000 ok? true
+After: 2000
+CAS 1012 -> 3000 ok? false
+After: 2000
+```
+
+`get` returns whatever the value currently is. `getAndIncrement` returns the prior value (`1000`) and leaves `1001` behind. `incrementAndGet` returns the new value (`1002`). `addAndGet(10)` adds 10 and returns the new value (`1012`). The first `compareAndSet` succeeds because the value is `1012`. The second fails because the value is now `2000`.
+
+<h1 id="higher-order-updates-updateandget-and-accumulateandget">
+  Higher-Order Updates: updateAndGet and accumulateAndGet
+</h1>
+
+`incrementAndGet` and `addAndGet` cover the common cases, but sometimes you want a richer update. Maybe you want to clamp the value to a maximum, or apply a non-linear function. `updateAndGet` takes a function and applies it inside a CAS loop. `accumulateAndGet` is the two-argument cousin: it takes an extra value and a function that combines it with the current state.
+
+```java
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class HigherOrderUpdates {
+    public static void main(String[] args) {
+        AtomicInteger stock = new AtomicInteger(50);
+
+        // Decrement stock but never go below zero.
+        int afterFirst = stock.updateAndGet(current -> Math.max(0, current - 30));
+        System.out.println("After buy 30: " + afterFirst);
+
+        int afterSecond = stock.updateAndGet(current -> Math.max(0, current - 30));
+        System.out.println("After another buy 30: " + afterSecond);
+
+        // Use accumulateAndGet to add a delta but cap at 100.
+        int refill = stock.accumulateAndGet(40, (current, delta) -> Math.min(100, current + delta));
+        System.out.println("After refill of 40 (capped at 100): " + refill);
+    }
+}
+```
+
+`updateAndGet` runs `Math.max(0, current - 30)` inside a CAS loop. If another thread races in between the read and the write, the loop retries with the new current value. The clamp at zero is part of the function, so even under contention nobody can drive stock negative.
+
+`accumulateAndGet` takes the same idea and adds a second argument. The `40` is the delta passed in, and the function combines it with the current value. The cap at `100` lives in the function. You'd use this when the "thing to add" is a per-call value, but the combining rule is fixed.
+
+One detail matters: the function you pass must be **side-effect free** and **idempotent on retry**. The CAS loop may run it more than once if there's contention. If your function increments a different counter, makes a network call, or otherwise has side effects, those side effects happen on every retry. That's almost always wrong.
+
+```java
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class SideEffectsInUpdater {
+    static int retryCount = 0;  // not thread-safe, just for illustration
+
+    public static void main(String[] args) {
+        AtomicInteger v = new AtomicInteger(0);
+
+        v.updateAndGet(current -> {
+            retryCount++;  // BAD: side effect inside the updater
+            return current + 1;
+        });
+
+        System.out.println("Final value: " + v.get());
+        System.out.println("Function invocations: " + retryCount);
+    }
+}
+```
+
+**Output (single-threaded, no contention):**
+
+```text
+Final value: 1
+Function invocations: 1
+```
+
+In single-threaded code the function runs once, so the bad pattern looks fine. Add contention and the same code calls the function multiple times per logical increment, and the `retryCount` field overcounts. Keep updater functions pure: they read `current`, return a new value, and do nothing else.
+
+<h1 id="atomicboolean-one-shot-flags">AtomicBoolean: One-Shot Flags</h1>
+
+`AtomicBoolean` wraps a `boolean`. It exists for the same reason as `AtomicInteger`: you want a flag that many threads can read and write without confusion. The most common use is a one-shot guard, the kind of "I want this initializer to run exactly once" pattern.
+
+```java
+import java.util.concurrent.atomic.AtomicBoolean;
+
+public class OneShotInitializer {
+    private static final AtomicBoolean initialized = new AtomicBoolean(false);
+
+    public static void initOnce() {
+        if (initialized.compareAndSet(false, true)) {
+            System.out.println("Initializing on thread " + Thread.currentThread().getName());
+            // Pretend to load configuration here.
+        } else {
+            System.out.println("Skip on thread " + Thread.currentThread().getName() + " (already done)");
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread t1 = new Thread(OneShotInitializer::initOnce, "T1");
+        Thread t2 = new Thread(OneShotInitializer::initOnce, "T2");
+        Thread t3 = new Thread(OneShotInitializer::initOnce, "T3");
+
+        t1.start();
+        t2.start();
+        t3.start();
+        t1.join();
+        t2.join();
+        t3.join();
+    }
+}
+```
+
+**Output (one possible run):**
+
+```text
+Initializing on thread T1
+Skip on thread T2 (already done)
+Skip on thread T3 (already done)
+```
+
+Whichever thread wins the CAS race runs the initialization. The other two see `false -> true` fail (because the value is already `true`), and they take the "skip" branch. The pattern is `compareAndSet(false, true)` to claim the flag, and the boolean return tells you whether you won.
+
+The same shape works for shutdown flags, "has this work been claimed?" checks, and any other state that goes from one value to another exactly once. Don't use a plain `boolean` for this. The plain field would let two threads both pass an `if` check between the read and the write.
+
+<h1 id="atomicreference-for-hot-swappable-objects">
+  AtomicReference for Hot-Swappable Objects
+</h1>
+
+Atomics aren't limited to numbers. `AtomicReference<T>` wraps an object reference and lets you swap it atomically. The classic use case is a configuration or pricing snapshot that you want to replace whole, without locking, while threads keep reading.
+
+In an e-commerce store, the pricing service might keep an in-memory price list. A background job rebuilds the list every minute and swaps the new version in. Hundreds of request threads are reading the current list at the same time. Readers should never block, and the writer should atomically publish the new list.
+
+```java
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
+
+public class PricingService {
+    record PriceList(Map<String, Double> prices, long version) {}
+
+    private static final AtomicReference<PriceList> current =
+        new AtomicReference<>(new PriceList(Map.of("Notebook", 4.99, "Pen", 1.49), 1));
+
+    public static double priceOf(String name) {
+        PriceList snapshot = current.get();
+        return snapshot.prices().getOrDefault(name, 0.0);
+    }
+
+    public static void publish(PriceList next) {
+        current.set(next);
+    }
+
+    public static void main(String[] args) {
+        System.out.println("Notebook (v1): $" + priceOf("Notebook"));
+        System.out.println("Pen (v1): $" + priceOf("Pen"));
+
+        publish(new PriceList(Map.of("Notebook", 3.99, "Pen", 0.99, "Eraser", 0.59), 2));
+
+        System.out.println("Notebook (v2): $" + priceOf("Notebook"));
+        System.out.println("Pen (v2): $" + priceOf("Pen"));
+        System.out.println("Eraser (v2): $" + priceOf("Eraser"));
+    }
+}
+```
+
+Each call to `priceOf` does a single `current.get()` to grab the current `PriceList` reference. Whatever happens after that point reads through that one snapshot, even if a publisher swaps in a new list mid-call. Different threads can see different snapshots for a moment after a publish, which is fine: every snapshot is internally consistent because it's an immutable object.
+
+The published `PriceList` must be **immutable** for this to work. If readers can mutate the underlying `Map`, you've lost the safety. The pattern works because the writer assembles a fresh, immutable object, and the swap publishes it whole.
+
+`AtomicReference` also has `compareAndSet`, `updateAndGet`, and `accumulateAndGet` versions, exactly like `AtomicInteger`. Use the CAS version if multiple threads might publish a new version and each one needs to be built from the most recent state.
+
+```java
+import java.util.concurrent.atomic.AtomicReference;
+
+public class CasReference {
+    record Cart(int items, double total) {
+        Cart addItem(double price) {
+            return new Cart(items + 1, total + price);
+        }
+    }
+
+    public static void main(String[] args) {
+        AtomicReference<Cart> cart = new AtomicReference<>(new Cart(0, 0.0));
+
+        cart.updateAndGet(c -> c.addItem(4.99));
+        cart.updateAndGet(c -> c.addItem(1.49));
+        cart.updateAndGet(c -> c.addItem(0.79));
+
+        Cart finalCart = cart.get();
+        System.out.println("Items: " + finalCart.items() + ", total: $" + finalCart.total());
+    }
+}
+```
+
+Each call to `updateAndGet` reads the current `Cart`, builds a new one with one more item, and CAS-swaps it in. If two threads race, one wins and the other retries with the new state. The `Cart` record is immutable, so even concurrent readers always see a coherent snapshot.
+
+Every `updateAndGet` on an `AtomicReference` allocates a new object (the result of the function). For a high-frequency code path, that allocation pressure can matter. A mutable single-instance object protected by a lock can be cheaper when contention is low and the object is large.
+
+<h1 id="atomicintegerarray-for-per-slot-atomicity">
+  AtomicIntegerArray for Per-Slot Atomicity
+</h1>
+
+Sometimes you want a whole array of counters, and you want each slot to be independently atomic. You could use an `AtomicInteger[]`, where each element is its own object, but that's a lot of small objects and a lot of indirection. `AtomicIntegerArray` packs `int` slots directly and gives you atomic methods on each index.
+
+Consider per-category page-view counters for a storefront. There's no single hot counter; the load is spread across hundreds of categories.
+
+```java
+import java.util.concurrent.atomic.AtomicIntegerArray;
+
+public class CategoryViewCounters {
+    static final String[] CATEGORIES = {"books", "electronics", "clothing", "kitchen"};
+    static final AtomicIntegerArray views = new AtomicIntegerArray(CATEGORIES.length);
+
+    public static void recordView(int categoryIndex) {
+        views.incrementAndGet(categoryIndex);
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        Runnable shopper = () -> {
+            for (int i = 0; i < 100_000; i++) {
+                recordView(i % CATEGORIES.length);
+            }
+        };
+
+        Thread t1 = new Thread(shopper);
+        Thread t2 = new Thread(shopper);
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+
+        for (int i = 0; i < CATEGORIES.length; i++) {
+            System.out.println(CATEGORIES[i] + ": " + views.get(i));
+        }
+    }
+}
+```
+
+Each call to `views.incrementAndGet(i)` does a CAS on slot `i` only. Two threads incrementing different slots don't contend with each other at all. Two threads incrementing the same slot do contend, but only on that one slot. The class also has `compareAndSet(index, expected, update)`, `getAndAdd(index, delta)`, and the rest of the familiar suite, indexed by slot.
+
+`AtomicLongArray` and `AtomicReferenceArray<T>` are the same shape for `long` and reference types. Use them when you have a fixed-size collection of independent atomic cells.
+
+<h1 id="when-cas-hurts-high-contention-on-one-counter">
+  When CAS Hurts: High Contention on One Counter
+</h1>
+
+CAS is fast when most threads succeed on the first try. It hurts when many threads are hammering one variable and most CAS attempts fail. Each failed attempt does a memory read, computes a new value, attempts the swap, and goes back to the start. With ten threads all incrementing the same `AtomicLong`, most of the CPU time can end up in retries instead of useful work.
+
+A page-view tracker is a standard case. Every request increments a global counter. At peak, you might have eight CPUs all trying to increment one `AtomicLong`, and the cache line holding that long is bouncing between cores. Every other CAS fails because the line keeps getting invalidated.
+
+`LongAdder` and `LongAccumulator`, both added in Java 8, solve this with a different design. Instead of one cell, they keep an array of cells. Each thread updates whichever cell is least contended (in practice, a cell chosen by the thread's hash). When you want the total, you sum the cells.
+
+```java
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
+
+public class CounterShootout {
+    public static void main(String[] args) throws InterruptedException {
+        int threads = 8;
+        int increments = 1_000_000;
+
+        AtomicLong atomic = new AtomicLong(0);
+        LongAdder adder = new LongAdder();
+
+        long atomicTime = bench(threads, () -> {
+            for (int i = 0; i < increments; i++) atomic.incrementAndGet();
+        });
+
+        long adderTime = bench(threads, () -> {
+            for (int i = 0; i < increments; i++) adder.increment();
+        });
+
+        System.out.println("AtomicLong final: " + atomic.get() + " in " + atomicTime + " ms");
+        System.out.println("LongAdder  final: " + adder.sum() + " in " + adderTime + " ms");
+    }
+
+    static long bench(int threadCount, Runnable task) throws InterruptedException {
+        ExecutorService pool = Executors.newFixedThreadPool(threadCount);
+        long start = System.currentTimeMillis();
+        for (int i = 0; i < threadCount; i++) pool.submit(task);
+        pool.shutdown();
+        pool.awaitTermination(60, TimeUnit.SECONDS);
+        return System.currentTimeMillis() - start;
+    }
+}
+```
+
+**Output (one possible run on an 8-core machine):**
+
+```text
+AtomicLong final: 8000000 in 412 ms
+LongAdder  final: 8000000 in 87 ms
+```
+
+Both counters end at `8,000,000`. The `LongAdder` finished in about a fifth of the time. Numbers vary by machine and JVM, but the shape is consistent: under high contention, `LongAdder` wins comfortably. Under low contention (one thread incrementing), `AtomicLong` is usually slightly faster because it doesn't have the per-cell overhead. The two diagrams below show the difference in shape.
+
+The `AtomicLong` shape is a funnel: every thread targets one memory location, and contention is whatever the slowest cache-coherence step costs times the number of competing threads.
+
+The `LongAdder` shape spreads writes across cells. Each thread mostly hits its own cell, so the cache lines don't bounce. Reading the total is slower (you sum all the cells), but writes are the hot path, and writes are what high-throughput counters care about.
+
+The trade-off is right there in the diagram. Use `LongAdder` when you write often and read rarely (metrics, page views, request counts). Avoid it when you need a precise, current value on every read (a remaining-stock counter that gates "out of stock" decisions, where reading and acting on the value has to be atomic). For that, use `AtomicLong` or a lock.
+
+`LongAccumulator` is `LongAdder`'s generalization. Instead of always adding, you pass in a `LongBinaryOperator` that combines the new value with the accumulated state. Use it when the combining rule isn't `+`, for example tracking the running maximum response time.
+
+```java
+import java.util.concurrent.atomic.LongAccumulator;
+
+public class MaxResponseTime {
+    public static void main(String[] args) {
+        // Combine function: keep the larger of accumulated and new.
+        LongAccumulator maxLatency = new LongAccumulator(Long::max, 0L);
+
+        maxLatency.accumulate(42);
+        maxLatency.accumulate(180);
+        maxLatency.accumulate(95);
+        maxLatency.accumulate(310);
+        maxLatency.accumulate(7);
+
+        System.out.println("Max latency observed: " + maxLatency.get() + " ms");
+    }
+}
+```
+
+`Long::max` is the combiner. The starting state is `0`. Each `accumulate` updates the per-cell value with `max(currentCell, newValue)`. When you call `get`, it reduces across cells with the same operator. The result is a running maximum that scales the same way `LongAdder` does, without lock contention on a single cell.
+
+<h1 id="the-aba-problem">The ABA Problem</h1>
+
+CAS has one famous wrinkle. The compare step checks "does the value equal X?", not "has the value been X the entire time?". If another thread changes the value from `A` to `B` and then back to `A`, the CAS still sees `A` and succeeds, even though the world wasn't stable during the read-modify-write window. This is the **ABA problem**.
+
+For an `int` counter that only ever increments, ABA doesn't apply. The value never goes backwards. For a reference to a node in a lock-free linked list, ABA can cause real bugs: another thread might pop a node, push it again, and your CAS happily proceeds based on a stale assumption about what the node points to.
+
+The diagram shows the timeline. Thread 1 read `A`, paused. Thread 2 changed the value to `B`, then back to `A`. Thread 1 wakes up, runs its CAS expecting `A`, finds `A`, and proceeds as if nothing had happened. For some workloads, that's fine. For others (especially anything involving recycled objects), it's a bug.
+
+`AtomicStampedReference<V>` is the fix. It pairs the reference with an integer "stamp" that increments on every update. The CAS checks both the reference and the stamp. If the stamp has moved, the CAS fails, even if the reference came back to its original value.
+
+```java
+import java.util.concurrent.atomic.AtomicStampedReference;
+
+public class StampedDemo {
+    public static void main(String[] args) {
+        String initial = "A";
+        AtomicStampedReference<String> ref = new AtomicStampedReference<>(initial, 1);
+
+        // Simulate ABA: change A -> B -> A, bumping the stamp each time.
+        int[] stampHolder = new int[1];
+        String observed = ref.get(stampHolder);
+        int observedStamp = stampHolder[0];
+
+        ref.compareAndSet(observed, "B", observedStamp, observedStamp + 1);
+        int afterB = stampHolder[0] + 1;
+        ref.compareAndSet("B", "A", afterB, afterB + 1);
+
+        // Thread 1's original stamp is stale, even though value is back to "A".
+        boolean swapped = ref.compareAndSet("A", "C", observedStamp, observedStamp + 100);
+        System.out.println("ABA-safe swap with stale stamp succeeded? " + swapped);
+        System.out.println("Current value: " + ref.getReference()
+            + ", stamp: " + ref.getStamp());
+    }
+}
+```
+
+The final CAS expected the reference `"A"` and the stamp `1`. The reference is `"A"` (so a plain `compareAndSet` on an `AtomicReference` would have succeeded), but the stamp is `3`. The check on the stamp catches the change history and the CAS returns `false`. The state stays at `"A"` with stamp `3`, and the failed thread can re-read and decide what to do.
+
+The stamp doesn't have to be a counter. It can be any `int` that you guarantee to change on every meaningful update. In practice, monotonically incrementing is the simplest pattern and avoids accidental stamp reuse.
+
+For pure numeric atomics, ABA isn't a concern. It arises when implementing lock-free data structures (Treiber stacks, Michael-Scott queues), where nodes can be recycled. If you find yourself building one of those, use `AtomicStampedReference` or its cousin `AtomicMarkableReference`.
+
+<h1 id="atomics-vs-synchronized-when-to-pick-which">
+  Atomics vs synchronized: When to Pick Which
+</h1>
+
+By now you've seen the two main approaches to safe shared state: lock-based (with `synchronized` or `ReentrantLock`) and lock-free (with atomics). The choice isn't aesthetic; it depends on what you're protecting.
+
+| Situation                                  | Lock-based                                    | Atomic                                                        |
+| ------------------------------------------ | --------------------------------------------- | ------------------------------------------------------------- |
+| Updating one variable                      | Works, but heavy                              | Best fit                                                      |
+| Coordinating updates to multiple variables | Best fit                                      | Awkward; you'd need an `AtomicReference` to a snapshot object |
+| Critical section with several statements   | Best fit                                      | Doesn't apply; atomics are per-operation                      |
+| High contention on one counter             | Works, but parks threads                      | Use `LongAdder`                                               |
+| Hot-swapping immutable state               | Awkward                                       | `AtomicReference`                                             |
+| Need to wait until a condition is true     | Best fit (use `wait`/`notify` or `Condition`) | Doesn't apply; atomics never block                            |
+| Want zero blocking                         | Doesn't apply                                 | Best fit                                                      |
+
+The general rule of thumb: if you're updating one variable, an atomic is almost always appropriate. If you're updating two or more variables together (a balance and a transaction log, say), a lock is usually cleaner, because the lock can guard the whole multi-step update. You could use an `AtomicReference` to a record holding both values, but you have to be willing to allocate a new record on every change.
+
+The other consideration is correctness under retry. Atomics achieve safety by retrying CAS until it succeeds. Locks achieve safety by serializing access. Retry is cheap when the protected work is small (an `int` increment) and expensive when the protected work is large (rebuilding a 10 MB object). Locks scale better to large critical sections; atomics scale better to small ones.
+
+<h1 id="memory-visibility-the-volatile-connection">
+  Memory Visibility: The Volatile Connection
+</h1>
+
+A short note for completeness, since the `volatile` lesson covered this. Every atomic class internally uses a `volatile` field (`AtomicInteger` has a `private volatile int value`). That means writes to an atomic are visible to other threads as soon as they complete, and reads see the most recent write. You get the visibility guarantees of `volatile` plus the atomicity of CAS, in one package.
+
+The practical impact: when one thread does `atomicCounter.set(42)` and another thread does `atomicCounter.get()`, the second thread is guaranteed to see `42` (or any value written later). That's something `synchronized` also gives you, but without the visibility cost of acquiring a monitor. Atomics give you visibility almost free, on top of the atomicity.
+
+This is why a plain `volatile long` with `++` is broken: `volatile` gives you visibility, but `++` is still three steps, and two of them aren't atomic. Atomics give you visibility **and** atomic compound operations. You need both.
+
+<h1 id="putting-it-together-an-e-commerce-counters-module">
+  Putting It Together: An E-Commerce Counters Module
+</h1>
+
+A short program that pulls the major pieces together: an `AtomicInteger` for order IDs, an `AtomicReference` for the current price list, and a `LongAdder` for page views. Multiple threads exercise each one.
+
+```java
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.LongAdder;
+
+public class StoreCounters {
+    record PriceList(Map<String, Double> prices, int version) {}
+
+    static final AtomicInteger nextOrderId = new AtomicInteger(1000);
+    static final AtomicReference<PriceList> prices =
+        new AtomicReference<>(new PriceList(Map.of("Notebook", 4.99, "Pen", 1.49), 1));
+    static final LongAdder pageViews = new LongAdder();
+
+    public static int placeOrder() {
+        pageViews.increment();
+        return nextOrderId.incrementAndGet();
+    }
+
+    public static double priceOf(String name) {
+        pageViews.increment();
+        return prices.get().prices().getOrDefault(name, 0.0);
+    }
+
+    public static void republish(PriceList next) {
+        prices.set(next);
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        Runnable shopper = () -> {
+            for (int i = 0; i < 50_000; i++) {
+                priceOf("Notebook");
+                if (i % 1000 == 0) placeOrder();
+            }
+        };
+
+        Thread t1 = new Thread(shopper);
+        Thread t2 = new Thread(shopper);
+        Thread t3 = new Thread(shopper);
+
+        t1.start();
+        t2.start();
+        t3.start();
+
+        republish(new PriceList(Map.of("Notebook", 3.99, "Pen", 0.99, "Eraser", 0.59), 2));
+
+        t1.join();
+        t2.join();
+        t3.join();
+
+        System.out.println("Final order id: " + nextOrderId.get());
+        System.out.println("Total page views: " + pageViews.sum());
+        System.out.println("Current price list version: " + prices.get().version());
+        System.out.println("Notebook price now: $" + prices.get().prices().get("Notebook"));
+    }
+}
+```
+
+**Output (numbers depend on the schedule):**
+
+```text
+Final order id: 1150
+Total page views: 150150
+Current price list version: 2
+Notebook price now: $3.99
+```
+
+Three threads run concurrently. Each one calls `priceOf` (which reads `prices` and bumps `pageViews`) and occasionally calls `placeOrder` (which bumps `pageViews` and `nextOrderId`). The main thread, in parallel, swaps in a new price list. The final order ID and page-view total are exact: no missed increments, despite hundreds of thousands of concurrent updates. The price list version on the readers' side is `2` because the publish happened during the run.
+
+Each atomic in the program is doing the job it's best at. `AtomicInteger` for a monotonic ID. `AtomicReference` for a hot-swap of an immutable snapshot. `LongAdder` for a high-throughput counter that's read infrequently. No `synchronized` block anywhere, and no threads parked waiting for locks.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

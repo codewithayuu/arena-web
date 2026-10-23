@@ -1,0 +1,1182 @@
+---
+title: "Design Spotify"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Design Spotify explained with clear examples, visuals, and practice questions in Mindflare's System Design Interviews course."
+---
+
+<LessonCard>
+
+Let’s begin by clarifying the requirements.
+
+<h1 id="1-requirements-gathering">1. Requirements Gathering</h1>
+
+Before jumping into architecture diagrams, we need to understand what we are building.
+
+Music streaming might seem straightforward, but the requirements can vary significantly. Are we designing for millions or hundreds of millions of users? Do we need to support offline playback? How sophisticated should the recommendation engine be? These questions shape our design decisions.
+
+Here is how a requirements discussion might unfold in an interview:
+
+> **Candidate:** "How many users should the system support, and what does daily usage look like?"
+>
+> **Interviewer:** "Let's design for 500 million total users, with about 200 million daily active users. On an average day, we see around 1 billion streams."
+>
+> **Candidate:** "That's substantial scale. A billion streams per day means we are dealing with serious CDN and bandwidth requirements. Should I focus primarily on music, or do we need to handle podcasts and other audio formats as well?"
+>
+> **Interviewer:** "Focus on music streaming for now. Podcasts have different characteristics like longer duration and less repeat listening, so you can mention them but don't need to design for them in detail."
+>
+> **Candidate:** "Understood. What about the user experience around playback? I am thinking about latency requirements and whether users can download content for offline listening."
+>
+> **Interviewer:** "Latency is critical. Users expect to hear audio within 200ms of pressing play. As for offline playback, yes, that's an important feature for premium subscribers, especially for people with limited data plans or unreliable connectivity."
+>
+> **Candidate:** "Personalization is a big part of what makes these services sticky. Should I include the recommendation system in the design, or treat it as out of scope?"
+>
+> **Interviewer:** "Cover the high-level approach to recommendations, though you don't need to dive deep into the ML algorithms."
+>
+> **Candidate:** "One more question: should I design the content ingestion pipeline, meaning how artists upload music to the platform?"
+>
+> **Interviewer:** "That's a separate system entirely. Focus on the consumer-facing streaming experience."
+
+This conversation reveals several important constraints that will influence our design. Let's formalize these into functional and non-functional requirements.
+
+<h1 id="2-back-of-the-envelope-estimation">
+  2. Back-of-the-Envelope Estimation
+</h1>
+
+Before diving into the design, let's run some quick calculations to understand the scale we are dealing with. These numbers will guide our architectural decisions, particularly around CDN infrastructure, storage, and database selection.
+
+<h3 id="21-traffic-estimates">2.1 Traffic Estimates</h3>
+
+Starting with the numbers from our requirements discussion:
+
+<h4 id="streaming-traffic">Streaming Traffic</h4>
+
+We expect 1 billion streams per day. Let's convert this to queries per second (QPS):
+
+```python
+Average stream QPS = 1,000,000,000 streams / 86,400 seconds ≈ 11,500 QPS
+```
+
+Traffic is rarely uniform throughout the day. Music streaming sees significant spikes during morning and evening commutes, lunch breaks, and weekends. During peak hours, we might see 3x the average load:
+
+```python
+Peak stream QPS = 11,500 × 3 ≈ 35,000 QPS
+```
+
+<h4 id="metadata-traffic">Metadata Traffic</h4>
+
+Every stream request triggers additional metadata lookups: song info, artist details, album art URLs, lyrics. Users also browse, search, and load playlists. This metadata traffic is typically 5-10x higher than the stream traffic:
+
+```python
+Estimated metadata QPS: 50,000 - 100,000 QPS
+```
+
+These numbers are significant. At peak, we are handling over 300,000 requests per second across all services. This is why we need aggressive caching at multiple layers.
+
+<h3 id="22-storage-estimates">2.2 Storage Estimates</h3>
+
+Music streaming has an interesting storage profile: a large catalog of audio files that rarely changes, combined with user data that grows continuously.
+
+<h4 id="audio-files-the-big-one">Audio Files (The Big One)</h4>
+
+The audio catalog is where most of the storage goes. We have 100 million songs in the catalog, each stored in multiple quality levels (64, 96, 160, 320 kbps), which works out to an average total size of around 10 MB per song across all qualities.
+
+```python
+Total audio storage = 100,000,000 songs × 10 MB = 1 PB (Petabyte)
+```
+
+One petabyte is substantial but manageable with object storage services like S3. The key insight is that this data is mostly static. Songs don't change once uploaded, which makes caching highly effective.
+
+<h4 id="metadata">Metadata</h4>
+
+Song metadata is relatively small but needs to be fast:
+
+| Data Type       | Estimate             | Notes                                 |
+| --------------- | -------------------- | ------------------------------------- |
+| Song metadata   | 100M × 2 KB = 200 GB | Title, artist, album, duration, genre |
+| Artist profiles | 10M × 5 KB = 50 GB   | Bio, images, discography              |
+| Album data      | 20M × 3 KB = 60 GB   | Track lists, artwork, release info    |
+
+This comfortably fits in memory for caching, which is important for the response times we need.
+
+<h4 id="user-data">User Data</h4>
+
+User data grows continuously and needs different handling:
+
+| Data Type         | Estimate             | Notes                               |
+| ----------------- | -------------------- | ----------------------------------- |
+| User profiles     | 500M × 2 KB = 1 TB   | Preferences, settings, subscription |
+| Playlists         | 500M × 5 KB = 2.5 TB | Average user has 5-10 playlists     |
+| Listening history | 500M × 8 KB = 4 TB   | Last 6 months of plays              |
+
+<h3 id="23-bandwidth-estimates">2.3 Bandwidth Estimates</h3>
+
+Bandwidth is where music streaming gets expensive. Each stream transfers significant data:
+
+```python
+Average song: 4 minutes at 160 kbps = ~5 MB
+Daily data transfer: 1B streams × 5 MB = 5 PB per day
+```
+
+Five petabytes per day of bandwidth is massive. At typical cloud egress rates ($0.05-0.09 per GB), this would cost millions per month without optimization. This is exactly why CDN infrastructure is not optional for music streaming. It is essential for both performance and cost control.
+
+<h3 id="24-key-insights">2.4 Key Insights</h3>
+
+These estimates reveal several important design implications:
+
+1. **CDN is critical:** With 5 PB of daily bandwidth, serving from origin is financially and technically impractical. Most streams must be served from edge caches.
+2. **Read-heavy workload:** For every song uploaded (which happens through a separate pipeline), there are millions of plays. We should invest heavily in caching and optimize for read performance.
+3. **Metadata fits in memory:** At 200 GB, song metadata can be cached aggressively. This enables the sub-100ms response times users expect.
+4. **Audio storage is static:** Unlike user-generated content platforms, the audio catalog changes slowly. This makes CDN caching straightforward.
+5. **User data is the scaling challenge:** While audio files are large but static, user listening history grows continuously and drives database scaling decisions.
+
+<h1 id="3-core-apis">3. Core APIs</h1>
+
+With our requirements and scale understood, let's define the API contract. A music streaming service needs APIs for search, playback, playlist management, and recommendations. Let's walk through each one.
+
+<h3 id="31-search">3.1 Search</h3>
+
+<h4 id="endpoint-get-search">Endpoint: GET /search</h4>
+
+This is the entry point for discovery. Users type a query and expect relevant songs, artists, albums, and playlists back within milliseconds.
+
+<h4 id="request-parameters">Request Parameters</h4>
+
+| Parameter | Type    | Required | Description                                                               |
+| --------- | ------- | -------- | ------------------------------------------------------------------------- |
+| `query`   | string  | Yes      | The search term (e.g., "bohemian rhapsody", "queen")                      |
+| `type`    | string  | No       | Filter by type: "song", "artist", "album", "playlist". Default: all types |
+| `limit`   | integer | No       | Number of results per type. Default: 20                                   |
+| `offset`  | integer | No       | Pagination offset for results                                             |
+
+<h4 id="example-response-200-ok">Example Response (200 OK)</h4>
+
+```json
+{
+  "songs": [
+    {
+      "id": "song_123",
+      "title": "Bohemian Rhapsody",
+      "artist": "Queen",
+      "album": "A Night at the Opera",
+      "duration_ms": 354000,
+      "album_art_url": "https://cdn.example.com/art/album_456.jpg"
+    }
+  ],
+  "artists": [
+    {
+      "id": "artist_789",
+      "name": "Queen",
+      "image_url": "https://cdn.example.com/artist/queen.jpg",
+      "monthly_listeners": 45000000
+    }
+  ],
+  "albums": [...]
+}
+```
+
+<h3 id="32-get-stream-url">3.2 Get Stream URL</h3>
+
+<h4 id="endpoint-get-songssong_idstream">
+  Endpoint: GET /songs/&#123;song_id&#125;/stream
+</h4>
+
+This is the critical path for playback. Instead of streaming audio directly through our API servers, we return a signed URL that points to a CDN edge server. This approach offloads bandwidth from our application tier and ensures users get audio from a server close to them.
+
+<h4 id="path-parameters">Path Parameters</h4>
+
+| Parameter | Type   | Description                        |
+| --------- | ------ | ---------------------------------- |
+| `song_id` | string | The unique identifier for the song |
+
+<h4 id="query-parameters">Query Parameters</h4>
+
+| Parameter | Type   | Required | Description                                                             |
+| --------- | ------ | -------- | ----------------------------------------------------------------------- |
+| `quality` | string | No       | Preferred quality: "low" (96kbps), "medium" (160kbps), "high" (320kbps) |
+
+<h4 id="example-response-200-ok">Example Response (200 OK)</h4>
+
+```json
+{
+  "stream_url": "https://cdn.example.com/audio/song_123/320.mp3?token=eyJhbGc...&expires=1705320000",
+  "expires_at": "2024-01-15T12:00:00Z",
+  "format": "mp3",
+  "bitrate": 320,
+  "duration_ms": 354000
+}
+```
+
+The signed URL includes an authentication token and expiration time. This prevents URL sharing (the token is tied to the user) and limits the window for unauthorized access.
+
+<h3 id="33-create-playlist">3.3 Create Playlist</h3>
+
+<h4 id="endpoint-post-playlists">Endpoint: POST /playlists</h4>
+
+Creates a new playlist for the authenticated user.
+
+<h4 id="request-body">Request Body</h4>
+
+| Parameter     | Type    | Required | Description                                             |
+| ------------- | ------- | -------- | ------------------------------------------------------- |
+| `name`        | string  | Yes      | Playlist name (max 100 characters)                      |
+| `description` | string  | No       | Playlist description                                    |
+| `is_public`   | boolean | No       | Whether the playlist is publicly visible. Default: true |
+
+<h4 id="example-request">Example Request</h4>
+
+```json
+{
+  "name": "My Workout Mix",
+  "description": "High energy songs for the gym",
+  "is_public": true
+}
+```
+
+<h4 id="example-response-201-created">Example Response (201 Created)</h4>
+
+```json
+{
+  "playlist_id": "playlist_456",
+  "name": "My Workout Mix",
+  "description": "High energy songs for the gym",
+  "owner_id": "user_789",
+  "is_public": true,
+  "created_at": "2024-01-15T10:00:00Z",
+  "song_count": 0
+}
+```
+
+<h3 id="34-add-songs-to-playlist">3.4 Add Songs to Playlist</h3>
+
+<h4 id="endpoint-post-playlistsplaylist_idsongs">
+  Endpoint: POST /playlists/&#123;playlist_id&#125;/songs
+</h4>
+
+Adds one or more songs to an existing playlist. Songs are added at the end of the playlist by default.
+
+<h4 id="request-body">Request Body</h4>
+
+```json
+{
+  "song_ids": ["song_123", "song_456", "song_789"],
+  "position": 0
+}
+```
+
+The optional `position` parameter allows inserting songs at a specific index. If omitted, songs are appended.
+
+<h4 id="example-response-200-ok">Example Response (200 OK)</h4>
+
+```json
+{
+  "playlist_id": "playlist_456",
+  "added_count": 3,
+  "song_count": 15
+}
+```
+
+<h3 id="35-get-recommendations">3.5 Get Recommendations</h3>
+
+<h4 id="endpoint-get-recommendations">Endpoint: GET /recommendations</h4>
+
+Returns personalized song recommendations based on the user's listening history and optional seed inputs.
+
+<h4 id="query-parameters">Query Parameters</h4>
+
+| Parameter      | Type    | Required | Description                                         |
+| -------------- | ------- | -------- | --------------------------------------------------- |
+| `seed_songs`   | string  | No       | Comma-separated song IDs to base recommendations on |
+| `seed_artists` | string  | No       | Comma-separated artist IDs                          |
+| `limit`        | integer | No       | Number of recommendations (1-100). Default: 20      |
+
+<h4 id="example-response-200-ok">Example Response (200 OK)</h4>
+
+```json
+{
+  "songs": [
+    {
+      "id": "song_999",
+      "title": "Don't Stop Me Now",
+      "artist": "Queen",
+      "album": "Jazz",
+      "duration_ms": 210000,
+      "reason": "Because you listened to Bohemian Rhapsody"
+    },
+    {
+      "id": "song_888",
+      "title": "Under Pressure",
+      "artist": "Queen & David Bowie",
+      "album": "Hot Space",
+      "duration_ms": 248000,
+      "reason": "Popular with Queen fans"
+    }
+  ]
+}
+```
+
+The `reason` field provides transparency about why each song was recommended, which helps users understand and trust the recommendations.
+
+<h1 id="4-high-level-design">4. High-Level Design</h1>
+
+Now we get to the interesting part: designing the system architecture. Rather than presenting a complex diagram upfront, we will build the design incrementally, starting with the core user journey (streaming music) and adding components as we address each requirement. This mirrors how you would approach the problem in an interview.
+
+Our system needs to handle four core operations:
+
+1. **Stream Music:** Play any song with sub-200ms latency
+2. **Search:** Find songs, artists, and albums instantly
+3. **Manage Playlists:** Create, edit, and share playlists
+4. **Get Recommendations:** Surface personalized music discovery
+
+The system is heavily read-intensive. For every song added to the catalog (which happens through a separate ingestion pipeline), there are millions of streams. This read-to-write asymmetry means we should optimize aggressively for read performance, and caching will be essential at every layer.
+
+Let's visualize the two primary paths through our system:
+
+Notice how the stream path separates the control plane (getting a signed URL) from the data plane (actual audio delivery via CDN). This separation is key to handling billions of streams without our API servers becoming a bottleneck.
+
+Let's build this architecture step by step.
+
+<h2 id="41-requirement-1-music-streaming">
+  4.1 Requirement 1: Music Streaming
+</h2>
+
+This is the core functionality. When a user taps play, audio must start within 200ms. Once playing, buffering should be rare even on variable network conditions. Let's design for this critical path first.
+
+When a user clicks play on a song, several things need to happen:
+
+1. Validate the user has permission to play this song (subscription, region)
+2. Generate a secure, time-limited URL for the audio file
+3. Return the URL so the client can fetch audio directly from a CDN edge server
+4. Track the play for analytics and royalty calculations
+
+Let's introduce the components we need to make this work.
+
+<h3 id="components-for-streaming">Components for Streaming</h3>
+
+Four components work together to deliver audio from origin storage to a user's device in under 200ms: the API Gateway, the Playback Service, a CDN edge layer, and object storage holding the audio files.
+
+<h4 id="api-gateway">API Gateway</h4>
+
+Every request enters through the API Gateway. Think of it as the front door to our system, handling concerns that are common across all requests.
+
+The gateway terminates SSL connections, validates request format, enforces rate limits, authenticates users via tokens, and routes requests to the appropriate backend service. By handling these cross-cutting concerns at the edge, we keep our application services focused on business logic.
+
+<h4 id="playback-service">Playback Service</h4>
+
+This service handles the critical decision: should this user be allowed to play this song? It checks:
+
+- Is the user authenticated with a valid session?
+- Does their subscription tier allow the requested quality (320kbps is premium-only)?
+- Is the song available in the user's geographic region (licensing varies by country)?
+- Has the user exceeded any rate limits?
+
+If all checks pass, the service generates a signed URL that grants temporary access to the audio file on the CDN. The URL includes an authentication token and expiration time, typically 15-30 minutes. This prevents URL sharing and limits the window for unauthorized access.
+
+<h4 id="content-delivery-network-cdn">Content Delivery Network (CDN)</h4>
+
+This is where the magic happens for low-latency playback. A CDN is a network of edge servers distributed globally. When a user in Tokyo requests audio, instead of fetching from our origin in Virginia, they get it from a nearby edge server.
+
+For popular songs (think Taylor Swift's latest release), the audio is already cached at edge locations worldwide. The CDN can serve millions of concurrent streams without touching our origin servers. This is essential given our bandwidth estimates of 5 PB per day.
+
+<h4 id="object-storage">Object Storage</h4>
+
+The actual audio files live in object storage (S3, Google Cloud Storage, or Azure Blob). Files are organized by song ID and quality level:
+
+```python
+s3://audio-bucket/
+  songs/
+    song_abc123/
+      320kbps.mp3    (high quality, ~10 MB)
+      160kbps.mp3    (standard, ~5 MB)
+      96kbps.mp3     (low bandwidth, ~3 MB)
+      manifest.json  (metadata about available formats)
+```
+
+Each song exists in multiple quality levels to support adaptive bitrate streaming and different subscription tiers.
+
+<h3 id="the-streaming-flow-in-action">The Streaming Flow in Action</h3>
+
+The sequence diagram traces a full play request from the moment the user taps play through authorization, signed URL generation, and audio delivery from the CDN.
+
+Let's trace through this step by step:
+
+1. **Client requests playback:** The user taps play. The client sends a request to our API Gateway with the song ID and the user's auth token.
+2. **Gateway validates and routes:** The API Gateway verifies the token is valid, checks rate limits, and forwards the request to the Playback Service with the user's context.
+3. **Playback Service checks entitlements:** The service looks up the song metadata (often from cache) and verifies the user can play this song. Premium-only songs require a premium subscription. Some songs are not available in certain countries due to licensing.
+4. **Generate signed URL:** If all checks pass, the service generates a signed URL. This URL includes a cryptographic signature that proves the user was authorized at this moment. The signature expires after 15-30 minutes.
+5. **Client fetches audio from CDN:** The client now has a URL pointing to a CDN edge server. It fetches the audio directly, bypassing our API entirely. This is crucial for scale.
+6. **CDN serves or fetches:** If the song is popular, it's already cached at the edge. If not, the CDN fetches from origin (S3), caches it, and serves. Either way, the audio streams to the client.
+
+**Why this design works:** By separating the control plane (authorization and URL generation) from the data plane (audio delivery), we can handle billions of streams. Our API servers handle lightweight authorization requests, while the heavy lifting of audio delivery falls to CDN infrastructure designed for exactly this purpose.
+
+<h2 id="42-requirement-2-music-search">4.2 Requirement 2: Music Search</h2>
+
+Users need to find any song instantly. They type "bohemian" and expect to see Queen's Bohemian Rhapsody appear within milliseconds. Search must be fast (under 100ms), handle typos ("bohemain"), partial matches, and return results ranked by relevance.
+
+<h3 id="components-for-search">Components for Search</h3>
+
+Search traffic flows through the API Gateway to a dedicated Search Service, which checks a Redis cache before falling back to an Elasticsearch cluster that holds a full-text index of the catalog.
+
+<h4 id="search-service">Search Service</h4>
+
+This service handles all search queries. It does not query the primary database directly. Instead, it queries a dedicated search index optimized for text matching.
+
+The Search Service parses queries, handles autocomplete requests, applies filters, and ranks results based on relevance and popularity. It also caches frequent queries since many users search for the same popular songs and artists.
+
+<h4 id="elasticsearch-cluster">Elasticsearch Cluster</h4>
+
+We use Elasticsearch (or a similar search engine like OpenSearch) for full-text search. Elasticsearch is purpose-built for this use case:
+
+- **Inverted indexes** enable fast text matching across 100 million songs
+- **Fuzzy matching** handles typos ("bohemain" matches "bohemian")
+- **Relevance scoring** ranks results by how well they match the query
+- **Horizontal scalability** allows us to add nodes as the catalog grows
+
+The search index contains denormalized data: song titles, artist names, album names, genres, and popularity scores. When a new song is added to the catalog, an indexing pipeline updates Elasticsearch.
+
+<h3 id="the-search-flow-in-action">The Search Flow in Action</h3>
+
+The sequence diagram shows how a cache hit short-circuits the round trip to Elasticsearch, and how a cache miss triggers an Elasticsearch query followed by caching the result for subsequent identical searches.
+
+**Why cache search results?** Popular searches are repeated constantly. "Taylor Swift", "Drake", and "Bohemian Rhapsody" are searched thousands of times per minute. Caching these results for even a few minutes dramatically reduces load on Elasticsearch.
+
+<h2 id="43-requirement-3-playlist-management">
+  4.3 Requirement 3: Playlist Management
+</h2>
+
+Users create playlists to organize their music. A playlist can contain anywhere from a few songs to thousands. Users expect to add songs instantly and have changes sync across all their devices.
+
+<h3 id="components-for-playlists">Components for Playlists</h3>
+
+Playlist writes touch the Playlist Service, a Redis cache for ownership verification and cache invalidation, and a persistent Playlist Database that keeps the authoritative record of each playlist's contents.
+
+<h4 id="playlist-service">Playlist Service</h4>
+
+This service manages all playlist CRUD operations. It creates, updates, and deletes playlists, adds and removes songs while maintaining their order, handles collaborative playlists where multiple users can edit, and manages sharing and privacy settings.
+
+<h4 id="playlist-database">Playlist Database</h4>
+
+We need a database that handles high read volume, since users constantly load their playlists, along with a reasonable write volume from adding and removing songs. It also needs efficient queries by `user_id` (show me all my playlists) and efficient ordering, since songs have a position in the playlist.
+
+We will discuss the specific database choice in the Database Design section.
+
+<h3 id="the-playlist-flow-in-action">The Playlist Flow in Action</h3>
+
+The sequence diagram covers adding a song to a playlist: ownership verification from cache, the database write, and the cache invalidation that keeps all of a user's devices in sync.
+
+The cache invalidation is important: when a user adds a song on their phone, the change must appear immediately when they open the app on their laptop. By invalidating the cache, we ensure the next request fetches fresh data.
+
+<h2 id="44-requirement-4-personalized-recommendations">
+  4.4 Requirement 4: Personalized Recommendations
+</h2>
+
+This is what makes modern streaming services sticky. Users expect the app to know their taste and surface music they will love but haven't discovered yet. Features like "Discover Weekly" and "Daily Mix" drive significant engagement.
+
+Recommendations combine two fundamentally different patterns: batch processing (generating recommendations offline) and real-time serving (delivering them instantly when requested).
+
+<h3 id="components-for-recommendations">Components for Recommendations</h3>
+
+The recommendation system splits into two paths: an offline batch pipeline that trains models and pre-computes results, and a real-time serving path that reads from Redis cache or the Feature Store on cache miss.
+
+<h4 id="ml-pipeline-offline">ML Pipeline (Offline)</h4>
+
+This batch processing system runs periodically (daily or weekly). It aggregates listening history across all users, trains collaborative filtering models (users who liked X also liked Y), generates user taste profiles from audio features, and pre-computes personalized recommendations for each user.
+
+The pipeline produces recommendations that are stored and ready to serve. This is how features like "Discover Weekly" work: they are generated once per week and cached.
+
+<h4 id="feature-store">Feature Store</h4>
+
+This stores computed features about users and songs: user taste vectors that capture preferred genres, moods, and tempos, song embeddings that numerically represent audio characteristics, and contextual features such as what users listen to in the morning versus the evening.
+
+<h4 id="recommendation-service">Recommendation Service</h4>
+
+Serves recommendations in real-time. For most requests, it fetches pre-computed recommendations from cache. For seed-based recommendations ("songs similar to X"), it may compute results on the fly using the feature store.
+
+<h3 id="the-recommendation-flow-in-action">
+  The Recommendation Flow in Action
+</h3>
+
+The sequence diagram shows the common case, where pre-computed recommendations are returned from Redis in a single step, and the slower fallback path, where the Recommendation Service queries the Feature Store and ranks candidates before responding.
+
+The key insight is that most recommendations are pre-computed. "Discover Weekly" is generated once per week for each user. When a user opens the app, we fetch their pre-computed playlist from cache. This approach allows us to use sophisticated ML models that would be too slow to run in real-time.
+
+<h2 id="45-putting-it-all-together">4.5 Putting It All Together</h2>
+
+Now that we have designed each requirement, let's step back and see the complete architecture:
+
+The architecture follows a layered approach, with each layer having a specific responsibility:
+
+**Client Layer:** Users access the service through mobile apps, web browsers, or desktop applications. From our perspective, they all look the same: HTTP requests with authentication tokens.
+
+**Edge Layer:** The CDN handles audio delivery at the edge, close to users geographically. The load balancer distributes API traffic across gateway instances.
+
+**Gateway Layer:** The API Gateway handles authentication, rate limiting, and request routing. It is the single entry point for all API traffic.
+
+**Application Layer:** Stateless services implement the business logic. Each service is independently deployable and horizontally scalable.
+
+**Cache Layer:** Redis provides low-latency access to frequently requested data: song metadata, user sessions, search results, and pre-computed recommendations.
+
+**Data Layer:** Different databases for different access patterns: Elasticsearch for search, relational databases for metadata and playlists, and potentially Cassandra for high-write-volume data like listening history.
+
+**ML Infrastructure:** Offline pipelines train models and generate recommendations. The feature store provides fast access to user and song features.
+
+<h3 id="component-responsibilities">Component Responsibilities</h3>
+
+Each service in the architecture has a distinct role and a corresponding scaling strategy, ranging from managed services that scale automatically to stateless application tiers that add horizontal pods under load.
+
+| Component              | Primary Responsibility            | Scaling Strategy              |
+| ---------------------- | --------------------------------- | ----------------------------- |
+| CDN                    | Audio delivery, edge caching      | Managed service (auto-scales) |
+| Load Balancer          | Traffic distribution              | Managed service               |
+| API Gateway            | Auth, rate limiting, routing      | Horizontal (stateless)        |
+| Playback Service       | Stream authorization, URL signing | Horizontal (stateless)        |
+| Search Service         | Query parsing, result ranking     | Horizontal (stateless)        |
+| Playlist Service       | Playlist CRUD operations          | Horizontal (stateless)        |
+| Recommendation Service | Serve personalized content        | Horizontal (stateless)        |
+| Elasticsearch          | Full-text search                  | Add nodes to cluster          |
+| Redis Cluster          | Hot data caching                  | Add nodes, shard by key       |
+| Databases              | Persistent storage                | Read replicas, sharding       |
+| Object Storage         | Audio files                       | Managed (infinite scale)      |
+
+This architecture handles our requirements well: the CDN absorbs audio streaming traffic, the cache layer handles most read traffic, and the stateless services scale horizontally for everything else.
+
+<h1 id="5-database-design">5. Database Design</h1>
+
+With the high-level architecture in place, let's zoom into the data layer. Choosing the right database and designing an efficient schema are critical decisions that affect performance, scalability, and operational complexity.
+
+<h2 id="51-choosing-the-right-databases">5.1 Choosing the Right Databases</h2>
+
+Music streaming has diverse data with very different access patterns. Song metadata needs complex queries and relationships. Playlists need fast reads by user. Listening history is append-heavy with billions of writes. No single database excels at all of these.
+
+This is where polyglot persistence shines: using different databases for different data types, each optimized for its specific access pattern.
+
+Let's think through why each data type maps to a specific database:
+
+<h4 id="song-metadata-postgresql">Song Metadata: PostgreSQL</h4>
+
+Song, artist, and album data has natural relationships: songs belong to albums, albums belong to artists, artists can collaborate on songs. A relational database handles these relationships well with foreign keys and joins.
+
+We need complex queries: find all songs by this artist, find albums released in this year, get the top 50 songs in this genre. PostgreSQL's rich query language handles this naturally.
+
+The catalog (100 million songs) changes slowly and fits comfortably in a single database with read replicas. No need for the complexity of sharding.
+
+<h4 id="search-index-elasticsearch">Search Index: Elasticsearch</h4>
+
+We already discussed this: full-text search, fuzzy matching, relevance scoring. Elasticsearch is purpose-built for these requirements. It sits alongside PostgreSQL, receiving updates when the catalog changes.
+
+<h4 id="playlists-cassandra">Playlists: Cassandra</h4>
+
+Playlist access patterns are user-centric: show me all my playlists, load this specific playlist, add a song to this playlist. These queries always include a user_id, making it a perfect partition key.
+
+Cassandra excels here because it partitions data by user, so all of a user's playlists live on the same node, and reads and writes within a partition are fast. It also scales horizontally as the user count grows and handles the high write throughput of active playlist editing.
+
+<h4 id="user-sessions-and-recommendations-redis">
+  User Sessions and Recommendations: Redis
+</h4>
+
+Session data (is this user logged in?) and pre-computed recommendations need sub-millisecond reads. Redis keeps this data in memory and handles millions of reads per second.
+
+Redis also supports TTLs natively, which is perfect for session expiration and recommendation refresh cycles.
+
+<h4 id="listening-history-cassandra">Listening History: Cassandra</h4>
+
+This is the highest-write-volume data in the system. With 1 billion streams per day, we are writing 11,500+ events per second. Cassandra handles this write throughput while still supporting efficient reads by user (show me my recent listening history).
+
+The partition key is user_id, and the clustering key is listened_at timestamp (descending). This means we can efficiently query "last 100 songs this user played" without scanning the entire table.
+
+<h3 id="database-choice-summary">Database Choice Summary</h3>
+
+| Data Type         | Database      | Key Reasoning                                       |
+| ----------------- | ------------- | --------------------------------------------------- |
+| Song Metadata     | PostgreSQL    | Complex relationships, rich queries, stable catalog |
+| Search Index      | Elasticsearch | Full-text search, fuzzy matching, relevance scoring |
+| Playlists         | Cassandra     | User-partitioned, high read/write throughput        |
+| User Sessions     | Redis         | Sub-millisecond reads, TTL support                  |
+| Listening History | Cassandra     | High write volume, time-series access pattern       |
+| Recommendations   | Redis         | Pre-computed, needs instant reads                   |
+
+<h2 id="52-database-schema">5.2 Database Schema</h2>
+
+Now let's design the schema for each data store.
+
+<h3 id="songs-table-postgresql">Songs Table (PostgreSQL)</h3>
+
+This is the heart of our catalog. Each row represents one song.
+
+| Field          | Type         | Description                                             |
+| -------------- | ------------ | ------------------------------------------------------- |
+| `song_id`      | UUID (PK)    | Unique identifier for the song                          |
+| `title`        | VARCHAR(255) | Song title                                              |
+| `artist_id`    | UUID (FK)    | Reference to artists table                              |
+| `album_id`     | UUID (FK)    | Reference to albums table                               |
+| `duration_ms`  | INTEGER      | Song duration in milliseconds                           |
+| `release_date` | DATE         | When the song was released                              |
+| `genres`       | VARCHAR[]    | Array of genre tags                                     |
+| `audio_path`   | VARCHAR(500) | Path to audio in object storage (e.g., "songs/abc123/") |
+| `play_count`   | BIGINT       | Total play count (updated periodically)                 |
+| `created_at`   | TIMESTAMP    | When the record was created                             |
+
+**Indexes:**
+
+```sql
+-- Primary lookup
+PRIMARY KEY (song_id)
+
+-- Find songs by artist
+CREATE INDEX idx_songs_artist ON songs(artist_id);
+
+-- Find songs by album
+CREATE INDEX idx_songs_album ON songs(album_id);
+
+-- Search by title (for exact match, fuzzy search uses Elasticsearch)
+CREATE INDEX idx_songs_title ON songs(title);
+```
+
+<h3 id="artists-table-postgresql">Artists Table (PostgreSQL)</h3>
+
+Artist records store profile data that changes infrequently: name, biography, image URL, and a periodically refreshed monthly listener count used for search ranking.
+
+| Field               | Type         | Description                                    |
+| ------------------- | ------------ | ---------------------------------------------- |
+| `artist_id`         | UUID (PK)    | Unique identifier for the artist               |
+| `name`              | VARCHAR(255) | Artist name                                    |
+| `bio`               | TEXT         | Artist biography                               |
+| `image_url`         | VARCHAR(500) | Profile image URL on CDN                       |
+| `monthly_listeners` | INTEGER      | Current monthly listener count (updated daily) |
+| `verified`          | BOOLEAN      | Whether artist is verified                     |
+| `created_at`        | TIMESTAMP    | When the record was created                    |
+
+<h3 id="playlists-table-cassandra">Playlists Table (Cassandra)</h3>
+
+Cassandra tables are designed around query patterns. Our primary queries are:
+
+- Get all playlists for a user
+- Get a specific playlist by ID
+- Get songs in a playlist
+
+```sql
+-- Playlists by user
+CREATE TABLE playlists_by_user (
+    user_id       UUID,
+    playlist_id   UUID,
+    name          TEXT,
+    description   TEXT,
+    is_public     BOOLEAN,
+    song_count    INT,
+    created_at    TIMESTAMP,
+    updated_at    TIMESTAMP,
+    PRIMARY KEY (user_id, created_at, playlist_id)
+) WITH CLUSTERING ORDER BY (created_at DESC, playlist_id ASC);
+```
+
+The partition key is `user_id`, so all of a user's playlists are on the same node. The clustering key orders playlists by creation date (newest first).
+
+<h3 id="playlist-songs-table-cassandra">Playlist Songs Table (Cassandra)</h3>
+
+This table stores the ordered contents of each playlist. Partitioning by `playlist_id` and clustering by `position` lets Cassandra return all songs in correct order with a single partition read.
+
+```sql
+-- Songs in a playlist
+CREATE TABLE playlist_songs (
+    playlist_id   UUID,
+    position      INT,
+    song_id       UUID,
+    added_at      TIMESTAMP,
+    added_by      UUID,
+    PRIMARY KEY (playlist_id, position)
+) WITH CLUSTERING ORDER BY (position ASC);
+```
+
+The partition key is `playlist_id`, and songs are ordered by position. This makes loading a playlist efficient: one query returns all songs in order.
+
+<h3 id="user-listening-history-table-cassandra">
+  User Listening History Table (Cassandra)
+</h3>
+
+Listening history is the highest-write-volume table in the system. Partitioning by `user_id` and clustering by `listened_at` in descending order makes it fast to retrieve a user's most recent plays, which feed both the recommendation pipeline and the listening history UI.
+
+```sql
+-- Listening history by user
+CREATE TABLE listening_history (
+    user_id           UUID,
+    listened_at       TIMESTAMP,
+    song_id           UUID,
+    duration_played   INT,
+    context_type      TEXT,
+    context_id        UUID,
+    PRIMARY KEY (user_id, listened_at)
+) WITH CLUSTERING ORDER BY (listened_at DESC);
+```
+
+With this schema, we can efficiently query "last 50 songs user X played" since data is partitioned by user and ordered by timestamp.
+
+**Why Cassandra handles the write volume:** With 200 million DAU and an average of 5 songs per session, we are writing 1 billion events per day. Cassandra distributes this across nodes and handles writes without locks, achieving the throughput we need.
+
+<h1 id="6-design-deep-dive">6. Design Deep Dive</h1>
+
+The high-level architecture gives us a solid foundation, but system design interviews often go deeper into specific components. In this section, we will explore the trickiest parts of our design: audio streaming architecture, search infrastructure, personalization, scaling strategies, and offline playback.
+
+These are the topics that distinguish a good system design answer from a great one.
+
+<h2 id="61-audio-streaming-architecture">6.1 Audio Streaming Architecture</h2>
+
+Delivering audio with low latency and high quality is the core technical challenge. A user clicks play and expects music within 200ms. Once playing, there should be no buffering even when network conditions change. Let's explore how to achieve this at scale.
+
+<h3 id="audio-file-preparation">Audio File Preparation</h3>
+
+Before a song can be streamed, it goes through an ingestion pipeline that prepares it for delivery:
+
+<h4 id="step-1-transcoding">Step 1: Transcoding</h4>
+
+The original high-quality audio (often WAV or FLAC from the label) is converted to multiple quality levels:
+
+| Quality   | Bitrate  | File Size (4 min song) | Target Users             |
+| --------- | -------- | ---------------------- | ------------------------ |
+| Very High | 320 kbps | ~10 MB                 | Premium users on WiFi    |
+| High      | 160 kbps | ~5 MB                  | Standard quality         |
+| Normal    | 96 kbps  | ~3 MB                  | Low bandwidth/data saver |
+| Low       | 24 kbps  | ~720 KB                | Extreme data saver       |
+
+Multiple quality levels enable adaptive streaming: if network conditions degrade, the client can switch to a lower quality mid-song rather than buffering.
+
+<h4 id="step-2-chunking">Step 2: Chunking</h4>
+
+Each quality variant is split into small chunks, typically 5-10 seconds each. A 4-minute song becomes roughly 24-48 chunks per quality level.
+
+Why chunk? Several reasons:
+
+- **Faster start:** The client only needs the first chunk to start playing, not the entire file
+- **Efficient seeking:** Jumping to 2:30 means fetching only that chunk, not everything before it
+- **Quality switching:** The client can switch quality on chunk boundaries without audible artifacts
+- **Better caching:** Individual chunks can be cached and evicted independently
+
+<h4 id="step-3-drm-encryption">Step 3: DRM Encryption</h4>
+
+Each chunk is encrypted for digital rights management. The client decrypts on playback using a license key tied to the user's subscription. This prevents users from extracting and redistributing audio files.
+
+<h3 id="streaming-protocol-options">Streaming Protocol Options</h3>
+
+There are several ways to deliver audio to clients. Let's compare the approaches:
+
+<h4 id="approach-1-progressive-download">Approach 1: Progressive Download</h4>
+
+The simplest approach: the client requests the complete audio file and downloads it sequentially.
+
+<h4 id="approach-2-http-live-streaming-hls-or-dash">
+  Approach 2: HTTP Live Streaming (HLS) or DASH
+</h4>
+
+The modern standard for adaptive streaming. Audio is pre-chunked, and a manifest file describes available qualities and chunk URLs.
+
+**How it works:**
+
+1. Client fetches the manifest file listing all available quality levels and chunk URLs
+2. Based on measured bandwidth, client selects a quality level
+3. Client downloads chunks sequentially, measuring download speed
+4. If bandwidth changes, client switches quality at the next chunk boundary
+
+<h4 id="approach-3-custom-protocol">Approach 3: Custom Protocol</h4>
+
+Spotify uses a proprietary streaming protocol optimized specifically for music. Key optimizations include:
+
+- **Predictive buffering:** Pre-fetches the next song while the current one is playing
+- **Gapless playback:** No silence between tracks in an album
+- **Multiple connections:** Uses parallel connections for redundancy
+- **Stutter-free algorithms:** Prioritizes playback continuity over quality
+
+<h4 id="recommendation-for-interviews">Recommendation for interviews</h4>
+
+Use HLS/DASH as your answer. It's well understood, handles the core requirements (adaptive streaming, CDN compatibility), and is what most new streaming services would choose. Mention that mature services like Spotify have evolved custom protocols for specialized optimizations.
+
+<h3 id="cdn-caching-strategy">CDN Caching Strategy</h3>
+
+With 5 PB of daily bandwidth, CDN caching is essential for both cost and latency. But not all songs are equal: some are played millions of times per day, while others might be played once per year.
+
+<h4 id="the-pareto-effect-in-music">The Pareto Effect in Music</h4>
+
+Music consumption follows an extreme power law. The top 1% of songs account for roughly 90% of all streams, the top 10% covers more than 99% of streams, and the remaining 90% of the catalog, the "long tail," is rarely accessed.
+
+This distribution makes caching highly effective. Taylor Swift's latest single is requested millions of times per day and should be cached at every edge location. An obscure jazz recording from the 1960s might be requested once per month and can stay at origin.
+
+<h4 id="cache-warming-strategies">Cache Warming Strategies</h4>
+
+1. **New releases:** When an anticipated album drops (Beyonce, Taylor Swift), pre-push it to all edge locations before the release time
+2. **Trending content:** Monitor stream velocity and proactively cache songs that are gaining momentum
+3. **Predictive caching:** When a user starts a playlist, pre-cache upcoming songs at their nearest edge
+4. **Geographic patterns:** Songs popular in specific regions (K-pop in Korea, Reggaeton in Latin America) are prioritized at regional caches
+
+<h4 id="cache-headers">Cache Headers</h4>
+
+For audio chunks, we set long cache times since content never changes:
+
+```text
+Cache-Control: public, max-age=31536000, immutable
+```
+
+The `immutable` directive tells browsers and CDNs that the content will never change, eliminating conditional requests.
+
+<h2 id="62-search-and-discovery">6.2 Search and Discovery</h2>
+
+Search is how users find music. They type a few letters and expect to see relevant results instantly, even if they misspell the artist name or only remember part of the song title. Search must be fast (under 100ms), forgiving of errors, and smart about ranking.
+
+<h3 id="search-index-architecture">Search Index Architecture</h3>
+
+We do not query the primary database for search. Instead, we maintain a dedicated search index using Elasticsearch (or OpenSearch). This separation allows us to optimize each system for its specific workload.
+
+<h4 id="what-gets-indexed">What Gets Indexed</h4>
+
+The Elasticsearch index holds a denormalized view of the catalog, pulling fields from several source tables so that a single query can match songs by title, artist, album name, lyrics, or genre without joins.
+
+| Field            | Source         | Notes                               |
+| ---------------- | -------------- | ----------------------------------- |
+| Song titles      | Song metadata  | Primary search target               |
+| Artist names     | Artist table   | Includes aliases and collaborations |
+| Album names      | Album table    | Including compilation names         |
+| Lyrics           | Lyrics service | For "search by lyric" feature       |
+| Genres and moods | Tagging system | "upbeat pop", "chill electronic"    |
+
+<h4 id="index-structure">Index Structure</h4>
+
+Elasticsearch uses inverted indexes, mapping terms to the documents containing them:
+
+```text
+"bohemian" -> [song_123, song_456, album_789]
+"queen" -> [artist_001, song_123, song_456, album_789]
+"rhapsody" -> [song_123, song_888]
+```
+
+When a user searches "bohemian rhapsody", Elasticsearch finds documents matching both terms and ranks them by relevance.
+
+<h3 id="handling-typos-and-fuzzy-matching">
+  Handling Typos and Fuzzy Matching
+</h3>
+
+Users frequently misspell artist and song names. "Ariana Grandi", "Tylor Swift", "bohemain rapsody" should all return correct results.
+
+Elasticsearch provides several mechanisms:
+
+1. **Fuzzy queries:** Allow for character edits (insertions, deletions, substitutions). "bohemain" with edit distance 1 matches "bohemian".
+2. **Phonetic matching:** "Cue" sounds like "Queue". Phonetic analyzers (Soundex, Metaphone) index words by how they sound.
+3. **N-gram tokenization:** Index partial words for autocomplete. "bohe" matches "bohemian" because we index ["b", "bo", "boh", "bohe", "bohem", ...].
+
+<h3 id="search-ranking">Search Ranking</h3>
+
+Raw text matching is not enough. When searching "queen", users probably want the legendary rock band, not every song with "queen" in the title. We rank results using multiple signals:
+
+| Signal          | Weight | Description                                         |
+| --------------- | ------ | --------------------------------------------------- |
+| Text relevance  | High   | Exact matches rank higher than partial matches      |
+| Popularity      | High   | Monthly listeners, total streams, trending velocity |
+| Personalization | Medium | Boost artists the user has listened to before       |
+| Recency         | Low    | New releases get a small boost                      |
+
+The weights are tuned based on user behavior data. If users consistently click the 3rd result, something is wrong with the ranking.
+
+<h3 id="autocomplete">Autocomplete</h3>
+
+As users type, we show suggestions in real-time. This requires extremely low latency (under 50ms) because users are actively typing and waiting.
+
+<h4 id="implementation">Implementation</h4>
+
+1. Index names with edge n-grams: "taylor" becomes ["t", "ta", "tay", "tayl", "taylo", "taylor"]
+2. Use Elasticsearch's completion suggester, optimized for prefix matching
+3. Return top 5-10 suggestions sorted by popularity
+4. Client-side debouncing (100ms) prevents excessive requests while typing
+
+<h2 id="63-personalization-and-recommendations">
+  6.3 Personalization and Recommendations
+</h2>
+
+Personalization is what makes Spotify addictive. When you open the app and "Discover Weekly" has exactly the kind of music you love but have never heard, it feels like magic. That magic is the result of sophisticated recommendation systems running at massive scale.
+
+<h3 id="understanding-user-taste">Understanding User Taste</h3>
+
+The recommendation system learns user preferences from multiple signals, each providing different information:
+
+| Signal            | Type     | Strength    | Notes                                        |
+| ----------------- | -------- | ----------- | -------------------------------------------- |
+| Liked songs       | Explicit | Very strong | User clicked heart, clear preference         |
+| Added to playlist | Explicit | Strong      | Deliberate curation                          |
+| Listening history | Implicit | Medium      | What they play repeatedly                    |
+| Skip behavior     | Implicit | Medium      | Skipping within 30 seconds indicates dislike |
+| Listen duration   | Implicit | Weak        | Full song = engagement, partial = maybe skip |
+| Time of day       | Context  | Weak        | Morning playlists differ from night          |
+
+<h3 id="recommendation-approaches">Recommendation Approaches</h3>
+
+There are several approaches to generating recommendations, each with trade-offs:
+
+<h4 id="approach-1-collaborative-filtering">
+  Approach 1: Collaborative Filtering
+</h4>
+
+The core idea: users with similar taste like similar songs. If you and I both love the same 50 songs, and you love a song I have not heard, I will probably like it too.
+
+**How it works:**
+
+1. Build a sparse matrix of user-song interactions (plays, likes, skips)
+2. Use matrix factorization (ALS, SVD) to find latent factors
+3. Each user and song becomes a vector in latent space
+4. Predict preference as the dot product of user and song vectors
+
+<h4 id="approach-2-content-based-filtering">
+  Approach 2: Content-Based Filtering
+</h4>
+
+The idea: recommend songs similar to what the user already likes, based on the songs' characteristics.
+
+**How it works:**
+
+1. Extract audio features from songs: tempo (BPM), energy, acousticness, danceability, valence (happiness)
+2. Convert each song into an embedding (vector representation)
+3. Find songs with similar embeddings to what the user likes
+
+<h4 id="approach-3-hybrid-what-spotify-uses">
+  Approach 3: Hybrid (What Spotify Uses)
+</h4>
+
+Real systems combine multiple approaches:
+
+The ensemble layer learns how to weight each model's predictions. For new users, content-based gets more weight. For users with rich history, collaborative filtering dominates.
+
+<h3 id="batch-vs-real-time-recommendations">
+  Batch vs Real-Time Recommendations
+</h3>
+
+Different recommendation features have different latency requirements:
+
+| Feature                         | Compute Time | Refresh Rate | Infrastructure                |
+| ------------------------------- | ------------ | ------------ | ----------------------------- |
+| Discover Weekly                 | Hours        | Weekly       | Spark batch jobs              |
+| Daily Mix                       | Hours        | Daily        | Spark batch jobs              |
+| "Because you listened to..."    | &lt;100ms    | Per request  | Model serving + feature store |
+| Radio (similar to current song) | &lt;100ms    | Per request  | Nearest neighbor search       |
+
+**Batch recommendations** (Discover Weekly) run offline using full model training. They are pre-computed for every user and stored in Redis for instant serving.
+
+**Real-time recommendations** use pre-trained models with real-time features. When you finish a song, we query the model with your current session context to suggest the next song.
+
+<h3 id="recommendation-system-architecture">
+  Recommendation System Architecture
+</h3>
+
+The full pipeline connects event ingestion through Kafka, stream and batch processing, model training, and the serving layer that delivers recommendations to the API. Each stage is decoupled so that a slow batch job does not delay real-time serving.
+
+1. **Event collection:** Every play, skip, and like flows through Kafka
+2. **Stream processing:** Real-time features are computed (current session, recent plays)
+3. **Batch processing:** Heavy model training runs on Spark, retraining weekly
+4. **Feature store:** Central repository for all user and song features
+5. **Model serving:** Trained models are deployed for real-time inference
+6. **Caching:** Pre-computed recommendations (Discover Weekly) are stored in Redis
+
+<h2 id="64-handling-scale-and-high-availability">
+  6.4 Handling Scale and High Availability
+</h2>
+
+With 200 million daily active users and 1 billion streams per day, the system must be designed for extreme scale. Equally important, it must stay up. Users expect music to be available 24/7, and outages are highly visible on social media.
+
+<h3 id="horizontal-scaling">Horizontal Scaling</h3>
+
+The key to horizontal scaling is keeping services stateless. When a service stores no state locally, you can add or remove instances without coordination.
+
+<h4 id="all-our-application-services-are-stateless">
+  All our application services are stateless
+</h4>
+
+The Playback Service can handle any request on any instance, the Search Service queries Elasticsearch, the Playlist Service reads from and writes to Cassandra, and the Recommendation Service fetches from the cache or feature store.
+
+<h4 id="auto-scaling-with-kubernetes">Auto-scaling with Kubernetes</h4>
+
+We use Horizontal Pod Autoscaler (HPA) to automatically add capacity:
+
+| Metric                | Target | Action                      |
+| --------------------- | ------ | --------------------------- |
+| CPU utilization       | 70%    | Add pods when exceeded      |
+| Request latency (p99) | 100ms  | Add pods if latency spikes  |
+| Request queue depth   | 100    | Add pods if queue builds up |
+
+During peak hours (evening commute, weekends), the system automatically scales up. During low-traffic periods (3 AM), it scales down to save costs.
+
+<h3 id="database-scaling">Database Scaling</h3>
+
+Different databases scale differently:
+
+<h4 id="cassandra-playlists-listening-history">
+  Cassandra (Playlists, Listening History)
+</h4>
+
+Cassandra scales horizontally by adding nodes. Data is automatically rebalanced across the cluster using consistent hashing.
+
+Each user's data lives on a subset of nodes (replication factor = 3). Reads and writes for a user hit the same nodes, making operations efficient.
+
+<h4 id="postgresql-song-metadata">PostgreSQL (Song Metadata)</h4>
+
+For the song catalog, we use read replicas rather than sharding. One primary handles writes such as song additions and metadata updates, while multiple read replicas handle read traffic.
+
+This works because writes are infrequent, since new songs are added daily rather than per second, and 100 million songs fits comfortably in a well-indexed PostgreSQL instance.
+
+<h4 id="elasticsearch-search">Elasticsearch (Search)</h4>
+
+Elasticsearch scales by adding nodes to the cluster. Indexes are automatically sharded across nodes.
+
+<h3 id="multi-layer-caching">Multi-Layer Caching</h3>
+
+Caching is essential at every layer to handle our traffic:
+
+| Layer    | What's Cached                            | TTL       | Hit Rate  |
+| -------- | ---------------------------------------- | --------- | --------- |
+| Client   | Recently played, user preferences        | 1 hour    | Very high |
+| CDN      | Audio files, album art, static assets    | 24+ hours | 80-90%    |
+| Redis    | Song metadata, recommendations, sessions | 5-15 min  | 90%+      |
+| Database | Query results in buffer pool             | Automatic | 95%+      |
+
+With these cache layers, only a tiny fraction of requests reach the primary databases.
+
+<h3 id="high-availability">High Availability</h3>
+
+<h4 id="multi-region-deployment">Multi-Region Deployment</h4>
+
+We deploy in multiple geographic regions with active-active configuration:
+
+Users are routed to the nearest region via DNS-based load balancing, and each region can handle its traffic independently. If one region fails, traffic is automatically routed to the remaining regions.
+
+Data is replicated across regions, eventually consistent for playlists and synchronous for critical user data.
+
+<h4 id="graceful-degradation">Graceful Degradation</h4>
+
+When components fail, the system should degrade gracefully rather than crash entirely:
+
+| Component              | If It Fails                       | Fallback                         |
+| ---------------------- | --------------------------------- | -------------------------------- |
+| Recommendation Service | Home page shows generic playlists | Serve cached "top hits"          |
+| Search Service         | Search is temporarily unavailable | Show recently played             |
+| Playlist Service       | Cannot modify playlists           | Read from cache (read-only mode) |
+| CDN                    | Slower audio delivery             | Fall back to origin              |
+
+The most important invariant: **playback should always work**. Users can tolerate degraded recommendations, but not being able to play music is a critical failure.
+
+<h3 id="rate-limiting">Rate Limiting</h3>
+
+Protection against abuse and accidental overload:
+
+| Endpoint              | Limit            | Notes                    |
+| --------------------- | ---------------- | ------------------------ |
+| Stream requests       | 100/min per user | Prevents bot abuse       |
+| Search requests       | 30/min per user  | Prevents scraping        |
+| Playlist writes       | 60/min per user  | Prevents spam            |
+| API (unauthenticated) | 10/min per IP    | Prevents anonymous abuse |
+
+Rate limits are enforced at the API Gateway using Redis-backed counters with sliding window algorithm.
+
+<h1 id="7-follow-ups">7. Follow-ups</h1>
+
+<h2 id="71-offline-playback">7.1 Offline Playback</h2>
+
+Premium users can download songs for offline listening. This is essential for users on flights, subways, or in areas with poor connectivity. But it introduces unique challenges: we are giving users permanent copies of copyrighted content that we need to protect and eventually revoke.
+
+<h3 id="download-architecture">Download Architecture</h3>
+
+The download flow is similar to streaming, but the client stores the content locally instead of playing it immediately:
+
+<h3 id="the-download-flow-in-detail">The Download Flow in Detail</h3>
+
+1. **User initiates download:** User marks a playlist for offline access
+2. **Entitlement check:** Download Service verifies:
+3. **License generation:** For each song, we generate an encrypted license tied to:
+4. **Download:** Client downloads encrypted audio files from CDN
+5. **Local storage:** Audio and licenses are stored in encrypted local storage
+
+<h3 id="drm-and-content-protection">DRM and Content Protection</h3>
+
+Downloaded files must be protected from piracy. If users could extract and share downloaded MP3s, the entire licensing model would collapse.
+
+<h4 id="encryption">Encryption</h4>
+
+Audio files are encrypted using industry-standard DRM systems: Widevine on Android and Chrome, FairPlay on iOS and Safari, and PlayReady on Windows. The decryption keys are stored in secure hardware (when available) and never exposed to the application layer.
+
+<h4 id="license-expiration">License Expiration</h4>
+
+Downloaded content does not last forever. Licenses expire after 30 days of offline use. When the device comes online, it must check with the License Server to renew. If the user's subscription has lapsed, renewal fails and downloaded content becomes unplayable.
+
+<h4 id="device-management">Device Management</h4>
+
+| Limit                    | Value        | Reason                             |
+| ------------------------ | ------------ | ---------------------------------- |
+| Max devices per account  | 5            | Prevent account sharing abuse      |
+| Max downloads per device | 10,000 songs | Storage sanity                     |
+| Offline validity         | 30 days      | Periodic subscription verification |
+
+<h3 id="storage-management-on-device">Storage Management on Device</h3>
+
+The client is responsible for managing downloaded content:
+
+- **Quality selection:** Users choose download quality (affects storage)
+- **Storage tracking:** Show users how much storage is used
+- **Smart cleanup:** Automatically remove songs that have not been played offline in 60+ days, oldest downloads first when storage is low
+
+<h2 id="72-royalty-calculation-and-playback-tracking">
+  7.2 Royalty Calculation and Playback Tracking
+</h2>
+
+Every stream must be tracked accurately for royalty payments to artists and labels. This is not only a feature; it's a legal and financial requirement. Billions of dollars flow from Spotify to rights holders based on stream counts.
+
+<h3 id="what-counts-as-a-stream">What Counts as a Stream?</h3>
+
+Not every play counts as a stream for royalty purposes:
+
+| Condition                           | Counts as Stream? | Why                              |
+| ----------------------------------- | ----------------- | -------------------------------- |
+| Played 30+ seconds                  | Yes               | Industry standard threshold      |
+| Played &lt; 30 seconds              | No                | Prevents gaming with short plays |
+| Automated/bot playback              | No                | Detected and filtered            |
+| User actively listening             | Yes               | Normal usage                     |
+| Background audio with no engagement | Maybe             | Complex rules apply              |
+
+The 30-second threshold is an industry standard. Playing 29 seconds and skipping does not count. Playing 30 seconds and then skipping does count.
+
+<h3 id="playback-event-pipeline">Playback Event Pipeline</h3>
+
+We need to capture every play event, process it at scale, and aggregate for royalty calculation:
+
+<h3 id="event-flow-in-detail">Event Flow in Detail</h3>
+
+1. **Client emits events:** The app sends events for key playback moments:
+2. **Event collection:** Events are batched and sent to our Event Collector API. We use batching to reduce network overhead and handle intermittent connectivity.
+3. **Kafka for durability:** Events flow into Kafka, providing durability and buffering. If downstream systems are slow, Kafka absorbs the backlog without losing data.
+4. **Stream processing:** A Flink or Spark Streaming job processes events in near-real-time:
+5. **Fraud detection:** ML models flag suspicious patterns before counting streams
+6. **Analytics and royalties:** Valid streams are written to analytics databases and fed into the royalty calculation pipeline
+
+<h3 id="fraud-detection">Fraud Detection</h3>
+
+Stream manipulation is a real problem. Bad actors try to inflate stream counts to earn royalties fraudulently. We detect and filter these:
+
+<h4 id="detection-signals">Detection signals</h4>
+
+The fraud classifier draws on five categories of signal, ranging from obvious replay loops to subtle geographic and device anomalies that distinguish legitimate listeners from automated accounts.
+
+| Signal                   | Description                                | Indicates             |
+| ------------------------ | ------------------------------------------ | --------------------- |
+| Loop behavior            | Same song played 100+ times                | Bot or manipulation   |
+| Geographic impossibility | User in Tokyo, then NYC 5 minutes later    | Account compromise    |
+| Device fingerprint       | Virtual machine, emulator, automation      | Bot farm              |
+| No diversity             | Only plays one artist, no browsing         | Targeted manipulation |
+| Payment anomalies        | Many streams but subscription always fails | Stolen credentials    |
+
+Detected fraud is flagged, excluded from royalty calculations, and investigated. Repeat offenders have accounts suspended.
+
+<h3 id="royalty-calculation">Royalty Calculation</h3>
+
+Stream data feeds into the royalty system that determines artist payments. The calculation is complex and varies by contract, but the basic model is:
+
+1. **Pool model:** Total subscription revenue forms a pool
+2. **Stream share:** Each artist's streams as a percentage of total streams
+3. **Payment:** Artist receives their percentage of the revenue pool
+
+This happens monthly, processing billions of stream records to determine millions of payments.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

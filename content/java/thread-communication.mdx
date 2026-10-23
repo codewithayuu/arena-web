@@ -1,0 +1,513 @@
+---
+title: "Thread Communication"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Thread Communication explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="why-mutual-exclusion-is-not-enough">
+  Why Mutual Exclusion Is Not Enough
+</h1>
+
+A `synchronized` block guarantees that at most one thread runs the protected code at a time. That's mutual exclusion. It prevents lost updates, torn reads, and broken-counter problems. What it doesn't do is help a thread wait for a condition that another thread has to make true.
+
+Consider an order queue with a fixed capacity of three. Two roles share it: an order-taker thread that adds new orders, and an order-processor thread that pulls orders out and ships them. A naive version of this pattern looks fine on the surface.
+
+```java
+import java.util.ArrayDeque;
+import java.util.Queue;
+
+public class NaiveOrderQueue {
+    private final Queue<String> orders = new ArrayDeque<>();
+    private final int capacity = 3;
+
+    public synchronized void place(String order) {
+        if (orders.size() < capacity) {
+            orders.add(order);
+            System.out.println("Placed: " + order);
+        }
+    }
+
+    public synchronized String pickUp() {
+        if (!orders.isEmpty()) {
+            return orders.poll();
+        }
+        return null;
+    }
+}
+```
+
+Both methods are `synchronized`, so the queue can't be torn between two threads writing at the same instant. Good. What happens when the order-taker finds the queue full? It drops the order on the floor and returns. What happens when the processor finds the queue empty? It returns `null`, and the caller has to deal with the missing data.
+
+We could fix that by spinning:
+
+```java
+public void place(String order) {
+    while (true) {
+        synchronized (this) {
+            if (orders.size() < capacity) {
+                orders.add(order);
+                return;
+            }
+        }
+        // capacity full, try again
+    }
+}
+```
+
+That loop "works" in the sense that the order eventually lands. It burns a CPU core doing nothing useful, hammering the lock thousands of times a second to ask "are we there yet?" When a producer thread is blocked because the queue is full, you want it to step aside cleanly until a consumer makes room, then come back. Spinning isn't stepping aside; it's pacing back and forth on top of the lock.
+
+What we want is a way to say: "I am holding the lock, but the condition I need isn't true yet. Please release the lock, put me to sleep, and wake me up when something changes." That's what `Object.wait` does.
+
+<h1 id="the-monitor-every-object-has-one">The Monitor: Every Object Has One</h1>
+
+Every Java object carries an invisible piece of machinery called a **monitor**. It's the combination of three things bundled together: a lock you can acquire with `synchronized`, a wait set (a holding area for sleeping threads), and the mechanics to move threads between them. You don't allocate a monitor explicitly. The JVM gives every object one at no extra cost.
+
+The wait set is the part that matters for this chapter. It's a queue of threads that have voluntarily gone to sleep on this object, waiting for someone else to wake them up. Threads in the wait set aren't running. They don't consume CPU. They don't hold the lock. They're parked, by name, on the monitor of one specific object.
+
+The diagram shows the three populations around an object's monitor at one moment. Thread A currently holds the lock and is running protected code. Threads B and C are in the wait set; they called `wait()` earlier, released the lock, and are now parked. Thread D wants the lock but can't get it because A has it; it's blocked at the entry to a `synchronized` block. When A leaves the block, D will take the lock. When someone calls `notify` or `notifyAll`, one or all of B and C will move from the wait set to the "trying to reacquire the lock" state, joining D in the queue for the lock.
+
+The key distinction: **blocked** threads want the lock and will get it as soon as it's free. **Waiting** threads have voluntarily parked themselves and won't reawaken until another thread calls `notify` or `notifyAll` on the same object. They're two different states with two different exits.
+
+<h1 id="wait-notify-and-notifyall">wait, notify, and notifyAll</h1>
+
+The three methods that operate on the wait set are defined on `Object`, not `Thread`. Every object inherits them.
+
+| Method          | What it does                                                                                          |
+| --------------- | ----------------------------------------------------------------------------------------------------- |
+| `wait()`        | Releases the lock, parks the current thread in the wait set, and blocks until notified.               |
+| `wait(long ms)` | Same as `wait()`, but wakes up automatically after `ms` milliseconds even if no notification arrives. |
+| `notify()`      | Wakes one arbitrary thread from the wait set. Doesn't release the lock.                               |
+| `notifyAll()`   | Wakes every thread in the wait set. Doesn't release the lock.                                         |
+
+The key fact is that `wait` releases the lock as part of going to sleep. Without that release, a thread waiting inside a `synchronized` block would hold the lock forever, and no other thread could enter the block to change the condition. The release happens atomically with the parking; there's no window where the thread is awake but lockless, or asleep but lock-holding.
+
+The second thing is that `notify` and `notifyAll` don't release the lock either. They mark threads in the wait set as eligible to wake up. Those threads can't actually run until the notifier leaves its `synchronized` block (or calls `wait` itself) and frees the lock. So the typical pattern is: hold the lock, change the shared state, call `notify` or `notifyAll`, exit the block. The woken thread then competes with anyone else for the lock and re-enters the block when it wins.
+
+The flow has a loop in it on purpose. A thread that wakes up doesn't just charge ahead. It rechecks the condition, because by the time it reacquires the lock, the state might have changed again.
+
+<h1 id="the-must-hold-the-monitor-rule">The "Must Hold the Monitor" Rule</h1>
+
+Calling `wait`, `notify`, or `notifyAll` on an object requires the calling thread to currently hold that object's monitor. If you call them without holding the lock, the JVM throws `IllegalMonitorStateException` immediately. There's no "tries to be nice and acquires the lock for you" version.
+
+```java
+public class WrongWaitCall {
+    public static void main(String[] args) {
+        Object queue = new Object();
+        try {
+            queue.wait(); // not inside synchronized(queue)
+        } catch (IllegalMonitorStateException e) {
+            System.out.println("Caught: " + e.getClass().getSimpleName());
+        } catch (InterruptedException e) {
+            // unreachable here, but the method declares it
+        }
+    }
+}
+```
+
+The `wait` call is outside any `synchronized` block on `queue`, so the current thread isn't holding `queue`'s monitor. The JVM refuses, and the exception fires before the thread could ever go to sleep. The fix is to wrap the call:
+
+```java
+public class CorrectWaitCall {
+    public static void main(String[] args) throws InterruptedException {
+        Object queue = new Object();
+        synchronized (queue) {
+            // Now we hold queue's monitor, so wait() is legal.
+            // We won't actually call it here, just illustrate the structure.
+            System.out.println("Holding the lock; could safely call queue.wait() now.");
+        }
+    }
+}
+```
+
+The same rule applies to `notify` and `notifyAll`. They've to be called on an object whose monitor the current thread already holds. The reason is consistency. The three methods operate on the monitor's internal data structures (the wait set, the lock state), and the JVM needs to know exactly one thread is touching them at a time. The lock provides that guarantee, so the language reuses it.
+
+There's a second, more subtle reason. The whole point of `wait` is to release the lock as part of going to sleep. If the thread isn't holding the lock to begin with, there's nothing to release, and the operation doesn't make sense. The exception is the JVM telling you the call is structurally meaningless.
+
+The monitor you wait on and the monitor you notify on must be the **same** object. Calling `queueA.wait()` and later `queueB.notifyAll()` does nothing useful. Threads in `queueA`'s wait set will keep sleeping forever, because nobody notifies on `queueA`. This sounds obvious, but it's a common bug when you've multiple shared objects and accidentally call `notify` on the wrong one.
+
+```java
+public class WrongObject {
+    public static void main(String[] args) {
+        Object lockA = new Object();
+        Object lockB = new Object();
+
+        Thread waiter = new Thread(() -> {
+            synchronized (lockA) {
+                try {
+                    System.out.println("waiter: about to wait on lockA");
+                    lockA.wait(2000);
+                    System.out.println("waiter: returned from wait");
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        });
+        waiter.start();
+
+        try {
+            Thread.sleep(200);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
+        synchronized (lockB) {
+            System.out.println("main: notifying on lockB (wrong object)");
+            lockB.notifyAll();
+        }
+    }
+}
+```
+
+The waiter thread does come back, but only because we gave `wait` a two-second timeout. The notification on `lockB` had no effect on `lockA`'s wait set. Without the timeout, the waiter would have stayed asleep until the JVM exited. This is one of the quietest, hardest-to-spot mistakes in `wait/notify` code: nothing throws, nothing logs, the program hangs.
+
+<h1 id="spurious-wakeups-why-while-beats-if">
+  Spurious Wakeups: Why while Beats if
+</h1>
+
+A subtle fact about `wait`: a thread can return from `wait` without anyone calling `notify`. The JVM is allowed to wake up a waiting thread for its own reasons, with no guarantee that the condition the thread was waiting on has changed. This is called a **spurious wakeup**.
+
+Spurious wakeups aren't a bug. They're explicitly permitted by the Java Language Specification and the JVM's underlying OS primitives. They happen because the threading primitives Java is built on (POSIX condition variables, Windows events) allow them, and forcing the JVM to filter them out would be expensive. The agreement Java makes with you is: "We may wake you up for no reason. You're responsible for checking whether your condition is actually true."
+
+That single fact dictates the standard `wait` pattern. Always wrap `wait` in a loop that checks the condition each time you wake up:
+
+```java
+synchronized (lock) {
+    while (!condition) {
+        lock.wait();
+    }
+    // condition is true, do the work
+}
+```
+
+The `while` matters. An `if` here's wrong, even though it looks like it might work.
+
+**What's wrong with this code?**
+
+```java
+public class BrokenWithIf {
+
+    private final Object lock = new Object();
+    private boolean ready = false;
+
+    public void waitForReady() throws InterruptedException {
+        synchronized (lock) {
+            if (!ready) {
+                lock.wait();
+            }
+            // BUG: ready might still be false here.
+            System.out.println("Proceeding with ready=" + ready);
+        }
+    }
+
+    public void setReady() {
+        synchronized (lock) {
+            ready = true;
+            lock.notifyAll();
+        }
+    }
+}
+```
+
+**Fix:**
+
+```java
+public class FixedWithWhile {
+
+    private final Object lock = new Object();
+    private boolean ready = false;
+
+    public void waitForReady() throws InterruptedException {
+        synchronized (lock) {
+            while (!ready) {
+                lock.wait();
+            }
+            // Now we know ready is true.
+            System.out.println("Proceeding with ready=" + ready);
+        }
+    }
+
+    public void setReady() {
+        synchronized (lock) {
+            ready = true;
+            lock.notifyAll();
+        }
+    }
+}
+```
+
+Two distinct failures the `if` version invites. First, a spurious wakeup can pop the thread out of `wait` while `ready` is still `false`. The `if` version sails past the check and runs as if the condition were satisfied. The `while` version goes back to sleep. Second, even if the wakeup is legitimate, the thread doesn't immediately have the lock. Between `notifyAll` waking it up and the thread reacquiring the lock, another thread could enter the block, change the state in some way, and leave the waiter to see something different from what the notifier intended. The `while` re-check catches that case too.
+
+The pattern is so common that you should treat it as a single unit: `while (!condition) lock.wait();`. It's not a suggestion. It's the only correct shape.
+
+The loop keeps the thread honest. Every return from `wait` is treated as "maybe my condition is true, let me check." If it's not, the thread goes back to sleep. The condition check and the `wait` call together form a tight contract: when the loop exits, the condition really is true, and the lock is still held.
+
+<h1 id="the-producer-consumer-pattern">The Producer-Consumer Pattern</h1>
+
+The classic motivating example for `wait/notify` is the producer-consumer problem. One or more producer threads generate items and place them in a shared buffer. One or more consumer threads pull items out and process them. The buffer has a fixed capacity. Producers must wait when it's full; consumers must wait when it's empty.
+
+For our e-commerce store, the buffer is a bounded order queue. Order-takers (producers) add new orders as customers check out. Order-processors (consumers) pull orders off the queue and ship them. The queue has a small fixed capacity, so a sudden burst of orders forces the takers to slow down until the processors catch up. A lull in orders forces the processors to wait until new orders arrive.
+
+The queue sits in the middle with two ports: one for producers calling `place`, one for consumers calling `pickUp`. Each port has a wait condition: producers wait if the queue is full, consumers wait if it's empty. The two wait states are different conditions on the same shared object, so we use the same monitor for both, with two separate `while` loops checking the right thing for each role.
+
+The `OrderQueue` itself:
+
+```java
+import java.util.ArrayDeque;
+import java.util.Queue;
+
+public class OrderQueue {
+
+    private final Queue<String> orders = new ArrayDeque<>();
+    private final int capacity;
+
+    public OrderQueue(int capacity) {
+        this.capacity = capacity;
+    }
+
+    public synchronized void place(String order) throws InterruptedException {
+        while (orders.size() == capacity) {
+            System.out.println(Thread.currentThread().getName()
+                + " sees queue full, waiting...");
+            wait();
+        }
+        orders.add(order);
+        System.out.println(Thread.currentThread().getName()
+            + " placed " + order + " (size=" + orders.size() + ")");
+        notifyAll();
+    }
+
+    public synchronized String pickUp() throws InterruptedException {
+        while (orders.isEmpty()) {
+            System.out.println(Thread.currentThread().getName()
+                + " sees queue empty, waiting...");
+            wait();
+        }
+        String order = orders.poll();
+        System.out.println(Thread.currentThread().getName()
+            + " picked up " + order + " (size=" + orders.size() + ")");
+        notifyAll();
+        return order;
+    }
+}
+```
+
+Three details. First, both methods are `synchronized` on the `OrderQueue` instance itself, which is the monitor we wait and notify on. Inside the methods, `wait()` and `notifyAll()` with no explicit receiver are shorthand for `this.wait()` and `this.notifyAll()`, exactly what we need. Second, each method has its own `while` loop checking the condition that's relevant to it: full for producers, empty for consumers. Third, both methods call `notifyAll()` after they modify the queue, because either change can free up a thread on the other side. After a `place`, the queue has one more item, so a waiting consumer might be able to proceed. After a `pickUp`, the queue has one less item, so a waiting producer might be able to proceed.
+
+A runnable demo that wires up two producers and two consumers:
+
+```java
+import java.util.ArrayDeque;
+import java.util.Queue;
+
+public class ProducerConsumerDemo {
+
+    public static void main(String[] args) throws InterruptedException {
+        OrderQueue queue = new OrderQueue(3);
+
+        Thread taker1 = new Thread(() -> placeOrders(queue, "T1", 4), "taker-1");
+        Thread taker2 = new Thread(() -> placeOrders(queue, "T2", 4), "taker-2");
+        Thread processor1 = new Thread(() -> processOrders(queue, 4), "processor-1");
+        Thread processor2 = new Thread(() -> processOrders(queue, 4), "processor-2");
+
+        processor1.start();
+        processor2.start();
+        taker1.start();
+        taker2.start();
+
+        taker1.join();
+        taker2.join();
+        processor1.join();
+        processor2.join();
+
+        System.out.println("All done.");
+    }
+
+    private static void placeOrders(OrderQueue queue, String prefix, int count) {
+        try {
+            for (int i = 1; i <= count; i++) {
+                queue.place(prefix + "-order-" + i);
+                Thread.sleep(50);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private static void processOrders(OrderQueue queue, int count) {
+        try {
+            for (int i = 0; i < count; i++) {
+                queue.pickUp();
+                Thread.sleep(120); // processing takes longer than placing
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+}
+
+class OrderQueue {
+
+    private final Queue<String> orders = new ArrayDeque<>();
+    private final int capacity;
+
+    public OrderQueue(int capacity) {
+        this.capacity = capacity;
+    }
+
+    public synchronized void place(String order) throws InterruptedException {
+        while (orders.size() == capacity) {
+            System.out.println(Thread.currentThread().getName()
+                + " sees queue full, waiting...");
+            wait();
+        }
+        orders.add(order);
+        System.out.println(Thread.currentThread().getName()
+            + " placed " + order + " (size=" + orders.size() + ")");
+        notifyAll();
+    }
+
+    public synchronized String pickUp() throws InterruptedException {
+        while (orders.isEmpty()) {
+            System.out.println(Thread.currentThread().getName()
+                + " sees queue empty, waiting...");
+            wait();
+        }
+        String order = orders.poll();
+        System.out.println(Thread.currentThread().getName()
+            + " picked up " + order + " (size=" + orders.size() + ")");
+        notifyAll();
+        return order;
+    }
+}
+```
+
+The interleaving will vary between runs, since thread scheduling isn't deterministic. The overall shape stays the same: processors are forced to wait when the queue is empty at startup, takers are forced to wait once the queue hits capacity 3, and every wait is followed eventually by a wake-up from a thread on the other side. No CPU spinning, no dropped orders, no buffer overflow. Each role does its work, blocks cleanly when it can't proceed, and resumes when the other side makes the condition true.
+
+`wait` is cheap when the thread parks. The OS suspends it, the CPU moves on to other work, and the thread costs nothing until it wakes up. A spurious wakeup re-runs the `while` condition once, which is essentially free. Where things get expensive is contention on the lock itself: if hundreds of threads all `notifyAll` and then race to reacquire one lock, the contention dominates. For that scale, the `java.util.concurrent` tools cover it better.
+
+<h1 id="notify-vs-notifyall">notify vs notifyAll</h1>
+
+We've been using `notifyAll` everywhere. There's a sibling, `notify`, that wakes one arbitrary thread from the wait set instead of all of them. It sounds like an optimization: why wake everyone when one will do? In practice, `notify` is error-prone, and `notifyAll` is the safe default.
+
+The reason. `notify` picks one thread, and the JVM doesn't promise which one. It could be a producer when you wanted a consumer to wake up. It could be a thread that's about to spuriously return to the wait set anyway. It could be a thread waiting on a different condition than the one your state change satisfies, in which case that thread checks its `while` predicate, sees it's still false, and goes back to sleep, leaving the actually-relevant thread still parked.
+
+The pathological case is the **missed signal**: you've one producer and one consumer waiting on the same monitor for different conditions. The producer is parked because the queue is full. The consumer is parked because the queue is empty (impossible in steady state, but reachable during shutdown or with a third actor). A `notify` wakes one of them. If it wakes the wrong one, that thread rechecks its condition, finds it still false, and goes back to sleep without notifying anyone else. The other thread, the one that could have made progress, never gets the signal. The system deadlocks until a future event arrives.
+
+`notifyAll` sidesteps the problem by waking everyone. Each thread rechecks its `while` predicate. Threads whose condition isn't satisfied go back to sleep harmlessly. Threads whose condition is satisfied proceed. No missed signals.
+
+The cost of `notifyAll` is that every parked thread wakes up, contests the lock, runs a quick check, and possibly goes back to sleep. For a wait set with hundreds of threads, that's measurable. For a wait set with a handful, it's noise. And it's almost always cheaper than debugging a missed-signal deadlock six months later.
+
+The rule of thumb: use `notifyAll` unless you've proved, with measurements, that you've:
+
+- Exactly one condition that all waiters are waiting on (no role mix).
+- A reason to expect the wait set to be large enough that `notifyAll` is a meaningful cost.
+- A clear argument that no thread can be left starved.
+
+For producer-consumer with mixed roles on one monitor, those conditions don't hold. Stick with `notifyAll`.
+
+The diagram shows the failure mode on the left and the safe path on the right. Both branches eat the cost of a thread wakeup. Only one of them risks leaving a thread that could have made progress asleep forever.
+
+<h1 id="walking-through-one-round-of-the-protocol">
+  Walking Through One Round of the Protocol
+</h1>
+
+To cement the mechanics, a step-by-step trace of a single `place`/`pickUp` round, assuming an empty queue, one producer thread P, and one consumer thread C.
+
+| Step | Thread | State change                                                           | Lock held by | Wait set   |
+| ---- | ------ | ---------------------------------------------------------------------- | ------------ | ---------- |
+| 1    | C      | Enters `pickUp`, acquires lock.                                        | C            | (empty)    |
+| 2    | C      | Sees queue empty, calls `wait()`. Releases lock, parks.                | (none)       | {C}        |
+| 3    | P      | Enters `place("X")`, acquires lock.                                    | P            | {C}        |
+| 4    | P      | Adds X, calls `notifyAll()`. Marks C ready to wake.                    | P            | {C, ready} |
+| 5    | P      | Returns from `place`, releases lock by exiting the synchronized block. | (none)       | {C, ready} |
+| 6    | C      | Wakes up, attempts to reacquire lock, succeeds.                        | C            | (empty)    |
+| 7    | C      | Re-checks `while (orders.isEmpty())`. Now false. Polls X.              | C            | (empty)    |
+| 8    | C      | Calls `notifyAll()` (no one to wake), returns. Releases lock.          | (none)       | (empty)    |
+
+Step 2 is the most critical. The release and the park happen atomically. Between step 1 (C holds the lock) and step 3 (P acquires the lock), there's no observable moment where C is awake but lockless, or asleep but still holding the lock. The atomicity is what makes the protocol safe. If C could release the lock first and then park separately, a notification arriving in that gap would be lost (no one in the wait set to notice it). The JVM guarantees the two operations happen together.
+
+Step 4 is the second-most critical. `notifyAll` doesn't hand C the lock. It marks C as a candidate to wake up. C still has to wait for P to leave the block (step 5) before C can reacquire the lock (step 6). `notify` and `notifyAll` don't release the lock. The notifying thread keeps running its code, possibly making more state changes, until it naturally exits the synchronized region.
+
+Step 7 is where the `while` loop matters. C checks the condition again because we made it a `while`. In this trace the condition is now true, so C proceeds. If a third thread had snuck in between steps 5 and 6 and consumed the X, C would have found the queue empty again, gone back to `wait()`, and the protocol would continue without losing correctness. The `if` version would have polled an empty queue and crashed.
+
+<h1 id="modern-alternatives">Modern Alternatives</h1>
+
+`wait` and `notifyAll` are the original Java concurrency primitives, dating back to Java 1.0. They work, and they're worth understanding because they explain how the higher-level tools are built. For new code, the `java.util.concurrent` package has tools that are easier to use, harder to misuse, and richer in features. Two of them deserve mention here.
+
+**`Lock` with `Condition` objects.** The short version: `ReentrantLock` replaces `synchronized` with an explicit `Lock` you call `lock()` and `unlock()` on. From a `Lock`, you can call `newCondition()` to get one or more `Condition` objects, each with its own wait set. Instead of one wait set per monitor, you can have a "not full" condition for producers and a "not empty" condition for consumers, and signal each one separately. That removes the need for `notifyAll` to wake the wrong threads, because each condition only holds threads waiting on the same predicate.
+
+```java
+// Sketch only.
+Lock lock = new ReentrantLock();
+Condition notFull = lock.newCondition();
+Condition notEmpty = lock.newCondition();
+
+// Producer
+lock.lock();
+try {
+    while (orders.size() == capacity) {
+        notFull.await();
+    }
+    orders.add(order);
+    notEmpty.signal(); // only wakes consumers, not other producers
+} finally {
+    lock.unlock();
+}
+```
+
+**`BlockingQueue` from `java.util.concurrent`.** When the use case is literally "a thread-safe bounded queue with blocking put and take," the JDK already has it. `ArrayBlockingQueue` and `LinkedBlockingQueue` give you a `put(item)` that blocks when full and a `take()` that blocks when empty, with all the locking, signaling, and `while` loops already written and tested. The producer-consumer demo above shrinks to about ten lines if you swap `OrderQueue` for `ArrayBlockingQueue<String>(3)`.
+
+```java
+// Sketch only.
+BlockingQueue<String> orders = new ArrayBlockingQueue<>(3);
+// producer
+orders.put("X-1"); // blocks if full
+// consumer
+String order = orders.take(); // blocks if empty
+```
+
+In practice, use `BlockingQueue` first for producer-consumer, `Lock` + `Condition` when you need finer signaling than `synchronized` offers, and raw `wait/notifyAll` only when maintaining older code or building something at the same level as `BlockingQueue` itself. The same monitor mechanics still apply underneath all three; the higher-level tools package them.
+
+<h1 id="common-mistakes">Common Mistakes</h1>
+
+A few specific failure modes show up over and over in `wait/notify` code.
+
+**Calling `wait` or `notify` without holding the monitor.** Throws `IllegalMonitorStateException` immediately. Always wrap the call in a `synchronized` block on the same object.
+
+**Using `if` instead of `while` for the wait condition.** Sails past spurious wakeups, sails past state changes between notification and lock reacquisition. The condition might not actually be true when the code resumes. Always use `while`.
+
+**Notifying on the wrong object.** Threads in object A's wait set don't hear notifications on object B. The bug is silent: nothing throws, threads hang. Audit that every `wait` and every `notifyAll` use the same lock object.
+
+**Forgetting to call `notifyAll` after changing state.** Easy to do if you've an "early return" path in a method that mutates the shared state. Producers waiting on "not full" will stay asleep because no one tells them the queue has room. Make the state-change-then-notifyAll pair routine.
+
+**Using `notify` instead of `notifyAll` when waiters wait on different conditions.** Risks missed signals. Prefer `notifyAll` unless you can prove the optimization is safe and worth it.
+
+**Not handling `InterruptedException`.** `wait` declares it. You've to either propagate it (re-throw, or declare your method `throws InterruptedException`) or restore the interrupt flag with `Thread.currentThread().interrupt()`. Swallowing it breaks the cooperative cancellation pattern Java relies on.
+
+```java
+// Bad: swallowed interrupt
+try {
+    lock.wait();
+} catch (InterruptedException e) {
+    // do nothing
+}
+
+// Better: restore the flag
+try {
+    lock.wait();
+} catch (InterruptedException e) {
+    Thread.currentThread().interrupt();
+    return; // or break out of the loop, depending on context
+}
+```
+
+Restoring the flag lets higher-level code in the same thread notice the interruption and stop cleanly. Swallowing it loses that signal forever.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

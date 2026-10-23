@@ -1,0 +1,1289 @@
+---
+title: "Tim Sort"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Tim Sort explained with clear examples, visuals, and practice questions in Mindflare's Data Structures and Algorithms course."
+---
+
+<LessonCard>
+
+It was designed by Tim Peters in 2002 specifically for Python's needs: stable, fast on real-world (often partially sorted) data, in-place where reasonable, and graceful on adversarial inputs. The algorithm is a hybrid of merge sort and insertion sort with a long list of practical optimizations that exploit pre-existing order in the input.
+
+The core insight that drives the algorithm: real-world arrays are rarely random. They contain runs (already-sorted subsequences), and a sort algorithm that detects and merges runs instead of starting from scratch does less work.
+
+This chapter explains the algorithm, the run-detection and merging machinery, why it is stable and adaptive, and a simplified educational implementation. Production implementations (Python's `listsort.c`, JDK's `TimSort.java`) run to around 1000 lines and build on the simplified version below.
+
+<h2 id="why-tim-sort-exists">Why Tim Sort Exists</h2>
+
+Two algorithms dominate sorting:
+
+- **Merge Sort**. O(n log n) in every case, stable, but always does the full log n levels even on nearly-sorted input. Allocates O(n) extra space.
+- **Quick Sort**. O(n log n) average, O(n^2) worst case, not stable. Faster than merge sort in practice on random data because of cache locality, but unstable.
+
+For programming languages that sort generic objects (Java, Python, JavaScript, Swift), stability matters. When users sort a list of records by one field and then re-sort by another, they expect the original order to break ties from the second sort. Quick Sort destroys that.
+
+Merge Sort gives stability, but it does too much work on data that is already partially sorted. Real-world examples of partially sorted data:
+
+- Log files sorted by timestamp with a few late-arriving entries
+- Database query results sorted by index plus a few rows added at the end
+- User-facing lists where the user reorders a handful of items
+- Concatenations of two already-sorted lists
+
+Tim Sort takes Merge Sort's structure and adds two ideas: **detect runs that are already sorted**, and **merge runs using a small stack with bounded depth invariants**.
+
+<h2 id="the-building-blocks">The Building Blocks</h2>
+
+Tim Sort combines four ideas:
+
+1. **Run detection.** Scan the array left to right and identify maximal sorted runs.
+2. **Minimum run length (**`**minrun**`**).** Short runs are extended by insertion sort. The threshold is chosen so that merges are well-balanced.
+3. **Merge stack with invariants.** Discovered runs go onto a stack; invariants over the top few runs trigger merges to keep the stack short.
+4. **Galloping mode.** When one run dominates a merge (one side keeps "winning" comparisons), switch to exponential search to skip ahead.
+
+Each of these is worth understanding on its own.
+
+<h3 id="runs">Runs</h3>
+
+A **natural run** is a maximal contiguous subsequence that is either non-decreasing (`a <= b <= c <= ...`) or strictly decreasing (`a > b > c > ...`). Tim Sort uses the strictly-decreasing convention for descending runs so that reversal is stable (no equal elements get reordered).
+
+If a descending run is found, it is reversed in place to make it ascending. After this step every run is ascending.
+
+For the array `[5, 4, 3, 6, 7, 10, 9, 8, 11]`:
+
+- `[5, 4, 3]` is a strictly decreasing run -> reverse to `[3, 4, 5]`.
+- `[6, 7, 10]` is an ascending run.
+- `[9, 8]` is a strictly decreasing run -> reverse to `[8, 9]`.
+- `[11]` is a single-element run.
+
+After run detection: four ascending runs, ready to be merged.
+
+<h3 id="minimum-run-length">Minimum Run Length</h3>
+
+Very short runs trigger many small merges, which is expensive. Tim Sort fixes a `minrun` value (typically between 32 and 64) and extends any run shorter than `minrun` using insertion sort.
+
+The choice of `minrun` matters. The original Python implementation picks `minrun` so that `n / minrun` is just below or equal to a power of 2. This balances the merge tree.
+
+```java
+int compute_minrun(int n) {
+    int r = 0;
+    while (n >= 64) {
+        r |= n & 1;
+        n >>= 1;
+    }
+    return n + r;
+}
+```
+
+```python
+def compute_minrun(n: int) -> int:
+    """Return a minrun for an array of size n."""
+    r = 0
+    while n >= 64:
+        r |= n & 1
+        n >>= 1
+    return n + r
+```
+
+```cpp
+int compute_minrun(int n) {
+    int r = 0;
+    while (n >= 64) {
+        r |= n & 1;
+        n >>= 1;
+    }
+    return n + r;
+}
+```
+
+```go
+func computeMinrun(n int) int {
+	r := 0
+	for n >= 64 {
+		r |= n & 1
+		n >>= 1
+	}
+	return n + r
+}
+```
+
+```csharp
+int compute_minrun(int n)
+{
+    int r = 0;
+    while (n >= 64)
+    {
+        r |= n & 1;
+        n >>= 1;
+    }
+    return n + r;
+}
+```
+
+```rust
+fn compute_minrun(mut n: i32) -> i32 {
+    let mut r = 0;
+    while n >= 64 {
+        r |= n & 1;
+        n >>= 1;
+    }
+    n + r
+}
+```
+
+```javascript
+function compute_minrun(n) {
+  let r = 0;
+  while (n >= 64) {
+    r |= n & 1;
+    n >>= 1;
+  }
+  return n + r;
+}
+```
+
+```typescript
+function compute_minrun(n: number): number {
+  let r = 0;
+  while (n >= 64) {
+    r |= n & 1;
+    n >>= 1;
+  }
+  return n + r;
+}
+```
+
+For `n = 1000`, `compute_minrun(1000) = 32`. For `n = 1_000_000`, `compute_minrun(1_000_000) ~= 61`.
+
+<h3 id="insertion-sort-for-short-runs">Insertion Sort for Short Runs</h3>
+
+Insertion sort is O(n^2) on random data but **O(n) on nearly-sorted data**, with very low constants. For runs shorter than `minrun`, the insertion-sort extension is faster than recursive merge work.
+
+Tim Sort uses a binary-search variant of insertion sort: to insert a new element into the already-sorted prefix, find the insertion position with binary search (O(log k)) and then shift elements (O(k)). The binary search saves a constant factor on average inputs.
+
+<h3 id="merge-stack-with-invariants">Merge Stack with Invariants</h3>
+
+After run detection and extension, runs are pushed onto a stack as they are produced. Tim Sort maintains two invariants over the top three runs on the stack, denoted `A`, `B`, `C` from bottom to top:
+
+1. `len(A) > len(B) + len(C)`
+2. `len(B) > len(C)`
+
+If either invariant is violated, the middle run is merged with its smaller neighbor. The merges happen eagerly as new runs are pushed, keeping the stack short (`O(log n)` runs) and the merges balanced.
+
+This invariant pair was the source of a bug found in 2015. Researchers at TU Munich showed that the original invariant set was insufficient to bound the stack size, and constructed an adversarial input that caused a stack overflow in Java's TimSort. The fix was to tighten the invariants, which Python adopted as well.
+
+<h3 id="galloping-mode">Galloping Mode</h3>
+
+The standard "compare and pick the smaller" merge is optimal when the two runs are similar in size. When one run dominates (its elements are mostly smaller, so it "wins" most comparisons), repeated one-element copies are wasteful.
+
+Galloping mode activates when the same run has won `MIN_GALLOP` comparisons in a row (Python's default is 7). Instead of comparing one element at a time, Tim Sort uses **exponential search** to find how far the winning run extends, then **binary search** within the located range, and copies that block in one batch. The combination of exponential plus binary search bounds the work at O(log k) comparisons for a block of size k, far better than the O(k) of one-at-a-time merging when one side dominates.
+
+Galloping makes the algorithm fast on inputs like "two pre-sorted halves concatenated" because almost every comparison is won by the smaller half, and exponential search jumps over large chunks at a time.
+
+<h2 id="how-the-whole-algorithm-fits-together">
+  How the Whole Algorithm Fits Together
+</h2>
+
+The outer loop alternates between extracting one run from the input and possibly merging top-of-stack runs to maintain invariants. When the input is exhausted, the algorithm enters its final phase: merge whatever remains on the stack to produce the sorted result.
+
+<h2 id="implementation">Implementation</h2>
+
+A complete production Tim Sort runs to several hundred lines. The educational version below covers run detection, insertion-sort extension, the merge stack with invariants, and the standard merge, but omits galloping mode for clarity. With galloping omitted, the algorithm is still O(n log n) worst case and stable, slightly slower on pre-sorted inputs.
+
+```java
+class TimSort {
+    private static final int MIN_RUN = 32;
+
+    public static void timSort(int[] arr) {
+        int n = arr.length;
+        java.util.ArrayList<int[]> stack = new java.util.ArrayList<>(); // each entry: (start, length)
+
+        int i = 0;
+        while (i < n) {
+            int runStart = i;
+            int runLen = countRun(arr, i, n);
+            if (runLen < MIN_RUN) {
+                int forceLen = Math.min(MIN_RUN, n - runStart);
+                insertionSort(arr, runStart, runStart + forceLen, runStart + runLen);
+                runLen = forceLen;
+            }
+            stack.add(new int[] { runStart, runLen });
+            mergeCollapse(arr, stack);
+            i = runStart + runLen;
+        }
+
+        while (stack.size() >= 2) {
+            mergeAdjacent(arr, stack, false);
+        }
+    }
+
+    private static int countRun(int[] arr, int lo, int hi) {
+        if (lo + 1 >= hi) return 1;
+        int runHi = lo + 1;
+        if (arr[runHi] < arr[lo]) {
+            while (runHi < hi && arr[runHi] < arr[runHi - 1]) runHi++;
+            reverse(arr, lo, runHi - 1);
+        } else {
+            while (runHi < hi && arr[runHi] >= arr[runHi - 1]) runHi++;
+        }
+        return runHi - lo;
+    }
+
+    private static void insertionSort(int[] arr, int lo, int hi, int start) {
+        if (start == lo) start++;
+        while (start < hi) {
+            int pivot = arr[start];
+            int left = lo, right = start;
+            while (left < right) {
+                int mid = (left + right) >>> 1;
+                if (pivot < arr[mid]) right = mid;
+                else left = mid + 1;
+            }
+            for (int k = start; k > left; k--) arr[k] = arr[k - 1];
+            arr[left] = pivot;
+            start++;
+        }
+    }
+
+    private static void mergeCollapse(int[] arr, java.util.ArrayList<int[]> stack) {
+        while (stack.size() >= 2) {
+            if (stack.size() >= 3) {
+                int[] b = stack.get(stack.size() - 3);
+                int[] m = stack.get(stack.size() - 2);
+                int[] t = stack.get(stack.size() - 1);
+                if (b[1] <= m[1] + t[1]) {
+                    if (b[1] < t[1]) {
+                        mergeAt(arr, stack, stack.size() - 3);
+                    } else {
+                        mergeAt(arr, stack, stack.size() - 2);
+                    }
+                    continue;
+                }
+            }
+            int[] m = stack.get(stack.size() - 2);
+            int[] t = stack.get(stack.size() - 1);
+            if (m[1] <= t[1]) {
+                mergeAt(arr, stack, stack.size() - 2);
+                continue;
+            }
+            break;
+        }
+    }
+
+    private static void mergeAdjacent(int[] arr, java.util.ArrayList<int[]> stack, boolean withBottom) {
+        mergeAt(arr, stack, stack.size() - 2);
+    }
+
+    private static void mergeAt(int[] arr, java.util.ArrayList<int[]> stack, int i) {
+        int[] r1 = stack.get(i);
+        int[] r2 = stack.get(i + 1);
+        int s1 = r1[0], l1 = r1[1];
+        int s2 = r2[0], l2 = r2[1];
+        merge(arr, s1, s1 + l1, s2 + l2);
+        stack.set(i, new int[] { s1, l1 + l2 });
+        stack.remove(i + 1);
+    }
+
+    private static void merge(int[] arr, int lo, int mid, int hi) {
+        int[] left = java.util.Arrays.copyOfRange(arr, lo, mid);
+        int i = 0, j = mid, k = lo;
+        while (i < left.length && j < hi) {
+            if (arr[j] < left[i]) {
+                arr[k++] = arr[j++];
+            } else {
+                arr[k++] = left[i++];
+            }
+        }
+        while (i < left.length) {
+            arr[k++] = left[i++];
+        }
+    }
+
+    private static void reverse(int[] arr, int l, int r) {
+        while (l < r) {
+            int tmp = arr[l];
+            arr[l] = arr[r];
+            arr[r] = tmp;
+            l++;
+            r--;
+        }
+    }
+}
+```
+
+```python
+MIN_RUN = 32
+
+def tim_sort(arr: list[int]) -> None:
+    n = len(arr)
+    stack = []  # each entry: (start, length)
+
+    i = 0
+    while i < n:
+        run_start = i
+        run_len = count_run(arr, i, n)
+        if run_len < MIN_RUN:
+            force_len = min(MIN_RUN, n - run_start)
+            insertion_sort(arr, run_start, run_start + force_len, run_start + run_len)
+            run_len = force_len
+        stack.append((run_start, run_len))
+        merge_collapse(arr, stack)
+        i = run_start + run_len
+
+    while len(stack) >= 2:
+        merge_adjacent(arr, stack, with_bottom=False)
+
+
+def count_run(arr, lo, hi):
+    if lo + 1 >= hi:
+        return 1
+    run_hi = lo + 1
+    if arr[run_hi] < arr[lo]:
+        while run_hi < hi and arr[run_hi] < arr[run_hi - 1]:
+            run_hi += 1
+        arr[lo:run_hi] = arr[lo:run_hi][::-1]
+    else:
+        while run_hi < hi and arr[run_hi] >= arr[run_hi - 1]:
+            run_hi += 1
+    return run_hi - lo
+
+
+def insertion_sort(arr, lo, hi, start):
+    if start == lo:
+        start += 1
+    while start < hi:
+        pivot = arr[start]
+        left, right = lo, start
+        while left < right:
+            mid = (left + right) // 2
+            if pivot < arr[mid]:
+                right = mid
+            else:
+                left = mid + 1
+        arr[left + 1:start + 1] = arr[left:start]
+        arr[left] = pivot
+        start += 1
+
+
+def merge_collapse(arr, stack):
+    while len(stack) >= 2:
+        if len(stack) >= 3:
+            (bs, bl), (ms, ml), (ts, tl) = stack[-3], stack[-2], stack[-1]
+            if bl <= ml + tl:
+                if bl < tl:
+                    merge_at(arr, stack, len(stack) - 3)
+                else:
+                    merge_at(arr, stack, len(stack) - 2)
+                continue
+        (ms, ml), (ts, tl) = stack[-2], stack[-1]
+        if ml <= tl:
+            merge_at(arr, stack, len(stack) - 2)
+            continue
+        break
+
+
+def merge_adjacent(arr, stack, with_bottom):
+    merge_at(arr, stack, len(stack) - 2)
+
+
+def merge_at(arr, stack, i):
+    s1, l1 = stack[i]
+    s2, l2 = stack[i + 1]
+    merge(arr, s1, s1 + l1, s2 + l2)
+    stack[i] = (s1, l1 + l2)
+    del stack[i + 1]
+
+
+def merge(arr, lo, mid, hi):
+    left = arr[lo:mid]
+    i, j, k = 0, mid, lo
+    while i < len(left) and j < hi:
+        if arr[j] < left[i]:        # strict < for stability
+            arr[k] = arr[j]
+            j += 1
+        else:
+            arr[k] = left[i]
+            i += 1
+        k += 1
+    while i < len(left):
+        arr[k] = left[i]
+        i += 1
+        k += 1
+```
+
+```cpp
+class TimSort {
+    static constexpr int MIN_RUN = 32;
+
+public:
+    static void timSort(std::vector<int>& arr) {
+        int n = (int)arr.size();
+        std::vector<std::pair<int, int>> stack; // each entry: (start, length)
+
+        int i = 0;
+        while (i < n) {
+            int runStart = i;
+            int runLen = countRun(arr, i, n);
+            if (runLen < MIN_RUN) {
+                int forceLen = std::min(MIN_RUN, n - runStart);
+                insertionSort(arr, runStart, runStart + forceLen, runStart + runLen);
+                runLen = forceLen;
+            }
+            stack.push_back({runStart, runLen});
+            mergeCollapse(arr, stack);
+            i = runStart + runLen;
+        }
+
+        while (stack.size() >= 2) {
+            mergeAdjacent(arr, stack, false);
+        }
+    }
+
+private:
+    static int countRun(std::vector<int>& arr, int lo, int hi) {
+        if (lo + 1 >= hi) return 1;
+        int runHi = lo + 1;
+        if (arr[runHi] < arr[lo]) {
+            while (runHi < hi && arr[runHi] < arr[runHi - 1]) runHi++;
+            reverse(arr, lo, runHi - 1);
+        } else {
+            while (runHi < hi && arr[runHi] >= arr[runHi - 1]) runHi++;
+        }
+        return runHi - lo;
+    }
+
+    static void insertionSort(std::vector<int>& arr, int lo, int hi, int start) {
+        if (start == lo) start++;
+        while (start < hi) {
+            int pivot = arr[start];
+            int left = lo, right = start;
+            while (left < right) {
+                int mid = (left + right) >>> 1;
+                if (pivot < arr[mid]) right = mid;
+                else left = mid + 1;
+            }
+            for (int k = start; k > left; k--) arr[k] = arr[k - 1];
+            arr[left] = pivot;
+            start++;
+        }
+    }
+
+    static void mergeCollapse(std::vector<int>& arr, std::vector<std::pair<int, int>>& stack) {
+        while (stack.size() >= 2) {
+            if (stack.size() >= 3) {
+                auto b = stack[stack.size() - 3];
+                auto m = stack[stack.size() - 2];
+                auto t = stack[stack.size() - 1];
+                if (b.second <= m.second + t.second) {
+                    if (b.second < t.second) {
+                        mergeAt(arr, stack, (int)stack.size() - 3);
+                    } else {
+                        mergeAt(arr, stack, (int)stack.size() - 2);
+                    }
+                    continue;
+                }
+            }
+            auto m = stack[stack.size() - 2];
+            auto t = stack[stack.size() - 1];
+            if (m.second <= t.second) {
+                mergeAt(arr, stack, (int)stack.size() - 2);
+                continue;
+            }
+            break;
+        }
+    }
+
+    static void mergeAdjacent(std::vector<int>& arr, std::vector<std::pair<int, int>>& stack, bool withBottom) {
+        mergeAt(arr, stack, (int)stack.size() - 2);
+    }
+
+    static void mergeAt(std::vector<int>& arr, std::vector<std::pair<int, int>>& stack, int i) {
+        auto r1 = stack[i];
+        auto r2 = stack[i + 1];
+        int s1 = r1.first, l1 = r1.second;
+        int s2 = r2.first, l2 = r2.second;
+        merge(arr, s1, s1 + l1, s2 + l2);
+        stack[i] = {s1, l1 + l2};
+        stack.erase(stack.begin() + i + 1);
+    }
+
+    static void merge(std::vector<int>& arr, int lo, int mid, int hi) {
+        std::vector<int> left(arr.begin() + lo, arr.begin() + mid);
+        int i = 0, j = mid, k = lo;
+        while (i < (int)left.size() && j < hi) {
+            if (arr[j] < left[i]) {
+                arr[k++] = arr[j++];
+            } else {
+                arr[k++] = left[i++];
+            }
+        }
+        while (i < (int)left.size()) {
+            arr[k++] = left[i++];
+        }
+    }
+
+    static void reverse(std::vector<int>& arr, int l, int r) {
+        while (l < r) {
+            int tmp = arr[l];
+            arr[l] = arr[r];
+            arr[r] = tmp;
+            l++;
+            r--;
+        }
+    }
+};
+```
+
+```csharp
+class TimSort {
+    private const int MIN_RUN = 32;
+
+    public static void timSort(int[] arr) {
+        int n = arr.Length;
+        var stack = new System.Collections.Generic.List<(int start, int length)>(); // each entry: (start, length)
+
+        int i = 0;
+        while (i < n) {
+            int runStart = i;
+            int runLen = countRun(arr, i, n);
+            if (runLen < MIN_RUN) {
+                int forceLen = System.Math.Min(MIN_RUN, n - runStart);
+                insertionSort(arr, runStart, runStart + forceLen, runStart + runLen);
+                runLen = forceLen;
+            }
+            stack.Add((runStart, runLen));
+            mergeCollapse(arr, stack);
+            i = runStart + runLen;
+        }
+
+        while (stack.Count >= 2) {
+            mergeAdjacent(arr, stack, false);
+        }
+    }
+
+    private static int countRun(int[] arr, int lo, int hi) {
+        if (lo + 1 >= hi) return 1;
+        int runHi = lo + 1;
+        if (arr[runHi] < arr[lo]) {
+            while (runHi < hi && arr[runHi] < arr[runHi - 1]) runHi++;
+            reverse(arr, lo, runHi - 1);
+        } else {
+            while (runHi < hi && arr[runHi] >= arr[runHi - 1]) runHi++;
+        }
+        return runHi - lo;
+    }
+
+    private static void insertionSort(int[] arr, int lo, int hi, int start) {
+        if (start == lo) start++;
+        while (start < hi) {
+            int pivot = arr[start];
+            int left = lo, right = start;
+            while (left < right) {
+                int mid = (left + right) >> 1;
+                if (pivot < arr[mid]) right = mid;
+                else left = mid + 1;
+            }
+            for (int k = start; k > left; k--) arr[k] = arr[k - 1];
+            arr[left] = pivot;
+            start++;
+        }
+    }
+
+    private static void mergeCollapse(int[] arr, System.Collections.Generic.List<(int start, int length)> stack) {
+        while (stack.Count >= 2) {
+            if (stack.Count >= 3) {
+                var b = stack[stack.Count - 3];
+                var m = stack[stack.Count - 2];
+                var t = stack[stack.Count - 1];
+                if (b.length <= m.length + t.length) {
+                    if (b.length < t.length) {
+                        mergeAt(arr, stack, stack.Count - 3);
+                    } else {
+                        mergeAt(arr, stack, stack.Count - 2);
+                    }
+                    continue;
+                }
+            }
+            var mm = stack[stack.Count - 2];
+            var tt = stack[stack.Count - 1];
+            if (mm.length <= tt.length) {
+                mergeAt(arr, stack, stack.Count - 2);
+                continue;
+            }
+            break;
+        }
+    }
+
+    private static void mergeAdjacent(int[] arr, System.Collections.Generic.List<(int start, int length)> stack, bool withBottom) {
+        mergeAt(arr, stack, stack.Count - 2);
+    }
+
+    private static void mergeAt(int[] arr, System.Collections.Generic.List<(int start, int length)> stack, int i) {
+        var r1 = stack[i];
+        var r2 = stack[i + 1];
+        int s1 = r1.start, l1 = r1.length;
+        int s2 = r2.start, l2 = r2.length;
+        merge(arr, s1, s1 + l1, s2 + l2);
+        stack[i] = (s1, l1 + l2);
+        stack.RemoveAt(i + 1);
+    }
+
+    private static void merge(int[] arr, int lo, int mid, int hi) {
+        int[] left = new int[mid - lo];
+        System.Array.Copy(arr, lo, left, 0, mid - lo);
+        int i = 0, j = mid, k = lo;
+        while (i < left.Length && j < hi) {
+            if (arr[j] < left[i]) {
+                arr[k++] = arr[j++];
+            } else {
+                arr[k++] = left[i++];
+            }
+        }
+        while (i < left.Length) {
+            arr[k++] = left[i++];
+        }
+    }
+
+    private static void reverse(int[] arr, int l, int r) {
+        while (l < r) {
+            int tmp = arr[l];
+            arr[l] = arr[r];
+            arr[r] = tmp;
+            l++;
+            r--;
+        }
+    }
+}
+```
+
+```go
+package main
+
+const MIN_RUN = 32
+
+func timSort(arr []int) {
+	n := len(arr)
+	stack := make([][2]int, 0) // each entry: (start, length)
+
+	i := 0
+	for i < n {
+		runStart := i
+		runLen := countRun(arr, i, n)
+		if runLen < MIN_RUN {
+			forceLen := min(MIN_RUN, n-runStart)
+			insertionSort(arr, runStart, runStart+forceLen, runStart+runLen)
+			runLen = forceLen
+		}
+		stack = append(stack, [2]int{runStart, runLen})
+		mergeCollapse(arr, stack)
+		i = runStart + runLen
+	}
+
+	for len(stack) >= 2 {
+		mergeAdjacent(arr, stack, false)
+	}
+}
+
+func countRun(arr []int, lo, hi int) int {
+	if lo+1 >= hi {
+		return 1
+	}
+	runHi := lo + 1
+	if arr[runHi] < arr[lo] {
+		for runHi < hi && arr[runHi] < arr[runHi-1] {
+			runHi++
+		}
+		reverse(arr, lo, runHi-1)
+	} else {
+		for runHi < hi && arr[runHi] >= arr[runHi-1] {
+			runHi++
+		}
+	}
+	return runHi - lo
+}
+
+func insertionSort(arr []int, lo, hi, start int) {
+	if start == lo {
+		start++
+	}
+	for start < hi {
+		pivot := arr[start]
+		left, right := lo, start
+		for left < right {
+			mid := (left + right) >> 1
+			if pivot < arr[mid] {
+				right = mid
+			} else {
+				left = mid + 1
+			}
+		}
+		for k := start; k > left; k-- {
+			arr[k] = arr[k-1]
+		}
+		arr[left] = pivot
+		start++
+	}
+}
+
+func mergeCollapse(arr []int, stack [][2]int) {
+	for len(stack) >= 2 {
+		if len(stack) >= 3 {
+			b := stack[len(stack)-3]
+			m := stack[len(stack)-2]
+			t := stack[len(stack)-1]
+			if b[1] <= m[1]+t[1] {
+				if b[1] < t[1] {
+					mergeAt(arr, &stack, len(stack)-3)
+				} else {
+					mergeAt(arr, &stack, len(stack)-2)
+				}
+				continue
+			}
+		}
+		m := stack[len(stack)-2]
+		t := stack[len(stack)-1]
+		if m[1] <= t[1] {
+			mergeAt(arr, &stack, len(stack)-2)
+			continue
+		}
+		break
+	}
+}
+
+func mergeAdjacent(arr []int, stack [][2]int, withBottom bool) {
+	mergeAt(arr, &stack, len(stack)-2)
+}
+
+func mergeAt(arr []int, stack *[][2]int, i int) {
+	r1 := (*stack)[i]
+	r2 := (*stack)[i+1]
+	s1, l1 := r1[0], r1[1]
+	_, l2 := r2[0], r2[1]
+	merge(arr, s1, s1+l1, s1+l1+l2)
+	(*stack)[i] = [2]int{s1, l1 + l2}
+	*stack = append((*stack)[:i+1], (*stack)[i+2:]...)
+}
+
+func merge(arr []int, lo, mid, hi int) {
+	left := append([]int(nil), arr[lo:mid]...)
+	i, j, k := 0, mid, lo
+	for i < len(left) && j < hi {
+		if arr[j] < left[i] {
+			arr[k] = arr[j]
+			j++
+		} else {
+			arr[k] = left[i]
+			i++
+		}
+		k++
+	}
+	for i < len(left) {
+		arr[k] = left[i]
+		i++
+		k++
+	}
+}
+
+func reverse(arr []int, l, r int) {
+	for l < r {
+		arr[l], arr[r] = arr[r], arr[l]
+		l++
+		r--
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+```
+
+```rust
+const MIN_RUN: usize = 32;
+
+pub fn tim_sort(arr: &mut [i32]) {
+    let n = arr.len();
+    let mut stack: Vec<(usize, usize)> = Vec::new(); // each entry: (start, length)
+
+    let mut i = 0usize;
+    while i < n {
+        let run_start = i;
+        let mut run_len = count_run(arr, i, n);
+        if run_len < MIN_RUN {
+            let force_len = std::cmp::min(MIN_RUN, n - run_start);
+            insertion_sort(arr, run_start, run_start + force_len, run_start + run_len);
+            run_len = force_len;
+        }
+        stack.push((run_start, run_len));
+        merge_collapse(arr, &mut stack);
+        i = run_start + run_len;
+    }
+
+    while stack.len() >= 2 {
+        merge_adjacent(arr, &mut stack, false);
+    }
+}
+
+fn count_run(arr: &mut [i32], lo: usize, hi: usize) -> usize {
+    if lo + 1 >= hi {
+        return 1;
+    }
+    let mut run_hi = lo + 1;
+    if arr[run_hi] < arr[lo] {
+        while run_hi < hi && arr[run_hi] < arr[run_hi - 1] {
+            run_hi += 1;
+        }
+        reverse(arr, lo, run_hi - 1);
+    } else {
+        while run_hi < hi && arr[run_hi] >= arr[run_hi - 1] {
+            run_hi += 1;
+        }
+    }
+    run_hi - lo
+}
+
+fn insertion_sort(arr: &mut [i32], lo: usize, hi: usize, mut start: usize) {
+    if start == lo {
+        start += 1;
+    }
+    while start < hi {
+        let pivot = arr[start];
+        let mut left = lo;
+        let mut right = start;
+        while left < right {
+            let mid = (left + right) >> 1;
+            if pivot < arr[mid] {
+                right = mid;
+            } else {
+                left = mid + 1;
+            }
+        }
+        for k in (left + 1..=start).rev() {
+            arr[k] = arr[k - 1];
+        }
+        arr[left] = pivot;
+        start += 1;
+    }
+}
+
+fn merge_collapse(arr: &mut [i32], stack: &mut Vec<(usize, usize)>) {
+    while stack.len() >= 2 {
+        if stack.len() >= 3 {
+            let b = stack[stack.len() - 3];
+            let m = stack[stack.len() - 2];
+            let t = stack[stack.len() - 1];
+            if b.1 <= m.1 + t.1 {
+                if b.1 < t.1 {
+                    merge_at(arr, stack, stack.len() - 3);
+                } else {
+                    merge_at(arr, stack, stack.len() - 2);
+                }
+                continue;
+            }
+        }
+        let m = stack[stack.len() - 2];
+        let t = stack[stack.len() - 1];
+        if m.1 <= t.1 {
+            merge_at(arr, stack, stack.len() - 2);
+            continue;
+        }
+        break;
+    }
+}
+
+fn merge_adjacent(arr: &mut [i32], stack: &mut Vec<(usize, usize)>, _with_bottom: bool) {
+    merge_at(arr, stack, stack.len() - 2);
+}
+
+fn merge_at(arr: &mut [i32], stack: &mut Vec<(usize, usize)>, i: usize) {
+    let (s1, l1) = stack[i];
+    let (_s2, l2) = stack[i + 1];
+    merge(arr, s1, s1 + l1, s1 + l1 + l2);
+    stack[i] = (s1, l1 + l2);
+    stack.remove(i + 1);
+}
+
+fn merge(arr: &mut [i32], lo: usize, mid: usize, hi: usize) {
+    let left: Vec<i32> = arr[lo..mid].to_vec();
+    let mut i = 0usize;
+    let mut j = mid;
+    let mut k = lo;
+    while i < left.len() && j < hi {
+        if arr[j] < left[i] {
+            arr[k] = arr[j];
+            j += 1;
+        } else {
+            arr[k] = left[i];
+            i += 1;
+        }
+        k += 1;
+    }
+    while i < left.len() {
+        arr[k] = left[i];
+        i += 1;
+        k += 1;
+    }
+}
+
+fn reverse(arr: &mut [i32], mut l: usize, mut r: usize) {
+    while l < r {
+        arr.swap(l, r);
+        l += 1;
+        r -= 1;
+    }
+}
+```
+
+```javascript
+class TimSort {
+  static MIN_RUN = 32;
+
+  static timSort(arr) {
+    const n = arr.length;
+    const stack = []; // each entry: (start, length)
+
+    let i = 0;
+    while (i < n) {
+      const runStart = i;
+      let runLen = TimSort.countRun(arr, i, n);
+      if (runLen < TimSort.MIN_RUN) {
+        const forceLen = Math.min(TimSort.MIN_RUN, n - runStart);
+        TimSort.insertionSort(
+          arr,
+          runStart,
+          runStart + forceLen,
+          runStart + runLen,
+        );
+        runLen = forceLen;
+      }
+      stack.push([runStart, runLen]);
+      TimSort.mergeCollapse(arr, stack);
+      i = runStart + runLen;
+    }
+
+    while (stack.length >= 2) {
+      TimSort.mergeAdjacent(arr, stack, false);
+    }
+  }
+
+  static countRun(arr, lo, hi) {
+    if (lo + 1 >= hi) return 1;
+    let runHi = lo + 1;
+    if (arr[runHi] < arr[lo]) {
+      while (runHi < hi && arr[runHi] < arr[runHi - 1]) runHi++;
+      TimSort.reverse(arr, lo, runHi - 1);
+    } else {
+      while (runHi < hi && arr[runHi] >= arr[runHi - 1]) runHi++;
+    }
+    return runHi - lo;
+  }
+
+  static insertionSort(arr, lo, hi, start) {
+    if (start === lo) start++;
+    while (start < hi) {
+      const pivot = arr[start];
+      let left = lo,
+        right = start;
+      while (left < right) {
+        const mid = (left + right) >>> 1;
+        if (pivot < arr[mid]) right = mid;
+        else left = mid + 1;
+      }
+      for (let k = start; k > left; k--) arr[k] = arr[k - 1];
+      arr[left] = pivot;
+      start++;
+    }
+  }
+
+  static mergeCollapse(arr, stack) {
+    while (stack.length >= 2) {
+      if (stack.length >= 3) {
+        const b = stack[stack.length - 3];
+        const m = stack[stack.length - 2];
+        const t = stack[stack.length - 1];
+        if (b[1] <= m[1] + t[1]) {
+          if (b[1] < t[1]) {
+            TimSort.mergeAt(arr, stack, stack.length - 3);
+          } else {
+            TimSort.mergeAt(arr, stack, stack.length - 2);
+          }
+          continue;
+        }
+      }
+      const m = stack[stack.length - 2];
+      const t = stack[stack.length - 1];
+      if (m[1] <= t[1]) {
+        TimSort.mergeAt(arr, stack, stack.length - 2);
+        continue;
+      }
+      break;
+    }
+  }
+
+  static mergeAdjacent(arr, stack, withBottom) {
+    TimSort.mergeAt(arr, stack, stack.length - 2);
+  }
+
+  static mergeAt(arr, stack, i) {
+    const r1 = stack[i];
+    const r2 = stack[i + 1];
+    const s1 = r1[0],
+      l1 = r1[1];
+    const s2 = r2[0],
+      l2 = r2[1];
+    TimSort.merge(arr, s1, s1 + l1, s2 + l2);
+    stack[i] = [s1, l1 + l2];
+    stack.splice(i + 1, 1);
+  }
+
+  static merge(arr, lo, mid, hi) {
+    const left = arr.slice(lo, mid);
+    let i = 0,
+      j = mid,
+      k = lo;
+    while (i < left.length && j < hi) {
+      if (arr[j] < left[i]) {
+        arr[k++] = arr[j++];
+      } else {
+        arr[k++] = left[i++];
+      }
+    }
+    while (i < left.length) {
+      arr[k++] = left[i++];
+    }
+  }
+
+  static reverse(arr, l, r) {
+    while (l < r) {
+      const tmp = arr[l];
+      arr[l] = arr[r];
+      arr[r] = tmp;
+      l++;
+      r--;
+    }
+  }
+}
+```
+
+```typescript
+class TimSort {
+  private static readonly MIN_RUN = 32;
+
+  public static timSort(arr: number[]): void {
+    const n = arr.length;
+    const stack: [number, number][] = []; // each entry: (start, length)
+
+    let i = 0;
+    while (i < n) {
+      const runStart = i;
+      let runLen = TimSort.countRun(arr, i, n);
+      if (runLen < TimSort.MIN_RUN) {
+        const forceLen = Math.min(TimSort.MIN_RUN, n - runStart);
+        TimSort.insertionSort(
+          arr,
+          runStart,
+          runStart + forceLen,
+          runStart + runLen,
+        );
+        runLen = forceLen;
+      }
+      stack.push([runStart, runLen]);
+      TimSort.mergeCollapse(arr, stack);
+      i = runStart + runLen;
+    }
+
+    while (stack.length >= 2) {
+      TimSort.mergeAdjacent(arr, stack, false);
+    }
+  }
+
+  private static countRun(arr: number[], lo: number, hi: number): number {
+    if (lo + 1 >= hi) return 1;
+    let runHi = lo + 1;
+    if (arr[runHi] < arr[lo]) {
+      while (runHi < hi && arr[runHi] < arr[runHi - 1]) runHi++;
+      TimSort.reverse(arr, lo, runHi - 1);
+    } else {
+      while (runHi < hi && arr[runHi] >= arr[runHi - 1]) runHi++;
+    }
+    return runHi - lo;
+  }
+
+  private static insertionSort(
+    arr: number[],
+    lo: number,
+    hi: number,
+    start: number,
+  ): void {
+    if (start === lo) start++;
+    while (start < hi) {
+      const pivot = arr[start];
+      let left = lo,
+        right = start;
+      while (left < right) {
+        const mid = (left + right) >>> 1;
+        if (pivot < arr[mid]) right = mid;
+        else left = mid + 1;
+      }
+      for (let k = start; k > left; k--) arr[k] = arr[k - 1];
+      arr[left] = pivot;
+      start++;
+    }
+  }
+
+  private static mergeCollapse(arr: number[], stack: [number, number][]): void {
+    while (stack.length >= 2) {
+      if (stack.length >= 3) {
+        const b = stack[stack.length - 3];
+        const m = stack[stack.length - 2];
+        const t = stack[stack.length - 1];
+        if (b[1] <= m[1] + t[1]) {
+          if (b[1] < t[1]) {
+            TimSort.mergeAt(arr, stack, stack.length - 3);
+          } else {
+            TimSort.mergeAt(arr, stack, stack.length - 2);
+          }
+          continue;
+        }
+      }
+      const m = stack[stack.length - 2];
+      const t = stack[stack.length - 1];
+      if (m[1] <= t[1]) {
+        TimSort.mergeAt(arr, stack, stack.length - 2);
+        continue;
+      }
+      break;
+    }
+  }
+
+  private static mergeAdjacent(
+    arr: number[],
+    stack: [number, number][],
+    withBottom: boolean,
+  ): void {
+    TimSort.mergeAt(arr, stack, stack.length - 2);
+  }
+
+  private static mergeAt(
+    arr: number[],
+    stack: [number, number][],
+    i: number,
+  ): void {
+    const r1 = stack[i];
+    const r2 = stack[i + 1];
+    const s1 = r1[0],
+      l1 = r1[1];
+    const s2 = r2[0],
+      l2 = r2[1];
+    TimSort.merge(arr, s1, s1 + l1, s2 + l2);
+    stack[i] = [s1, l1 + l2];
+    stack.splice(i + 1, 1);
+  }
+
+  private static merge(
+    arr: number[],
+    lo: number,
+    mid: number,
+    hi: number,
+  ): void {
+    const left = arr.slice(lo, mid);
+    let i = 0,
+      j = mid,
+      k = lo;
+    while (i < left.length && j < hi) {
+      if (arr[j] < left[i]) {
+        arr[k++] = arr[j++];
+      } else {
+        arr[k++] = left[i++];
+      }
+    }
+    while (i < left.length) {
+      arr[k++] = left[i++];
+    }
+  }
+
+  private static reverse(arr: number[], l: number, r: number): void {
+    while (l < r) {
+      const tmp = arr[l];
+      arr[l] = arr[r];
+      arr[r] = tmp;
+      l++;
+      r--;
+    }
+  }
+}
+```
+
+The implementation captures the structure: detect runs, extend short ones with insertion sort, push onto a stack, merge eagerly to maintain invariants, and force-merge at the end. Production code adds galloping, careful memory reuse for the auxiliary array, and additional fast paths.
+
+<h2 id="why-it-is-on-log-n-worst-case-and-on-best-case">
+  Why It Is O(n log n) Worst Case and O(n) Best Case
+</h2>
+
+**Worst case O(n log n).** The merge structure is the same as Merge Sort: every element is involved in at most O(log n) merges. Insertion sort on `minrun`-sized chunks is O(minrun^2) per chunk, summed to O(n \* minrun), which is O(n) for fixed `minrun`. Together: O(n log n).
+
+**Best case O(n).** On already-sorted input, the algorithm finds one giant run, performs no merges, and returns. The total work is the O(n) scan to detect the run.
+
+**Adaptive on partially-sorted input.** Real-world inputs with `k` already-sorted runs of average length `n / k` cost about O(n log k) instead of O(n log n). This is the practical advantage that motivates Tim Sort.
+
+<h2 id="stability">Stability</h2>
+
+The merge step uses strict less-than (`arr[j] < left[i]`) to decide which side wins ties. Strict less-than means that when two elements are equal, the **left** side wins, which preserves the original relative order. This is what makes Tim Sort a stable sort.
+
+Stability matters when sorting objects by a key that is not a primary key. Sorting a list of records by "name" and then by "department" should place all records with the same department together while preserving the within-department alphabetical order from the first sort. Quick Sort cannot do this without a tiebreaker; Tim Sort does it natively.
+
+<h2 id="where-tim-sort-is-used">Where Tim Sort Is Used</h2>
+
+| Language / Runtime  | Where                                                                                                           |
+| ------------------- | --------------------------------------------------------------------------------------------------------------- |
+| **Python**          | `list.sort()`, `sorted()`. Since Python 2.3. The reference implementation.                                      |
+| **Java**            | `Arrays.sort(Object[])`, `Collections.sort()`, `List.sort()`. Primitive arrays still use dual-pivot Quick Sort. |
+| **JavaScript (V8)** | `Array.prototype.sort()` since V8 7.0 (Node 11, Chrome 70).                                                     |
+| **Android**         | Default sort on Java collections.                                                                               |
+| **Swift**           | `Array.sort()` and `sorted()`.                                                                                  |
+| **Octave / R**      | Several internal sort routines.                                                                                 |
+
+Languages that sort primitive integer arrays often use Quick Sort or Radix Sort instead. The reason: Quick Sort's instability does not matter for raw integers (no tiebreaker is needed), and its cache locality wins. Tim Sort wins when stability matters and the data is partially sorted, which is the common case for object arrays.
+
+<h2 id="comparison-with-other-sorts">Comparison with Other Sorts</h2>
+
+| Algorithm          | Time (Avg) | Time (Worst) | Space    | Stable | Adaptive | Notes                                                |
+| ------------------ | ---------- | ------------ | -------- | ------ | -------- | ---------------------------------------------------- |
+| **Tim Sort**       | O(n log n) | O(n log n)   | O(n)     | Yes    | **Yes**  | Default in Python, Java (Object), V8, Swift          |
+| **Merge Sort**     | O(n log n) | O(n log n)   | O(n)     | Yes    | No       | Stable but does full work on sorted input            |
+| **Quick Sort**     | O(n log n) | O(n^2)       | O(log n) | No     | No       | Fast but unstable; production variants use introsort |
+| **Heap Sort**      | O(n log n) | O(n log n)   | O(1)     | No     | No       | Worst-case guarantee, poor cache behavior            |
+| **Insertion Sort** | O(n^2)     | O(n^2)       | O(1)     | Yes    | Yes      | Tim Sort uses it for short runs                      |
+| **Radix Sort**     | O(n \* d)  | O(n \* d)    | O(n)     | Yes    | No       | For integers and fixed-width keys only               |
+
+Adaptive means "faster on partially sorted input than the worst case suggests." Among mainstream O(n log n) algorithms, Tim Sort is the one that combines stability with strong adaptiveness, which is why it is the default sort in several languages.
+
+<h2 id="common-pitfalls">Common Pitfalls</h2>
+
+**Using strict greater-than in the merge.** Stability requires that ties go to the left side: `if (arr[j] < left[i])`. Replacing `<` with `<=` reverses ties and breaks stability.
+
+**Choosing **`**minrun**`** poorly.** A fixed `minrun` of 32 is fine for most inputs, but Python's adaptive calculation gives better merge balance on inputs of unusual sizes. For an educational implementation, 32 is acceptable.
+
+**Skipping the descending-run reversal.** If a descending run is treated as ascending, the run-detection step ends after two elements and the algorithm degenerates. Always reverse strict descending runs before pushing.
+
+**Confusing strict and non-strict in run detection.** Descending runs must be strict (`<`) so that reversal does not swap equal elements (which would break stability). Ascending runs use non-strict (`<=`).
+
+**Implementing merge invariants incompletely.** The 2015 Java TimSort bug came from invariants that did not guarantee bounded stack depth. Educational implementations can use a simpler invariant (`always merge the top two runs eagerly`) at the cost of slightly more merging work. Production implementations need the full invariant set described in the Python documentation.
+
+<h2 id="complexity-analysis">Complexity Analysis</h2>
+
+| Operation                                 | Time       | Space | Notes                                        |
+| ----------------------------------------- | ---------- | ----- | -------------------------------------------- |
+| Best case (one already-sorted run)        | O(n)       | O(n)  | Single scan, no merges                       |
+| Worst case (random input)                 | O(n log n) | O(n)  | Same merge structure as Merge Sort           |
+| Partially-sorted input with k runs        | O(n log k) | O(n)  | The adaptive case                            |
+| Already-sorted, then one element appended | O(n)       | O(n)  | One merge of length 1 against the rest       |
+| Stable                                    | Yes        |       | Strict `<` in merge preserves relative order |
+| In-place                                  | No         |       | Needs O(n) auxiliary array for merge         |
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

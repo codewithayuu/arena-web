@@ -1,0 +1,601 @@
+---
+title: "External Sort"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "External Sort explained with clear examples, visuals, and practice questions in Mindflare's Data Structures and Algorithms course."
+---
+
+<LessonCard>
+
+The algorithm is conceptually simple and has been the standard answer since the 1950s, when "external" meant "magnetic tape." The two phases:
+
+1. **Split-and-sort.** Read the input in chunks that fit in memory, sort each chunk with any in-memory algorithm, write the sorted chunk back to disk as a temporary file.
+2. **Multi-way merge.** Read from all the sorted chunks simultaneously, use a min-heap to merge them into the final sorted output.
+
+This chapter covers the algorithm, the heap-based merge that makes it efficient, the I/O complexity, the tuning knobs that matter in practice (chunk size, fan-in), and the systems that ship External Sort variants internally.
+
+<h2 id="why-in-memory-sorts-fail">Why In-Memory Sorts Fail</h2>
+
+A 1 TB file on a machine with 16 GB RAM cannot be loaded with one `read()` call. Even attempting it triggers paging, then thrashing, then process termination. The OS will swap pages to disk arbitrarily, which is the worst possible access pattern for sorting (every comparison potentially causes two page faults).
+
+External Sort sidesteps this by **explicitly choosing what to keep in memory**. At any time, only a controlled amount of data is resident: a single chunk during phase 1, and `k` blocks (one per merge input) during phase 2. This keeps total memory use bounded and predictable.
+
+The other key property: External Sort uses **sequential I/O** throughout. Reading and writing in long streams is one to two orders of magnitude faster than random I/O, on both spinning disks (seek time is the bottleneck) and SSDs (large sequential reads avoid amplification). Merge Sort is the only standard in-memory sort whose data-access pattern is sequential-friendly, which is why every External Sort is built on it.
+
+<h2 id="phase-1-sort-runs">Phase 1: Sort Runs</h2>
+
+Choose a **chunk size** `M` based on available memory. A common rule of thumb is to use half of the available RAM, leaving room for the OS, the sort buffers, and a margin of safety.
+
+For each chunk:
+
+1. Read the next `M` bytes (or records) from the input file.
+2. Sort the chunk in memory using any in-memory algorithm. Quick Sort, Tim Sort, or Heap Sort are all standard choices.
+3. Write the sorted chunk to a temporary file. Number the temp files sequentially: `run-0`, `run-1`, `run-2`, ...
+
+After phase 1, the input has been replaced with `ceil(n / M)` sorted files. Each is at most `M` bytes; the last may be smaller. The set of files together contains the same records as the input, sorted within each file but unsorted across files.
+
+Phase 1 cost in I/O terms: each record is read once and written once. For an input of `n` records, phase 1 does `2n` I/O operations.
+
+<h2 id="phase-2-multi-way-merge">Phase 2: Multi-way Merge</h2>
+
+Phase 2 combines the `k = ceil(n / M)` sorted runs into a single sorted output. The naive approach is to merge them two at a time, like a binary merge: merge run 0 with run 1 to produce run 0', merge run 0' with run 2, and so on. Each merge passes every record through I/O once, so a binary merge of `k` runs costs `k * n` total I/O. For `k = 1000`, that is `1000 * n` reads and writes, far too much for a disk-bound workload.
+
+The better approach is a **multi-way merge**: open all `k` runs at once and merge them in a single pass using a min-heap. Each record is read once and written once, for a total of `2n` I/O in phase 2.
+
+<h3 id="the-min-heap-merge">The Min-Heap Merge</h3>
+
+To produce the next output record, look at the smallest current record across all `k` runs. The candidates are the head of each run. A linear scan of `k` heads costs O(k) per output record, for O(nk) total comparisons. A min-heap reduces this to O(log k) per output record, for O(n log k) total.
+
+The heap stores `k` entries, one per run, where each entry is `(value, runIndex)`. The heap is keyed by `value`. Loop:
+
+1. Extract the minimum `(v, r)` from the heap.
+2. Write `v` to output.
+3. Read the next record from run `r`. If it exists, push `(nextV, r)` onto the heap. If run `r` is exhausted, do nothing.
+
+The heap stays at size `<= k` throughout.
+
+<h2 id="implementation">Implementation</h2>
+
+A complete production External Sort handles temp file management, buffered I/O, and error recovery. The simulation below ignores those concerns and operates on in-memory lists in place of files, which keeps the algorithmic core visible without disk-level plumbing.
+
+```java
+import java.util.*;
+
+public class ExternalSort {
+
+    // Phase 1 + Phase 2 simulated with in-memory lists.
+    public static List<Integer> sort(List<Integer> input, int chunkSize) {
+        // ---- Phase 1: split-and-sort ----
+        List<List<Integer>> runs = new ArrayList<>();
+        for (int i = 0; i < input.size(); i += chunkSize) {
+            List<Integer> chunk = new ArrayList<>(
+                input.subList(i, Math.min(i + chunkSize, input.size())));
+            Collections.sort(chunk);
+            runs.add(chunk);
+        }
+
+        // ---- Phase 2: k-way merge with a min-heap ----
+        return mergeRuns(runs);
+    }
+
+    static List<Integer> mergeRuns(List<List<Integer>> runs) {
+        // Heap entry: (value, runIndex, indexWithinRun)
+        PriorityQueue<int[]> heap = new PriorityQueue<>((a, b) -> Integer.compare(a[0], b[0]));
+        for (int r = 0; r < runs.size(); r++) {
+            if (!runs.get(r).isEmpty()) {
+                heap.offer(new int[]{runs.get(r).get(0), r, 0});
+            }
+        }
+
+        List<Integer> out = new ArrayList<>();
+        while (!heap.isEmpty()) {
+            int[] top = heap.poll();
+            int value = top[0], runIdx = top[1], pos = top[2];
+            out.add(value);
+            if (pos + 1 < runs.get(runIdx).size()) {
+                heap.offer(new int[]{runs.get(runIdx).get(pos + 1), runIdx, pos + 1});
+            }
+        }
+        return out;
+    }
+}
+```
+
+```python
+import heapq
+from typing import List
+
+def external_sort(input_data: List[int], chunk_size: int) -> List[int]:
+    # ---- Phase 1: split-and-sort ----
+    runs = []
+    for i in range(0, len(input_data), chunk_size):
+        chunk = sorted(input_data[i:i + chunk_size])
+        runs.append(chunk)
+
+    # ---- Phase 2: k-way merge ----
+    return merge_runs(runs)
+
+
+def merge_runs(runs: List[List[int]]) -> List[int]:
+    heap = []
+    for r, run in enumerate(runs):
+        if run:
+            heapq.heappush(heap, (run[0], r, 0))
+
+    out = []
+    while heap:
+        value, run_idx, pos = heapq.heappop(heap)
+        out.append(value)
+        if pos + 1 < len(runs[run_idx]):
+            heapq.heappush(heap, (runs[run_idx][pos + 1], run_idx, pos + 1))
+    return out
+```
+
+```cpp
+#include <vector>
+#include <queue>
+#include <algorithm>
+
+using namespace std;
+
+vector<int> mergeRuns(const vector<vector<int>>& runs) {
+    // Heap entry: (value, runIndex, indexWithinRun)
+    using Entry = tuple<int, int, int>;
+    priority_queue<Entry, vector<Entry>, greater<Entry>> heap;
+
+    for (int r = 0; r < (int)runs.size(); r++) {
+        if (!runs[r].empty()) {
+            heap.emplace(runs[r][0], r, 0);
+        }
+    }
+
+    vector<int> out;
+    while (!heap.empty()) {
+        auto [value, runIdx, pos] = heap.top();
+        heap.pop();
+        out.push_back(value);
+        if (pos + 1 < (int)runs[runIdx].size()) {
+            heap.emplace(runs[runIdx][pos + 1], runIdx, pos + 1);
+        }
+    }
+    return out;
+}
+
+vector<int> externalSort(const vector<int>& input, int chunkSize) {
+    // ---- Phase 1: split-and-sort ----
+    vector<vector<int>> runs;
+    for (int i = 0; i < (int)input.size(); i += chunkSize) {
+        vector<int> chunk(input.begin() + i,
+                          input.begin() + min(i + chunkSize, (int)input.size()));
+        sort(chunk.begin(), chunk.end());
+        runs.push_back(std::move(chunk));
+    }
+
+    // ---- Phase 2: k-way merge ----
+    return mergeRuns(runs);
+}
+```
+
+```csharp
+using System.Collections.Generic;
+
+public class ExternalSort {
+    public static List<int> Sort(List<int> input, int chunkSize) {
+        var runs = new List<List<int>>();
+        for (int i = 0; i < input.Count; i += chunkSize) {
+            var chunk = input.GetRange(i, System.Math.Min(chunkSize, input.Count - i));
+            chunk.Sort();
+            runs.Add(chunk);
+        }
+        return MergeRuns(runs);
+    }
+
+    private static List<int> MergeRuns(List<List<int>> runs) {
+        // .NET PriorityQueue compares by priority. Use (value) as priority.
+        var heap = new PriorityQueue<(int value, int runIdx, int pos), int>();
+        for (int r = 0; r < runs.Count; r++) {
+            if (runs[r].Count > 0) heap.Enqueue((runs[r][0], r, 0), runs[r][0]);
+        }
+
+        var output = new List<int>();
+        while (heap.Count > 0) {
+            var (value, runIdx, pos) = heap.Dequeue();
+            output.Add(value);
+            if (pos + 1 < runs[runIdx].Count) {
+                int next = runs[runIdx][pos + 1];
+                heap.Enqueue((next, runIdx, pos + 1), next);
+            }
+        }
+        return output;
+    }
+}
+```
+
+```go
+import (
+    "container/heap"
+    "sort"
+)
+
+type extItem struct {
+    value, runIdx, pos int
+}
+
+type extHeap []extItem
+
+func (h extHeap) Len() int            { return len(h) }
+func (h extHeap) Less(i, j int) bool  { return h[i].value < h[j].value }
+func (h extHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
+func (h *extHeap) Push(x interface{}) { *h = append(*h, x.(extItem)) }
+func (h *extHeap) Pop() interface{} {
+    old := *h
+    n := len(old)
+    x := old[n-1]
+    *h = old[:n-1]
+    return x
+}
+
+func ExternalSort(input []int, chunkSize int) []int {
+    var runs [][]int
+    for i := 0; i < len(input); i += chunkSize {
+        end := i + chunkSize
+        if end > len(input) {
+            end = len(input)
+        }
+        chunk := append([]int{}, input[i:end]...)
+        sort.Ints(chunk)
+        runs = append(runs, chunk)
+    }
+    return mergeRuns(runs)
+}
+
+func mergeRuns(runs [][]int) []int {
+    h := &extHeap{}
+    heap.Init(h)
+    for r, run := range runs {
+        if len(run) > 0 {
+            heap.Push(h, extItem{run[0], r, 0})
+        }
+    }
+
+    var out []int
+    for h.Len() > 0 {
+        top := heap.Pop(h).(extItem)
+        out = append(out, top.value)
+        if top.pos+1 < len(runs[top.runIdx]) {
+            heap.Push(h, extItem{runs[top.runIdx][top.pos+1], top.runIdx, top.pos + 1})
+        }
+    }
+    return out
+}
+```
+
+```rust
+use std::collections::BinaryHeap;
+use std::cmp::Reverse;
+
+pub fn external_sort(input: &[i32], chunk_size: usize) -> Vec<i32> {
+    let mut runs: Vec<Vec<i32>> = Vec::new();
+    let mut i = 0;
+    while i < input.len() {
+        let end = std::cmp::min(i + chunk_size, input.len());
+        let mut chunk: Vec<i32> = input[i..end].to_vec();
+        chunk.sort();
+        runs.push(chunk);
+        i = end;
+    }
+    merge_runs(&runs)
+}
+
+fn merge_runs(runs: &[Vec<i32>]) -> Vec<i32> {
+    // BinaryHeap is a max-heap; wrap with Reverse to get min-heap semantics.
+    // Tuple ordering: (value, runIdx, pos).
+    let mut heap: BinaryHeap<Reverse<(i32, usize, usize)>> = BinaryHeap::new();
+    for (r, run) in runs.iter().enumerate() {
+        if !run.is_empty() {
+            heap.push(Reverse((run[0], r, 0)));
+        }
+    }
+
+    let mut out: Vec<i32> = Vec::new();
+    while let Some(Reverse((value, run_idx, pos))) = heap.pop() {
+        out.push(value);
+        if pos + 1 < runs[run_idx].len() {
+            heap.push(Reverse((runs[run_idx][pos + 1], run_idx, pos + 1)));
+        }
+    }
+    out
+}
+```
+
+```javascript
+// Min-heap implemented as an array.
+class MinHeap {
+  constructor() {
+    this.data = [];
+  }
+  size() {
+    return this.data.length;
+  }
+  push(item) {
+    this.data.push(item);
+    this._up(this.data.length - 1);
+  }
+  pop() {
+    const top = this.data[0];
+    const last = this.data.pop();
+    if (this.data.length > 0) {
+      this.data[0] = last;
+      this._down(0);
+    }
+    return top;
+  }
+  _up(i) {
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (this.data[p][0] <= this.data[i][0]) break;
+      [this.data[p], this.data[i]] = [this.data[i], this.data[p]];
+      i = p;
+    }
+  }
+  _down(i) {
+    const n = this.data.length;
+    while (true) {
+      const l = 2 * i + 1,
+        r = 2 * i + 2;
+      let smallest = i;
+      if (l < n && this.data[l][0] < this.data[smallest][0]) smallest = l;
+      if (r < n && this.data[r][0] < this.data[smallest][0]) smallest = r;
+      if (smallest === i) break;
+      [this.data[i], this.data[smallest]] = [this.data[smallest], this.data[i]];
+      i = smallest;
+    }
+  }
+}
+
+function externalSort(input, chunkSize) {
+  const runs = [];
+  for (let i = 0; i < input.length; i += chunkSize) {
+    const chunk = input.slice(i, Math.min(i + chunkSize, input.length));
+    chunk.sort((a, b) => a - b);
+    runs.push(chunk);
+  }
+  return mergeRuns(runs);
+}
+
+function mergeRuns(runs) {
+  const heap = new MinHeap(); // each entry: [value, runIdx, pos]
+  for (let r = 0; r < runs.length; r++) {
+    if (runs[r].length > 0) heap.push([runs[r][0], r, 0]);
+  }
+
+  const out = [];
+  while (heap.size() > 0) {
+    const [value, runIdx, pos] = heap.pop();
+    out.push(value);
+    if (pos + 1 < runs[runIdx].length) {
+      heap.push([runs[runIdx][pos + 1], runIdx, pos + 1]);
+    }
+  }
+  return out;
+}
+```
+
+```typescript
+class MinHeap<T> {
+  private data: T[] = [];
+  constructor(private cmp: (a: T, b: T) => number) {}
+
+  size(): number {
+    return this.data.length;
+  }
+
+  push(item: T): void {
+    this.data.push(item);
+    this._up(this.data.length - 1);
+  }
+
+  pop(): T | undefined {
+    if (this.data.length === 0) return undefined;
+    const top = this.data[0];
+    const last = this.data.pop()!;
+    if (this.data.length > 0) {
+      this.data[0] = last;
+      this._down(0);
+    }
+    return top;
+  }
+
+  private _up(i: number): void {
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (this.cmp(this.data[p], this.data[i]) <= 0) break;
+      [this.data[p], this.data[i]] = [this.data[i], this.data[p]];
+      i = p;
+    }
+  }
+
+  private _down(i: number): void {
+    const n = this.data.length;
+    while (true) {
+      const l = 2 * i + 1,
+        r = 2 * i + 2;
+      let smallest = i;
+      if (l < n && this.cmp(this.data[l], this.data[smallest]) < 0)
+        smallest = l;
+      if (r < n && this.cmp(this.data[r], this.data[smallest]) < 0)
+        smallest = r;
+      if (smallest === i) break;
+      [this.data[i], this.data[smallest]] = [this.data[smallest], this.data[i]];
+      i = smallest;
+    }
+  }
+}
+
+function externalSort(input: number[], chunkSize: number): number[] {
+  const runs: number[][] = [];
+  for (let i = 0; i < input.length; i += chunkSize) {
+    const chunk = input.slice(i, Math.min(i + chunkSize, input.length));
+    chunk.sort((a, b) => a - b);
+    runs.push(chunk);
+  }
+  return mergeRuns(runs);
+}
+
+function mergeRuns(runs: number[][]): number[] {
+  type Entry = [number, number, number]; // [value, runIdx, pos]
+  const heap = new MinHeap<Entry>((a, b) => a[0] - b[0]);
+  for (let r = 0; r < runs.length; r++) {
+    if (runs[r].length > 0) heap.push([runs[r][0], r, 0]);
+  }
+
+  const out: number[] = [];
+  while (heap.size() > 0) {
+    const [value, runIdx, pos] = heap.pop()!;
+    out.push(value);
+    if (pos + 1 < runs[runIdx].length) {
+      heap.push([runs[runIdx][pos + 1], runIdx, pos + 1]);
+    }
+  }
+  return out;
+}
+```
+
+Python's standard library has `heapq.merge`, which already implements an efficient k-way merge over sorted iterables. In production code, that builtin is preferred over a hand-written heap loop:
+
+```python
+def external_sort_with_builtin(input_data: List[int], chunk_size: int) -> List[int]:
+    runs = []
+    for i in range(0, len(input_data), chunk_size):
+        runs.append(sorted(input_data[i:i + chunk_size]))
+    return list(heapq.merge(*runs))
+```
+
+The simulation captures the algorithm at the level that matters. A real implementation replaces the lists with file handles, the chunk extraction with a `read(chunkSize)` from the input file, and the output `add` with a buffered write to the final output file. The skeleton stays identical.
+
+<h2 id="why-multi-way-merge-is-necessary">Why Multi-way Merge Is Necessary</h2>
+
+A binary merge with `log2(k)` levels would also produce a sorted output, but at much higher I/O cost.
+
+| Strategy                     | Total I/O Passes                           | I/O Operations      |
+| ---------------------------- | ------------------------------------------ | ------------------- |
+| Binary merge                 | `log2(k) + 1`                              | `n * (log2(k) + 1)` |
+| Multi-way merge (fan-in `k`) | 2 (phase 1 read+write, phase 2 read+write) | `4n`                |
+
+For `k = 1000`:
+
+- Binary merge: ~11 passes over all data, `11 * n` I/O operations.
+- Multi-way merge: 2 passes, `4n` I/O operations.
+
+The savings are large on disk-bound workloads. The cost: phase 2 needs `k` file handles open simultaneously, plus a buffer per handle. For `k = 10000` and 1 MB buffers, that is 10 GB of buffer memory. Real systems trade off `k` against per-handle buffer size to stay within available memory.
+
+If `k` is too large to merge in a single pass (because memory cannot hold one buffer per run), do a **two-phase merge**: merge groups of `k'` runs into intermediate runs, then merge the intermediate runs. This brings the total I/O passes to `log_{k'}(k) + 1`, still far below binary merge for any reasonable `k'`.
+
+<h2 id="io-complexity">I/O Complexity</h2>
+
+External Sort is analyzed in terms of **I/O operations**, not CPU operations, because disk I/O is the dominant cost. The standard model is the **External Memory Model** by Aggarwal and Vitter: data is moved in blocks of size `B`, and the algorithm has `M` bytes of memory.
+
+For an input of `n` records:
+
+- Phase 1: `O(n / B)` I/O. Each record is read and written once, in blocks of size `B`.
+- Phase 2 (single-pass multi-way merge): `O(n / B)` I/O. Each record is read once from its run and written once to the output.
+- Total: `O(n / B)` I/O for the typical case where everything fits in two phases.
+
+For very large `k` (one pass of merging is not enough because the heap would not fit in memory), the I/O cost becomes `O((n / B) * log_{M/B}(n / B))`, which is the classic external sort lower bound.
+
+Compared to in-memory sorts where the dominant cost is CPU comparisons (`O(n log n)`), External Sort's dominant cost is I/O bandwidth. Optimization focuses on minimizing passes over the data, not minimizing comparisons.
+
+<h2 id="replacement-selection-generating-longer-runs">
+  Replacement Selection: Generating Longer Runs
+</h2>
+
+**Replacement selection** is an optimization from the tape-sort era that still helps on modern systems. Instead of fixed-size chunks, phase 1 uses it to produce runs that are on average **twice as long** as the chunk size.
+
+The technique: maintain a min-heap of size `M`. For each output record:
+
+1. Extract the minimum from the heap.
+2. Write it to the current run.
+3. Read the next input record. If it is >= the last written value, push it into the heap (it can still belong to the current run). Otherwise, push it into a "deferred" heap that will start the next run when the current heap empties.
+
+The deferred heap is what extends runs. On uniformly random input, replacement selection produces runs averaging `2M` long instead of `M`.
+
+The trade-off: replacement selection produces fewer but longer runs, which reduces the merge fan-in needed in phase 2. For massive datasets where one pass of merging would otherwise be impossible, replacement selection can halve the number of phases. For inputs where the simpler chunked sort works fine, the added complexity of replacement selection is rarely worth it.
+
+<h2 id="where-external-sort-shows-up">Where External Sort Shows Up</h2>
+
+External Sort is the foundation of several systems infrastructure components:
+
+- **Database **`**ORDER BY**` on result sets too large for the buffer pool. PostgreSQL, MySQL, SQL Server, and Oracle all use external merge sort for large sorts. The pattern is visible in `EXPLAIN ANALYZE` output as "external sort" with a "disk" annotation.
+- **MapReduce **`**GROUP BY**` and the shuffle phase. Each mapper produces sorted shards; the reducer phase is a k-way merge of all mapper outputs for a given key range.
+- **Spark / Flink shuffle**. Same architecture: per-partition sorted outputs, merged on read.
+- **Lucene index merging**. Inverted index segments are sorted; merging them combines segments without re-sorting.
+- `**sort**`** GNU coreutils**. The `--buffer-size` and `--parallel` flags expose External Sort tuning. By default, `sort` on a file too large for memory automatically falls back to external sort.
+- `**samtools sort**` for genomics workloads. BAM files routinely exceed memory; samtools uses external sort with custom temp file management.
+- **B-tree bulk loading**. Building a B-tree from an unsorted dataset usually starts with an external sort, followed by sequential page packing.
+
+The GNU `sort` example is the most accessible. Running `sort huge_file.csv > sorted.csv` on a file larger than RAM transparently does external sort, with temp files in `$$TMPDIR`. The default chunk size is conservative (`SORT_SIZE` env var); raising it toward available memory reduces the number of runs and merge passes, which speeds up the sort.
+
+<h2 id="tuning-knobs">Tuning Knobs</h2>
+
+Three parameters dominate the performance of an External Sort implementation.
+
+**Chunk size (M).** Bigger chunks mean fewer runs and a smaller fan-in in phase 2. The limit is available memory. Use as much memory as you can without paging.
+
+**Fan-in (k).** Higher fan-in means fewer merge passes. The limit is memory per merge buffer: `k * buffer_size` must fit in memory. For SSDs, smaller buffers per stream work fine (random read penalty is mild). For HDDs, larger buffers per stream avoid seek thrashing.
+
+**Buffered I/O.** Reading one record at a time from a file issues a separate syscall and disk access per record, which is slow. Use buffered reads with at least a 4 KB block, ideally 64 KB or larger. The buffer amortizes the per-syscall and per-disk-seek cost across many records.
+
+A typical production tuning for a 1 TB sort on a 64 GB machine:
+
+- Chunk size: 16 GB (leaving 48 GB for OS, sort buffers, and merge phase).
+- Fan-in for phase 2: ~64 (16 MB buffer per stream, 1 GB total buffer memory).
+- Two phases total: 1 TB / 16 GB ~ 64 runs, merged in one pass at k = 64.
+
+<h2 id="comparison-with-other-sorting-strategies">
+  Comparison with Other Sorting Strategies
+</h2>
+
+| Scenario                             | Best Strategy                                          |
+| ------------------------------------ | ------------------------------------------------------ |
+| Data fits in memory                  | In-memory sort: Quick Sort, Tim Sort, Heap Sort        |
+| Data > memory, single machine        | External Sort (two-phase, multi-way merge)             |
+| Data >> single-machine disk          | Distributed sort: TeraSort on Hadoop / Spark           |
+| Streaming, top-k only                | Heap of size k, no sort needed                         |
+| Streaming, full sorted output        | External Sort with progressive output as runs complete |
+| Sorted ranges that overlap minimally | Direct k-way merge (skip phase 1)                      |
+| Integer keys, fixed-width            | External Radix Sort variant                            |
+
+External Sort fits the "single machine, data larger than memory" regime. Once data is distributed across machines (because it does not even fit on one disk), the algorithm extends to **TeraSort** and **distributed merge sort**, where phase 1 happens on each node and phase 2 is a coordinated network merge. The principles stay the same; only the I/O substrate changes.
+
+<h2 id="common-pitfalls">Common Pitfalls</h2>
+
+**Forgetting buffered I/O.** Reading and writing one record at a time bypasses the disk's natural sequential-access advantage. Always wrap file handles with buffered readers and writers.
+
+**Letting **`**k**`** get too large.** Opening 100k temp files and trying to merge them all in one pass exhausts file descriptors and memory. Cap the fan-in and merge in multiple phases when necessary.
+
+**Using random I/O during merge.** The merge phase should read from each run sequentially. Random access to the middle of a run defeats the entire point of External Sort.
+
+**Ignoring temp file location.** Temp files default to `/tmp` on Linux, which is often a small in-memory `tmpfs`. Sorting a 1 TB file with `tmpfs` as temp storage runs out of space immediately. Use `--temporary-directory` (for GNU `sort`) or the equivalent option to redirect temp files to a real disk.
+
+**Not handling tie-breaking for stability.** Like in-memory sorts, External Sort can be made stable by using strict `<` comparisons in the merge step. Production sorts often need this when ordering by a non-primary key.
+
+**Confusing CPU bound vs I/O bound.** Optimizing the in-memory sort algorithm in phase 1 is rarely the bottleneck. The bottleneck is disk bandwidth, so the right place to optimize is buffer sizes, fan-in, and temp file placement.
+
+<h2 id="complexity-analysis">Complexity Analysis</h2>
+
+| Metric                     | Formula                            | Notes                                                      |
+| -------------------------- | ---------------------------------- | ---------------------------------------------------------- |
+| Total I/O (two-phase case) | O(n / B)                           | Each record read once + written once per phase, two phases |
+| Total I/O (multi-phase)    | `O((n / B) * log_{M/B}(n / B))`    | When fan-in is bounded                                     |
+| CPU time                   | O(n log n)                         | Same as in-memory merge sort                               |
+| Memory                     | O(M)                               | Bounded by chosen chunk size + merge buffers               |
+| Temp disk space            | O(n)                               | Temp files store one copy of the input                     |
+| Stable                     | Possible (use strict `<` in merge) | Same trick as merge sort                                   |
+
+The `B` in the I/O formulas is the disk block size, and `M` is the available memory. For typical values (`B = 4 KB`, `M = 16 GB`), the `log_{M/B}` term is so small that two phases is enough for any input up to many terabytes.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

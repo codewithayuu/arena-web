@@ -1,0 +1,519 @@
+---
+title: "REST APIs"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "REST APIs explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+REST is a style for designing HTTP APIs around resources, verbs, and stateless communication. It's the dominant pattern for web APIs, and the conventions are worth knowing whether the API is built in FastAPI, Django, or Flask. This lesson covers REST principles, how HTTP methods map to CRUD operations, common status codes, versioning, pagination, filtering, idempotency, authentication options, error formats, and the alternatives (GraphQL, gRPC) to know when REST is the wrong choice.
+
+<h1 id="what-rest-means">What REST Means</h1>
+
+REST stands for Representational State Transfer, a term Roy Fielding introduced in his 2000 PhD dissertation describing the architectural style behind the web. The shortest useful definition: a REST API exposes resources at URLs, uses HTTP methods to act on them, and returns representations of state (usually JSON these days) as the response.
+
+The four core ideas are:
+
+1. **Resources** are the nouns. A product, an order, a customer. Each resource has a stable URL.
+2. **HTTP methods** are the verbs. GET to read, POST to create, PUT and PATCH to update, DELETE to remove.
+3. **Representations** are how the state is serialized over the wire. JSON for almost everything modern, sometimes XML or binary formats for special cases.
+4. **Stateless** means each request carries everything the server needs. No server-side session for the API itself; auth tokens travel in every request.
+
+The original dissertation describes six constraints (client-server, stateless, cacheable, layered system, uniform interface, code on demand). Most real APIs honor the first four loosely and the "uniform interface" idea mostly. The day-to-day version of REST that teams ship is more relaxed than the academic version, sometimes called "RESTful" or "REST-ish." That's fine. The pragmatic rules in this lesson are the ones in common use.
+
+The diagram traces three typical exchanges. Every interaction is a request and a response. The verb and URL describe the intent, the body carries the data, the status code conveys the outcome. There's no hidden state between calls.
+
+<h1 id="resources-and-uris">Resources and URIs</h1>
+
+A REST URL should name a resource, not an action. Compare:
+
+| Good (RESTful)             | Bad (RPC-style)                            |
+| -------------------------- | ------------------------------------------ |
+| `GET /products/42`         | `GET /getProductById?id=42`                |
+| `POST /orders`             | `POST /createOrder`                        |
+| `DELETE /orders/7/items/3` | `POST /deleteOrderItem?orderId=7&itemId=3` |
+| `PATCH /products/42`       | `POST /updateProductPrice?id=42&price=15`  |
+
+The left column treats products and orders as things with URLs. The right column treats them as functions to call. The right column works, but it gives up most of the convention that makes REST useful: cacheability, predictability, and the ability for a developer to guess the endpoint without reading the docs.
+
+A few rules of thumb:
+
+- **Use plural nouns for collections.** `/products`, not `/product`. Even though `/product/42` reads fine in English, consistency with the collection URL wins.
+- **Nest resources to express hierarchy, sparingly.** `/orders/7/items` is reasonable; `/customers/3/orders/7/items/5/price` is too deep. Three levels is usually the limit.
+- **Use kebab-case for multi-word paths.** `/order-items`, not `/orderItems` or `/order_items`. URLs are case-sensitive technically, but treating them as lowercase is the universal convention.
+- **Don't put actions in URLs unless they really aren't CRUD.** `POST /products/42/restock` is fine if "restock" doesn't naturally fit into an update. A handful of these custom actions per API is normal; using them for every operation isn't.
+
+Query parameters are for filtering, sorting, paginating, and selecting fields, not for identifying resources. `/products?category=mugs&min_price=5` filters; `/products/42` identifies a single product.
+
+Inconsistent URL conventions are a common reason an API is hard to consume. A team mixing `/customers/3/orders` with `/orders?customer_id=3` and `/get-orders-for-customer/3` ships an API that requires constant docs lookup. Pick a convention on day one and apply it everywhere.
+
+<h1 id="http-methods-and-crud">HTTP Methods and CRUD</h1>
+
+The standard mapping between HTTP methods and CRUD operations:
+
+| Method | CRUD             | Use For                               | Idempotent?  | Safe? |
+| ------ | ---------------- | ------------------------------------- | ------------ | ----- |
+| GET    | Read             | Fetch a resource or collection        | Yes          | Yes   |
+| POST   | Create           | Create a new resource in a collection | No           | No    |
+| PUT    | Update (replace) | Replace a resource entirely           | Yes          | No    |
+| PATCH  | Update (partial) | Modify some fields of a resource      | No (usually) | No    |
+| DELETE | Delete           | Remove a resource                     | Yes          | No    |
+
+"Safe" means the request doesn't modify state on the server. GET is the only safe method; nothing else is. "Idempotent" means doing the same request multiple times has the same effect as doing it once. GET, PUT, and DELETE are idempotent; POST and PATCH usually aren't.
+
+The PUT vs POST distinction is subtle. PUT replaces the resource at a URL; POST creates a new one under a collection.
+
+```text
+PUT /products/42        # Replace product 42 with the body
+POST /products          # Create a new product, server picks the ID
+```
+
+If the client knows the ID it wants (because the ID is part of the natural key, like a slug or an externally chosen identifier), PUT is reasonable. If the server assigns the ID, POST to the collection is the standard.
+
+PATCH is for partial updates. Send only the fields that should change:
+
+```text
+PATCH /products/42
+Content-Type: application/json
+
+{"price": 19.99}
+```
+
+The price changes, every other field stays. Two PATCH formats exist: JSON Merge Patch (RFC 7396, what most APIs use) and JSON Patch (RFC 6902, a list of operations like add/remove/replace). Merge Patch is simpler and more common; JSON Patch is more precise. Pick one and document it.
+
+<h1 id="status-codes">Status Codes</h1>
+
+The status code is how the server tells the client what happened. There are a lot of codes; about a dozen cover the common cases.
+
+| Code | Name                  | Use For                                                                                             |
+| ---- | --------------------- | --------------------------------------------------------------------------------------------------- |
+| 200  | OK                    | Successful GET, PUT, PATCH, or DELETE with a body                                                   |
+| 201  | Created               | Successful POST that created a resource. Include a `Location` header pointing to it                 |
+| 204  | No Content            | Successful request with no response body. Common for DELETE                                         |
+| 400  | Bad Request           | The request is malformed (missing fields, bad JSON, invalid types at the structural level)          |
+| 401  | Unauthorized          | The client isn't authenticated. Confusingly named; this is about authentication, not authorization  |
+| 403  | Forbidden             | The client is authenticated but lacks permission for this resource                                  |
+| 404  | Not Found             | The resource doesn't exist                                                                          |
+| 409  | Conflict              | The request conflicts with the current state. Common for duplicate keys or concurrent modifications |
+| 422  | Unprocessable Entity  | The request is structurally valid but fails business validation (negative price, invalid email)     |
+| 429  | Too Many Requests     | Rate limit exceeded                                                                                 |
+| 500  | Internal Server Error | The server crashed or hit an unhandled exception                                                    |
+| 503  | Service Unavailable   | The server is overloaded or down for maintenance                                                    |
+
+A few subtle points:
+
+**400 vs 422.** The line is "is the request structurally valid?" A POST that sends `{"name": "Mug", "price": "not-a-number"}` is structurally valid (it's parseable JSON) but semantically invalid (price isn't a number), so 422 fits. A POST that sends `not even JSON` or omits required fields is 400. Many APIs use 400 for both and don't bother distinguishing. FastAPI uses 422 for validation errors, Django REST Framework uses 400 by default. Pick a convention. **401 vs 403.** 401 means the client is unauthenticated. 403 means the client is authenticated but lacks permission. If a client without credentials hits a protected endpoint, return 401. If a logged-in user tries to access another user's data, return 403.
+
+**201 with Location.** A successful POST that creates a resource should set the response status to 201 and include a `Location` header pointing to the new resource's URL:
+
+```text
+HTTP/1.1 201 Created
+Location: /products/42
+Content-Type: application/json
+
+{"id": 42, "name": "Ceramic Mug", "price": 14.99}
+```
+
+This is one of the small details that makes an API more usable.
+
+<h1 id="versioning">Versioning</h1>
+
+APIs evolve. Fields get added, removed, renamed. Schemas change. Breaking changes have to ship without breaking every existing client. Two common approaches, and a third one to know about.
+
+**URL path versioning** is the most common approach:
+
+```text
+GET /v1/products/42
+GET /v2/products/42
+```
+
+Pros: visible, cacheable (different URLs are different cache entries), easy to debug. Cons: changing the version touches every URL, and "versioning" tends to become "freeze v1 forever and add new versions on top."
+
+**Header versioning** uses a custom header:
+
+```text
+GET /products/42
+Accept: application/vnd.example.v2+json
+```
+
+Pros: URLs stay clean, RESTful purists prefer this because the URL identifies the resource, not the version. Cons: invisible in browser URLs, harder to debug, and requires every client to set the right header. In practice, header versioning is rare except for very mature APIs with strong tooling.
+
+**Query parameter versioning** uses `?version=2`. It works but is generally considered the worst of the three (looks like a filter, easy to forget).
+
+Most teams pick URL path versioning and live with it. The bigger question isn't where to put the version, it's how often to bump it. Major version bumps are expensive: every client has to migrate. Strategies to avoid bumping include:
+
+- **Add fields without removing.** New optional fields don't break old clients.
+- **Default new behavior off.** A new feature is opt-in via a parameter or header.
+- **Deprecate, don't delete.** Mark fields as deprecated in docs, log usage, remove them only when usage is near zero.
+
+A common version cadence is one major version per few years. Many large APIs have never gone past v1.
+
+<h1 id="pagination">Pagination</h1>
+
+A collection endpoint that returns thousands or millions of rows in one response is a problem: slow, expensive, and likely to time out. Pagination splits the response into pages.
+
+Two common pagination styles:
+
+**Offset/limit** is the simpler of the two:
+
+```text
+GET /products?offset=0&limit=20
+GET /products?offset=20&limit=20
+GET /products?offset=40&limit=20
+```
+
+The client asks for a window starting at offset N with length M. Simple to implement on top of SQL (`OFFSET 20 LIMIT 20`), simple for clients to understand, supports random access. The downside is that performance degrades with larger offsets (the database has to scan and discard all the rows before the offset) and the page contents can shift when items are inserted or deleted between requests.
+
+**Cursor-based** uses an opaque cursor that the server returns and the client passes back:
+
+```text
+GET /products?limit=20
+HTTP/1.1 200 OK
+
+{
+  "data": [...],
+  "next_cursor": "eyJpZCI6MjB9"
+}
+
+GET /products?limit=20&cursor=eyJpZCI6MjB9
+HTTP/1.1 200 OK
+
+{
+  "data": [...],
+  "next_cursor": "eyJpZCI6NDB9"
+}
+```
+
+The cursor is typically a base64-encoded structure that encodes the position (the last item's ID, sort key, or similar). The server uses it to construct a `WHERE id > <cursor>` query that scans efficiently from the cursor forward.
+
+Pros of cursor: consistent performance regardless of depth, stable under concurrent modifications, suited to infinite-scroll UIs. Cons: no random access (can't jump to page 100), the cursor is opaque so it's harder to debug, and the implementation is more involved than offset/limit.
+
+A pragmatic rule: use offset/limit for admin interfaces and simple paginated lists. Use cursors for high-volume APIs, feeds, and anywhere clients are likely to page deep. Many APIs offer both.
+
+The diagram shows a cursor-based pagination walk. Each response includes a cursor for the next page; a null cursor signals the end. The client never computes the cursor itself; it round-trips whatever the server returned.
+
+<h1 id="filtering-and-sorting">Filtering and Sorting</h1>
+
+Filtering and sorting belong in query parameters.
+
+```text
+GET /products?category=mugs&min_price=5&max_price=50&sort=-price
+```
+
+Conventions for the sort parameter vary. A common one is to use a hyphen prefix for descending:
+
+```text
+?sort=price       # ascending
+?sort=-price      # descending
+?sort=name,-price # name asc, then price desc
+```
+
+Some APIs use `order=asc` and `order=desc` as a separate parameter; pick a convention and stick to it.
+
+For filtering, simple equality (`category=mugs`) is the baseline. Range queries (`min_price=5&max_price=50`) work for numeric fields. Some APIs adopt an operator suffix syntax for richer filters:
+
+```text
+?price__gte=5&price__lte=50    # Django ORM style
+?price>=5&price<=50            # symbolic
+?filter=price:gte:5            # structured
+```
+
+There's no universal standard. The most readable for clients is usually the simplest possible naming (`min_price`, `max_price`) until that breaks down for a more complex case, at which point a suffix or operator scheme makes sense.
+
+Be cautious with overly flexible filtering. An API that accepts arbitrary SQL-like filters is convenient until a client constructs a query that overwhelms the database. A sound default is to allow filtering on a fixed set of fields with a fixed set of operators, and require an index on every filterable field.
+
+<h1 id="idempotency-in-practice">Idempotency in Practice</h1>
+
+Idempotency means "if you send this request twice, the effect is the same as sending it once." GET, PUT, and DELETE are idempotent by definition. POST and PATCH usually aren't.
+
+In practice, idempotency matters because networks fail. A client sends a POST to create an order, the connection drops before the response arrives, and the client retries. Without idempotency, the retry creates a second order. With idempotency, the retry returns the original result.
+
+The standard pattern for making POST safely retryable is the **idempotency key**, a unique value the client generates and sends in a header:
+
+```text
+POST /orders
+Idempotency-Key: 9a4f3e0c-1b8d-4f2e-a6c7-3d1e0f8b9a2c
+Content-Type: application/json
+
+{"customer_id": 7, "items": [...]}
+```
+
+The server stores the key (usually in a cache with a TTL of 24 hours) along with the response. If the same key arrives again, the server returns the stored response instead of re-running the operation. The client retries safely.
+
+Stripe popularized this pattern in their API, and most modern payment, billing, and order systems adopt it. The cost is small (one extra header, one cache lookup), and the benefit is large (safe retries on flaky networks).
+
+DELETE is naturally idempotent: deleting an already-deleted resource is a no-op. Most APIs return 204 on a successful delete and either 204 again or 404 on a repeat delete. Either is defensible; 204 fits idempotency better because the client doesn't have to handle "already deleted" as a separate case.
+
+PUT is naturally idempotent: replacing a resource with the same body twice gives the same result. The first call updates, the second is a no-op.
+
+<h1 id="authentication">Authentication</h1>
+
+REST APIs are stateless, so every request has to carry its own credentials. Three main patterns, roughly in order of complexity:
+
+**API keys** are the simplest of the three. The server issues a long random string, the client sends it in every request:
+
+```text
+GET /products/42
+X-Api-Key: sk_live_4e6f4d2a8c9b1e2f3a4b5c6d7e8f9a0b
+```
+
+Pros: easy to issue, easy to revoke, no expiration logic. Cons: long-lived (compromised keys stay valid until revoked), one key per client (no per-user scoping). Fine for server-to-server APIs and internal services.
+
+**JWT (JSON Web Tokens)** are signed tokens that carry claims (user ID, expiration, scopes) in their payload:
+
+```text
+GET /me
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3O...
+```
+
+The server validates the signature and reads the claims without a database lookup. Short-lived (15 minutes is common), often paired with a refresh token that lives longer. The advantage is statelessness; the disadvantage is that revocation is hard (a JWT is valid until it expires, even if the user logs out). Common for browser sessions and mobile clients.
+
+**OAuth 2.0** is the standard for "log in with Google" / "log in with GitHub" flows and for issuing scoped tokens to third-party applications. It's a full protocol, not a token format. The result is usually a bearer token (often a JWT) that the third-party app uses to call the API on behalf of a user. OAuth fits when third parties need access to the API's data; it's overkill for first-party clients.
+
+A practical rule: API keys for service-to-service, JWTs for first-party browser and mobile clients, OAuth for third-party integrations and SSO.
+
+Every authentication scheme has secret handling, rotation, and revocation costs. API keys in source control or environment variables get leaked. JWTs without short expirations become long-lived credentials by accident. OAuth is complex enough to misconfigure in dozens of ways. Use libraries for all of these (PyJWT, authlib, fastapi-users); don't roll your own.
+
+<h1 id="error-response-format">Error Response Format</h1>
+
+When a request fails, the response should tell the client what went wrong in a structured way. A consistent error format across the API saves clients from writing a different parser per endpoint.
+
+A widely-used shape (RFC 7807, "Problem Details for HTTP APIs"):
+
+```text
+HTTP/1.1 422 Unprocessable Entity
+Content-Type: application/problem+json
+
+{
+  "type": "https://api.example.com/problems/validation-error",
+  "title": "Validation failed",
+  "status": 422,
+  "detail": "Price must be greater than zero",
+  "instance": "/orders/9a4f3e0c"
+}
+```
+
+A simpler, more common shape that most APIs ship:
+
+```text
+HTTP/1.1 422 Unprocessable Entity
+Content-Type: application/json
+
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "Validation failed",
+    "fields": [
+      {"field": "price", "message": "must be greater than zero"},
+      {"field": "name", "message": "is required"}
+    ]
+  }
+}
+```
+
+The exact shape matters less than consistency. Pick one, document it, use it everywhere. The minimum useful contents are:
+
+- A machine-readable error code (`VALIDATION_ERROR`, `PERMISSION_DENIED`, `RESOURCE_NOT_FOUND`)
+- A human-readable message safe to show in logs
+- Per-field details for validation errors
+- The status code in the body (redundant with the HTTP status, but convenient for clients that don't have easy access to it)
+
+What not to do: return HTML error pages from a JSON API, return different formats for different errors, include stack traces in production responses (they leak information about the server).
+
+<h1 id="hateoas-briefly">HATEOAS (Briefly)</h1>
+
+Hypermedia as the Engine of Application State, usually called HATEOAS, is the part of the original REST dissertation that says a response should include links to related actions and resources. The client follows links rather than constructing URLs from documentation.
+
+```text
+GET /orders/42
+
+{
+  "id": 42,
+  "status": "pending",
+  "_links": {
+    "self": {"href": "/orders/42"},
+    "items": {"href": "/orders/42/items"},
+    "cancel": {"href": "/orders/42", "method": "DELETE"},
+    "customer": {"href": "/customers/7"}
+  }
+}
+```
+
+The idea is appealing: clients become more decoupled from URL structure, the API can change links without breaking clients. In practice, HATEOAS is rare outside of a few well-known APIs (PayPal, GitHub partially). Most teams ship documented URL structures instead, because the cost of building hypermedia-aware clients is high and the benefit is low for the typical API consumer.
+
+If a project has a small number of well-known clients (a single mobile app, a single SPA), HATEOAS is overkill. If a project is a public API consumed by many independent developers, the discoverability is worth more, but documentation is still required. Most APIs settle for documented URLs and skip HATEOAS.
+
+<h1 id="designing-good-endpoints">Designing Good Endpoints</h1>
+
+A few patterns make an API easier to consume:
+
+**Make the common case easy.** If most consumers want active products, default to active. Add `?include_archived=true` for the less common case. Don't make every consumer pass twelve query parameters to get the obvious thing.
+
+**Use consistent field names across endpoints.** If `created_at` is the convention, use it everywhere. Don't mix `created_at`, `createDate`, `creation_time`, and `dateCreated` across different resources.
+
+**Use the same types for the same concepts.** If product IDs are integers, they're integers everywhere. Don't have customers identified by integer IDs and products by UUIDs and orders by short codes without a good reason. Mixed identifier types make clients fragile.
+
+**Prefer expansion over chattiness.** If a client fetching an order almost always needs the order items too, include them in the response (or offer `?include=items` to opt in). Forcing the client to fetch `/orders/42` and then `/orders/42/items` adds latency for no benefit.
+
+**Use ISO 8601 for dates and times.** `"2026-05-22T14:30:00Z"`, not `"5/22/2026"` or epoch milliseconds. The standard parses unambiguously across timezones and languages.
+
+**Return the created or updated resource.** A POST or PATCH should respond with the new state of the resource (or at minimum, the fields that changed plus IDs and timestamps). The client shouldn't have to make a second request to see the result.
+
+**Document everything that isn't obvious.** Required fields, defaults, validation rules, rate limits, max page sizes, error codes. The docs are part of the API.
+
+<h1 id="tools-for-working-with-rest-apis">Tools for Working with REST APIs</h1>
+
+When developing, debugging, or testing REST APIs, three command-line tools come up often.
+
+**curl** is the universal HTTP client. It's available everywhere, scriptable, and verbose enough to be useful:
+
+```text
+curl -X POST https://api.example.com/orders \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"customer_id": 7, "items": [1, 2, 3]}'
+```
+
+Add `-v` to see the full request and response including headers. Add `-i` to include the response headers in the output. Add `--fail` to make curl exit with a non-zero status on HTTP errors (useful in scripts).
+
+**httpie** is a friendlier alternative for interactive use:
+
+```text
+http POST api.example.com/orders \
+  Authorization:"Bearer $TOKEN" \
+  customer_id:=7 \
+  items:='[1, 2, 3]'
+```
+
+It pretty-prints JSON responses by default, accepts a simpler syntax for JSON bodies, and highlights headers. Many developers prefer it for ad-hoc requests; curl wins for scripting.
+
+**Postman** is a GUI HTTP client with collections, environments, and team sharing. It's the standard tool for API exploration in mixed teams (developers, QA, PMs). The free tier is enough for individual use; paid tiers add team features.
+
+For Python code that consumes REST APIs, the `requests` library (sync) and `httpx` (sync and async) are the conventional choices:
+
+```python
+import httpx
+
+response = httpx.get("https://api.example.com/products/42")
+response.raise_for_status()
+product = response.json()
+print(product["name"])
+```
+
+`httpx.AsyncClient` is the async-native version, suitable for use inside FastAPI endpoints and other async code.
+
+<h1 id="rest-alternatives">REST Alternatives</h1>
+
+REST is the default for HTTP APIs but isn't the only option. Two alternatives are worth knowing about.
+
+**GraphQL** is a query language for APIs. Instead of multiple REST endpoints, a GraphQL service exposes a single endpoint that accepts queries describing exactly what data the client wants:
+
+```text
+POST /graphql
+
+query {
+  order(id: 42) {
+    id
+    status
+    items { id name price }
+    customer { id name }
+  }
+}
+```
+
+The response contains exactly those fields, no more. Strengths: the client decides what to fetch (good for mobile apps that want to avoid over-fetching), the schema is strongly typed, introspection is built in. Weaknesses: caching is harder (every query is unique), N+1 queries on the server side require dataloader patterns, and GraphQL servers are more complex to write and operate than REST. GraphQL fits client-driven APIs where the same data is read in many shapes; for simple CRUD APIs, it's usually overkill.
+
+In Python, the main GraphQL libraries are Strawberry (modern, type-driven) and Graphene (older, more code). Strawberry integrates well with FastAPI.
+
+**gRPC** is a binary RPC framework using HTTP/2 and Protocol Buffers. Instead of REST's nouns and verbs, you define services with methods:
+
+```text
+service ProductService {
+  rpc GetProduct(GetProductRequest) returns (Product);
+  rpc CreateProduct(CreateProductRequest) returns (Product);
+  rpc ListProducts(ListProductsRequest) returns (stream Product);
+}
+```
+
+Strengths: fast (binary serialization, HTTP/2 multiplexing), strongly typed, streaming support, native code generation for many languages. Weaknesses: not human-readable (no curl debugging), browser support requires gRPC-Web, the tooling ecosystem is smaller than REST. gRPC dominates internal service-to-service communication at large companies (Google, Netflix, Uber); it's less common for public APIs that browsers consume.
+
+A common pattern in larger systems uses REST or GraphQL at the edge (the API the frontend talks to) and gRPC for internal service-to-service calls.
+
+| Concern              | REST                                 | GraphQL                                | gRPC                                |
+| -------------------- | ------------------------------------ | -------------------------------------- | ----------------------------------- |
+| Format               | JSON over HTTP                       | JSON over HTTP                         | Protocol Buffers over HTTP/2        |
+| Schema               | Often informal, OpenAPI describes it | Required, strongly typed               | Required, strongly typed            |
+| Client decides shape | No, server decides                   | Yes                                    | No                                  |
+| Browser-friendly     | Yes                                  | Yes                                    | Limited (needs gRPC-Web)            |
+| Streaming            | Limited (SSE, WebSockets)            | Subscriptions                          | Native                              |
+| Tooling              | Mature, ubiquitous                   | Mature for major languages             | Mature for Google's languages       |
+| Best match           | Most APIs                            | Client-driven, mobile, complex schemas | Internal services, high performance |
+
+For most projects, REST is the right default. Use GraphQL when the same data is consumed in many shapes by many clients; use gRPC when binary efficiency matters and you control both sides.
+
+<h1 id="quiz">Quiz</h1>
+
+<h1 id="quiz-questions">Quiz Questions</h1>
+
+**Question 1: Which endpoint best follows REST conventions for removing item 3 from order 7?**
+
+- [x] DELETE /orders/7/items/3
+- [ ] POST /deleteOrderItem?orderId=7&itemId=3
+- [ ] GET /orders/7/items/3/delete
+- [ ] PATCH /orders/7?deleteItem=3
+
+**Question 2: Which statement correctly describes safety and idempotency in common REST usage?**
+
+- [x] PUT is idempotent, but it is not safe.
+- [ ] POST is safe, but it is not idempotent.
+- [ ] GET is unsafe, but it is idempotent.
+- [ ] DELETE is safe, and it is idempotent.
+
+**Question 3: A client sends a valid token but lacks access to /admin/reports. Which status code is most appropriate?**
+
+- [ ] 401 Unauthorized, because the token is missing
+- [x] 403 Forbidden, because permission is denied
+- [ ] 404 Not Found, because auth always hides resources
+- [ ] 400 Bad Request, because the client used a token
+
+**Question 4: Where should a REST API usually place filtering and pagination for a product collection?**
+
+- [x] Use query parameters such as ?category=mugs&limit=20.
+- [ ] Use action paths such as /filterProducts/category/mugs.
+- [ ] Use only headers, because URLs should never vary.
+- [ ] Use POST bodies for all collection reads.
+
+**Question 5: Which statement gives a reasonable reason to choose an alternative to REST?**
+
+- [x] gRPC can suit internal typed, low-latency service calls.
+- [ ] REST is best when clients need arbitrary nested shapes.
+- [ ] GraphQL is mainly for binary RPC between services.
+- [ ] REST requires server-side sessions for every client.
+
+**Question 6: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 7: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 8: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+<QuizCard />
+
+<CommentsSection />
+
+</LessonCard>

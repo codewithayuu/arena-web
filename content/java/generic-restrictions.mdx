@@ -1,0 +1,494 @@
+---
+title: "Generic Restrictions"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Generic Restrictions explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="you-cant-use-primitive-types-as-type-arguments">
+  You Can't Use Primitive Types as Type Arguments
+</h1>
+
+`List<int>` doesn't compile. Type arguments to a generic class or method must be reference types, not primitives.
+
+```java
+import java.util.ArrayList;
+
+public class PrimitiveTypeArg {
+    public static void main(String[] args) {
+        ArrayList<int> stockCounts = new ArrayList<>();
+        // Compile error: unexpected type
+        //   required: reference
+        //   found:    int
+    }
+}
+```
+
+The compiler rejects this because every type parameter is replaced by its erasure at runtime. `T` erases to `Object` (or to its upper bound if it has one). A primitive `int` isn't an `Object`, so a slot that ultimately holds an `Object` reference can't hold a raw `int` value directly.
+
+The fix is to use the wrapper class. Every primitive has one: `int` becomes `Integer`, `double` becomes `Double`, `boolean` becomes `Boolean`, and so on. Autoboxing and unboxing then make the code look like it stores primitives.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class WrapperTypeArg {
+    public static void main(String[] args) {
+        List<Integer> stockCounts = new ArrayList<>();
+        stockCounts.add(10);   // autoboxes int to Integer
+        stockCounts.add(25);
+        stockCounts.add(7);
+
+        int total = 0;
+        for (int count : stockCounts) {   // unboxes Integer to int
+            total += count;
+        }
+        System.out.println("Total stock: " + total);
+    }
+}
+```
+
+Every `add(10)` creates a new `Integer` object on the heap (modulo the small Integer cache for values from -128 to 127), and every loop iteration unboxes it back to `int`. For tight numeric loops over millions of values, a primitive `int[]` or a specialized primitive stream beats `List<Integer>`.
+
+<h1 id="you-cant-instantiate-a-type-parameter">
+  You Can't Instantiate a Type Parameter
+</h1>
+
+Inside a generic class or method, `new T()` doesn't compile. The compiler has no way to figure out which class's constructor to call, because by the time the code runs, `T` is gone.
+
+```java
+public class ProductFactory<T> {
+    public T createBlank() {
+        return new T();
+        // Compile error: type parameter 'T' cannot be instantiated directly
+    }
+}
+```
+
+The same problem applies to `new T[10]` and to any reflective trick that pretends to "ask T for its constructor". The type parameter is a compile-time symbol; at runtime, there's nothing to call `new` on.
+
+There are two clean workarounds. The first is to accept a `Supplier<T>` from the caller. The caller knows the concrete type, so it can pass in a no-arg constructor reference.
+
+```java
+import java.util.function.Supplier;
+
+public class ProductFactory<T> {
+    private final Supplier<T> creator;
+
+    public ProductFactory(Supplier<T> creator) {
+        this.creator = creator;
+    }
+
+    public T createBlank() {
+        return creator.get();
+    }
+
+    public static void main(String[] args) {
+        ProductFactory<StringBuilder> factory = new ProductFactory<>(StringBuilder::new);
+        StringBuilder description = factory.createBlank();
+        description.append("Notebook, A5, 200 pages");
+        System.out.println("Product description: " + description);
+    }
+}
+```
+
+The second option is to take a `Class<T>` token and call its `getDeclaredConstructor().newInstance()`. This works but is more verbose, can throw checked exceptions, and forces the type to have a no-arg constructor. Prefer `Supplier<T>` unless you specifically need the reflective form.
+
+```java
+import java.lang.reflect.InvocationTargetException;
+
+public class ReflectiveProductFactory<T> {
+    private final Class<T> type;
+
+    public ReflectiveProductFactory(Class<T> type) {
+        this.type = type;
+    }
+
+    public T createBlank() throws ReflectiveOperationException {
+        return type.getDeclaredConstructor().newInstance();
+    }
+
+    public static void main(String[] args) throws ReflectiveOperationException {
+        ReflectiveProductFactory<StringBuilder> factory =
+                new ReflectiveProductFactory<>(StringBuilder.class);
+        StringBuilder description = factory.createBlank();
+        description.append("Pen, blue ink");
+        System.out.println("Product description: " + description);
+    }
+}
+```
+
+<h1 id="you-cant-create-generic-arrays">You Can't Create Generic Arrays</h1>
+
+Java arrays are reified: they know their element type at runtime and check every store against it. Generics are erased: the type parameter is gone at runtime. Mixing the two would break the array's runtime check, so the compiler forbids `new T[10]` and `new List<String>[10]`.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class GenericArray<T> {
+    public T[] makeArray(int size) {
+        return new T[size];
+        // Compile error: generic array creation
+    }
+
+    public static void main(String[] args) {
+        List<String>[] carts = new List<String>[3];
+        // Compile error: generic array creation
+    }
+}
+```
+
+If a `List<String>[]` were allowed, it could be assigned to an `Object[]` and a `List<Integer>` put into it without any runtime check (because at runtime both lists are just `List`). That would let `ArrayStoreException` slip through the type system. Rejecting generic array creation closes the hole.
+
+The practical workaround is to use `ArrayList<T>` (or another generic collection) instead of an array. The result is a resizable container with no casts.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class CartStorage<T> {
+    private final List<T> items = new ArrayList<>();
+
+    public void add(T item) {
+        items.add(item);
+    }
+
+    public T get(int index) {
+        return items.get(index);
+    }
+
+    public int size() {
+        return items.size();
+    }
+
+    public static void main(String[] args) {
+        CartStorage<String> cart = new CartStorage<>();
+        cart.add("Notebook");
+        cart.add("Pen");
+        System.out.println("Cart size: " + cart.size());
+        System.out.println("First item: " + cart.get(0));
+    }
+}
+```
+
+When an array is required (for instance, to return one from a method whose signature can't change), the conventional workaround is to allocate an `Object[]` and cast it, suppressing the resulting unchecked warning.
+
+```java
+public class TypedArray<T> {
+    private final T[] data;
+
+    @SuppressWarnings("unchecked")
+    public TypedArray(int size) {
+        this.data = (T[]) new Object[size];
+    }
+
+    public void set(int index, T value) {
+        data[index] = value;
+    }
+
+    public T get(int index) {
+        return data[index];
+    }
+
+    public static void main(String[] args) {
+        TypedArray<String> wishlist = new TypedArray<>(3);
+        wishlist.set(0, "Notebook");
+        wishlist.set(1, "Pen");
+        System.out.println("Wishlist[0]: " + wishlist.get(0));
+        System.out.println("Wishlist[1]: " + wishlist.get(1));
+    }
+}
+```
+
+This works because the array's true runtime type is `Object[]`, and the cast to `T[]` is erased anyway. The downside is that `data.getClass()` reports `Object[]`, not `String[]`, so this trick is fine internally but dangerous when the array is returned to a caller who expects a true `String[]`.
+
+<h1 id="you-cant-use-tclass">You Can't Use T.class</h1>
+
+Inside a generic class, `T.class` is illegal as a way to get a `Class` object for the type parameter. The compiler has no `Class<T>` to provide, because `T` is erased before the bytecode runs.
+
+```java
+public class ProductRegistry<T> {
+    public void registerType() {
+        Class<T> type = T.class;
+        // Compile error: cannot select from a type variable
+    }
+}
+```
+
+This restriction is a direct consequence of erasure. `T.class` would have to be resolved at runtime, but at runtime `T` doesn't exist as a distinct entity. Inside the bytecode, `T` is replaced by its erasure (typically `Object`), and `Object.class` isn't what the caller wanted.
+
+The workaround is to accept a `Class<T>` token as a constructor argument. The caller has the concrete class at the call site and can pass it in.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class ProductRegistry<T> {
+    private final Class<T> type;
+    private final List<T> items = new ArrayList<>();
+
+    public ProductRegistry(Class<T> type) {
+        this.type = type;
+    }
+
+    public void add(Object raw) {
+        if (type.isInstance(raw)) {
+            items.add(type.cast(raw));
+        }
+    }
+
+    public Class<T> getType() {
+        return type;
+    }
+
+    public int size() {
+        return items.size();
+    }
+
+    public static void main(String[] args) {
+        ProductRegistry<String> productNames = new ProductRegistry<>(String.class);
+        productNames.add("Notebook");
+        productNames.add("Pen");
+        productNames.add(42);   // not a String, gets filtered out
+
+        System.out.println("Registered type: " + productNames.getType().getSimpleName());
+        System.out.println("Stored count: " + productNames.size());
+    }
+}
+```
+
+`type.isInstance(raw)` and `type.cast(raw)` are the runtime-safe equivalents of `instanceof T` and `(T) raw`. Both depend on the `Class<T>` token being passed in. This pattern is so common that the JDK uses it in `Collections.checkedList`, `EnumMap`, and several reflection APIs.
+
+<h1 id="you-cant-use-instanceof-with-parameterized-types">
+  You Can't Use instanceof with Parameterized Types
+</h1>
+
+`instanceof` is a runtime check, and the runtime can't tell `List<String>` apart from `List<Integer>`. Both erase to the raw type `List`. The compiler refuses to pretend otherwise.
+
+```java
+import java.util.List;
+
+public class TypeCheckMistake {
+    public static void process(Object data) {
+        if (data instanceof List<String>) {
+            // Compile error: illegal generic type for instanceof
+        }
+    }
+}
+```
+
+There are two legal forms. The first uses the unbounded wildcard `List<?>`, which means "a list of some unspecified type". The second uses the raw type `List`, which loses generic information entirely but is sometimes acceptable in legacy code.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class TypeCheck {
+    public static void describe(Object data) {
+        if (data instanceof List<?> list) {
+            System.out.println("Got a list of size " + list.size());
+        } else {
+            System.out.println("Not a list");
+        }
+    }
+
+    public static void main(String[] args) {
+        List<String> cart = new ArrayList<>();
+        cart.add("Notebook");
+        cart.add("Pen");
+
+        describe(cart);
+        describe("not a list");
+    }
+}
+```
+
+The `instanceof List<?> list` form uses pattern matching for `instanceof` (Java 16+), which binds the matched value to a typed variable in one step. The variable `list` has type `List<?>`, so calling `size()`, `isEmpty()`, and reading elements as `Object` works, but adding anything to it doesn't (the wildcard says "some unknown type", and the compiler won't allow values to go into a list whose element type it can't verify).
+
+This isn't a performance issue so much as a correctness one. Needing `instanceof List<String>` usually means the design has lost track of types somewhere upstream. Push type information into the API rather than recovering it at the receiving end.
+
+<h1 id="you-cant-have-static-fields-typed-as-t">
+  You Can't Have Static Fields Typed as T
+</h1>
+
+A type parameter belongs to an instance, not to the class. With `class Cart<T>`, every `new Cart<String>()` and `new Cart<Integer>()` shares the same `Class<Cart>` object (because of erasure), so a static field can't reasonably be of type `T`. Which `T` would it be?
+
+```java
+public class Cart<T> {
+    private static T cachedItem;
+    // Compile error: non-static type variable T cannot be referenced from a static context
+}
+```
+
+The same rule applies to static methods that try to reference the class's `T`: they can't. They can declare their own independent type parameter, though, because that one is scoped to the method.
+
+The usual workaround depends on the intent. For a per-class cache that doesn't care about `T`, declare the field as `Object` and cast when reading it (accepting the unchecked warning). For a per-type cache, use a `Map<Class<?>, Object>` keyed by class.
+
+```java
+import java.util.HashMap;
+import java.util.Map;
+
+public class Cart<T> {
+    private static final Map<Class<?>, Object> defaults = new HashMap<>();
+
+    public static <U> void registerDefault(Class<U> type, U value) {
+        defaults.put(type, value);
+    }
+
+    @SuppressWarnings("unchecked")
+    public static <U> U getDefault(Class<U> type) {
+        return (U) defaults.get(type);
+    }
+
+    public static void main(String[] args) {
+        Cart.registerDefault(String.class, "Notebook");
+        Cart.registerDefault(Integer.class, 1);
+
+        String defaultProduct = Cart.getDefault(String.class);
+        Integer defaultQuantity = Cart.getDefault(Integer.class);
+
+        System.out.println("Default product: " + defaultProduct);
+        System.out.println("Default quantity: " + defaultQuantity);
+    }
+}
+```
+
+The static method `registerDefault` declares its own `<U>`, which is scoped to that method alone. It has nothing to do with the class's `T`, even though it lives inside `Cart<T>`. This is the standard escape hatch when a static method needs to be generic.
+
+<h1 id="you-cant-catch-or-throw-a-type-parameter">
+  You Can't Catch or Throw a Type Parameter
+</h1>
+
+`catch` clauses match by runtime class. Because `T` is erased to its bound, the JVM has no way to tell whether a thrown exception's class matches a specific `T`. The compiler rejects the attempt.
+
+```java
+public class ExceptionHandler<T extends Exception> {
+    public void run() {
+        try {
+            riskyOperation();
+        } catch (T e) {
+            // Compile error: cannot use type variable in catch clause
+            System.out.println("Caught: " + e.getMessage());
+        }
+    }
+
+    private void riskyOperation() throws Exception {
+        throw new Exception("Failed");
+    }
+}
+```
+
+The related restriction is that a generic class can't extend `Throwable`, directly or indirectly. That blocks the design `class CartException<T> extends Exception`, because then `catch (CartException<String> e)` would be ambiguous at runtime (both `CartException<String>` and `CartException<Integer>` would erase to the same `CartException`).
+
+```java
+public class OrderException<T> extends Exception {
+    // Compile error: generic class may not extend java.lang.Throwable
+}
+```
+
+The standard workaround is to make the exception class non-generic and carry the type information as a regular field.
+
+```java
+public class OrderException extends Exception {
+    private final Class<?> productType;
+
+    public OrderException(String message, Class<?> productType) {
+        super(message);
+        this.productType = productType;
+    }
+
+    public Class<?> getProductType() {
+        return productType;
+    }
+
+    public static void main(String[] args) {
+        try {
+            throw new OrderException("Out of stock", String.class);
+        } catch (OrderException e) {
+            System.out.println("Caught: " + e.getMessage());
+            System.out.println("Type involved: " + e.getProductType().getSimpleName());
+        }
+    }
+}
+```
+
+For the catch-by-`T` case, the same idea applies: catch the bound (often `Exception`) and inspect the caught exception at runtime to discriminate further.
+
+<h1 id="you-cant-overload-methods-with-the-same-erasure">
+  You Can't Overload Methods with the Same Erasure
+</h1>
+
+Method overloading distinguishes methods by their parameter types. Two methods that only differ in their generic type arguments erase to the same signature at the bytecode level, so they look identical to the JVM. The compiler rejects them up front.
+
+```java
+import java.util.List;
+
+public class OrderProcessor {
+    public void process(List<String> productNames) {
+        System.out.println("Processing " + productNames.size() + " names");
+    }
+
+    public void process(List<Integer> quantities) {
+        // Compile error: 'process(List<String>)' clashes with 'process(List<Integer>)';
+        //   both methods have same erasure
+    }
+}
+```
+
+Both methods erase to `void process(List)`, and two methods with the same erased signature can't coexist in the same class.
+
+The fix is to give the two operations different names. Code is easier to read this way anyway, because the names can describe what each one does.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class OrderProcessor {
+    public void processNames(List<String> productNames) {
+        for (String name : productNames) {
+            System.out.println("Product: " + name);
+        }
+    }
+
+    public void processQuantities(List<Integer> quantities) {
+        int total = 0;
+        for (int qty : quantities) {
+            total += qty;
+        }
+        System.out.println("Total quantity: " + total);
+    }
+
+    public static void main(String[] args) {
+        List<String> names = new ArrayList<>();
+        names.add("Notebook");
+        names.add("Pen");
+
+        List<Integer> quantities = new ArrayList<>();
+        quantities.add(3);
+        quantities.add(5);
+
+        OrderProcessor processor = new OrderProcessor();
+        processor.processNames(names);
+        processor.processQuantities(quantities);
+    }
+}
+```
+
+If the two methods truly need to share a name (say, because they implement a common interface contract), push the discrimination into a different mechanism: a `Class<T>` token, a dedicated wrapper type, or a method type parameter with a bound that's actually distinct after erasure.
+
+<h1 id="restrictions-and-workarounds-at-a-glance">
+  Restrictions and Workarounds at a Glance
+</h1>
+
+Most of these decisions follow the same pattern: the language forbids something that depends on `T` existing at runtime, and the workaround is to pass the missing type information explicitly (as a `Class<T>` token or a `Supplier<T>`) or to use a structure that doesn't need `T` to be reified (a generic collection instead of an array, a non-generic exception with a `Class<?>` field).
+
+The diagram is a lookup table. When one of the cyan-to-orange branches comes up, the green box on the right is the workaround. Three of the eight (Supplier, Class token, and generic collection) cover most cases between them.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,420 @@
+---
+title: "Statement Interface"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Statement Interface explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="creating-a-statement">Creating a Statement</h1>
+
+You do not construct `Statement` with `new`. You ask a `Connection` for one, and the JDBC driver decides which concrete class to return. The factory method is `createStatement()`.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.Statement;
+
+public class FirstStatement {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1", "sa", "");
+             Statement stmt = conn.createStatement()) {
+            System.out.println("Got a statement: " + stmt.getClass().getSimpleName());
+        }
+    }
+}
+```
+
+The exact class name comes from the driver; H2 returns `JdbcStatement`, PostgreSQL returns `PgStatement`, and so on. Your code never depends on the concrete type. You talk to the `Statement` interface, and JDBC dispatches the call to whichever driver is on the classpath.
+
+A `Statement` is bound to the connection that created it. Closing the connection closes every statement it produced. Closing a statement closes every result set the statement produced. The chain matters when you forget a close; the connection holds onto cursors and server-side resources until the JVM exits, and on a busy server those leaks add up fast.
+
+Each `Statement` holds memory on both the JVM side and inside the database for cursor state. A leaked statement is a leaked database resource, not just a Java object. Always close statements through `try-with-resources`.
+
+The diagram shows the path a SQL string takes. Your code never speaks to the database directly. It hands a SQL string to a `Statement`, the statement asks the connection to ship that string, and the database sends back either rows or a count. The same plumbing works for every kind of SQL you can send.
+
+<h1 id="the-three-execute-methods">The Three Execute Methods</h1>
+
+`Statement` has three execute methods, and learning which to use when is most of the work. Pick the one that matches what your SQL returns.
+
+| Method               | Use For                                                                                    | Returns         |
+| -------------------- | ------------------------------------------------------------------------------------------ | --------------- |
+| `executeQuery(sql)`  | `SELECT` statements that return rows.                                                      | `ResultSet`     |
+| `executeUpdate(sql)` | `INSERT`, `UPDATE`, `DELETE`, and DDL like `CREATE TABLE`.                                 | `int` row count |
+| `execute(sql)`       | SQL whose shape you don't know at compile time, or SQL that might return multiple results. | `boolean`       |
+
+If you call the wrong one, the driver throws an exception. `executeQuery` on an `INSERT` fails because there is no result set to give back. `executeUpdate` on a `SELECT` fails for the symmetric reason: there are rows, not a count.
+
+We'll set up a small e-commerce schema first so the rest of the lesson has something concrete to run against. Every code block from here on assumes this table exists in the in-memory H2 database.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.Statement;
+
+public class CreateSchema {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1", "sa", "");
+             Statement stmt = conn.createStatement()) {
+
+            stmt.execute("DROP TABLE IF EXISTS products");
+            stmt.execute("CREATE TABLE products ("
+                    + "id INT AUTO_INCREMENT PRIMARY KEY,"
+                    + "name VARCHAR(100) NOT NULL,"
+                    + "price DECIMAL(10,2) NOT NULL,"
+                    + "stock INT NOT NULL)");
+
+            stmt.executeUpdate("INSERT INTO products(name, price, stock) VALUES ('Coffee Mug', 12.99, 100)");
+            stmt.executeUpdate("INSERT INTO products(name, price, stock) VALUES ('Notebook', 4.50, 250)");
+            stmt.executeUpdate("INSERT INTO products(name, price, stock) VALUES ('Desk Lamp', 29.99, 40)");
+
+            System.out.println("Schema ready");
+        }
+    }
+}
+```
+
+The `DB_CLOSE_DELAY=-1` part of the URL tells H2 to keep the in-memory database alive for the lifetime of the JVM, even after every connection closes. Without it, the data disappears the moment your `try-with-resources` releases the last connection, which makes multi-step examples annoying to test.
+
+<h3 id="executequery-for-select">executeQuery for SELECT</h3>
+
+`executeQuery` is the method for whenever you need rows back. It returns a `ResultSet`, which is a forward cursor over the rows the database sent. Only the contract of `executeQuery` matters here.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class ListProducts {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1", "sa", "");
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT id, name, price FROM products ORDER BY id")) {
+
+            while (rs.next()) {
+                int id = rs.getInt("id");
+                String name = rs.getString("name");
+                double price = rs.getDouble("price");
+                System.out.println(id + " | " + name + " | $" + price);
+            }
+        }
+    }
+}
+```
+
+A few rules. `executeQuery` always returns a non-null `ResultSet`, even when no rows match; the first `rs.next()` call returns `false`. The `ResultSet` lives until either you close it, you close the `Statement`, or you run another execute on the same statement. The last point trips up many users: each `Statement` can only have one active `ResultSet`. If you call `executeQuery` again on the same statement, JDBC closes the previous result set with no warning.
+
+`executeQuery` does not pull every row into memory upfront. It opens a cursor and streams rows as you call `next()`. For a `SELECT *` on a million-row table, your memory stays small; for the same query with `rs.next()` looped to the end, you still pay the full network and server cost of that scan.
+
+<h3 id="executeupdate-for-insert-update-delete">
+  executeUpdate for INSERT, UPDATE, DELETE
+</h3>
+
+Use `executeUpdate` for SQL that changes data and gives back a count instead of rows. The integer it returns is the number of rows the statement affected. For a single-row insert that count is `1`. For a delete that matched ten rows it is `10`. For a DDL statement like `CREATE TABLE` it is `0`, because DDL doesn't affect any rows in the SQL sense; the call still succeeds.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.Statement;
+
+public class UpdateStock {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1", "sa", "");
+             Statement stmt = conn.createStatement()) {
+
+            int inserted = stmt.executeUpdate(
+                    "INSERT INTO products(name, price, stock) VALUES ('Water Bottle', 8.99, 75)");
+            System.out.println("Inserted rows: " + inserted);
+
+            int updated = stmt.executeUpdate("UPDATE products SET stock = stock - 5 WHERE price < 15");
+            System.out.println("Updated rows: " + updated);
+
+            int deleted = stmt.executeUpdate("DELETE FROM products WHERE stock < 0");
+            System.out.println("Deleted rows: " + deleted);
+        }
+    }
+}
+```
+
+The return value matters. An `UPDATE` that touches zero rows is almost always a bug or a race condition, not a no-op. If you write code that updates an order's status to `SHIPPED` and the count comes back as `0`, the order you wanted to update did not exist (or its status was not what you expected). Checking the count is a cheap way to catch mistakes that would otherwise show up much later as data drift.
+
+<h3 id="execute-for-everything-else">execute for Everything Else</h3>
+
+`execute` is the general-purpose method. It returns a `boolean`: `true` if the SQL produced a `ResultSet`, `false` if it produced an update count (or nothing). Pull the actual result with `getResultSet()` or `getUpdateCount()` depending on which one applies.
+
+Most of the time you don't need it. If you know your SQL is a `SELECT`, call `executeQuery`. If you know it's a `DELETE`, call `executeUpdate`. The two cases where `execute` is useful are when the SQL shape isn't known statically (a tool that runs arbitrary SQL the user typed), or when the statement can produce multiple results.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class GenericExecute {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1", "sa", "");
+             Statement stmt = conn.createStatement()) {
+
+            String sql = "SELECT name, price FROM products WHERE stock > 50";
+            boolean isResultSet = stmt.execute(sql);
+
+            if (isResultSet) {
+                try (ResultSet rs = stmt.getResultSet()) {
+                    while (rs.next()) {
+                        System.out.println(rs.getString("name") + " $" + rs.getDouble("price"));
+                    }
+                }
+            } else {
+                System.out.println("Rows affected: " + stmt.getUpdateCount());
+            }
+        }
+    }
+}
+```
+
+The same code handles an `UPDATE` without modification. Swap the SQL string to `UPDATE products SET stock = stock + 10` and the `else` branch runs instead. That flexibility is the whole reason `execute` exists; if you know which branch you'll always hit, prefer the typed method, because the code reads more cleanly.
+
+<h3 id="getupdatecount-and-getmoreresults">
+  getUpdateCount and getMoreResults
+</h3>
+
+After `execute` returns `false`, `getUpdateCount()` gives you the row count. It returns `-1` if there's no current result (for example, after you've already pulled the only result). That `-1` is the convention JDBC uses for "nothing more to read."
+
+`getMoreResults()` advances to the next result when a single execute returned several. That happens with stored procedures that produce more than one result set, or with database-specific multi-statement SQL. For ordinary single-statement SQL, you never need it. It's documented here in case it appears in the API.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.Statement;
+
+public class UpdateCountAfterExecute {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1", "sa", "");
+             Statement stmt = conn.createStatement()) {
+
+            boolean isResultSet = stmt.execute("UPDATE products SET stock = stock + 1");
+            System.out.println("isResultSet = " + isResultSet);
+            System.out.println("updateCount = " + stmt.getUpdateCount());
+            System.out.println("after exhausting: " + stmt.getMoreResults());
+            System.out.println("updateCount now = " + stmt.getUpdateCount());
+        }
+    }
+}
+```
+
+The first `getUpdateCount` returns `4` because the `UPDATE` touched every product row. `getMoreResults` returns `false` because there are no further results from this single-statement execute, and once you advance past the last result, `getUpdateCount` returns `-1`. The pair `(false, -1)` is the JDBC way of saying "you're done."
+
+<h1 id="auto-generated-keys">Auto-Generated Keys</h1>
+
+When you `INSERT` into a table with an auto-increment column, the database picks the new id for you. Most of the time you want that id back, because the next thing you do is insert a related row that needs it (an order line referencing an order id, a review referencing a product id). `Statement` exposes the generated keys through an extra step.
+
+You opt in when you create the statement or when you call execute, by passing `Statement.RETURN_GENERATED_KEYS`. After the insert, you call `getGeneratedKeys()` and read the new id from the returned result set.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class InsertAndGetId {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1", "sa", "");
+             Statement stmt = conn.createStatement()) {
+
+            String sql = "INSERT INTO products(name, price, stock) VALUES ('Travel Mug', 15.49, 60)";
+            int rows = stmt.executeUpdate(sql, Statement.RETURN_GENERATED_KEYS);
+            System.out.println("Inserted rows: " + rows);
+
+            try (ResultSet keys = stmt.getGeneratedKeys()) {
+                if (keys.next()) {
+                    int newId = keys.getInt(1);
+                    System.out.println("New product id: " + newId);
+                }
+            }
+        }
+    }
+}
+```
+
+The flag is the part that matters. Without `Statement.RETURN_GENERATED_KEYS`, calling `getGeneratedKeys` returns an empty result set with no obvious reason. The column index `1` works for the simple case of one auto-increment column. If your table has several generated columns, read each by index in declaration order.
+
+Why not `SELECT MAX(id)` after the insert? Because that's a race. Two threads inserting at the same time both read the same max value and pair their next inserts with the wrong id. `getGeneratedKeys` gives you the id of the row this exact insert produced, with no race.
+
+Asking for generated keys is essentially free on most drivers; the database had to compute the new id anyway. The real win is avoiding the extra round trip and race condition of a follow-up `SELECT MAX(id)`.
+
+<h1 id="the-sql-injection-problem">The SQL Injection Problem</h1>
+
+The dark side of `Statement`: it takes a SQL string, the database parses that string, and whatever the string says is what runs. If part of that string comes from user input and you built it with concatenation, the user can rewrite your query.
+
+A common shape: a product search. The user types a name into a form, your code concatenates it into a SQL `WHERE` clause, and you run the result.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class VulnerableSearch {
+    public static void main(String[] args) throws Exception {
+        String userInput = "Coffee Mug";  // From a form, untrusted.
+
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1", "sa", "");
+             Statement stmt = conn.createStatement()) {
+
+            String sql = "SELECT id, name, price FROM products WHERE name = '" + userInput + "'";
+            System.out.println("Running: " + sql);
+
+            try (ResultSet rs = stmt.executeQuery(sql)) {
+                while (rs.next()) {
+                    System.out.println(rs.getInt("id") + " | " + rs.getString("name"));
+                }
+            }
+        }
+    }
+}
+```
+
+Looks fine for a polite user. Now consider an attacker who types this into the search box instead:
+
+```text
+' OR '1'='1
+```
+
+Your concatenation builds the following SQL, and the database runs it:
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class InjectedSearch {
+    public static void main(String[] args) throws Exception {
+        String userInput = "' OR '1'='1";  // Attacker input.
+
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1", "sa", "");
+             Statement stmt = conn.createStatement()) {
+
+            String sql = "SELECT id, name, price FROM products WHERE name = '" + userInput + "'";
+            System.out.println("Running: " + sql);
+
+            try (ResultSet rs = stmt.executeQuery(sql)) {
+                while (rs.next()) {
+                    System.out.println(rs.getInt("id") + " | " + rs.getString("name"));
+                }
+            }
+        }
+    }
+}
+```
+
+The attacker's single quote closed the original string literal early, the `OR '1'='1'` made the rest of the `WHERE` clause always true, and the trailing quote in your template paired up cleanly. The query went from "products named exactly X" to "every product in the table." That's a tame example. A real attacker would chain a `UNION SELECT` to leak password hashes from another table, or in some databases a `;` followed by `DROP TABLE products` to delete the whole catalog.
+
+A common mistake is thinking sanitization fixes this. Escaping single quotes feels like a fix, but real input has Unicode quotes, backslashes, comment syntax, multi-byte sequences, and database-specific edge cases. Every hand-rolled escaper has been beaten by a real exploit. The only correct fix is to stop building SQL with string concatenation at all.
+
+`PreparedStatement` is the answer. Instead of pasting values into a SQL string, you write the SQL once with `?` placeholders for each value, and you bind the values separately. The database treats values as values, not as syntax, so `' OR '1'='1` becomes a literal nine-character string that no product is named.
+
+The rule is: any SQL that touches user input, or any external input, should be a `PreparedStatement`. `Statement` is fine for SQL that's a fixed string in your source code (a `CREATE TABLE`, a hand-typed admin query). For anything where a value comes from outside, use the prepared version.
+
+The top path is the broken pattern: user input is mixed into the SQL text, the database parser cannot tell which characters are data and which are syntax, and anything the user types becomes part of the query. The bottom path is the prepared-statement pattern: the SQL structure is parsed first with placeholders, and values are bound afterward as opaque data the parser never sees as syntax. That separation is what makes the second path safe regardless of what the user types.
+
+SQL injection is not a Java-specific problem; every language with string concatenation into SQL has it. The fix in every language is the same shape: parameterized queries with values bound separately from the SQL text.
+
+<h1 id="batching-with-addbatch-and-executebatch">
+  Batching with addBatch and executeBatch
+</h1>
+
+When you need to run many similar statements, sending each one separately is slow. Every execute is a round trip to the database: send the SQL, wait for the reply, parse, plan, run, return. For 100 inserts that's 100 round trips. Batching lets you queue several statements on the client side and send them all in one go.
+
+`Statement` exposes batching through two calls. `addBatch(sql)` queues a SQL string. `executeBatch()` ships every queued statement to the database in one shot and returns an `int[]` with one entry per statement: the update count of that statement, or `Statement.SUCCESS_NO_INFO` if the driver doesn't track individual counts, or `Statement.EXECUTE_FAILED` if that particular statement failed.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.Statement;
+import java.util.Arrays;
+
+public class BatchInsert {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1", "sa", "");
+             Statement stmt = conn.createStatement()) {
+
+            stmt.addBatch("INSERT INTO products(name, price, stock) VALUES ('Pencil', 0.99, 500)");
+            stmt.addBatch("INSERT INTO products(name, price, stock) VALUES ('Eraser', 0.50, 300)");
+            stmt.addBatch("INSERT INTO products(name, price, stock) VALUES ('Ruler', 2.25, 150)");
+            stmt.addBatch("UPDATE products SET stock = stock + 10 WHERE name = 'Coffee Mug'");
+
+            int[] counts = stmt.executeBatch();
+            System.out.println("Per-statement counts: " + Arrays.toString(counts));
+        }
+    }
+}
+```
+
+Each entry of the array lines up with the statement at the same position in the batch. Three inserts each affected one row, and the update touched one row, so the array is `[1, 1, 1, 1]`. If one of the inserts had violated a constraint, that entry would be `Statement.EXECUTE_FAILED` (the constant value is `-3`) and the driver, depending on its policy, might either skip the failed statement and continue, or abort the rest of the batch.
+
+The performance win comes from collapsing round trips. With a 1 ms network hop, 100 separate `executeUpdate` calls cost at least 100 ms in round trips alone, even before any work runs on the server. The same 100 statements in one batch is one round trip out and one back. On slow links the savings are dramatic.
+
+There is a catch. `Statement.addBatch(sql)` takes a full SQL string each time. Every string still has to be parsed by the database, even though they're sent in one shot. The bigger win comes from `PreparedStatement.addBatch()`, which parses the SQL once and rebinds parameters for each batch entry. That's the version to use in production for bulk inserts. Plain `Statement` batching is still useful when the statements are actually different (a mix of inserts, updates, and DDL) and the only goal is to avoid the round-trip tax.
+
+After `executeBatch` returns, the queue is empty. You can keep using the same statement to queue another batch. To abandon a queued batch without executing it, call `clearBatch()` and the queued SQL is forgotten.
+
+A batch of N statements costs one round trip instead of N, but the database still parses N SQL strings. For repeated similar statements use `PreparedStatement` batching, which parses once and reuses the plan.
+
+<h1 id="closing-and-resource-leaks">Closing and Resource Leaks</h1>
+
+A `Statement` holds resources on both the JVM side (the Java object, its internal buffers) and the database side (cursor state, parsed SQL, prepared plans, locks if you're mid-transaction). Forgetting to close one is a leak that accumulates with every request a server handles.
+
+The right answer is `try-with-resources`. The pattern handles the close even when an exception escapes the body, which is when you most need it because exception paths are where naive code forgets cleanup.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class CleanClose {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1", "sa", "");
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM products")) {
+
+            if (rs.next()) {
+                System.out.println("Product count: " + rs.getInt(1));
+            }
+        }
+    }
+}
+```
+
+The resources close in the reverse of the order you declared them: result set first, then statement, then connection. Each close is independent, so a failure to close the result set still lets the statement and connection close. JDBC closes child resources when a parent closes, so closing just the `Connection` would also work, but being explicit makes the intent clearer and helps when you want to release a statement early without giving up the connection.
+
+The mistake to avoid: declaring the resources outside `try-with-resources` and trying to close them in a `finally` block by hand. Every line of cleanup is one more place to forget a null check, swallow an exception, or get the close order wrong. `try-with-resources` was added in Java 7 precisely so you stop writing that boilerplate.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.Statement;
+
+public class LeakyStatement {
+    public static void main(String[] args) throws Exception {
+        Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1", "sa", "");
+        Statement stmt = conn.createStatement();
+        stmt.executeUpdate("INSERT INTO products(name, price, stock) VALUES ('Sticky Notes', 3.49, 200)");
+        // No close. Both the statement and the connection leak.
+        System.out.println("Inserted without closing");
+    }
+}
+```
+
+The code runs and the insert succeeds. The leak is invisible until the JVM exits or until you run this in a tight loop on a real database and watch the connection count climb. The fix is to wrap both resources in `try-with-resources`.
+
+A leaked statement holds a database cursor and a small chunk of server-side memory. A leaked connection holds those plus a TCP socket and a database-side session. Most production failures attributed to "the database is slow" are really "the application leaked connections and the pool is exhausted."
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

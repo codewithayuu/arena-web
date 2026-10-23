@@ -1,0 +1,432 @@
+---
+title: "mypy Type Checker"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "mypy Type Checker explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="static-checkers-vs-real-runtime-validation">
+  Static Checkers vs Real Runtime Validation
+</h1>
+
+A static type checker reads your source code as text. It builds a model of every function signature, variable, and call site, then compares the types it infers against the annotations you wrote. If you pass a `str` where the function declared `Price`, the checker prints an error. Your code never runs.
+
+A runtime validator does the opposite. It runs your code, and at the moment a value crosses a boundary you marked, it checks the actual object's type and raises if it doesn't match. Pydantic and beartype are the two most common examples.
+
+Both approaches have a place. Static checkers catch bugs across the whole codebase cheaply and stop a CI build before deploy. Runtime validators catch bad input from sources Python can't analyze statically: JSON from an HTTP request, rows from a database, environment variables, user-supplied config files.
+
+The diagram shows two independent flows. The top half happens before your code ships: a checker reads the source and either lets the build through or stops it. The bottom half happens while requests are flowing through the application, with a validator inspecting each value as it arrives at a boundary.
+
+Most of this chapter is about the top half, because that's where you'll spend almost all of your typing energy. The bottom half gets a focused section at the end, with a Pydantic example for the case the static checker can't help with.
+
+<h1 id="installing-and-running-mypy">Installing and Running mypy</h1>
+
+Mypy ships on PyPI. Install it with pip, ideally inside a virtual environment for the project you're checking.
+
+```text
+pip install mypy
+mypy --version
+```
+
+Mypy runs on a file, a folder, or a package name. For a small e-commerce module like the one below, point it at the file.
+
+```python
+# shop.py
+from typing import NewType
+
+Price = NewType("Price", float)
+
+def apply_discount(price: Price, percent: int) -> Price:
+    return Price(price * (1 - percent / 100))
+
+# Typo: passing a plain str instead of a Price
+total = apply_discount("29.99", 10)
+print(total)
+```
+
+Running mypy on this file flags the bad argument before the program ever runs:
+
+```text
+mypy shop.py
+```
+
+Three pieces of that output matter. The location (`shop.py:9`) points at the call site. The message explains what's wrong in plain English. The bracketed code at the end (`[arg-type]`) is the error category, and you'll need it later when you want to silence a specific false positive.
+
+> **Cost:** mypy's first run on a large project is slow because it analyzes every imported module. Subsequent runs are much faster because mypy caches inferred types in a `.mypy_cache/` directory. Don't commit this directory; add it to `.gitignore`.
+
+Mypy can also check a whole folder or your installed package.
+
+```text
+mypy src/             # All Python files under src/
+mypy --package shop   # Installed package named "shop"
+```
+
+<h1 id="installing-and-running-pyright">Installing and Running pyright</h1>
+
+Pyright is Microsoft's static type checker, written in TypeScript. It's faster than mypy on large codebases and powers the Pylance extension in VS Code. The Python wrapper installs the underlying tool and a `pyright` command.
+
+```text
+pip install pyright
+pyright --version
+```
+
+Running pyright on the same `shop.py` from the mypy section produces a similar but not identical report:
+
+```text
+pyright shop.py
+```
+
+Two practical differences from mypy worth noticing. First, pyright includes a column number (`:9:30`), which editors use to underline the exact token. Second, pyright is more aggressive about literal types: it inferred the string as `Literal['29.99']`, not just `str`, because the value is a constant.
+
+Pyright and mypy do not always agree. They implement the same PEPs (484, 526, 544, 612, and so on) but make different choices about inference and unsoundness. A team typically picks one as the source of truth and treats the other as a secondary signal.
+
+The IDE story is where pyright shines. The Pylance extension uses pyright under the hood to give VS Code its inline type errors, autocomplete, and hover information. Mypy can run inside an editor too, but the tooling story is rougher. The common pattern is pyright in the editor for fast feedback and mypy in CI for the authoritative gate. Some teams run both in CI; others pick one and stop.
+
+| Property                | mypy                           | pyright                                  |
+| ----------------------- | ------------------------------ | ---------------------------------------- |
+| Implementation language | Python                         | TypeScript / Node                        |
+| Speed on large repos    | Slower, has incremental cache  | Faster                                   |
+| IDE integration         | Decent (vim, emacs, VS Code)   | Best in class (Pylance)                  |
+| CI popularity           | More common                    | Growing                                  |
+| Inference style         | More conservative              | More aggressive                          |
+| Config file             | `mypy.ini` or `pyproject.toml` | `pyrightconfig.json` or `pyproject.toml` |
+
+<h1 id="configuring-mypy-pyprojecttoml">Configuring mypy (pyproject.toml)</h1>
+
+Once you're running mypy across a real project, you'll want a config file so every developer and the CI server use the same settings. Two formats are supported: an INI file named `mypy.ini` (or `.mypy.ini`), and a `[tool.mypy]` table inside `pyproject.toml`. The pyproject form is the modern default.
+
+A small but realistic config for an e-commerce package:
+
+```text
+# pyproject.toml
+[tool.mypy]
+python_version = "3.12"
+files = ["src/shop", "tests"]
+exclude = ["src/shop/legacy"]
+strict = true
+warn_unused_ignores = true
+warn_return_any = true
+pretty = true
+
+[[tool.mypy.overrides]]
+module = "shop.legacy.*"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "requests.*"
+ignore_missing_imports = true
+```
+
+Walking through what each piece does:
+
+- `python_version` pins which Python syntax mypy assumes. If you write `list[int]` (3.9+) in code declared as 3.8, mypy will complain.
+- `files` is the default set of paths mypy checks when you run `mypy` with no arguments.
+- `exclude` is a regex of paths to skip. Useful for vendored code or a legacy folder being migrated.
+- `strict = true` is a shortcut that turns on a bundle of stricter flags at once (we cover this in its own section below).
+- `warn_unused_ignores` flags `# type: ignore` comments that no longer suppress anything. Without this flag, stale ignores rot in the codebase.
+- `warn_return_any` complains when a function annotated to return a concrete type ends up returning `Any` (usually because an untyped library leaked in).
+- The two `[[tool.mypy.overrides]]` sections relax rules per module. The first disables errors for the legacy folder while it's being migrated. The second tells mypy not to complain when an external library has no type stubs.
+
+You run mypy the same way; it now reads its settings from `pyproject.toml` automatically:
+
+```text
+mypy
+```
+
+If mypy reports `Cannot find implementation or library stub for module named "X"`, the library doesn't ship type stubs. Common fixes:
+
+- Install the stubs: `pip install types-requests` (the typeshed convention).
+- Add the module to a per-module override with `ignore_missing_imports = true`.
+
+> **Cost:** Enabling `strict` on day one of a large untyped codebase can produce thousands of errors. Roll it out per-package using `[[tool.mypy.overrides]]` so you tighten one module at a time rather than facing a single overwhelming queue.
+
+<h1 id="configuring-pyright">Configuring pyright</h1>
+
+Pyright reads `pyrightconfig.json` in the project root by default, but it also reads a `[tool.pyright]` table in `pyproject.toml`. The pyproject form keeps Python tooling config in one file, which most teams prefer.
+
+```text
+# pyproject.toml
+[tool.pyright]
+pythonVersion = "3.12"
+include = ["src/shop", "tests"]
+exclude = ["src/shop/legacy", "**/__pycache__"]
+typeCheckingMode = "strict"
+reportMissingImports = "error"
+reportUnusedVariable = "warning"
+```
+
+The flag names differ from mypy (`pythonVersion` instead of `python_version`, `typeCheckingMode` instead of `strict`), but the shape is similar. Pyright has three checking modes: `off`, `basic`, and `strict`. Strict is the equivalent of mypy's `strict = true`.
+
+The JSON form looks the same and lives at the repo root as `pyrightconfig.json`:
+
+```text
+{
+  "pythonVersion": "3.12",
+  "include": ["src/shop", "tests"],
+  "exclude": ["src/shop/legacy"],
+  "typeCheckingMode": "strict"
+}
+```
+
+Pick one config location and stick to it. Pyright reads `pyrightconfig.json` if present and ignores `pyproject.toml`; if there's no JSON config, it falls back to pyproject. Having both files in the same repo is a recipe for confusion.
+
+<h1 id="silencing-false-positives-with-type-ignore">
+  Silencing False Positives with # type: ignore
+</h1>
+
+Static checkers are not perfect. A library with no stubs, a metaprogramming trick, a dynamically-built class, any of these can trigger an error the checker can't resolve on its own. The escape hatch is the `# type: ignore` comment.
+
+A bare ignore silences any error on that line:
+
+```python
+# Library has no stubs, we're confident the return type is correct
+config = load_external_config()  # type: ignore
+```
+
+The bare form is a smell. It hides every error on the line, including ones that creep in later when the surrounding code changes. The safer version names the specific error code:
+
+```python
+config = load_external_config()  # type: ignore[no-untyped-call]
+```
+
+Now mypy only suppresses `no-untyped-call` on this line. If a different error appears later, you'll still see it. The error code in brackets is the same one mypy prints when it reports the error.
+
+A worked example. Suppose you have a cart class and you intentionally pass a Decimal where the type says float, because the surrounding code handles both:
+
+```python
+from decimal import Decimal
+
+def add_to_cart_total(total: float, item_price: float) -> float:
+    return total + item_price
+
+cart_total: float = 0.0
+new_total = add_to_cart_total(cart_total, Decimal("29.99"))
+```
+
+Mypy flags the Decimal:
+
+```text
+cart.py:7: error: Argument 2 to "add_to_cart_total" has incompatible type "Decimal"; expected "float"  [arg-type]
+```
+
+If the surrounding code genuinely handles both, you silence that specific error:
+
+```python
+new_total = add_to_cart_total(cart_total, Decimal("29.99"))  # type: ignore[arg-type]
+```
+
+Mypy now stays quiet on that line for `arg-type` errors only. With `warn_unused_ignores = true` in the config, mypy will also tell you if you remove the Decimal later and the ignore becomes redundant.
+
+When is `# type: ignore` legitimate, and when is it a smell?
+
+| Legitimate                                       | Smell                                          |
+| ------------------------------------------------ | ---------------------------------------------- |
+| Third-party library with broken or missing stubs | Hiding errors you don't understand             |
+| Metaprogramming the checker can't follow         | Suppressing every line in a function           |
+| Type system gap you've checked is safe           | Silencing an error instead of fixing it        |
+| Migrating an old module incrementally            | Using bare `# type: ignore` with no error code |
+
+The rule of thumb: every `# type: ignore` should be paired with a code review comment explaining why the suppression is safe. A grep for `type: ignore` in the codebase becomes the list of "places we've taken on debt to the type checker."
+
+<h1 id="strict-mode">Strict Mode</h1>
+
+Mypy's default settings are lenient. They accept untyped functions, treat `Any` as a free pass, and let imports without stubs through. This is intentional: it lets you adopt mypy on a large codebase without immediately drowning in errors. Once you've made progress, you'll want stricter checks.
+
+`strict = true` is a shortcut for around a dozen individual flags. The most important ones it enables:
+
+- `disallow_untyped_defs`: every function must have parameter and return annotations.
+- `disallow_incomplete_defs`: a function can't be half-annotated. All or nothing.
+- `disallow_untyped_calls`: calling an untyped function from a typed one is an error.
+- `no_implicit_optional`: a parameter with a default of `None` must be annotated as `Optional[T]`, not bare `T`.
+- `warn_return_any`: returning `Any` from a function with a concrete return type is flagged.
+- `warn_unused_ignores`: stale `# type: ignore` comments are reported.
+- `check_untyped_defs`: even functions without annotations get type-checked internally.
+
+Teams usually adopt strict mode gradually. Three common rollout patterns:
+
+1. **Per-module:** Enable strict mode globally, then use `[[tool.mypy.overrides]]` to relax it for legacy folders. As each folder gets cleaned up, remove its override.
+2. **Per-flag:** Skip the `strict` shortcut and turn on individual flags one at a time, starting with the cheapest (`warn_unused_ignores`) and ending with the most invasive (`disallow_untyped_defs`).
+3. **New code only:** Use the strict-equality flag plus a pre-commit hook that runs mypy on changed files only. Old code stays as-is; new code arrives clean.
+
+```text
+# Gradual rollout: strict everywhere except legacy
+[tool.mypy]
+strict = true
+
+[[tool.mypy.overrides]]
+module = "shop.legacy.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+warn_return_any = false
+```
+
+Pyright's `strict` mode does the same kind of thing, with a similar trade-off. Both checkers support a "files-strict" workflow where strict applies only to a list of paths and the rest of the project stays in basic mode.
+
+> **Cost:** Strict mode can multiply error counts by 10x or more on a previously-loose codebase. Always commit a baseline of allowed errors (`mypy --baseline`) or use per-module overrides; don't ask the team to fix everything at once.
+
+<h1 id="debugging-with-reveal_type-and-cast">
+  Debugging with reveal_type and cast
+</h1>
+
+Sometimes mypy infers a type that surprises you, and you need to know what it actually thinks a variable is. The tool for this is `reveal_type`, a special pseudo-function the checker recognizes:
+
+```python
+from typing import NewType
+
+Price = NewType("Price", float)
+
+prices: list[Price] = [Price(29.99), Price(14.99)]
+
+cheapest = min(prices)
+reveal_type(cheapest)
+```
+
+You don't import `reveal_type` from anywhere when running mypy. Mypy treats it as a builtin during type checking. (For runtime correctness, `typing.reveal_type` exists since Python 3.11 and returns its argument unchanged, so the line works at runtime too on modern Python.)
+
+Running mypy prints the inferred type as a "note" line:
+
+```text
+mypy shop.py
+```
+
+That confirms mypy thinks `cheapest` is a `Price`, not a plain `float`. Drop `reveal_type` into any spot where the checker's behavior surprises you. Pyright supports the same call.
+
+`cast` is the next tool down. When you know more about a value's type than the checker can possibly figure out, `cast(T, value)` tells the checker "trust me, treat this as `T`." At runtime, `cast` returns the value unchanged. No conversion happens.
+
+```python
+from typing import cast, Any
+from decimal import Decimal
+
+def fetch_price_from_db(product_id: str) -> Any:
+    # Pretend this returns Any because the DB layer is untyped
+    return Decimal("29.99")
+
+raw = fetch_price_from_db("wireless-mouse")
+
+# We know the DB column is always Decimal, even though the function is typed Any
+price: Decimal = cast(Decimal, raw)
+discount = price * Decimal("0.9")
+
+print(discount)
+```
+
+Without the `cast`, mypy would let `price = raw` through (because `Any` is compatible with everything), but downstream code that depends on `Decimal` methods would silently lose its type information. The `cast` is a contract: you're asserting the type so the checker can keep doing its job after this point.
+
+`cast` is a tool of last resort. Each one is a place where the type checker is no longer protecting you, because you've overridden it. If you find yourself reaching for `cast` often, the upstream code probably needs better types instead.
+
+<h1 id="adopting-types-in-an-existing-codebase-gradual-typing">
+  Adopting Types in an Existing Codebase (Gradual Typing)
+</h1>
+
+Most projects don't start typed. The realistic question is how to add types to an existing codebase without grinding feature work to a halt. The answer Python's type system was designed for is **gradual typing**: any function or variable can be typed or untyped, and the two coexist.
+
+The starting point is `Any`. A function annotated to take and return `Any` participates in the type system without actually constraining anything:
+
+```python
+from typing import Any
+
+def get_product(product_id: Any) -> Any:
+    # Original untyped implementation, unchanged
+    return database.fetch(product_id)
+```
+
+Compare with the same function written without annotations. Mypy treats unannotated parameters and returns as `Any` by default (in non-strict mode), so the two are equivalent for type checking. The difference is intent: the explicit `Any` says "I haven't decided yet," while the missing annotation can mean "I forgot."
+
+A pragmatic rollout for a real project:
+
+1. **Install mypy and run with no config.** Get a baseline of how bad it is. Most projects start at zero errors here because mypy is lenient by default.
+2. **Add a `pyproject.toml` config** with `python_version` and `files`. Commit it.
+3. **Add `# type: ignore[import-untyped]` or per-module overrides** for libraries with no stubs. Don't fix them all at once.
+4. **Type the public API first.** Functions that other code imports get annotated first, because their signatures propagate. Internal helpers can wait.
+5. **Turn on individual strict flags one at a time.** Start with `warn_unused_ignores`. Add `no_implicit_optional`. Then `disallow_untyped_defs`. Each one is its own pull request.
+6. **Add type checking to CI.** Make a failed mypy run fail the build. From now on, the codebase only gets stricter.
+7. **Enable `strict = true`** with per-module overrides for any legacy folders not yet converted.
+8. **Delete the per-module overrides** as each legacy folder gets typed.
+
+The diagram shows the typical progression from a fully untyped repository to one where strict mode runs in CI with no overrides. Each step is small enough to land in a single pull request without blocking other work.
+
+Two patterns that keep gradual typing manageable:
+
+**Stub files** (`.pyi`) let you add types to a third-party library without modifying its source. Drop a `requests.pyi` next to your code with the signatures you care about, and mypy uses it for type checking while the runtime keeps using the real `requests`.
+
+**Per-module strictness.** A repo might have one strictly-typed package (the new code) and one lenient one (legacy). Using overrides, you can hold the line on new code while old code catches up.
+
+> **Cost:** Adding types to a 100,000-line codebase is a months-long project, not a sprint. The win is incremental: each typed module makes refactoring safer for the next one, but you don't see the full benefit until coverage is high.
+
+<h1 id="true-runtime-validation-pydantic-beartype">
+  True Runtime Validation (pydantic, beartype)
+</h1>
+
+Static checkers can't see data that comes from outside your program. HTTP request bodies, JSON files, database rows, environment variables, message queue payloads. By the time your Python code receives them, they're just `dict`s and `str`s with no guarantee they match your types. Runtime validation is what closes that gap.
+
+**Pydantic** is the most popular Python runtime validation library. Define a model class, and Pydantic builds a fast validator that checks every field when you construct an instance. The model also doubles as a typed object for the rest of your code.
+
+```python
+from pydantic import BaseModel, ValidationError, Field
+
+class Product(BaseModel):
+    product_id: str
+    name: str
+    price: float = Field(gt=0)
+    stock: int = Field(ge=0)
+    in_stock: bool = True
+
+# Good input: parsed and typed
+good = Product(product_id="wireless-mouse", name="Wireless Mouse", price=29.99, stock=12)
+print(good)
+
+# Bad input: ValidationError with details
+try:
+    bad = Product(product_id="usb-cable", name="USB Cable", price=-1, stock="ten")
+except ValidationError as e:
+    print(e)
+```
+
+Two things to notice. First, the bad input gives a structured error with one entry per failing field. This is what makes Pydantic the standard for API input validation in Flask, FastAPI, and almost every modern Python web framework. Second, the `Product` class itself is statically typed: mypy treats `good.price` as a `float`, and pyright sees the same. You get static and runtime checking for the same annotations.
+
+**beartype** takes a different approach. Instead of a base class, it's a decorator that wraps any function and checks every argument and return value against the existing type hints:
+
+```python
+from beartype import beartype
+
+@beartype
+def apply_discount(price: float, percent: int) -> float:
+    return price * (1 - percent / 100)
+
+print(apply_discount(29.99, 10))
+
+# Bad call: beartype raises at the call site
+print(apply_discount("29.99", 10))
+```
+
+beartype doesn't ask you to change your model classes. You add `@beartype` (or a project-wide import hook) and your existing type hints become runtime contracts.
+
+**typeguard** is a third option in the same space, similar in spirit to beartype, with a slightly different feature set around lazy import-time instrumentation.
+
+| Library   | Style                                    | Best for                                                |
+| --------- | ---------------------------------------- | ------------------------------------------------------- |
+| Pydantic  | Declarative models, parsing + validation | API request bodies, config files, structured input      |
+| beartype  | Decorator, validates existing type hints | Internal function boundaries you don't trust            |
+| typeguard | Decorator, import-time hook option       | Whole-project runtime checking with minimal code change |
+
+When to reach for runtime validation:
+
+- Data arrives from a source you can't statically check: HTTP, JSON, CSV, environment variables, a third-party SDK that returns `Any`.
+- The cost of a bad value reaching deep code is high (data corruption, money calculations, security).
+- You want the validation error to come back to the caller with a specific message ("field `price` must be greater than 0"), not as a `TypeError` from somewhere 30 frames deep.
+
+When you don't need it:
+
+- Pure-Python boundaries inside a single typed codebase. mypy or pyright already covers these statically, for free.
+- Hot loops where every microsecond counts. Pydantic v2 is fast, but it's not free.
+- Code where you'd rather fail noisily later than slow down every call. A 30-frame `TypeError` is a fine debugging tool when the program isn't user-facing.
+
+The two halves of this chapter compose well. Static checkers catch type bugs in code you wrote. Pydantic catches bad data the moment it crosses into code you wrote. Together they cover both directions, with very little overlap.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

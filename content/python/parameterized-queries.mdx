@@ -1,0 +1,387 @@
+---
+title: "Parameterized Queries"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Parameterized Queries explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="why-parameterized-queries-exist">Why parameterized queries exist</h1>
+
+When a query string is built by concatenation, the database has no way to tell which characters are part of the SQL grammar and which characters are part of a value. A semicolon in a customer's email looks the same as a semicolon that ends a statement. A quote inside a product name looks the same as a quote that closes a string literal. The database parses whatever bytes arrive and follows them.
+
+A parameterized query splits the two channels. The SQL text says "look up the customer whose email matches the value in slot one." The driver then sends the value separately. The value is never parsed as SQL, no matter what it contains. A semicolon stays a semicolon. A quote stays a quote. The grammar of the query is fixed before the value arrives.
+
+Three concrete wins come out of that split. The first is security: an attacker who controls the value can't break out of it to inject extra SQL. The second is correctness: the driver escapes quotes, encodes binary data, and converts Python types to SQL types, so the code doesn't have to track whether single quotes need doubling or whether `True` becomes `1` or `'t'` for a given database. The third is performance: most databases cache a prepared plan against the SQL text. If the text is identical across calls (because the values live in placeholders), the database reuses the plan. If a new string is built every time, the database compiles a new plan every time.
+
+Two pipes leave Python and arrive at the driver: one carries the SQL template, the other carries the values. The database never sees the values mixed into the SQL text. This is the entire idea.
+
+<h1 id="string-interpolation-is-never-safe-for-sql">
+  String interpolation is never safe for SQL
+</h1>
+
+The wrong way to write a query is to build the SQL string with f-strings, `%` formatting, `.format()`, or `+`. Every one of these mixes SQL grammar and user input into one bag of bytes. The canonical broken version:
+
+```python
+import sqlite3
+
+conn = sqlite3.connect(":memory:")
+cursor = conn.cursor()
+cursor.execute("CREATE TABLE customers (id INTEGER, email TEXT, name TEXT)")
+cursor.execute("INSERT INTO customers VALUES (1, 'asha@shop.com', 'Asha')")
+cursor.execute("INSERT INTO customers VALUES (2, 'ben@shop.com', 'Ben')")
+
+email = "asha@shop.com"
+query = f"SELECT id, name FROM customers WHERE email = '{email}'"
+cursor.execute(query)
+print(cursor.fetchall())
+```
+
+This runs and returns the right row for a benign input. The trouble starts when the input isn't benign. Replace `email` with `' OR '1'='1` and the query becomes `SELECT id, name FROM customers WHERE email = '' OR '1'='1'`, which matches every row. Replace it with `x'; DROP TABLE customers; --` and the database runs two statements, deleting the table on the way out. The same f-string that worked for a tame input is wide open for any input.
+
+The parameterized version uses a placeholder. The SQL template is constant, the value rides in a separate tuple:
+
+```python
+import sqlite3
+
+conn = sqlite3.connect(":memory:")
+cursor = conn.cursor()
+cursor.execute("CREATE TABLE customers (id INTEGER, email TEXT, name TEXT)")
+cursor.execute("INSERT INTO customers VALUES (1, 'asha@shop.com', 'Asha')")
+cursor.execute("INSERT INTO customers VALUES (2, 'ben@shop.com', 'Ben')")
+
+email = "asha@shop.com"
+cursor.execute("SELECT id, name FROM customers WHERE email = ?", (email,))
+print(cursor.fetchall())
+```
+
+The result is the same for a benign input. The difference is what happens for hostile input. Pass `email = "' OR '1'='1"` and the driver sends that exact 13-character string to the database as the value for the placeholder. The database compares the literal string `' OR '1'='1` against each row's `email` column. Nothing matches, the query returns zero rows, and no SQL is ever injected.
+
+The two queries look almost identical, but the database treats them very differently. The f-string version compiles a new plan every call because the SQL text changes. The placeholder version compiles once and reuses the plan thousands of times. For high-volume endpoints, plan caching alone can multiply throughput.
+
+<h1 id="parameter-styles-defined-by-pep-249">
+  Parameter styles defined by PEP 249
+</h1>
+
+PEP 249 defines the Python Database API that every standard-library and third-party driver follows. The spec names five placeholder styles, and each driver picks exactly one and exposes it through the module's `paramstyle` attribute. The five styles look like this:
+
+| Style      | Example                   | Used by                                             |
+| ---------- | ------------------------- | --------------------------------------------------- |
+| `qmark`    | `WHERE email = ?`         | `sqlite3`, `pyodbc`                                 |
+| `numeric`  | `WHERE email = :1`        | `cx_Oracle` (older versions)                        |
+| `named`    | `WHERE email = :email`    | `sqlite3` (alternate form), `oracledb`              |
+| `format`   | `WHERE email = %s`        | rare in practice                                    |
+| `pyformat` | `WHERE email = %(email)s` | `psycopg2`, `mysql-connector-python`, `mysqlclient` |
+
+The `%s` in `pyformat` has nothing to do with Python's `%` operator. It's a placeholder that happens to look like `printf`-style formatting; the driver replaces it, the Python interpreter never touches it. Treat it as a literal sequence of characters the driver is watching for, not as a format spec.
+
+Different drivers picked different styles for historical reasons, and styles can't be mixed within one driver. Once a library is imported, the placeholder syntax is fixed.
+
+```python
+import sqlite3
+print(sqlite3.paramstyle)
+```
+
+```python
+# Conceptual: requires psycopg2 installed and a Postgres server.
+# import psycopg2
+# print(psycopg2.paramstyle)
+# # pyformat
+```
+
+Looking at `paramstyle` is the fastest way to confirm which placeholder a new library wants. For code that targets multiple databases (a backup tool, a test fixture loader), use an ORM or a query builder that abstracts the difference; switching placeholder syntax with string formatting is exactly the trap parameterized queries exist to prevent.
+
+<h1 id="qmark-sqlite-and-pyodbc">qmark: SQLite and pyodbc</h1>
+
+The simplest style is `qmark`. A `?` marks each placeholder, and the values arrive in a tuple in the same order. SQLite's driver, the one that ships with Python, uses this.
+
+```python
+import sqlite3
+
+conn = sqlite3.connect(":memory:")
+cursor = conn.cursor()
+cursor.execute("""
+    CREATE TABLE products (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        price REAL NOT NULL,
+        stock INTEGER NOT NULL
+    )
+""")
+
+cursor.execute(
+    "INSERT INTO products (name, price, stock) VALUES (?, ?, ?)",
+    ("Ceramic Mug", 14.99, 80),
+)
+cursor.execute(
+    "INSERT INTO products (name, price, stock) VALUES (?, ?, ?)",
+    ("Notebook", 4.99, 120),
+)
+conn.commit()
+
+cursor.execute(
+    "SELECT name, price FROM products WHERE price < ? AND stock > ?",
+    (10.00, 50),
+)
+print(cursor.fetchall())
+```
+
+Each `?` is positional. The first `?` binds the first value in the tuple, the second `?` binds the second, and so on. Omit a value and the driver raises `sqlite3.ProgrammingError: Incorrect number of bindings`. Pass too many and the same error appears from the other direction. The tuple is required even for a single value: `cursor.execute("... = ?", (email,))` with the trailing comma. Without the comma the call passes a string, and SQLite tries to bind one placeholder per character.
+
+The same `qmark` style works for batched inserts using `executemany`:
+
+```python
+import sqlite3
+
+conn = sqlite3.connect(":memory:")
+cursor = conn.cursor()
+cursor.execute("CREATE TABLE wishlist (customer TEXT, product TEXT)")
+
+items = [
+    ("Asha", "Ceramic Mug"),
+    ("Asha", "Notebook"),
+    ("Ben", "Headphones"),
+]
+cursor.executemany("INSERT INTO wishlist VALUES (?, ?)", items)
+conn.commit()
+
+cursor.execute("SELECT COUNT(*) FROM wishlist")
+print(cursor.fetchone())
+```
+
+`executemany` reuses the same prepared statement once and binds each tuple in turn. For three rows the speedup is tiny, but for 10,000 rows it can be 10x or more compared to looping over `execute`. The same parameter style applies.
+
+<h1 id="named-bind-by-name-not-position">named: bind by name, not position</h1>
+
+When a query has five or six placeholders, getting them all in the right order is error-prone. The `named` style uses `:label` placeholders and a dict of values, so the binding is by name instead of position.
+
+```python
+import sqlite3
+
+conn = sqlite3.connect(":memory:")
+cursor = conn.cursor()
+cursor.execute("""
+    CREATE TABLE orders (
+        id INTEGER PRIMARY KEY,
+        customer TEXT,
+        total REAL,
+        status TEXT
+    )
+""")
+
+cursor.execute(
+    """
+    INSERT INTO orders (customer, total, status)
+    VALUES (:customer, :total, :status)
+    """,
+    {"customer": "Asha", "total": 49.99, "status": "placed"},
+)
+cursor.execute(
+    """
+    SELECT id, customer, total
+    FROM orders
+    WHERE status = :status AND total > :minimum
+    """,
+    {"status": "placed", "minimum": 10.00},
+)
+print(cursor.fetchall())
+```
+
+The dict can list keys in any order. The driver matches `:customer` to the `"customer"` key, regardless of where it sits in the dict. That makes the call site easier to read at a glance, especially with five or more parameters. SQLite supports both `qmark` and `named` in the same driver, so styles can switch per call.
+
+`psycopg2` and `mysql-connector-python` use the `pyformat` variant of named binding, where the placeholder is `%(customer)s` instead of `:customer`. The mechanic is identical:
+
+```python
+# Conceptual example for psycopg2. Replace the connection details for a real database.
+# import psycopg2
+#
+# conn = psycopg2.connect("dbname=shop user=app")
+# cursor = conn.cursor()
+# cursor.execute(
+#     """
+#     INSERT INTO orders (customer, total, status)
+#     VALUES (%(customer)s, %(total)s, %(status)s)
+#     """,
+#     {"customer": "Asha", "total": 49.99, "status": "placed"},
+# )
+```
+
+Again, the `%(name)s` syntax has nothing to do with Python's `%` operator. It's a placeholder the driver scans for. Treat the SQL string as a raw template that the driver alone reads.
+
+<h1 id="pyformat-psycopg2-and-the-mysql-drivers">
+  pyformat: psycopg2 and the MySQL drivers
+</h1>
+
+PostgreSQL's most common driver, `psycopg2`, uses `pyformat`. Each placeholder is `%s` (positional) or `%(name)s` (named). Mixing the two in one query is a `ProgrammingError`, but switching between them across queries is fine.
+
+```python
+# Conceptual: psycopg2 against a Postgres server.
+# import psycopg2
+#
+# conn = psycopg2.connect("dbname=shop user=app password=...")
+# cursor = conn.cursor()
+#
+# # Positional pyformat
+# cursor.execute(
+#     "SELECT id, name FROM customers WHERE email = %s",
+#     ("asha@shop.com",),
+# )
+#
+# # Named pyformat
+# cursor.execute(
+#     """
+#     UPDATE orders
+#     SET status = %(status)s
+#     WHERE id = %(order_id)s
+#     """,
+#     {"status": "shipped", "order_id": 42},
+# )
+```
+
+The trailing comma in the positional form is the same constraint as with `qmark`. `("asha@shop.com",)` is a one-element tuple. `("asha@shop.com")` is a string in parentheses. Drop the comma and the driver tries to bind one placeholder per character.
+
+`psycopg2` has a useful debugging helper: `cursor.mogrify(query, params)` returns the exact SQL string the database will see, with the values substituted, but it's only safe to print, never safe to execute by hand. Use it to confirm the values went where expected.
+
+The MySQL connectors (`mysql-connector-python`, `mysqlclient`, `PyMySQL`) also use `pyformat`. The same placeholder syntax works across all three.
+
+<h1 id="bound-parameters-in-in-clauses">Bound parameters in IN clauses</h1>
+
+`IN` is the one place where string formatting often slips back in. A query like `WHERE id IN (1, 2, 3)` looks like it needs a comma-joined list, and a tuple won't bind to a single `?`. The clean fix is to generate one placeholder per value and pass the tuple.
+
+```python
+import sqlite3
+
+conn = sqlite3.connect(":memory:")
+cursor = conn.cursor()
+cursor.execute("CREATE TABLE products (id INTEGER, name TEXT)")
+cursor.executemany(
+    "INSERT INTO products VALUES (?, ?)",
+    [(1, "Mug"), (2, "Notebook"), (3, "Pen"), (4, "Headphones")],
+)
+conn.commit()
+
+ids = [1, 3, 4]
+placeholders = ",".join("?" for _ in ids)
+query = f"SELECT id, name FROM products WHERE id IN ({placeholders})"
+cursor.execute(query, ids)
+print(cursor.fetchall())
+```
+
+Two parts here deserve a careful look. The f-string only interpolates the placeholders themselves (`?,?,?`), not the values. The values still flow through the driver as parameters. The query string is built from a constant template plus a count of `?`s, both of which come from the program's own code, never from user input. As long as `ids` itself is validated (it's a list of integers, not a list of arbitrary strings), the result is safe.
+
+For psycopg2, the same idea uses `%s`:
+
+```python
+# Conceptual.
+# ids = [1, 3, 4]
+# placeholders = ",".join(["%s"] * len(ids))
+# cursor.execute(
+#     f"SELECT id, name FROM products WHERE id IN ({placeholders})",
+#     ids,
+# )
+```
+
+`psycopg2` also supports passing a tuple directly with `%s`, which expands to a parenthesized list. That's a `psycopg2`-specific convenience; standard PEP 249 doesn't define it.
+
+Empty `IN` lists are a trap. `WHERE id IN ()` is a syntax error in most databases. Check `if not ids: return []` before building the query, or use the special form `WHERE id = ANY(%s)` with `ids=[]` (Postgres), which returns no rows cleanly.
+
+<h1 id="what-you-cannot-parameterize">What you cannot parameterize</h1>
+
+Parameters bind values, not identifiers. Column names, table names, `ORDER BY` directions, and `LIMIT` clauses (in some drivers) are part of the SQL grammar, not data. Passing them as parameters fails with a syntax error.
+
+```python
+import sqlite3
+
+conn = sqlite3.connect(":memory:")
+cursor = conn.cursor()
+cursor.execute("CREATE TABLE products (id INTEGER, name TEXT, price REAL)")
+cursor.execute("INSERT INTO products VALUES (1, 'Mug', 14.99)")
+
+# This does not work. The driver binds the string "name" as a value.
+cursor.execute("SELECT ? FROM products", ("name",))
+print(cursor.fetchall())
+```
+
+The result is a row of literal strings, not the `name` column. The driver bound `'name'` as a value, so the query is `SELECT 'name' FROM products`, which returns the constant `'name'` once per row.
+
+If a column or table name needs to vary based on input (a sort order toggle, a tenant-specific table), validate the input against an explicit allowlist before splicing it into the SQL string:
+
+```python
+import sqlite3
+
+conn = sqlite3.connect(":memory:")
+cursor = conn.cursor()
+cursor.execute("CREATE TABLE products (id INTEGER, name TEXT, price REAL)")
+cursor.executemany(
+    "INSERT INTO products VALUES (?, ?, ?)",
+    [(1, "Mug", 14.99), (2, "Notebook", 4.99), (3, "Pen", 1.50)],
+)
+conn.commit()
+
+ALLOWED_SORTS = {"name", "price"}
+ALLOWED_DIRS = {"ASC", "DESC"}
+
+def search_products(sort_by: str, direction: str):
+    if sort_by not in ALLOWED_SORTS:
+        raise ValueError(f"Bad sort column: {sort_by}")
+    if direction not in ALLOWED_DIRS:
+        raise ValueError(f"Bad direction: {direction}")
+    query = f"SELECT id, name, price FROM products ORDER BY {sort_by} {direction}"
+    cursor.execute(query)
+    return cursor.fetchall()
+
+print(search_products("price", "DESC"))
+```
+
+The allowlist is the safety mechanism. Only the strings explicitly enumerated can reach the SQL string. An attacker can pass any input; if it isn't in the set, the function raises before any query runs. This is the only safe way to vary identifiers based on input. Never use user input for column or table names without an allowlist.
+
+For `LIMIT` and `OFFSET`, most drivers do support parameter binding, but treat them as integers and validate before passing them, otherwise a crafted string can confuse downstream paging logic.
+
+<h1 id="sql-injection-patterns">SQL injection patterns</h1>
+
+A few patterns recur often enough to name. Each one has the same fix, and the fix is always a parameterized query.
+
+The first pattern is the search box. A user types `name` into a search field, the application substitutes it into `WHERE name LIKE '%{user_input}%'`, and the user types `%'; DROP TABLE products; --` to delete the product catalog. The fix is `WHERE name LIKE ?` with `f"%{user_input}%"` as the value. The `%` wildcards are still part of the LIKE pattern, but they live inside the bound value, where they're treated as data.
+
+```python
+import sqlite3
+
+conn = sqlite3.connect(":memory:")
+cursor = conn.cursor()
+cursor.execute("CREATE TABLE products (id INTEGER, name TEXT)")
+cursor.executemany(
+    "INSERT INTO products VALUES (?, ?)",
+    [(1, "Ceramic Mug"), (2, "Notebook"), (3, "Travel Mug")],
+)
+conn.commit()
+
+search_term = "mug"
+cursor.execute(
+    "SELECT id, name FROM products WHERE name LIKE ?",
+    (f"%{search_term}%",),
+)
+print(cursor.fetchall())
+```
+
+The second pattern is the login form. A query like `SELECT id FROM users WHERE email = '{email}' AND password_hash = '{hash}'` is the standard example, and `' OR '1'='1` in the email field bypasses the check. Beyond the injection itself, the design is wrong: passwords should be hashed and verified with a constant-time function, not compared with SQL. But the SQL part has the same fix: bind both values as parameters.
+
+The third pattern is the admin-only dashboard. A SQL string is built with what looks like trusted input (a numeric user ID from a session cookie), but the cookie can be edited client-side. Anything that crosses a trust boundary is untrusted, including hidden form fields, query strings, and headers. The rule is mechanical: anywhere SQL meets data that came from outside the program, that data goes through a placeholder.
+
+<h1 id="putting-the-rules-together">Putting the rules together</h1>
+
+The full set of habits for safe, fast, correct database access in Python is short:
+
+1. The SQL text is always a constant string in source code. Never build it from user input with f-strings, `%`, `+`, or `.format()`.
+2. Every value goes through a placeholder. Look up the driver's `paramstyle` once and use it everywhere.
+3. For variable-length value lists (`IN`), build the placeholders from a constant template, pass the values as parameters.
+4. For variable identifiers (column names, sort directions, table names), validate against an explicit allowlist, then splice. Parameters won't help here.
+5. Reuse query strings across calls. The database caches the plan against the SQL text; identical text means cached plan.
+
+The discipline pays off well beyond security. Code with parameterized queries is easier to read (the SQL text says what's a value and what isn't), easier to log (the template and the parameters can be logged separately), and easier to test (the same query can be exercised with different values).
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

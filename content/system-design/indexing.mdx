@@ -1,0 +1,358 @@
+---
+title: "Database Indexing"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Indexing explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+<h1 id="1-what-is-a-database-index">1. What Is a Database Index?</h1>
+
+A **database index** is a separate data structure that helps the database find rows more efficiently.
+
+The actual data still lives in the table. The index is an additional structure designed to make certain access patterns faster. It stores the values of one or more columns in a lookup-friendly order, along with a reference back to each row.
+
+Here is an index on `email`. The emails are kept in sorted order, and each entry points to its row in the table:
+
+Notice that the table rows are in no particular order. Only the index is sorted. The table still holds the full rows, and the index holds just enough to find them.
+
+Creating that index takes one statement:
+
+```sql
+CREATE TABLE users (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL,
+    signup_date DATE NOT NULL
+);
+
+CREATE INDEX idx_users_email
+ON users(email);
+```
+
+Now the query for $undefined has a fast path. The database searches the index for the email, finds the matching entry, and follows its reference to the row.
+
+Most index lookups work in these two steps:
+
+1. Search the index for matching values.
+2. Use the row reference to fetch the table rows, unless the index already contains everything the query needs.
+
+<h1 id="2-why-indexes-are-faster">2. Why Indexes Are Faster</h1>
+
+Many traditional database indexes use a tree structure, such as a B-tree or a B+ tree.
+
+At each step of a search, the database determines which part of the tree could contain the value it is looking for and skips the rest. This lets it narrow down the search quickly instead of scanning every row in the table.
+
+As a result, the database can often find a value with far fewer operations:
+
+| Approach        | Work to find one user among 10 million       |
+| --------------- | -------------------------------------------- |
+| Full table scan | Up to 10,000,000 rows checked                |
+| B-tree index    | A few index pages read, then one row fetched |
+
+When writing queries, you usually do not need to think about how the tree is traversed. The database handles all of that internally. What matters is knowing which queries an index can help and which it cannot, and the rest of this chapter builds that intuition.
+
+<h1 id="3-how-a-b-tree-index-works">3. How a B-Tree Index Works</h1>
+
+Suppose we create an index on the user `id`. The index keeps the values in sorted order.
+
+But unlike a simple binary tree, where each node might contain only one value, a database B-tree can store many values inside a single node.
+
+This is important because databases read data in blocks, or pages, rather than one byte at a time. A single index page can therefore hold many keys. One page read gives the database many keys to compare against, and a tree with wide nodes stays short.
+
+Now suppose the database needs to find user `id` 500,000:
+
+The search follows the highlighted path:
+
+1. It starts near the top of the tree. The root holds 300K and 700K, so 500K must be in the middle child.
+2. That page holds 450K and 550K, which narrows the search range even further.
+3. After only a few levels, the database reaches the leaf page containing 500K, and the entry there points to the corresponding row.
+
+The grey pages are never read. Each level throws away most of the remaining tree.
+
+Real index pages hold hundreds of keys, not two or three. So even if the table contains millions of records, the index itself may only be three or four levels deep. That is one of the main reasons B-tree indexes work so well for large datasets.
+
+This is also why B-tree indexes are the default for most `CREATE INDEX` statements in relational databases.
+
+<h1 id="4-indexes-and-range-queries">4. Indexes and Range Queries</h1>
+
+Indexes are not only useful for exact lookups. Because B-tree indexes keep values ordered, they are also very useful for range queries.
+
+Suppose we want all orders created in January:
+
+```sql
+SELECT *
+FROM orders
+WHERE created_at BETWEEN '2026-01-01' AND '2026-01-31';
+```
+
+Without an index on `created_at`, the database might scan the entire `orders` table and check the timestamp of every row.
+
+With an index, the database can first locate the starting date inside the tree. Then it continues reading neighboring index entries, in order, until it reaches the end of the requested range:
+
+Only one tree search happens. After that, the matching entries sit next to each other, so the database reads them one after another.
+
+This makes B-tree indexes useful for:
+
+- Equality lookups: `email = 'alice@example.com'`
+- Range conditions: `>`, `<`, `>=`, `<=`, and `BETWEEN`
+- Ordered reads: `ORDER BY created_at DESC`
+- Prefix matches in some cases: `name LIKE 'Al%'`
+
+They can also help with sorting. If the database already has an index ordered by `created_at`, a query asking for the latest orders may be able to use that ordering instead of sorting a large result set from scratch:
+
+```sql
+SELECT id, total_amount, created_at
+FROM orders
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+The database can read the last 20 entries of the index and stop.
+
+<h1 id="5-single-column-and-composite-indexes">
+  5. Single-Column and Composite Indexes
+</h1>
+
+So far, we have looked at indexes on a single column. But databases can also create indexes across multiple columns. These are called **composite indexes**.
+
+Suppose we frequently run this query: find all orders for customer 123, ordered by creation time.
+
+```sql
+SELECT id, total_amount, created_at
+FROM orders
+WHERE customer_id = 123
+ORDER BY created_at;
+```
+
+We could create an index on `customer_id` and `created_at`:
+
+```sql
+CREATE INDEX idx_orders_customer_created
+ON orders(customer_id, created_at);
+```
+
+Conceptually, this index is sorted first by `customer_id`, and then by `created_at` within each customer. So the database can quickly find all entries for customer 123 and then read them in timestamp order, with no separate sort step.
+
+But the order of columns in a composite index matters. An index on `(customer_id, created_at)` is not equivalent to an index on `(created_at, customer_id)`. The second one is sorted by time first, so one customer's orders are scattered across the whole index.
+
+The database can usually use the leading columns of an index most effectively. For B-tree indexes, a useful rule of thumb is:
+
+1. Put equality filters first.
+2. Then range filters.
+3. Then columns used for ordering.
+
+This is not a universal law, but it is a good starting point. When designing a composite index, think about how your queries actually filter and sort the data, and confirm with a query plan such as `EXPLAIN`.
+
+<h1 id="6-the-leftmost-prefix-rule">6. The Leftmost Prefix Rule</h1>
+
+Column order leads to an important concept commonly called the **leftmost prefix rule**.
+
+Suppose we have an index on three columns: `(country, city, created_at)`.
+
+This index is primarily organized by `country`. Within each country, it is organized by `city`. And within each city, by `created_at`.
+
+That ordering decides which queries can use the index efficiently:
+
+| Query filters on                    | Uses the index well? | Why                         |
+| ----------------------------------- | -------------------- | --------------------------- |
+| `country`                           | Yes                  | Leading column              |
+| `country` and `city`                | Yes                  | First two columns, in order |
+| `country`, `city`, and `created_at` | Yes                  | All three columns, in order |
+| `city` only                         | Usually not          | Skips the first column      |
+
+A query filtering only by `city` may not benefit nearly as much, because `city` is not the first part of the index ordering. The entries for one city are spread across every country in the index.
+
+The exact behavior depends on the database and its query optimizer. Some databases can use techniques such as skip scan in limited cases. But the general principle holds: composite indexes should be designed around real query patterns, not simply by combining columns that seem related.
+
+<h1 id="7-covering-indexes">7. Covering Indexes</h1>
+
+Sometimes an index can do more than help locate rows. It can contain all the information needed to answer the query directly.
+
+Suppose we frequently run a query that asks for a user's email and signup date based on their id:
+
+```sql
+SELECT email, signup_date
+FROM users
+WHERE id = 7;
+```
+
+If the relevant index contains `id`, `email`, and `signup_date`, the database may be able to return the result directly from the index. It does not need to fetch the full table row.
+
+```sql
+CREATE INDEX idx_users_id_email_signup
+ON users(id, email, signup_date);
+```
+
+This is called a **covering index**, because the index covers every column the query needs. PostgreSQL calls the resulting plan an index-only scan when its internal visibility rules allow it, and it also supports `INCLUDE` to add columns to an index without making them part of the sort key. Other databases have similar ideas.
+
+Avoiding the extra table lookup can make some queries even faster. But larger indexes also consume more storage and are more expensive to maintain. Use covering indexes for important, frequently run queries where you have measured the benefit.
+
+<h1 id="8-indexes-are-not-free">8. Indexes Are Not Free</h1>
+
+Indexes can make reads faster, but they introduce additional cost.
+
+Suppose we insert a new user into the database. Without indexes, the database mainly needs to write the new row. But if the table has several indexes, each of those indexes must also be updated:
+
+One logical write became four physical ones. The same is true for deletes. And if an indexed column changes, the corresponding index entries may also need to change. So the more indexes you add, the more work the database may need to perform during writes.
+
+Indexes also consume storage. On large tables, index data can become very large. And because indexes occupy memory and disk cache, unnecessary indexes compete with useful data for resources.
+
+| Cost           | Why It Matters                                                 |
+| -------------- | -------------------------------------------------------------- |
+| Slower writes  | Inserts, updates, and deletes must update every affected index |
+| Storage        | Indexes can be large, especially wide multi-column indexes     |
+| Memory use     | Hot indexes compete with table data for cache                  |
+| Migration time | Creating indexes on large tables can take time and resources   |
+| Planning work  | Extra indexes give the database more choices to evaluate       |
+
+This is why adding indexes everywhere is not a good strategy. Indexes optimize specific read patterns at the cost of additional storage and write overhead.
+
+<h1 id="9-selectivity-matters">9. Selectivity Matters</h1>
+
+Another important concept is **selectivity**. Selectivity describes how effectively a column distinguishes between rows. In plain terms, it answers "how much does this filter narrow the search?"
+
+Consider our `users` table with 10 million records.
+
+An email address is usually highly selective, because most email addresses belong to only one user. Searching by email may return one row.
+
+Now consider a column called `account_status`, with values like `active` and `inactive`. If 9 million users are active, then filtering by `account_status = 'active'` still matches most of the table.
+
+An index may not help very much in that case. The database might decide that scanning the table is actually cheaper than using the index and then fetching millions of matching rows one by one.
+
+| Column                    | Example                                              | Selectivity    | Index Usefulness                    |
+| ------------------------- | ---------------------------------------------------- | -------------- | ----------------------------------- |
+| `email`                   | Unique per user                                      | High           | Usually very useful                 |
+| `customer_id` on `orders` | Many rows per customer, but still narrows the search | Medium to high | Often useful                        |
+| `account_status`          | `active`, `inactive`                                 | Low            | Sometimes useful with other columns |
+| `is_deleted`              | `true`, `false`                                      | Very low       | Usually weak alone                  |
+
+So an index does not automatically make every query faster. Indexes are generally most valuable when they help the database narrow the result set significantly.
+
+Low-selectivity columns can still be useful as part of a composite index, where another column does most of the narrowing. But an index on only a boolean column is often not worth much, because `true` or `false` may match a large part of the table.
+
+<h1 id="10-why-the-database-might-ignore-an-index">
+  10. Why the Database Might Ignore an Index
+</h1>
+
+Even if an index exists, the database does not always use it.
+
+When a query runs, the database's **query optimizer** estimates the cost of different execution strategies. It might compare using an index against scanning the entire table:
+
+- If the query returns a large percentage of the table, a sequential scan may be cheaper.
+- If the table is very small, scanning it may also be faster than performing an index lookup.
+
+The optimizer also considers things like available statistics, ordering, joins, and how much data needs to be fetched. So the existence of an index does not guarantee that it will be used. The optimizer chooses the plan it believes will require the least work.
+
+This is why understanding query execution plans is important when debugging database performance. `EXPLAIN` shows the plan the optimizer picked:
+
+```sql
+EXPLAIN
+SELECT *
+FROM users
+WHERE account_status = 'active';
+```
+
+If the plan shows a table scan where you expected an index, the usual causes are that the filter matches too many rows, the index does not match the query's shape, or the statistics about the table are stale.
+
+<h1 id="11-primary-keys-and-unique-indexes">
+  11. Primary Keys and Unique Indexes
+</h1>
+
+Primary keys are another place where indexes commonly appear.
+
+Our `users` table has a primary key called `id`. Most relational databases automatically create an index to enforce its uniqueness and make primary-key lookups efficient. So a query like this can usually use that index immediately:
+
+```sql
+SELECT *
+FROM users
+WHERE id = 123;
+```
+
+Unique constraints are often implemented using indexes as well. For example, if email addresses must be unique, the database may maintain a unique index on the `email` column:
+
+```sql
+CREATE TABLE users (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE,
+    signup_date DATE NOT NULL
+);
+```
+
+That index provides two benefits. It speeds up lookups by email, and it helps the database enforce the uniqueness rule. When a new row arrives, the database checks the index for an existing entry instead of scanning the table.
+
+<h1 id="12-when-to-add-an-index">12. When to Add an Index</h1>
+
+So when should you actually create an index? A good starting point is to look at your real query patterns.
+
+Indexes are often useful on columns that appear frequently in:
+
+- `WHERE` clauses
+- `JOIN` conditions
+- Sorting (`ORDER BY`)
+- Range queries
+
+They can also help columns used for frequent lookups, such as user ids, email addresses, order ids, or timestamps.
+
+But you should avoid adding an index just because a column exists. Before adding one, ask:
+
+1. How often is this column queried?
+2. How many rows does the query usually return?
+3. How expensive is the query today?
+4. How frequently is the table written to?
+5. Can an existing index already support this query?
+
+For example, take this query:
+
+```sql
+SELECT id, total_amount, created_at
+FROM orders
+WHERE customer_id = 123
+  AND status = 'PAID'
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+A reasonable index could be:
+
+```sql
+CREATE INDEX idx_orders_customer_status_created
+ON orders(customer_id, status, created_at DESC);
+```
+
+This puts the equality filters first and the sort column last, following the rule of thumb for composite indexes. It can also serve queries that filter only on `customer_id`, because `customer_id` is its leading column. So if the table already had an index on `(customer_id)` alone, that older index may now be redundant. Question 5 in the list above is meant to catch this kind of overlap.
+
+The best indexing strategy usually comes from measuring actual workloads rather than guessing. Confirm with `EXPLAIN` after adding the index.
+
+<h1 id="13-too-many-indexes">13. Too Many Indexes</h1>
+
+One common mistake is over-indexing.
+
+Suppose a table has twenty columns and we create an index on almost every one of them. Reads may improve in some cases, but every insert and update now has to maintain many additional structures:
+
+- Storage usage increases.
+- Backup size increases.
+- Memory pressure increases.
+- Some indexes may rarely or never be used.
+
+So indexing is not about creating as many indexes as possible. It is about creating the smallest useful set of indexes that supports the important query patterns in your system.
+
+In practice, this means reviewing indexes over time, not only when adding them. Most databases can report how often each index is used, which makes it possible to find indexes that are never read, or that duplicate the leading columns of another index, and drop them.
+
+<h1 id="summary">Summary</h1>
+
+A database index is a separate data structure that helps the database find rows without a full table scan. The data still lives in the table. The index is an extra, sorted path to it.
+
+Most relational indexes are B-trees. Their wide pages keep the tree only a few levels deep, so a lookup reads a handful of pages even on a table with millions of rows. Because the keys stay sorted, the same index serves exact lookups, range queries, and ordered reads.
+
+Composite indexes follow the leftmost prefix rule, so column order should match how queries filter and sort. A covering index can answer a query without touching the table at all.
+
+Indexes are not free. Every index adds write work, storage, and memory pressure, and a low-selectivity index may be ignored by the optimizer anyway. Good indexing starts with real query patterns, measured plans, and the smallest useful set of indexes.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

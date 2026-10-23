@@ -1,0 +1,470 @@
+---
+title: "Parallel Streams"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Parallel Streams explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+A parallel stream splits its source into chunks, runs the pipeline on multiple threads, and combines the results. The API looks almost identical to a sequential stream, but the execution model is different enough that the wrong call can make code slower, wrong, or both. This lesson covers how parallel streams actually run, when they help, when they hurt, and the pitfalls that turn correct sequential code into broken parallel code.
+
+<h1 id="getting-a-parallel-stream">Getting a Parallel Stream</h1>
+
+A parallel stream can be created from a collection in two ways. Both produce a stream that runs its terminal operation in parallel.
+
+```java
+import java.util.List;
+
+public class ParallelStart {
+    public static void main(String[] args) {
+        List<Integer> orderTotals = List.of(120, 80, 45, 200, 60, 90, 150, 75);
+
+        int viaParallelStream = orderTotals.parallelStream()
+                .mapToInt(Integer::intValue)
+                .sum();
+
+        int viaParallel = orderTotals.stream()
+                .parallel()
+                .mapToInt(Integer::intValue)
+                .sum();
+
+        System.out.println("via parallelStream: " + viaParallelStream);
+        System.out.println("via stream().parallel(): " + viaParallel);
+    }
+}
+```
+
+`Collection.parallelStream()` is the direct route. `stream().parallel()` works on any stream and is useful when a stream already exists from another source (a file, a generator, another pipeline). Both produce the same execution behavior.
+
+A pipeline can also flip back to sequential mid-pipeline with `.sequential()`. The mode that matters is the one set at the time the terminal operation runs. Calling `.parallel()` then `.sequential()` leaves the stream sequential.
+
+```java
+import java.util.stream.IntStream;
+
+public class ModeSwitch {
+    public static void main(String[] args) {
+        int sum = IntStream.rangeClosed(1, 1000)
+                .parallel()
+                .sequential()
+                .sum();
+        System.out.println("Sum: " + sum);
+    }
+}
+```
+
+The terminal operation here ran sequentially. Parallel mode is a property of the entire pipeline, set once before the terminal call, not toggled per stage.
+
+<h1 id="what-parallel-actually-means">What "Parallel" Actually Means</h1>
+
+A parallel stream is not a stream that automatically runs faster. It's a stream whose source is recursively split into chunks, each chunk processed on a worker thread, and the partial results combined. The mental model is a tree, not a left-to-right iteration.
+
+The source is split until each chunk is small enough to process directly. Workers run the pipeline (map, filter, anything in the middle) on their chunk. The combine step folds the partial results back into one answer. For `sum`, combine is addition; for `toList`, combine is list concatenation; for `reduce`, combine is the combiner passed in.
+
+Three pieces make this work. The `Spliterator` knows how to cut a source into smaller spliterators. The `ForkJoinPool` provides the worker threads. The pipeline's terminal operation knows how to combine partial results.
+
+The default pool is `ForkJoinPool.commonPool()`. Its size defaults to the number of available processors minus one (so on an 8-core machine, 7 workers, plus the calling thread that also participates).
+
+```java
+import java.util.concurrent.ForkJoinPool;
+
+public class PoolInfo {
+    public static void main(String[] args) {
+        System.out.println("Available processors: " + Runtime.getRuntime().availableProcessors());
+        System.out.println("Common pool parallelism: " + ForkJoinPool.commonPool().getParallelism());
+    }
+}
+```
+
+Numbers will vary by machine. The pool isn't infinite. Ten parallel streams launched at the same time all share the same workers.
+
+<h1 id="splittability-matters">Splittability Matters</h1>
+
+A stream is only as parallel as its source is splittable. Some sources cut cleanly down the middle and stay balanced after every cut. Others split poorly, leaving most of the work on one worker while the others sit idle.
+
+The well-behaved sources are arrays, `ArrayList`-backed streams, and ranges like `IntStream.range`. They know their size up front and can return the middle index in constant time. The poorly behaved sources are `LinkedList`, `Stream.iterate`, `Stream.generate`, and streams built from sources that have to be walked to know their size.
+
+```java
+import java.util.ArrayList;
+import java.util.LinkedList;
+import java.util.List;
+
+public class SplittabilityDemo {
+    public static void main(String[] args) {
+        List<Integer> arrayBased = new ArrayList<>();
+        List<Integer> linkedBased = new LinkedList<>();
+        for (int i = 0; i < 5_000_000; i++) {
+            arrayBased.add(i);
+            linkedBased.add(i);
+        }
+
+        long t1 = System.nanoTime();
+        long sumArray = arrayBased.parallelStream().mapToLong(Integer::longValue).sum();
+        long t2 = System.nanoTime();
+        long sumLinked = linkedBased.parallelStream().mapToLong(Integer::longValue).sum();
+        long t3 = System.nanoTime();
+
+        System.out.println("ArrayList sum: " + sumArray + " in " + (t2 - t1) / 1_000_000 + " ms");
+        System.out.println("LinkedList sum: " + sumLinked + " in " + (t3 - t2) / 1_000_000 + " ms");
+    }
+}
+```
+
+Numbers will differ across runs and machines, but the pattern is consistent. The `ArrayList` finishes faster because `ArrayList.spliterator()` can split the underlying array in half with index math. The `LinkedList` has to walk the chain to find a split point, and once it's split, the chunks aren't backed by efficient index lookups either.
+
+A microbenchmark like the one above gives a rough signal, not a real measurement. JIT warm-up, GC, and CPU caches make single-shot timings noisy. For decisions that matter, use JMH or run a hot loop many times before taking the timing.
+
+`Stream.iterate(seed, next)` is sequential by construction. Each value depends on the previous one, so the stream can't be cut into independent chunks. Calling `.parallel()` on it doesn't fail, but it doesn't help either.
+
+```java
+import java.util.stream.Stream;
+
+public class IterateIsSequential {
+    public static void main(String[] args) {
+        long sum = Stream.iterate(1L, n -> n + 1)
+                .limit(1_000_000)
+                .parallel()
+                .mapToLong(Long::longValue)
+                .sum();
+        System.out.println("Sum: " + sum);
+    }
+}
+```
+
+The `.parallel()` call is a no-op for throughput here. The pipeline has to compute values in order before it can split anything, and `limit` on an ordered stream adds further overhead in parallel mode.
+
+For a long range, use `LongStream.rangeClosed` instead. Ranges split perfectly.
+
+<h1 id="when-parallel-helps-and-when-it-doesnt">
+  When Parallel Helps and When It Doesn't
+</h1>
+
+Parallel streams have real overhead: thread coordination, splitting, combining, and the cost of moving work between threads. That overhead has to be earned back by the speedup. For small datasets or cheap per-element work, parallel is slower than sequential.
+
+| Use parallel when                                          | Avoid parallel when                               |
+| ---------------------------------------------------------- | ------------------------------------------------- |
+| Dataset is large (think 10K+ elements)                     | Dataset is small (a few hundred items)            |
+| Per-element work is real CPU work (math, hashing, parsing) | Per-element work is trivial (just a field access) |
+| Source splits cheaply (array, `ArrayList`, range)          | Source splits poorly (`LinkedList`, `iterate`)    |
+| Elements are independent (no shared state)                 | Pipeline touches shared mutable state             |
+| Combining partial results is cheap (sum, count, max)       | Combining is expensive or order-sensitive         |
+| The work is CPU-bound                                      | The work is I/O-bound (database, network, disk)   |
+
+A concrete example: computing total revenue across millions of orders is a good fit. Each order's contribution is independent, the source is an array-backed list, and the combine step is addition.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Random;
+
+public class RevenueTotal {
+    record Order(long id, double amount) { }
+
+    public static void main(String[] args) {
+        List<Order> orders = new ArrayList<>();
+        Random random = new Random(42);
+        for (int i = 0; i < 10_000_000; i++) {
+            orders.add(new Order(i, 10 + random.nextDouble() * 490));
+        }
+
+        long t1 = System.nanoTime();
+        double sequential = orders.stream().mapToDouble(Order::amount).sum();
+        long t2 = System.nanoTime();
+        double parallel = orders.parallelStream().mapToDouble(Order::amount).sum();
+        long t3 = System.nanoTime();
+
+        System.out.printf("Sequential: %.2f in %d ms%n", sequential, (t2 - t1) / 1_000_000);
+        System.out.printf("Parallel:   %.2f in %d ms%n", parallel, (t3 - t2) / 1_000_000);
+    }
+}
+```
+
+A poor example would be summing a list of 50 cart subtotals. The dataset is tiny, the per-element cost is one field read, and the overhead of splitting and joining dwarfs any gain. The sequential version wins by a wide margin.
+
+A rough rule of thumb: parallel becomes worth considering when `N x cost-per-element` clears roughly 100 microseconds of real CPU work. Below that, the overhead dominates. Above that, it's worth measuring. Measurement, not guessing, is the practical guide. Numbers change with the machine, the JIT, and the surrounding workload.
+
+I/O-bound operations (reading from a database, calling an HTTP service, hitting disk) don't benefit from parallel streams the way CPU work does. Parallel streams use a small pool sized for CPU work. Blocking those threads on I/O starves every other parallel stream sharing the same pool.
+
+<h1 id="stateful-operations-cost-more-in-parallel">
+  Stateful Operations Cost More in Parallel
+</h1>
+
+Operations like `sorted`, `distinct`, and `limit` are stateful. They need to see more than one element at a time to do their job. In a sequential stream, that is fine because there's only one thread walking the data. In a parallel stream, the operation has to coordinate across workers, which adds real cost.
+
+`sorted` in parallel has to gather elements from all workers, sort the merged result, and then hand the sorted sequence to the downstream stages. The sort itself can be parallelized internally, but it still requires a global view.
+
+`distinct` has to deduplicate across workers. On a stream with a well-defined encounter order, `distinct` also has to preserve the first occurrence, which forces coordination.
+
+`limit(n)` has to count elements in order. On an ordered parallel stream, taking the first `n` elements means workers can't just contribute whatever they've finished; the pipeline has to identify which `n` come first in encounter order.
+
+```java
+import java.util.stream.Stream;
+
+public class StatefulOps {
+    public static void main(String[] args) {
+        // limit on an unordered parallel stream is cheap
+        long countUnordered = Stream.generate(Math::random)
+                .parallel()
+                .unordered()
+                .limit(1_000_000)
+                .count();
+
+        // limit on an ordered parallel stream is more expensive
+        long countOrdered = Stream.iterate(0, n -> n + 1)
+                .parallel()
+                .limit(1_000_000)
+                .count();
+
+        System.out.println("Unordered count: " + countUnordered);
+        System.out.println("Ordered count: " + countOrdered);
+    }
+}
+```
+
+The two calls produce the same count, but the work to get there is different. `unordered()` tells the pipeline that encounter order doesn't matter, which lets `limit` accept whatever the first million elements happen to be, in any order. The ordered version does extra bookkeeping.
+
+The same applies to `findFirst` vs `findAny`. `findFirst` requires encounter order: in parallel, workers have to coordinate to identify which match came earliest. `findAny` says "any match is fine," which lets the first worker that finds one return immediately and short-circuit the rest.
+
+```java
+import java.util.List;
+import java.util.Optional;
+
+public class FindFirstVsFindAny {
+    record Product(String name, double price) { }
+
+    public static void main(String[] args) {
+        List<Product> catalog = List.of(
+                new Product("Pen", 2.50),
+                new Product("Notebook", 8.99),
+                new Product("Backpack", 49.95),
+                new Product("Headphones", 79.00)
+        );
+
+        Optional<Product> first = catalog.parallelStream()
+                .filter(p -> p.price() > 5)
+                .findFirst();
+
+        Optional<Product> any = catalog.parallelStream()
+                .filter(p -> p.price() > 5)
+                .findAny();
+
+        System.out.println("findFirst: " + first.orElseThrow().name());
+        System.out.println("findAny: " + any.orElseThrow().name());
+    }
+}
+```
+
+For this tiny list the results match, but with millions of elements `findAny` can finish in a fraction of the time. Use it when the first match in encounter order isn't required. For a "give me one product under $20" search, `findAny` is appropriate.
+
+`sorted` and `distinct` on a parallel stream still do useful work, but they shift cost from per-element to coordination. A pipeline that ends in `sorted().limit(n)` is often faster as `toList()` followed by a single sort, or by storing the data sorted to begin with.
+
+<h1 id="foreach-in-parallel-doesnt-preserve-order">
+  forEach in Parallel Doesn't Preserve Order
+</h1>
+
+`forEach` is unordered by contract. On a sequential stream it happens to run in encounter order, but the API doesn't promise it. On a parallel stream, elements run on whatever worker grabs them, so output order is not guaranteed.
+
+```java
+import java.util.stream.IntStream;
+
+public class ForEachOrder {
+    public static void main(String[] args) {
+        System.out.println("forEach parallel:");
+        IntStream.rangeClosed(1, 10).parallel().forEach(n -> System.out.print(n + " "));
+        System.out.println();
+
+        System.out.println("forEachOrdered parallel:");
+        IntStream.rangeClosed(1, 10).parallel().forEachOrdered(n -> System.out.print(n + " "));
+        System.out.println();
+    }
+}
+```
+
+The first line will differ across runs. `forEachOrdered` walks elements in encounter order, which costs coordination but guarantees the sequence. Use it when ordering matters for printing or for writing to an ordered sink. Use `forEach` when order is irrelevant, since it lets workers proceed independently.
+
+<h1 id="thread-safety-and-side-effects">Thread Safety and Side Effects</h1>
+
+The biggest source of bugs in parallel streams is using lambdas that mutate shared state. The API provides no protection here: the code compiles, it runs, and it produces wrong answers.
+
+**What's wrong with this code?**
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+import java.util.stream.IntStream;
+
+public class SharedListBug {
+    public static void main(String[] args) {
+        List<Integer> discountedPrices = new ArrayList<>();
+        IntStream.rangeClosed(1, 100_000)
+                .parallel()
+                .forEach(price -> discountedPrices.add((int) (price * 0.9)));
+        System.out.println("Collected: " + discountedPrices.size());
+    }
+}
+```
+
+The intent is to apply a discount and collect the results. The problem is that `ArrayList` is not thread-safe. Many workers call `add` on the same list concurrently. The result is one of three outcomes: a count less than 100,000 because writes were lost, an `ArrayIndexOutOfBoundsException` thrown from inside `ArrayList.add`, or, occasionally, the right answer if the timing happens to work. None of these are acceptable.
+
+**Fix:** let the stream collect the results with a proper collector. The collector knows how to merge partial results from each worker safely.
+
+```java
+import java.util.List;
+import java.util.stream.IntStream;
+
+public class CollectInsteadOfMutate {
+    public static void main(String[] args) {
+        List<Integer> discountedPrices = IntStream.rangeClosed(1, 100_000)
+                .parallel()
+                .map(price -> (int) (price * 0.9))
+                .boxed()
+                .toList();
+        System.out.println("Collected: " + discountedPrices.size());
+    }
+}
+```
+
+The rule is straightforward: any lambda passed into a stream operation must be stateless. It can read from the element it's given, use local variables, and call pure functions. It cannot mutate anything that another thread might also touch.
+
+Using a synchronized list like `Collections.synchronizedList` removes the visible bug but eliminates the speedup. Every `add` call serializes on a single lock, so all the workers end up waiting in line. Use a `Collector` that gives each worker its own bucket and merges them at the end.
+
+<h1 id="reduce-needs-an-associative-combiner">
+  reduce Needs an Associative Combiner
+</h1>
+
+`reduce` with an identity and a binary operator combines elements pairwise. In a sequential stream, the order is left-to-right: `((((id op a) op b) op c) op d)`. In a parallel stream, workers reduce their chunks independently, and the partial results are then combined. For the result to match the sequential answer, two conditions must hold.
+
+First, the operator must be associative: `(a op b) op c` equals `a op (b op c)`. Addition is associative; subtraction is not.
+
+Second, the identity must actually be an identity for the operator: `id op a` equals `a`. Zero is an identity for addition; one is not.
+
+When either condition is violated, the parallel reduce produces different results from the sequential reduce, and the result varies between runs as the split structure varies.
+
+```java
+import java.util.stream.IntStream;
+
+public class NonAssociativeReduce {
+    public static void main(String[] args) {
+        // Subtraction is not associative
+        int sequential = IntStream.rangeClosed(1, 10)
+                .reduce(0, (a, b) -> a - b);
+
+        int parallel = IntStream.rangeClosed(1, 10)
+                .parallel()
+                .reduce(0, (a, b) -> a - b);
+
+        System.out.println("Sequential: " + sequential);
+        System.out.println("Parallel:   " + parallel);
+    }
+}
+```
+
+The parallel result is wrong (relative to the sequential one) and depends on how the stream was split. Subtraction is the classic counterexample: `(10 - 5) - 3 = 2`, but `10 - (5 - 3) = 8`. Different groupings give different answers.
+
+Stick to associative operations: addition, multiplication, max, min, string concatenation (associative, even if slow). When unsure, check both conditions before parallelizing.
+
+<h1 id="intstream-and-longstream-avoid-autoboxing">
+  IntStream and LongStream Avoid Autoboxing
+</h1>
+
+Primitive streams (`IntStream`, `LongStream`, `DoubleStream`) matter even more in parallel than in sequential pipelines. `Stream<Integer>` boxes every element into an `Integer` object, and parallel work amplifies the allocation pressure because multiple threads allocate at once.
+
+```java
+import java.util.stream.IntStream;
+import java.util.stream.Stream;
+
+public class BoxingCost {
+    public static void main(String[] args) {
+        long t1 = System.nanoTime();
+        long boxedSum = Stream.iterate(1, n -> n + 1)
+                .limit(10_000_000)
+                .parallel()
+                .mapToLong(Integer::longValue)
+                .sum();
+        long t2 = System.nanoTime();
+
+        long primitiveSum = IntStream.rangeClosed(1, 10_000_000)
+                .parallel()
+                .asLongStream()
+                .sum();
+        long t3 = System.nanoTime();
+
+        System.out.println("Boxed: " + boxedSum + " in " + (t2 - t1) / 1_000_000 + " ms");
+        System.out.println("Primitive: " + primitiveSum + " in " + (t3 - t2) / 1_000_000 + " ms");
+    }
+}
+```
+
+The first version pays for two things: boxing each `int` into an `Integer`, and a poorly splittable `Stream.iterate` source. The second version uses `rangeClosed`, which splits perfectly, and never allocates wrapper objects. The gap is large enough that it's hard to attribute to noise.
+
+For aggregates over many numbers, prefer `IntStream`/`LongStream`/`DoubleStream`. The methods `mapToInt`, `mapToLong`, and `mapToDouble` drop into a primitive stream from an object stream.
+
+Boxing isn't just allocation. Boxed integers also defeat the JIT's ability to vectorize and inline aggressively. For tight numeric loops, primitive streams can be an order of magnitude faster than their boxed equivalents.
+
+<h1 id="the-common-pool-is-shared">The Common Pool Is Shared</h1>
+
+`ForkJoinPool.commonPool()` is shared across the entire JVM. Every parallel stream in the application, every parallel stream in every library it uses, and the default executor for some other JDK APIs all draw from the same set of workers.
+
+A slow parallel stream can starve other parallel work. Launching a parallel stream that runs a blocking call inside its lambda (a database query, an HTTP request, a `Thread.sleep`) parks the worker until that call returns. Other parallel streams waiting for a worker have to queue behind it.
+
+```java
+import java.util.concurrent.ForkJoinPool;
+import java.util.stream.IntStream;
+
+public class CommonPoolUsage {
+    public static void main(String[] args) {
+        System.out.println("Pool size: " + ForkJoinPool.commonPool().getParallelism());
+
+        IntStream.rangeClosed(1, 4)
+                .parallel()
+                .forEach(n -> System.out.println("Item " + n + " on " + Thread.currentThread().getName()));
+    }
+}
+```
+
+The calling thread (`main`) participates in the parallel work. The common pool isn't a thread pool that does all the work while the caller idles. The calling thread joins in, which is part of how Fork/Join's work-stealing scheduler keeps every thread busy.
+
+The advanced workaround for avoiding the common pool is to submit the terminal call to a dedicated `ForkJoinPool`.
+
+```java
+import java.util.concurrent.ForkJoinPool;
+import java.util.stream.IntStream;
+
+public class CustomPool {
+    public static void main(String[] args) throws Exception {
+        ForkJoinPool dedicated = new ForkJoinPool(4);
+        try {
+            long sum = dedicated.submit(() ->
+                    IntStream.rangeClosed(1, 1_000_000).parallel().sum()
+            ).get();
+            System.out.println("Sum: " + sum);
+        } finally {
+            dedicated.shutdown();
+        }
+    }
+}
+```
+
+The integer overflow in the output is a separate matter (`int` can't hold the sum; use `long` for real code). The structural point is that when the terminal operation runs inside `dedicated.submit(...)`, the workers used are those of `dedicated`, not the common pool. This is rarely needed in application code and not officially documented as a guarantee, but it's a known idiom for isolating expensive parallel work.
+
+For most code, the approach is not "use a custom pool" but "don't put blocking work in a parallel stream in the first place."
+
+<h1 id="a-decision-checklist">A Decision Checklist</h1>
+
+Before using `.parallel()`, run through these questions:
+
+1. Is the dataset big enough? Tens of thousands of elements at least, ideally more.
+2. Is the per-element work real CPU work? Math, parsing, hashing, encoding, comparing.
+3. Does the source split well? Arrays, `ArrayList`, ranges do; `LinkedList`, `iterate`, `generate` do not.
+4. Are the lambdas stateless? No shared mutable state, no side effects.
+5. Is the work CPU-bound? Calls out to disk, network, or a database make parallel streams unsuitable.
+6. Is the reduce associative? Is the identity actually an identity?
+7. Is encounter order required? If yes, `findFirst`/`forEachOrdered`/`limit` will cost more. If no, use `findAny`/`forEach`/`unordered`.
+
+If every answer is "yes" (or "no" where it should be), parallel is worth measuring. If two or more are wrong, sequential is likely faster, simpler, and harder to break.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

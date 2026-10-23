@@ -1,0 +1,363 @@
+---
+title: "Reference Counting"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Reference Counting explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="what-the-counter-holds">What the Counter Holds</h1>
+
+Every Python object on the heap has a `PyObject` header. The two fields that matter for this lesson are `ob_refcnt` (an integer counting how many references point at this object) and `ob_type` (a pointer to the object's class). The rest of the header is implementation-specific.
+
+For `product = Product("headphones", 79.99)`, CPython does roughly three things:
+
+1. Allocate memory for a new `Product` instance.
+2. Initialize its header with `ob_refcnt = 1` and `ob_type = Product`.
+3. Bind the name `product` to that address.
+
+The `1` comes from the assignment itself. The name `product` is one reference. If nothing else takes a reference before `product` goes out of scope, the count returns to zero and the memory is freed.
+
+The name `product` is the only thing keeping the counter above zero. The rest of the object is the data the class needs.
+
+<h1 id="inspecting-the-count">Inspecting the Count</h1>
+
+`sys.getrefcount(obj)` returns the current refcount of `obj`, including the temporary reference created by passing `obj` into `getrefcount` itself.
+
+```python
+import sys
+
+class Product:
+    def __init__(self, name, price):
+        self.name = name
+        self.price = price
+
+p = Product("headphones", 79.99)
+print(f"After p = ...: {sys.getrefcount(p)}")
+
+backup = p
+print(f"After backup = p: {sys.getrefcount(p)}")
+
+cart = [p]
+print(f"After cart.append(p): {sys.getrefcount(p)}")
+
+del backup
+print(f"After del backup: {sys.getrefcount(p)}")
+
+cart.clear()
+print(f"After cart.clear(): {sys.getrefcount(p)}")
+```
+
+The first line prints `2`, not `1`, because passing `p` to `getrefcount` adds a temporary reference inside the call frame. This is the "off by one" behavior. What matters is the **direction**:
+
+- `backup = p` adds one (a new name).
+- `cart.append(p)` adds one (the list now holds it).
+- `del backup` subtracts one.
+- `cart.clear()` subtracts one (the list dropped it).
+
+Absolute numbers from `getrefcount` are implementation-specific and depend on what is happening inside the runtime. Use the deltas, not the values.
+
+`sys.getrefcount` is cheap but the temporary reference is real. Avoid using it for fine-grained "did the refcount go up by exactly 1" assertions in tests; the temporary makes those assertions unreliable.
+
+<h1 id="what-changes-the-count">What Changes the Count</h1>
+
+Every operation that creates or destroys a reference changes the count. The list looks long but the rule is the same in every case: any time another piece of the program can reach this object, the count goes up; when it can no longer reach it, the count goes down.
+
+| Operation                         | Effect on the target's refcount             |
+| --------------------------------- | ------------------------------------------- |
+| `x = obj` (assignment)            | +1                                          |
+| `del x`                           | -1                                          |
+| Variable goes out of scope        | -1                                          |
+| `container.append(obj)`           | +1                                          |
+| `container.pop()`                 | -1                                          |
+| `container.clear()`               | -1 per element                              |
+| `func(obj)` (passing as argument) | +1 during the call, -1 after return         |
+| `return obj` from a function      | unchanged (caller takes over the reference) |
+| `obj.attr` (attribute read)       | +1 temporarily, -1 right after              |
+| `globals()['name'] = obj`         | +1                                          |
+| Closure captures `obj`            | +1 (closure cell holds it)                  |
+| Module imports re-bind a name     | -1 on the old object, +1 on the new         |
+
+A small example brings the table to life:
+
+```python
+import sys
+
+def show(obj):
+    return sys.getrefcount(obj)
+
+class Order:
+    def __init__(self, order_id):
+        self.order_id = order_id
+
+o = Order(101)
+print(f"Start: {show(o)}")
+
+orders_by_id = {101: o}
+print(f"In dict: {show(o)}")
+
+backup = o
+print(f"After backup: {show(o)}")
+
+del orders_by_id[101]
+print(f"After dict delete: {show(o)}")
+
+del backup
+print(f"After backup delete: {show(o)}")
+```
+
+Each piece of the program that can reach `o` contributes one to the count. Removing any of them takes one away.
+
+The `show` function is doing extra work here. Calling `show(o)` triggers an argument binding inside `show` that creates one new reference, then `sys.getrefcount(obj)` runs and counts it. The returned number is the count from inside `show`, which is always one higher than the count an outside observer would see. This is the "off by one" again from a different angle.
+
+<h1 id="function-arguments-and-returns">Function Arguments and Returns</h1>
+
+Arguments are passed by reference in Python. A call `func(obj)` does not copy `obj`; it binds the parameter name inside `func` to the same object. That binding is a new reference, so the count goes up by one for the duration of the call.
+
+```python
+import sys
+
+class Cart:
+    def __init__(self):
+        self.items = []
+
+def fill(cart):
+    print(f"Inside fill: {sys.getrefcount(cart)}")
+    cart.items.append("headphones")
+
+cart = Cart()
+print(f"Before call: {sys.getrefcount(cart)}")
+fill(cart)
+print(f"After call: {sys.getrefcount(cart)}")
+```
+
+Walking through the numbers: before the call, the count from outside is `1 + 1 = 2` (the name `cart` plus `getrefcount`'s temporary). Inside `fill`, three references exist: the outer `cart` name, the inner `cart` parameter, and `getrefcount`'s temporary. After the call returns, the parameter binding is gone, and the count is back to 2.
+
+Returning an object does not change the count by itself. The function's local reference is released, but the caller's name takes over, so the net effect is zero.
+
+```python
+import sys
+
+class Order:
+    def __init__(self, order_id):
+        self.order_id = order_id
+
+def make_order(order_id):
+    o = Order(order_id)
+    print(f"Inside make_order: {sys.getrefcount(o)}")
+    return o
+
+result = make_order(101)
+print(f"After return: {sys.getrefcount(result)}")
+```
+
+Inside `make_order`, the count is `1 (local o) + 1 (getrefcount temporary) = 2`. After the return, the local `o` is gone but `result` now holds the same reference, so the count is again `1 (result) + 1 (getrefcount temporary) = 2`.
+
+<h1 id="containers-hold-references">Containers Hold References</h1>
+
+Putting an object into a container counts as a new reference. The container is a regular Python object whose internal storage points at the items it holds.
+
+```python
+import sys
+
+class Product:
+    def __init__(self, name):
+        self.name = name
+
+p = Product("headphones")
+print(f"Just p: {sys.getrefcount(p)}")
+
+cart = [p, p, p]
+print(f"Three slots in cart: {sys.getrefcount(p)}")
+
+wishlist = {"a": p, "b": p}
+print(f"Plus two dict entries: {sys.getrefcount(p)}")
+
+cart.pop()
+print(f"After cart.pop(): {sys.getrefcount(p)}")
+```
+
+Each list slot contributes one. Each dict entry contributes one. `pop()` removes the last list slot, dropping the count by one. Removing the dict entries explicitly (`del wishlist['a']`) would also drop the count.
+
+When a container is itself freed, every element it holds loses one reference. This cascades: if dropping the container drops an element's count to zero, that element is freed too, which can drop further counts to zero, and so on. The cascade is bounded but deep cascades can produce noticeable pauses when a container with many large children goes away all at once.
+
+Clearing a large container is O(n) in refcount decrements. A `dict` of a million `Order` objects, freed in one go, performs a million decrements. Profilers occasionally show these as "GC pauses" even though no cycle collection is involved.
+
+<h1 id="why-the-object-is-freed-immediately">
+  Why the Object Is Freed Immediately
+</h1>
+
+When a refcount hits zero, CPython does not wait. The object is freed right then, before the next bytecode instruction. The class's `__del__` (if defined) runs as part of the cleanup. Any references the object held to other objects are released, possibly triggering further frees.
+
+```python
+class Order:
+    def __init__(self, order_id):
+        self.order_id = order_id
+
+    def __del__(self):
+        print(f"Order {self.order_id} freed")
+
+def process():
+    o = Order(101)
+    print("inside process")
+
+process()
+print("after process")
+```
+
+The `Order(101)` instance has exactly one reference: the local `o`. When `process` returns, the frame is torn down and `o` goes away. The refcount drops to zero. The cleanup runs. The interpreter then executes the next line, which prints "after process". The order of these three messages is fixed, not a coincidence.
+
+This is the deterministic-cleanup property of reference counting. Context managers, file handles, and locks all rely on it. For example:
+
+```python
+with open("orders.txt") as f:
+    data = f.read()
+# f's __exit__ has run by now, file is closed
+```
+
+This relies on the fact that the file's `__exit__` runs synchronously when the `with` block ends. Reference counting is what makes the `__del__` of a temporary file or the cleanup of a wrapping object reliable.
+
+For non-cyclic objects, the lifecycle is exactly this. No collector, no delay.
+
+<h1 id="what-reference-counting-cannot-do">
+  What Reference Counting Cannot Do
+</h1>
+
+The deterministic-free property is what makes reference counting attractive. The fatal limitation is that it cannot handle cycles. Two objects that reference each other keep each other's refcount above zero, even when nothing outside the cycle can reach them.
+
+```python
+import gc
+
+class Customer:
+    def __init__(self, name):
+        self.name = name
+        self.orders = []
+
+class Order:
+    def __init__(self, order_id, customer):
+        self.order_id = order_id
+        self.customer = customer
+        customer.orders.append(self)
+
+gc.disable()
+
+def make():
+    c = Customer("Priya")
+    Order(501, c)
+
+make()
+print("make returned")
+gc.enable()
+```
+
+Neither the customer nor the order is freed. Refcount on `Customer`: one (the order's `self.customer`). Refcount on `Order`: one (the customer's `orders` list). When `make` returns, the local `c` goes away, but the cycle still exists. Each side keeps the other alive.
+
+The cycle collector addresses this case. Reference counting handles most frees on its own. The cycle collector handles the rest. The two together cover the whole story.
+
+<h1 id="reference-counting-and-the-gil">Reference Counting and the GIL</h1>
+
+CPython's reference-count operations have to be atomic. If two threads incremented the same counter at the same time without synchronization, the result would be torn updates and a drifting count, eventually freeing a live object or leaking a dead one.
+
+In single-threaded code this is not a concern. In multi-threaded code, CPython solves it with the Global Interpreter Lock (GIL). Only one thread can execute Python bytecode at a time, which means only one thread can modify a refcount at a time. Every increment and decrement happens under the lock, and the lock is what makes the operation atomic from the runtime's point of view.
+
+This is one of the main reasons the GIL has been hard to remove from CPython. The naive fix (use an atomic compare-and-swap on every refcount op) makes single-threaded performance much worse: atomic ops on modern CPUs are 10 to 100 times slower than non-atomic ones, and refcount operations happen on essentially every Python expression. Decades of work has gone into figuring out how to remove the GIL without paying that cost.
+
+The free-threaded Python build (PEP 703, available in Python 3.13 and later as an experimental option) makes refcounts atomic for shared objects but uses biased reference counting and immortal objects to avoid the atomic-op cost in most cases. The details are subtle. For this lesson, the takeaway is that "refcount must be atomic" is the foundational reason the GIL exists, and removing it forces a redesign of how `ob_refcnt` is updated.
+
+Atomic refcount operations in free-threaded Python are slower than the GIL-protected non-atomic ops in regular CPython. Single-threaded code may run 15 to 25 percent slower on free-threaded builds. Multi-threaded code that previously serialized on the GIL can run much faster. Which one wins depends on the workload.
+
+<h1 id="other-pythons-do-not-use-refcounts">
+  Other Pythons Do Not Use Refcounts
+</h1>
+
+Reference counting is a CPython implementation detail. The Python language does not require it, and several alternative interpreters take a different approach.
+
+**PyPy** uses a tracing garbage collector instead of reference counting. Objects are allocated cheaply on a young-object heap, and a generational tracer reclaims them in bulk. There is no `ob_refcnt` field, no atomic counter, no deterministic-free guarantee.
+
+**Jython** runs Python on the JVM and uses the JVM's garbage collector. Same idea: tracing, not refcounting.
+
+**IronPython** runs on .NET's CLR and uses the CLR's garbage collector.
+
+**MicroPython** is small enough that it can ship either a refcount or a tracing collector depending on the target hardware.
+
+The visible difference is that `__del__` is no longer deterministic on these interpreters. A file that goes unclosed in CPython gets closed when the file object's refcount hits zero. On PyPy, the file might not be closed until the next major GC cycle runs, which could be much later. This is why "always use a context manager" is the right advice for resource cleanup, even though refcounting in CPython would make a bare `open()` work most of the time.
+
+```python
+# Avoid this even though it usually works on CPython:
+data = open("orders.txt").read()
+# The file handle may stay open for a while on PyPy.
+
+# Use this instead:
+with open("orders.txt") as f:
+    data = f.read()
+```
+
+Sticking to context managers makes the code portable across interpreters and predictable across Python versions.
+
+<h1 id="performance-characteristics">Performance Characteristics</h1>
+
+Refcounting has predictable, fine-grained overhead. Each new reference is an integer increment, each dropped reference is an integer decrement plus a check for zero. The numbers are small but they happen everywhere: every function call, every list append, every dict lookup that yields an object that is then used.
+
+The trade-off compared to tracing GC:
+
+| Aspect             | Refcounting (CPython)                                         | Tracing GC (PyPy)                                    |
+| ------------------ | ------------------------------------------------------------- | ---------------------------------------------------- |
+| Per-operation cost | Small but constant overhead on every reference op             | Almost zero on creation, periodic cost on collection |
+| Pause behavior     | No pauses for non-cyclic garbage; cycles collected separately | Periodic stop-the-world or incremental pauses        |
+| Determinism        | Immediate, deterministic `__del__` for non-cyclic objects     | Delayed, non-deterministic finalization              |
+| Multi-threading    | GIL required for atomicity (in standard build)                | No equivalent constraint                             |
+| Predictability     | High: same code, same lifecycle, every run                    | Lower: depends on heap state                         |
+
+For long-running services with mostly short-lived objects, refcounting wins on predictability (no surprise pauses) and loses on throughput (every reference op pays). For batch jobs that allocate huge amounts of short-lived garbage, tracing wins on throughput and may produce noticeable pauses.
+
+The deeper point is that either style produces correct, reasonably fast Python. The reasons to care show up in two places: when code depends on deterministic cleanup (refcounting helps), and when removing the GIL is the goal (refcounting gets in the way).
+
+<h1 id="a-practical-example-when-the-count-matters">
+  A Practical Example: When the Count Matters
+</h1>
+
+A common debugging task is "is anything still holding this object?" `sys.getrefcount` plus knowledge of "subtract one for the call itself" gives a quick answer.
+
+```python
+import sys
+
+class Session:
+    def __init__(self, session_id):
+        self.session_id = session_id
+
+# Simulate a connection pool that should release its sessions.
+class ConnectionPool:
+    def __init__(self):
+        self.idle = []
+
+    def acquire(self, session_id):
+        s = Session(session_id)
+        return s
+
+    def release(self, session):
+        self.idle.append(session)
+
+    def truly_release(self, session):
+        # No-op, mimicking a bug where release doesn't actually release.
+        pass
+
+pool = ConnectionPool()
+s = pool.acquire("abc")
+
+print(f"Before release: {sys.getrefcount(s)}")
+pool.release(s)
+print(f"After release: {sys.getrefcount(s)}")
+pool.truly_release(s)
+print(f"After truly_release: {sys.getrefcount(s)}")
+```
+
+The "before release" count of 2 is the local `s` plus `getrefcount`'s temporary. After `pool.release(s)`, the count rises to 3 because the pool's `idle` list now holds the session too. The `truly_release` call does not change anything, which is the bug: the function is supposed to drop the pool's reference but does not. The count staying at 3 is the evidence.
+
+In practice, scattered `sys.getrefcount` calls are not the right approach. The useful pattern is: when an object is sticking around longer than expected, use `gc.get_referrers(obj)` to identify what is holding it, and use the refcount as a quick "did anything change" indicator before and after a suspected fix.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

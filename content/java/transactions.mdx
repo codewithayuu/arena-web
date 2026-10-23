@@ -1,0 +1,745 @@
+---
+title: "Transactions"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Transactions explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="why-transactions-exist">Why Transactions Exist</h1>
+
+Consider the simplest possible checkout flow on an online store. A customer clicks "place order" for 2 units of product 101. The application code has to do three things in the database: subtract 2 from the stock of product 101, insert a row into the `orders` table, and insert a row into the `order_items` table linking the order to the product. Each one is a separate SQL statement. If any of them fails, the rest must not happen.
+
+Without transactions, every statement is committed the moment it runs. If the stock update succeeds and then the `INSERT` into `orders` fails because the database connection drops, the database ends up with a product that has 2 fewer units in stock but no order. The customer was never charged, the stock is wrong, and nobody knows it happened. Worse, with the order reversed (insert the order row first), a failure in the stock update leaves an order that promises 2 units the warehouse will never have.
+
+A transaction wraps these three statements so they either all happen or none of them do. The database does the bookkeeping: it tracks the changes, and on a successful `commit` it applies them all at once; on a `rollback` it throws them all away. From any other connection's point of view, the database moves cleanly from "before the order" to "after the order" with no halfway state ever visible.
+
+The diagram shows the model. Three writes go in, one of two things comes out: every write is applied, or no write is applied. There is no third outcome where only some of them stick.
+
+<h1 id="the-acid-properties">The ACID Properties</h1>
+
+Databases describe transactional guarantees with the acronym ACID. The four letters stand for **Atomicity**, **Consistency**, **Isolation**, and **Durability**. Each one solves a different failure mode, and each one shows up in production sooner or later.
+
+**Atomicity** is the all-or-nothing rule. Either every statement in the transaction takes effect, or none of them do. If the second `INSERT` fails, the first `UPDATE` is rolled back, even if the program crashed before it could ask for the rollback. The database engine handles that on recovery using its write-ahead log.
+
+**Consistency** means the database moves from one valid state to another. If a check constraint says `stock >= 0`, no transaction can leave the database with a negative stock value. If a unique constraint says `email` is unique, no transaction can commit two customers with the same email. Constraint checks happen as part of the commit, and a violation aborts the whole transaction.
+
+**Isolation** controls what one transaction can see of another transaction's in-progress changes. If a checkout is mid-flight and another customer is reading the same product's stock, what does that other customer see? The pre-decrement value, the post-decrement value, or a phantom in between? The four standard isolation levels are the knob for choosing.
+
+**Durability** means that once a transaction commits, its changes survive a crash. If the database server loses power half a second after the commit returns, the order is still there when the database comes back up. This guarantee is easy to take for granted, but it costs real disk I/O. Every commit waits for the log to be flushed to durable storage before returning, which is why commit is the slow part of a write workload.
+
+<h1 id="the-motivating-example-broken-first">
+  The Motivating Example, Broken First
+</h1>
+
+One way to demonstrate the value of transactions is to write a version of the checkout that doesn't use one, watch it leave the database in a bad state, then fix it. Every example in this lesson runs against an H2 in-memory database with the URL `jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1`. The `DB_CLOSE_DELAY=-1` part keeps the in-memory database alive for the JVM's lifetime, so a second connection in the same program can see the rows the first one inserted.
+
+Here is the broken version. It deducts stock, inserts an order, then tries to insert order items where one of the items references a product that does not exist. The third statement fails. By the time it fails, the stock and the order row are already permanent.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class CheckoutBroken {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            seed(conn);
+
+            try {
+                // Deduct stock for product 101.
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "UPDATE products SET stock = stock - ? WHERE id = ?")) {
+                    ps.setInt(1, 2);
+                    ps.setInt(2, 101);
+                    ps.executeUpdate();
+                }
+
+                // Insert the order row.
+                int orderId;
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "INSERT INTO orders (customer_id, status) VALUES (?, ?)",
+                        Statement.RETURN_GENERATED_KEYS)) {
+                    ps.setInt(1, 1);
+                    ps.setString(2, "PLACED");
+                    ps.executeUpdate();
+                    try (ResultSet keys = ps.getGeneratedKeys()) {
+                        keys.next();
+                        orderId = keys.getInt(1);
+                    }
+                }
+
+                // Insert order item. This fails: product 999 does not exist.
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "INSERT INTO order_items (order_id, product_id, quantity) VALUES (?, ?, ?)")) {
+                    ps.setInt(1, orderId);
+                    ps.setInt(2, 999);
+                    ps.setInt(3, 2);
+                    ps.executeUpdate();
+                }
+            } catch (Exception e) {
+                System.out.println("Checkout failed: " + e.getMessage());
+            }
+
+            // Inspect the wreckage.
+            try (Statement s = conn.createStatement();
+                 ResultSet rs = s.executeQuery("SELECT id, stock FROM products WHERE id = 101")) {
+                rs.next();
+                System.out.println("Stock for 101: " + rs.getInt("stock"));
+            }
+            try (Statement s = conn.createStatement();
+                 ResultSet rs = s.executeQuery("SELECT COUNT(*) FROM orders")) {
+                rs.next();
+                System.out.println("Orders in table: " + rs.getInt(1));
+            }
+            try (Statement s = conn.createStatement();
+                 ResultSet rs = s.executeQuery("SELECT COUNT(*) FROM order_items")) {
+                rs.next();
+                System.out.println("Items in table: " + rs.getInt(1));
+            }
+        }
+    }
+
+    static void seed(Connection conn) throws Exception {
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE TABLE products (id INT PRIMARY KEY, name VARCHAR(100), stock INT)");
+            s.execute("CREATE TABLE orders (id INT AUTO_INCREMENT PRIMARY KEY, customer_id INT, status VARCHAR(20))");
+            s.execute("CREATE TABLE order_items (id INT AUTO_INCREMENT PRIMARY KEY, " +
+                      "order_id INT, product_id INT REFERENCES products(id), quantity INT)");
+            s.execute("INSERT INTO products VALUES (101, 'Wireless Mouse', 10)");
+            s.execute("INSERT INTO customers_unused VALUES (1)"); // placeholder seed (no-op)
+        }
+    }
+}
+```
+
+Running that code, the seed will fail on the placeholder line because `customers_unused` doesn't exist. Here is the clean, runnable version. The point of the example is the broken checkout, not the seed table, so the seed only creates the three tables and one product.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class CheckoutBrokenRunnable {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            seed(conn);
+
+            try {
+                update(conn, "UPDATE products SET stock = stock - 2 WHERE id = 101");
+
+                int orderId;
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "INSERT INTO orders (customer_id, status) VALUES (1, 'PLACED')",
+                        Statement.RETURN_GENERATED_KEYS)) {
+                    ps.executeUpdate();
+                    try (ResultSet keys = ps.getGeneratedKeys()) {
+                        keys.next();
+                        orderId = keys.getInt(1);
+                    }
+                }
+
+                // This fails: product 999 does not exist; foreign key blocks the insert.
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "INSERT INTO order_items (order_id, product_id, quantity) VALUES (?, ?, ?)")) {
+                    ps.setInt(1, orderId);
+                    ps.setInt(2, 999);
+                    ps.setInt(3, 2);
+                    ps.executeUpdate();
+                }
+            } catch (Exception e) {
+                System.out.println("Checkout failed: " + e.getMessage().split("\n")[0]);
+            }
+
+            System.out.println("Stock for 101: " + scalarInt(conn, "SELECT stock FROM products WHERE id = 101"));
+            System.out.println("Orders in table: " + scalarInt(conn, "SELECT COUNT(*) FROM orders"));
+            System.out.println("Items in table:  " + scalarInt(conn, "SELECT COUNT(*) FROM order_items"));
+        }
+    }
+
+    static void seed(Connection conn) throws Exception {
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE TABLE products (id INT PRIMARY KEY, name VARCHAR(100), stock INT)");
+            s.execute("CREATE TABLE orders (id INT AUTO_INCREMENT PRIMARY KEY, customer_id INT, status VARCHAR(20))");
+            s.execute("CREATE TABLE order_items (id INT AUTO_INCREMENT PRIMARY KEY, " +
+                      "order_id INT, product_id INT REFERENCES products(id), quantity INT)");
+            s.execute("INSERT INTO products VALUES (101, 'Wireless Mouse', 10)");
+        }
+    }
+
+    static void update(Connection conn, String sql) throws Exception {
+        try (Statement s = conn.createStatement()) { s.executeUpdate(sql); }
+    }
+
+    static int scalarInt(Connection conn, String sql) throws Exception {
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(sql)) {
+            rs.next();
+            return rs.getInt(1);
+        }
+    }
+}
+```
+
+The output shows the result. The stock has dropped from 10 to 8. There is one row in `orders` with status `PLACED`. There are zero rows in `order_items`. From the database's perspective, customer 1 placed an order that has no items in it, and the warehouse thinks two units are reserved for an order that doesn't actually exist. This is the half-state failure mode transactions exist to prevent.
+
+Half-applied writes are silent until somebody notices the numbers don't match. The customer support ticket comes in two days later, the engineer has to reconstruct what happened from logs, and the bug exists in five other places. Transactions remove the whole class of failure.
+
+<h1 id="autocommit-the-reason-it-broke">Autocommit, the Reason It Broke</h1>
+
+JDBC connections start in **autocommit mode**. Every statement runs in its own tiny transaction that commits the moment the statement returns. The stock update, the order insert, and the order-items insert each got their own commit, in that order. By the time the third one failed, the first two were already permanent and there was nothing JDBC could do.
+
+Autocommit state is available on any connection via `conn.getAutoCommit()`. The default is `true`. The fix is `conn.setAutoCommit(false)`, which tells the driver "don't commit anything until I say so." From that point on, every statement on this connection runs inside the same open transaction, and the application decides when to commit it.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+
+public class AutocommitDefault {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            System.out.println("Initial autocommit: " + conn.getAutoCommit());
+            conn.setAutoCommit(false);
+            System.out.println("After setAutoCommit(false): " + conn.getAutoCommit());
+        }
+    }
+}
+```
+
+Turning autocommit off does not start a "named" transaction. There is no `BEGIN` statement to send in JDBC; the first statement after `setAutoCommit(false)` (or after the previous `commit`/`rollback`) implicitly opens a new transaction. The transaction stays open until `commit()` or `rollback()` is called on the connection, or until the connection is closed, whichever happens first.
+
+<h1 id="commit-and-rollback">Commit and Rollback</h1>
+
+`Connection.commit()` makes every change since the last commit visible to other transactions and permanent on disk. `Connection.rollback()` throws every change since the last commit away. Both methods only matter when autocommit is off, because autocommit already commits after each statement.
+
+Here is the broken checkout fixed. The only differences are `conn.setAutoCommit(false)` before the writes, `conn.commit()` after the third write, and `conn.rollback()` in the catch block. The rest of the code is identical.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class CheckoutFixed {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            seed(conn);
+            conn.setAutoCommit(false);
+
+            try {
+                update(conn, "UPDATE products SET stock = stock - 2 WHERE id = 101");
+
+                int orderId;
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "INSERT INTO orders (customer_id, status) VALUES (1, 'PLACED')",
+                        Statement.RETURN_GENERATED_KEYS)) {
+                    ps.executeUpdate();
+                    try (ResultSet keys = ps.getGeneratedKeys()) {
+                        keys.next();
+                        orderId = keys.getInt(1);
+                    }
+                }
+
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "INSERT INTO order_items (order_id, product_id, quantity) VALUES (?, ?, ?)")) {
+                    ps.setInt(1, orderId);
+                    ps.setInt(2, 999);  // Same bug as before: product 999 doesn't exist.
+                    ps.setInt(3, 2);
+                    ps.executeUpdate();
+                }
+
+                conn.commit();
+            } catch (Exception e) {
+                conn.rollback();
+                System.out.println("Rolled back: " + e.getMessage().split("\n")[0]);
+            }
+
+            System.out.println("Stock for 101: " + scalarInt(conn, "SELECT stock FROM products WHERE id = 101"));
+            System.out.println("Orders in table: " + scalarInt(conn, "SELECT COUNT(*) FROM orders"));
+            System.out.println("Items in table:  " + scalarInt(conn, "SELECT COUNT(*) FROM order_items"));
+        }
+    }
+
+    static void seed(Connection conn) throws Exception {
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE TABLE products (id INT PRIMARY KEY, name VARCHAR(100), stock INT)");
+            s.execute("CREATE TABLE orders (id INT AUTO_INCREMENT PRIMARY KEY, customer_id INT, status VARCHAR(20))");
+            s.execute("CREATE TABLE order_items (id INT AUTO_INCREMENT PRIMARY KEY, " +
+                      "order_id INT, product_id INT REFERENCES products(id), quantity INT)");
+            s.execute("INSERT INTO products VALUES (101, 'Wireless Mouse', 10)");
+        }
+    }
+
+    static void update(Connection conn, String sql) throws Exception {
+        try (Statement s = conn.createStatement()) { s.executeUpdate(sql); }
+    }
+
+    static int scalarInt(Connection conn, String sql) throws Exception {
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(sql)) {
+            rs.next();
+            return rs.getInt(1);
+        }
+    }
+}
+```
+
+This time the stock is still 10, there are zero orders, and zero order items. The third insert failed the same way, but the rollback undid the stock decrement and the order insert. From the outside, it is as if the checkout was never attempted. That is atomicity in action.
+
+The `SELECT` queries after the catch block work fine even though they share the same connection as the failed transaction. After a commit or rollback, the connection is implicitly back in "no open transaction" mode, ready for the next one. The autocommit flag stays the same as you set it.
+
+The diagram shows the four states a JDBC connection moves through with respect to transactions. `NO_TX` is the resting state when autocommit is on or right after a commit or rollback. `ACTIVE` is the state during an open transaction. `SAVED` is the state after at least one savepoint has been set. `COMMITTED` and `ROLLED_BACK` are terminal states for one transaction; both transition right back to `NO_TX` for the next one.
+
+<h1 id="the-safe-pattern-try-catch-finally">
+  The Safe Pattern: Try / Catch / Finally
+</h1>
+
+A real checkout has more than three statements, and any of them can throw. The pattern that scales is a `try` block that does the work and commits at the end, a `catch` block that rolls back on any exception, and a `finally` block that restores autocommit before the connection is closed. The whole thing lives inside a `try-with-resources` on the connection so the file descriptor is always released.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+
+public class SafeCheckout {
+
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            seed(conn);
+            placeOrder(conn, 1, 101, 2);
+            System.out.println("Stock for 101: " + scalarInt(conn, "SELECT stock FROM products WHERE id = 101"));
+            System.out.println("Orders: " + scalarInt(conn, "SELECT COUNT(*) FROM orders"));
+        }
+    }
+
+    static void placeOrder(Connection conn, int customerId, int productId, int quantity) throws SQLException {
+        boolean previousAutoCommit = conn.getAutoCommit();
+        conn.setAutoCommit(false);
+        try {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "UPDATE products SET stock = stock - ? WHERE id = ? AND stock >= ?")) {
+                ps.setInt(1, quantity);
+                ps.setInt(2, productId);
+                ps.setInt(3, quantity);
+                int rows = ps.executeUpdate();
+                if (rows == 0) {
+                    throw new SQLException("not enough stock for product " + productId);
+                }
+            }
+
+            int orderId;
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "INSERT INTO orders (customer_id, status) VALUES (?, 'PLACED')",
+                    Statement.RETURN_GENERATED_KEYS)) {
+                ps.setInt(1, customerId);
+                ps.executeUpdate();
+                try (ResultSet keys = ps.getGeneratedKeys()) {
+                    keys.next();
+                    orderId = keys.getInt(1);
+                }
+            }
+
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "INSERT INTO order_items (order_id, product_id, quantity) VALUES (?, ?, ?)")) {
+                ps.setInt(1, orderId);
+                ps.setInt(2, productId);
+                ps.setInt(3, quantity);
+                ps.executeUpdate();
+            }
+
+            conn.commit();
+        } catch (SQLException e) {
+            conn.rollback();
+            throw e;
+        } finally {
+            conn.setAutoCommit(previousAutoCommit);
+        }
+    }
+
+    static void seed(Connection conn) throws SQLException {
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE TABLE products (id INT PRIMARY KEY, name VARCHAR(100), stock INT)");
+            s.execute("CREATE TABLE orders (id INT AUTO_INCREMENT PRIMARY KEY, customer_id INT, status VARCHAR(20))");
+            s.execute("CREATE TABLE order_items (id INT AUTO_INCREMENT PRIMARY KEY, " +
+                      "order_id INT, product_id INT REFERENCES products(id), quantity INT)");
+            s.execute("INSERT INTO products VALUES (101, 'Wireless Mouse', 10)");
+        }
+    }
+
+    static int scalarInt(Connection conn, String sql) throws SQLException {
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(sql)) {
+            rs.next();
+            return rs.getInt(1);
+        }
+    }
+}
+```
+
+Four pieces of structure matter here. First, the method saves the previous value of `autoCommit` before changing it, then restores it in `finally`. This matters when the connection is shared (think connection pool): the next caller expects autocommit to be in whatever state they left it. Second, the `commit` is the last thing inside the `try` block; if any statement fails, control jumps straight to `catch`. Third, the `catch` does `rollback` and then rethrows. Swallowing a `SQLException` without logging it is a common debugging problem. Fourth, the `finally` is for the autocommit restoration only; the connection close is handled by the outer `try-with-resources`.
+
+The stock check inside the `UPDATE` is a small piece of defense. `WHERE stock >= ?` means the update only matches a row when there is enough stock to satisfy the order. If a competing transaction has already taken the stock to zero, this `UPDATE` returns zero rows, the method throws, and the rollback undoes any earlier statements in the transaction. Without the `WHERE` guard, the stock could go negative, which is what consistency constraints are meant to prevent.
+
+A transaction holds locks on every row it modifies until commit or rollback. The longer the transaction stays open, the longer other transactions wait on those locks. Keep transactions short. Don't do network calls, don't read files, don't wait for user input while a transaction is open.
+
+<h1 id="isolation-levels">Isolation Levels</h1>
+
+So far the examples have been a single connection writing to the database. The interesting questions show up when two connections are active at the same time, both reading and writing rows that the other might touch. Isolation is the rule for what one transaction sees of another transaction's in-flight changes.
+
+The SQL standard names four isolation levels and three concurrency anomalies. Each level prevents a specific subset of anomalies. The trade-off is straightforward: a stricter level prevents more anomalies but holds more locks for longer, which lowers throughput.
+
+The three anomalies are:
+
+- **Dirty read.** Transaction A reads a row that transaction B has modified but not yet committed. If B rolls back, A used a value that never officially existed.
+- **Non-repeatable read.** Transaction A reads the same row twice in one transaction and gets different values because B committed an update between the two reads.
+- **Phantom read.** Transaction A runs the same `SELECT ... WHERE ...` twice and the second run returns a different set of rows because B inserted (or deleted) rows that match the where clause.
+
+The four standard isolation levels, from weakest to strongest:
+
+| Level              | Prevents dirty read | Prevents non-repeatable read | Prevents phantom read              |
+| ------------------ | ------------------- | ---------------------------- | ---------------------------------- |
+| `READ_UNCOMMITTED` | No                  | No                           | No                                 |
+| `READ_COMMITTED`   | Yes                 | No                           | No                                 |
+| `REPEATABLE_READ`  | Yes                 | Yes                          | No (Postgres prevents it via MVCC) |
+| `SERIALIZABLE`     | Yes                 | Yes                          | Yes                                |
+
+The `Connection` interface exposes these as constants: `Connection.TRANSACTION_READ_UNCOMMITTED`, `Connection.TRANSACTION_READ_COMMITTED`, `Connection.TRANSACTION_REPEATABLE_READ`, `Connection.TRANSACTION_SERIALIZABLE`. There is also `TRANSACTION_NONE` for databases that don't support transactions at all, which is mostly historical.
+
+Real databases use different defaults. The defaults that matter:
+
+| Database       | Default isolation level |
+| -------------- | ----------------------- |
+| PostgreSQL     | `READ_COMMITTED`        |
+| MySQL (InnoDB) | `REPEATABLE_READ`       |
+| Oracle         | `READ_COMMITTED`        |
+| SQL Server     | `READ_COMMITTED`        |
+| H2             | `READ_COMMITTED`        |
+
+Knowing the default of the production database matters when reasoning about race conditions. Code that works fine in development against Postgres can break when ported to MySQL or vice versa, because the same SQL produces different concurrency outcomes.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+
+public class ShowIsolation {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            System.out.println("Default level: " + nameOf(conn.getTransactionIsolation()));
+
+            conn.setTransactionIsolation(Connection.TRANSACTION_SERIALIZABLE);
+            System.out.println("After change:  " + nameOf(conn.getTransactionIsolation()));
+        }
+    }
+
+    static String nameOf(int level) {
+        switch (level) {
+            case Connection.TRANSACTION_NONE: return "NONE";
+            case Connection.TRANSACTION_READ_UNCOMMITTED: return "READ_UNCOMMITTED";
+            case Connection.TRANSACTION_READ_COMMITTED: return "READ_COMMITTED";
+            case Connection.TRANSACTION_REPEATABLE_READ: return "REPEATABLE_READ";
+            case Connection.TRANSACTION_SERIALIZABLE: return "SERIALIZABLE";
+            default: return "UNKNOWN(" + level + ")";
+        }
+    }
+}
+```
+
+The setter is `Connection.setTransactionIsolation(int level)`. The change applies to subsequent transactions on this connection; calling it in the middle of an open transaction is undefined behavior by the spec, so set it before the first statement of the transaction.
+
+To make the trade-off concrete, here is a small demo of a dirty read at `READ_UNCOMMITTED` and how `READ_COMMITTED` prevents it. The demo uses two H2 connections to the same in-memory database. H2 only allows actual dirty reads at `READ_UNCOMMITTED`, which is exactly what the example is showing.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class DirtyReadDemo {
+    static final String URL = "jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1";
+
+    public static void main(String[] args) throws Exception {
+        try (Connection setup = DriverManager.getConnection(URL)) {
+            try (Statement s = setup.createStatement()) {
+                s.execute("CREATE TABLE products (id INT PRIMARY KEY, stock INT)");
+                s.execute("INSERT INTO products VALUES (101, 10)");
+            }
+        }
+
+        try (Connection writer = DriverManager.getConnection(URL);
+             Connection reader = DriverManager.getConnection(URL)) {
+
+            writer.setAutoCommit(false);
+            reader.setTransactionIsolation(Connection.TRANSACTION_READ_UNCOMMITTED);
+
+            try (Statement s = writer.createStatement()) {
+                s.executeUpdate("UPDATE products SET stock = 3 WHERE id = 101");
+            }
+            // The writer has NOT committed yet.
+
+            try (Statement s = reader.createStatement();
+                 ResultSet rs = s.executeQuery("SELECT stock FROM products WHERE id = 101")) {
+                rs.next();
+                System.out.println("Reader at READ_UNCOMMITTED sees stock = " + rs.getInt(1));
+            }
+
+            writer.rollback();
+            // Writer rolled back; the "3" the reader saw never officially existed.
+
+            try (Statement s = reader.createStatement();
+                 ResultSet rs = s.executeQuery("SELECT stock FROM products WHERE id = 101")) {
+                rs.next();
+                System.out.println("Stock after writer rollback: " + rs.getInt(1));
+            }
+        }
+    }
+}
+```
+
+The reader saw 3 while the writer was still in the middle of its transaction. The writer then rolled back, and the official value is still 10. If business logic had used the 3 to decide whether to accept a new order, the decision would have been based on data that never officially existed. `READ_COMMITTED` and above prevent this; they would have made the reader see 10 the whole time, blocking on the lock or reading the pre-update snapshot.
+
+<h1 id="savepoints-partial-rollback">Savepoints: Partial Rollback</h1>
+
+Sometimes a transaction should recover from a single failed step without throwing away the work that came before it. The classic case in an e-commerce setting: a customer's order has five line items. The fourth one fails validation (say, the product was discontinued five seconds ago). The right behavior is to drop the fourth item and continue with the other four, not abandon the whole order and ask the customer to start over.
+
+JDBC supports this through **savepoints**. A savepoint is a named marker inside an open transaction. `conn.setSavepoint()` returns a `Savepoint` object that points at the current position in the transaction. Later, `conn.rollback(savepoint)` rolls the transaction back to that marker, undoing everything done after it but leaving the work before it intact. The transaction stays open, so a subsequent `commit()` or `rollback()` ends it normally.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.Savepoint;
+import java.sql.Statement;
+
+public class SavepointDemo {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            seed(conn);
+            conn.setAutoCommit(false);
+
+            int orderId;
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "INSERT INTO orders (customer_id, status) VALUES (1, 'PLACED')",
+                    Statement.RETURN_GENERATED_KEYS)) {
+                ps.executeUpdate();
+                try (ResultSet keys = ps.getGeneratedKeys()) {
+                    keys.next();
+                    orderId = keys.getInt(1);
+                }
+            }
+
+            int[][] items = { {101, 1}, {102, 2}, {999, 1}, {103, 1} };  // 999 will fail.
+
+            for (int[] item : items) {
+                Savepoint savepoint = conn.setSavepoint("before_item_" + item[0]);
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "INSERT INTO order_items (order_id, product_id, quantity) VALUES (?, ?, ?)")) {
+                    ps.setInt(1, orderId);
+                    ps.setInt(2, item[0]);
+                    ps.setInt(3, item[1]);
+                    ps.executeUpdate();
+                    conn.releaseSavepoint(savepoint);
+                } catch (Exception e) {
+                    conn.rollback(savepoint);
+                    System.out.println("Skipped product " + item[0] + ": " + e.getMessage().split("\n")[0]);
+                }
+            }
+
+            conn.commit();
+
+            System.out.println("Items committed: " + scalarInt(conn,
+                    "SELECT COUNT(*) FROM order_items WHERE order_id = " + orderId));
+        }
+    }
+
+    static void seed(Connection conn) throws Exception {
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE TABLE products (id INT PRIMARY KEY, stock INT)");
+            s.execute("CREATE TABLE orders (id INT AUTO_INCREMENT PRIMARY KEY, customer_id INT, status VARCHAR(20))");
+            s.execute("CREATE TABLE order_items (id INT AUTO_INCREMENT PRIMARY KEY, " +
+                      "order_id INT, product_id INT REFERENCES products(id), quantity INT)");
+            s.execute("INSERT INTO products VALUES (101, 5), (102, 5), (103, 5)");
+        }
+    }
+
+    static int scalarInt(Connection conn, String sql) throws Exception {
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(sql)) {
+            rs.next();
+            return rs.getInt(1);
+        }
+    }
+}
+```
+
+Three items were inserted, product 999 was skipped, and the whole order committed at the end. The savepoint isolated the failure to that single insert. Without savepoints, the failed insert would have left the transaction in an aborted state in many databases (Postgres is strict about this; H2 is more forgiving), and the next statement would have failed too.
+
+`releaseSavepoint(savepoint)` tells the database "no more rollbacks to this point; the bookkeeping can be freed." It is optional for correctness, but it lets the database reclaim memory for long transactions with many savepoints. After a `rollback(savepoint)`, the savepoint is invalid for further use; to roll back to the same logical point again, set a fresh savepoint after the rollback.
+
+Savepoints are not free. The database has to remember enough state to undo the work between the savepoint and the current position, which costs memory and a small per-savepoint bookkeeping overhead. Use them for a real partial-recovery use case. For a transaction with three statements that all succeed or all fail, plain commit and rollback are simpler and faster.
+
+Each savepoint pins undo information in memory until it is released, rolled back to, or the surrounding transaction ends. A transaction with hundreds of savepoints inside a tight loop will use more memory on the database server than the same transaction with no savepoints.
+
+<h1 id="a-side-by-side-comparison">A Side-by-Side Comparison</h1>
+
+Here are the three flavors of rollback in one table.
+
+| Method                      | What it undoes                       | Transaction state after                     |
+| --------------------------- | ------------------------------------ | ------------------------------------------- |
+| `conn.commit()`             | Nothing; makes all changes permanent | Transaction ends, connection ready for next |
+| `conn.rollback()`           | Every change since the last commit   | Transaction ends, connection ready for next |
+| `conn.rollback(savepoint)`  | Every change since that savepoint    | Transaction still open, can continue or end |
+| `conn.releaseSavepoint(sp)` | Nothing; drops the savepoint marker  | Transaction still open                      |
+
+The distinction between full rollback and savepoint rollback is easy to forget. A full rollback ends the transaction. A savepoint rollback keeps the transaction alive. Either way, `commit` or `rollback` still has to run at the end.
+
+The diagram traces a transaction that uses a savepoint to recover from one bad item. The order insert and items 1 and 3 survive into the commit. Item 2 is undone by the savepoint rollback. The branch is what matters: the transaction comes back to a known good state and continues, instead of throwing the whole thing out.
+
+<h1 id="read-only-transactions">Read-Only Transactions</h1>
+
+`Connection.setReadOnly(true)` is a hint to the driver that the transaction will only read, not write. Some databases use the hint to route the connection to a read replica, skip lock acquisition, or pick a snapshot isolation strategy that doesn't need write locks. The driver is allowed to ignore the hint, so it is not a substitute for not writing; the database can still reject a write performed on a read-only connection.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class ReadOnlyTransaction {
+    public static void main(String[] args) throws Exception {
+        try (Connection setup = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            try (Statement s = setup.createStatement()) {
+                s.execute("CREATE TABLE products (id INT PRIMARY KEY, name VARCHAR(100), price DECIMAL(10,2))");
+                s.execute("INSERT INTO products VALUES (101, 'Wireless Mouse', 49.99), (102, 'USB Cable', 9.99)");
+            }
+        }
+
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            conn.setAutoCommit(false);
+            conn.setReadOnly(true);
+
+            try (Statement s = conn.createStatement();
+                 ResultSet rs = s.executeQuery("SELECT name, price FROM products ORDER BY id")) {
+                while (rs.next()) {
+                    System.out.println(rs.getString("name") + " - $" + rs.getBigDecimal("price"));
+                }
+            }
+            conn.commit();
+        }
+    }
+}
+```
+
+Read-only is also worth setting on long-running report queries against a busy production database. It signals intent, sometimes enables faster execution paths, and prevents accidental writes through a connection intended for reading.
+
+<h1 id="common-pitfalls">Common Pitfalls</h1>
+
+A few mistakes show up in JDBC codebases at some point. Each one is easy to fix once it's on the checklist.
+
+**Forgetting to commit.** A program runs `setAutoCommit(false)`, does its writes, and closes the connection without calling `commit`. Most drivers roll back the open transaction at close. The writes are gone, and the program looks like it worked, because no exception was thrown. The fix is to always commit on the success path before any close. The structured pattern from earlier (try / catch with rollback / finally with autocommit restore) gets this right by construction.
+
+**Long-running transactions.** A transaction holds locks on every row it has modified, and depending on the isolation level, possibly on rows it has read too. If a transaction does an `UPDATE`, then makes an HTTP call to a payment provider, then does another `UPDATE`, the lock on the first updated row is held for the entire HTTP round trip. Other transactions that want that row are stuck waiting. The fix is to do all the I/O outside the transaction. Compute the needed values, open the transaction, run the SQL fast, commit, then do whatever follow-up work the result requires.
+
+**Mixing DDL with transactions.** In many databases, DDL statements (like `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`) implicitly commit any open transaction before they run. MySQL and Oracle do this. With a transaction that does an `UPDATE`, then a `CREATE INDEX`, then an `INSERT`, the `CREATE INDEX` commits the `UPDATE`, and rolling it back is no longer possible. Postgres is the exception: DDL is transactional in Postgres. The portable rule is "don't put DDL inside a write transaction." Run schema changes as their own statements outside the application's normal transactional flow.
+
+**Swallowing `SQLException` without rollback.** A `catch` block that logs the exception and continues, without calling `rollback`, leaves the transaction open in an undefined state. Subsequent statements on the connection may fail or succeed unpredictably. Always pair the catch with a rollback.
+
+**Reusing a connection without resetting state.** A connection that was used for a transaction at `SERIALIZABLE` and read-only mode keeps those settings until they are changed. If the next user grabs the same connection (mostly a connection-pool concern) and runs a write workload at the wrong isolation level, problems follow. The fix is to restore connection state to a known baseline before returning the connection.
+
+**Catching only `Exception` and not `SQLException`.** This works at runtime, but the rollback call itself can throw a `SQLException`, and a broad catch swallows that too, losing information about why the rollback failed. A better pattern is to declare the method `throws SQLException` and catch only the specific things that can be handled.
+
+A 30-second transaction on a hot row can stall every other order placement during a flash sale. Watch for transactions that span network calls or user input; those turn a fast database into a slow one.
+
+<h1 id="a-concurrent-stock-race-the-serializable-fix">
+  A Concurrent Stock Race, the SERIALIZABLE Fix
+</h1>
+
+To pull the isolation discussion together, here is a small two-thread race that shows how the default `READ_COMMITTED` can let two concurrent checkouts both think there is enough stock when there really isn't, and how `SERIALIZABLE` shuts it down.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.Statement;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class StockRace {
+    static final String URL = "jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1";
+
+    public static void main(String[] args) throws Exception {
+        try (Connection setup = DriverManager.getConnection(URL)) {
+            try (Statement s = setup.createStatement()) {
+                s.execute("CREATE TABLE products (id INT PRIMARY KEY, stock INT)");
+                s.execute("INSERT INTO products VALUES (101, 1)");  // Only 1 in stock.
+            }
+        }
+
+        AtomicInteger successes = new AtomicInteger();
+        CountDownLatch ready = new CountDownLatch(2);
+        CountDownLatch go = new CountDownLatch(1);
+
+        Runnable buyer = () -> {
+            try (Connection conn = DriverManager.getConnection(URL)) {
+                conn.setAutoCommit(false);
+                conn.setTransactionIsolation(Connection.TRANSACTION_SERIALIZABLE);
+                ready.countDown();
+                go.await();
+
+                int stock;
+                try (Statement s = conn.createStatement();
+                     ResultSet rs = s.executeQuery("SELECT stock FROM products WHERE id = 101")) {
+                    rs.next();
+                    stock = rs.getInt(1);
+                }
+
+                if (stock >= 1) {
+                    try (PreparedStatement ps = conn.prepareStatement(
+                            "UPDATE products SET stock = stock - 1 WHERE id = 101")) {
+                        ps.executeUpdate();
+                    }
+                    conn.commit();
+                    successes.incrementAndGet();
+                } else {
+                    conn.rollback();
+                }
+            } catch (Exception e) {
+                // Conflicts at SERIALIZABLE surface as exceptions; treat as "lost the race".
+            }
+        };
+
+        Thread t1 = new Thread(buyer);
+        Thread t2 = new Thread(buyer);
+        t1.start();
+        t2.start();
+        ready.await();
+        go.countDown();
+        t1.join();
+        t2.join();
+
+        try (Connection check = DriverManager.getConnection(URL);
+             Statement s = check.createStatement();
+             ResultSet rs = s.executeQuery("SELECT stock FROM products WHERE id = 101")) {
+            rs.next();
+            System.out.println("Successful checkouts: " + successes.get());
+            System.out.println("Final stock: " + rs.getInt(1));
+        }
+    }
+}
+```
+
+Two threads try to buy the same single unit at the same time. At `SERIALIZABLE`, the database serializes them: one transaction wins, the other either blocks until the first commits or aborts with a serialization-failure error. Either way, only one checkout succeeds, and the final stock is exactly zero. If the same demo runs at `READ_COMMITTED` without the explicit stock guard inside the `UPDATE`, both threads might read `1`, both might think they can subtract, and the stock could end up at `-1` with two successful checkouts.
+
+The takeaway is that isolation is a real trade-off. Stricter isolation prevents more bugs but reduces throughput because more transactions contend for locks. Most production systems run at `READ_COMMITTED` and use application-level techniques (the `WHERE stock >= ?` guard, optimistic locking with version numbers, advisory locks) to get correctness for the specific rows that matter, rather than paying the cost of `SERIALIZABLE` for every read.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

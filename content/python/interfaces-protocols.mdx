@@ -1,0 +1,511 @@
+---
+title: "Interfaces & Protocols"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Interfaces & Protocols explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="pythons-missing-interface-keyword">
+  Python's Missing interface Keyword
+</h1>
+
+In nominally-typed languages, an interface is a named contract. You declare it once, every type that wants to satisfy it has to say so explicitly with an `implements` clause, and the compiler verifies the relationship.
+
+Python takes a different route. Duck typing already gives you "any object with the right methods works", and the abstract base classes from the `abc` module give you "any object that inherits from this base and implements its abstract methods works". Neither one is quite the same as a Java-style interface. `abc.ABC` forces inheritance, and duck typing has no written contract at all.
+
+`typing.Protocol` fills the gap. A protocol is a class definition that lists methods and attributes; any class that has those methods and attributes satisfies the protocol, regardless of inheritance. The type checker enforces the relationship structurally, the way Python developers already think about types in practice.
+
+```python
+from typing import Protocol
+
+class Shippable(Protocol):
+    """Anything we can ship."""
+
+    def calculate_shipping(self) -> float: ...
+    weight_kg: float
+
+class Book:
+    def __init__(self, title: str, weight_kg: float):
+        self.title = title
+        self.weight_kg = weight_kg
+
+    def calculate_shipping(self) -> float:
+        return 2.00 + self.weight_kg * 1.50
+
+class Tshirt:
+    def __init__(self, design: str):
+        self.design = design
+        self.weight_kg = 0.2
+
+    def calculate_shipping(self) -> float:
+        return 4.99
+
+def total_shipping(items: list[Shippable]) -> float:
+    return sum(item.calculate_shipping() for item in items)
+
+cart: list[Shippable] = [Book("Clean Code", 0.8), Tshirt("Logo")]
+print(f"Total: ${total_shipping(cart):.2f}")
+```
+
+`Book` and `Tshirt` satisfy the `Shippable` protocol. Neither inherits from it. A type checker (mypy, pyright) verifies that both classes have a `calculate_shipping` method returning `float` and a `weight_kg` attribute of type `float`. If a class is missing either, the checker reports an error at the point where it's passed to `total_shipping`.
+
+The `...` in the method body is the standard placeholder for a stub: no body, no implementation, just a signature. You could write `pass` instead; both mean "this is a declaration, not a real method". The protocol class is never instantiated and its methods are never called; it exists purely as a shape specification.
+
+| Concept                | Java/C#                                   | Python (with `Protocol`)                                    |
+| ---------------------- | ----------------------------------------- | ----------------------------------------------------------- |
+| Define a contract      | `interface Shippable { ... }`             | `class Shippable(Protocol): ...`                            |
+| Implement the contract | `class Book implements Shippable { ... }` | Just define the right methods                               |
+| Compile-time check     | Yes, the compiler enforces it             | Type checker enforces it (mypy, pyright)                    |
+| Runtime check          | `instanceof Shippable`                    | `isinstance(obj, Shippable)` only with `@runtime_checkable` |
+
+The shift from nominal to structural typing is the main point. In Java, `Book implements Shippable` is the contract. In Python, "the `Book` class has a `calculate_shipping` method and a `weight_kg` attribute" is the contract. The first one is a name; the second one is a shape. Same goal, different way of expressing it.
+
+<h1 id="what-typingprotocol-adds-over-duck-typing">
+  What typing.Protocol Adds Over Duck Typing
+</h1>
+
+If duck typing already lets unrelated classes satisfy implicit contracts, why bother with `Protocol`? Two reasons.
+
+The first is that **the contract becomes a written thing**. With plain duck typing, the function's parameter type is unspecified and its requirements live in the body of the function and in the test suite. A reader has to scan the code to figure out what an "item" needs to be. With a protocol, the contract sits at the top of the file as a class definition. Anyone reading the function signature `def total_shipping(items: list[Shippable])` knows what the function expects without reading the implementation.
+
+The second is that **a type checker enforces the contract** before the code runs. Duck typing only finds missing methods at the moment of the call. A protocol-typed parameter lets mypy or pyright check at type-check time that every caller passes objects with the right shape. The bug surfaces in your editor, before runtime.
+
+```python
+from typing import Protocol
+
+class Sendable(Protocol):
+    def send(self, message: str) -> None: ...
+
+class EmailSender:
+    def send(self, message: str) -> None:
+        print(f"Email: {message}")
+
+class GiftCard:
+    """No send method."""
+    pass
+
+def broadcast(senders: list[Sendable], message: str) -> None:
+    for s in senders:
+        s.send(message)
+
+broadcast([EmailSender()], "Order shipped")
+# A type checker would flag the next line: GiftCard doesn't satisfy Sendable.
+# broadcast([GiftCard()], "Order shipped")
+```
+
+The first call is fine. The commented-out call would type-check as an error before the program ever ran. With plain duck typing, the same mistake would only surface at runtime as an `AttributeError` inside `broadcast`. Protocols recover the safety of nominal typing while keeping duck typing's flexibility about how classes are written.
+
+Protocols add no runtime cost. They live in `typing.Protocol`, which is a regular Python class, but the type-check enforcement happens entirely at static analysis time. Without a type checker in your workflow, protocols become documentation; they still help readers, but they don't catch errors automatically.
+
+<h1 id="structural-vs-nominal-typing">Structural vs Nominal Typing</h1>
+
+The distinction between structural and nominal typing is the lever that decides whether `Protocol` or `ABC` fits.
+
+Nominal typing asks "is this thing named the right way?" Structural typing asks "is this thing shaped the right way?" `ABC` checks by walking the inheritance chain (plus any registered virtual subclasses). `Protocol` checks by inspecting the methods and attributes the class has.
+
+Both styles serve real needs. Nominal typing fits when you want explicit `is-a` relationships, when you control all the subclasses, or when the contract is part of a public API where inheritance is a feature, not a burden. Structural typing fits when you want to type-check existing code that wasn't built with your protocol in mind, when third-party classes need to slot in without modification, or when the contract is more about "shape" than "identity".
+
+Two cases show the difference.
+
+**Case 1: third-party class.** A library exports `LegacyEmailer` with a `send(self, message)` method. You want your function to accept it. With `ABC`, you'd have to write a wrapper class that inherits from your abstract base. With `Protocol`, you define `class Emailer(Protocol)` with a `send` method, and `LegacyEmailer` satisfies it as is.
+
+**Case 2: you control the hierarchy.** You're building a payment gateway with three concrete processors that all need to implement `charge` and `refund`. You want a runtime guarantee that no class can be shipped without both methods. `ABC` fits: instantiation fails on missing methods, and the explicit inheritance signals intent to anyone reading the class definition.
+
+<h1 id="defining-a-protocol">Defining a Protocol</h1>
+
+Protocols are regular classes that inherit from `typing.Protocol`. The body lists methods (with `...` or `pass` as the body) and attributes (with type annotations). That's the whole shape.
+
+```python
+from typing import Protocol
+
+class Drawable(Protocol):
+    """Something that can be drawn."""
+
+    color: str  # Attribute requirement
+
+    def draw(self) -> None: ...
+    def get_bounds(self) -> tuple[int, int, int, int]: ...
+```
+
+Any class with a `color` attribute (a string) and `draw` and `get_bounds` methods of the right shape satisfies `Drawable`. There's no `implements` clause to add anywhere, and `Drawable` itself is never instantiated.
+
+Method bodies use `...` by convention. `pass` works just as well. The body is purely declarative; it's never called. Don't put real logic in a protocol body unless you specifically want default methods (covered next).
+
+A protocol can have **default method implementations** that subclasses (or matching classes) inherit. If a class satisfies the rest of the protocol but explicitly inherits from the protocol class, it picks up the defaults:
+
+```python
+from typing import Protocol
+
+class Greetable(Protocol):
+    name: str
+
+    def greet(self) -> str:
+        return f"Hello, {self.name}"
+
+class Customer(Greetable):
+    def __init__(self, name: str):
+        self.name = name
+
+class Stranger:
+    def __init__(self):
+        self.name = "stranger"
+
+customer = Customer("Alice")
+print(customer.greet())
+
+# Stranger satisfies Greetable structurally, but doesn't inherit, so no default greet().
+stranger = Stranger()
+# stranger.greet()  # AttributeError
+```
+
+`Customer(Greetable)` inherits from the protocol and gets `greet` through inheritance. A class that satisfies `Greetable` only structurally (matches the methods without inheriting) doesn't pick up the defaults; structural conformance is about shape-matching, not inheriting code. This is the one case where the distinction between "inherits from Protocol" and "structurally satisfies Protocol" matters in behavior, not just typing.
+
+Protocols also support **inheritance between protocols** to compose larger contracts from smaller ones:
+
+```python
+from typing import Protocol
+
+class Named(Protocol):
+    name: str
+
+class Priced(Protocol):
+    price: float
+
+class CatalogItem(Named, Priced, Protocol):
+    """Anything with a name and a price."""
+    ...
+
+class Book:
+    def __init__(self, name: str, price: float):
+        self.name = name
+        self.price = price
+
+def show(item: CatalogItem) -> None:
+    print(f"{item.name}: ${item.price:.2f}")
+
+show(Book("Python in Practice", 29.99))
+```
+
+`CatalogItem` inherits from `Named` and `Priced` and explicitly extends `Protocol`. The explicit `Protocol` base is required when you inherit from multiple protocols; without it, the combined class would become a regular class. `Book` doesn't inherit from any of them but has both `name` and `price` attributes, so it satisfies `CatalogItem` structurally.
+
+<h1 id="runtime_checkable-adding-isinstance-support">
+  @runtime_checkable: Adding isinstance Support
+</h1>
+
+By default, a `Protocol` is a type-check-time concept. `isinstance(obj, Shippable)` raises a `TypeError` because the protocol doesn't carry a runtime check. Decorate the protocol with `@runtime_checkable` and `isinstance` starts working, but with one important caveat: the check inspects method names only, not signatures.
+
+```python
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class Sendable(Protocol):
+    def send(self, message: str) -> None: ...
+
+class EmailSender:
+    def send(self, message):
+        print(f"Email: {message}")
+
+class BrokenSender:
+    def send(self, x, y, z):  # Wrong signature, but only the name is checked.
+        pass
+
+class GiftCard:
+    pass
+
+print(isinstance(EmailSender(), Sendable))
+print(isinstance(BrokenSender(), Sendable))
+print(isinstance(GiftCard(), Sendable))
+```
+
+`EmailSender` has a `send` method, so the check passes. `BrokenSender` also has a `send` method, even though its signature is wrong; `@runtime_checkable` doesn't notice. `GiftCard` has no `send` method, so the check fails.
+
+`@runtime_checkable` is a fast, cheap, name-based check. It tells you "this object has the methods I'm looking for", not "this object will work the way I expect". The signature-level checking is the type checker's job.
+
+Use cases for `@runtime_checkable`:
+
+- **Defensive entry points.** When data crosses a boundary you don't fully control (user input, network responses, plugin loading), checking that the object has the right shape before dispatching is a reasonable safety measure.
+- **Dispatch tables.** You can use `isinstance(obj, SomeProtocol)` to pick between code paths at runtime, the same way you'd use `isinstance(obj, SomeABC)`.
+- **Fast plug-in discovery.** When loading plug-ins, check each module's exports against a protocol to filter for valid implementations.
+
+The decorator has limits. It only checks method names, not attribute presence (for non-method attributes, `isinstance` returns `True` without verification). It also adds a small runtime cost compared to a plain `isinstance` against a real class, because the check has to inspect the object's attribute table.
+
+`@runtime_checkable` does a name-based check at runtime by walking the protocol's methods and verifying each one exists on the object. In tight loops, check once at the boundary and trust the type afterward, rather than checking on every iteration.
+
+<h1 id="common-built-in-protocols">Common Built-in Protocols</h1>
+
+The `typing` module ships with a set of pre-defined protocols for the operations that come up most often. They're called the `Supports*` protocols, and using them in type hints lets a function declare "I work with anything that supports this one operation":
+
+| Protocol                                    | What it requires | Examples                                 |
+| ------------------------------------------- | ---------------- | ---------------------------------------- |
+| `SupportsLen` (via `collections.abc.Sized`) | `__len__`        | `list`, `str`, `dict`, custom containers |
+| `SupportsAbs`                               | `__abs__`        | `int`, `float`, `complex`                |
+| `SupportsFloat`                             | `__float__`      | `int`, `float`, `Decimal`                |
+| `SupportsInt`                               | `__int__`        | `int`, `float`, `bool`                   |
+| `SupportsRound`                             | `__round__`      | `int`, `float`, `Decimal`                |
+| `SupportsIndex`                             | `__index__`      | `int`, `bool`, integer-like types        |
+| `SupportsBytes`                             | `__bytes__`      | Types convertible to `bytes`             |
+
+The `Callable` ABC from `collections.abc` plays a similar role for "anything callable", and the `Iterable`, `Iterator`, `Sequence`, and `Mapping` ABCs cover the common collection protocols.
+
+```python
+from typing import SupportsAbs, SupportsFloat
+
+def magnitude(x: SupportsAbs[float]) -> float:
+    return abs(x)
+
+print(magnitude(-3.5))
+print(magnitude(7))
+print(magnitude(-2 + 3j))
+```
+
+`magnitude` accepts anything that supports `abs()`. The function signature documents the requirement; a type checker enforces it. `int`, `float`, and `complex` all satisfy the protocol because they all define `__abs__`.
+
+For an arbitrary file-like input, the `read()` protocol is more involved (no single built-in covers all the file-like behaviors), but you can write your own:
+
+```python
+from typing import Protocol
+
+class SupportsRead(Protocol):
+    def read(self) -> str: ...
+
+def count_words(source: SupportsRead) -> int:
+    return len(source.read().split())
+
+import io
+print(count_words(io.StringIO("apple banana cherry")))
+```
+
+Defining `SupportsRead` yourself is fine; the `typing` module's built-in protocols cover a small core of common operations and leave the rest to be written by hand. The standard library has a few more in `typing` and `collections.abc`, but most domain-specific protocols are user-defined.
+
+<h1 id="generic-protocols">Generic Protocols</h1>
+
+A protocol can be **generic** in one or more type parameters, the same way `list[int]` or `dict[str, int]` are generic. This lets you describe shapes that work with a specific element type without hardcoding it.
+
+```python
+from typing import Protocol, TypeVar
+
+T = TypeVar("T")
+
+class Stack(Protocol[T]):
+    """A LIFO container."""
+
+    def push(self, item: T) -> None: ...
+    def pop(self) -> T: ...
+    def peek(self) -> T: ...
+
+class IntStack:
+    def __init__(self):
+        self._items: list[int] = []
+
+    def push(self, item: int) -> None:
+        self._items.append(item)
+
+    def pop(self) -> int:
+        return self._items.pop()
+
+    def peek(self) -> int:
+        return self._items[-1]
+
+def process(stack: Stack[int]) -> int:
+    return stack.pop() + stack.pop()
+
+s = IntStack()
+s.push(10)
+s.push(20)
+s.push(30)
+print(process(s))
+```
+
+`Stack[T]` is generic. `IntStack` satisfies `Stack[int]` because all its methods work with integers. A `StringStack` could satisfy `Stack[str]` the same way. `process(stack: Stack[int])` is a function that requires specifically an integer stack; a type checker would flag a call with a `Stack[str]`.
+
+Generic protocols are useful when the protocol describes container-like behavior with a specific element type, or when multiple methods need to agree on a type (push and pop have to share the same `T`). For simple shapes, you can often write a non-generic protocol and have it work in practice; generics become important when the relationship between methods needs to be expressed.
+
+Starting from Python 3.12, you can use the more concise PEP 695 syntax with `class Stack[T](Protocol):` instead of declaring `T` separately. Both forms produce the same behavior; the older syntax is more widely compatible across Python versions.
+
+<h1 id="forward-declarations">Forward Declarations</h1>
+
+Sometimes a protocol references a type that's defined later in the file, or that hasn't been imported yet. The standard fix is to use a string for the type annotation, which delays the resolution until the type checker actually needs it:
+
+```python
+from typing import Protocol
+
+class CartItem(Protocol):
+    def get_related(self) -> "CartItem": ...  # Forward reference to self
+    def get_recommended(self) -> list["CartItem"]: ...
+```
+
+The strings `"CartItem"` are forward references. The type checker resolves them after the class is fully defined. Without the strings, the second method's annotation would fail because `CartItem` doesn't exist yet at the moment Python evaluates the annotation.
+
+Python 3.10+ supports the `from __future__ import annotations` future statement, which makes all annotations strings by default. With it, you can drop the explicit quotes:
+
+```python
+from __future__ import annotations
+from typing import Protocol
+
+class CartItem(Protocol):
+    def get_related(self) -> CartItem: ...
+    def get_recommended(self) -> list[CartItem]: ...
+```
+
+Either form works. The future-statement style is cleaner once you've added the import. The quoted-string style is more local and doesn't require a file-wide opt-in.
+
+The same trick applies to any annotation that references a not-yet-defined type, not just protocols. It's especially useful in protocols because protocol classes often reference themselves or other protocols in the same module, and forward references avoid the chicken-and-egg problem of needing the type to exist before defining the class that introduces it.
+
+<h1 id="plug-in-systems-with-protocols">Plug-in Systems With Protocols</h1>
+
+A plug-in system is a fitting use case for protocols. The host program defines a protocol describing what a plug-in must do; plug-ins live in separate files (or even separate packages) and don't have to import the host. The host loads plug-ins dynamically and uses `@runtime_checkable` to verify they fit the protocol.
+
+```python
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class FileFormat(Protocol):
+    """A plug-in that can read and write a specific file format."""
+
+    name: str
+
+    def can_handle(self, path: str) -> bool: ...
+    def read(self, path: str) -> str: ...
+    def write(self, path: str, content: str) -> None: ...
+
+# Plug-in implementations
+class TextFormat:
+    name = "text"
+
+    def can_handle(self, path):
+        return path.endswith(".txt")
+
+    def read(self, path):
+        return f"<contents of {path}>"
+
+    def write(self, path, content):
+        print(f"Writing text to {path}")
+
+class JsonFormat:
+    name = "json"
+
+    def can_handle(self, path):
+        return path.endswith(".json")
+
+    def read(self, path):
+        return f"<json from {path}>"
+
+    def write(self, path, content):
+        print(f"Writing JSON to {path}")
+
+class BrokenPlugin:
+    """Missing the write method."""
+    name = "broken"
+
+    def can_handle(self, path):
+        return False
+
+    def read(self, path):
+        return ""
+
+def load_plugins(candidates) -> list[FileFormat]:
+    return [c for c in candidates if isinstance(c, FileFormat)]
+
+candidates = [TextFormat(), JsonFormat(), BrokenPlugin()]
+plugins = load_plugins(candidates)
+print([p.name for p in plugins])
+
+def open_file(path: str, plugins: list[FileFormat]) -> str:
+    for plugin in plugins:
+        if plugin.can_handle(path):
+            return plugin.read(path)
+    raise ValueError(f"No plugin can handle {path}")
+
+print(open_file("orders.json", plugins))
+```
+
+`FileFormat` is the contract. `TextFormat` and `JsonFormat` satisfy it; neither inherits from `FileFormat`. `BrokenPlugin` doesn't, because it's missing `write`. The `load_plugins` function uses `@runtime_checkable` to filter the candidates down to the valid ones, which catches the broken plug-in before any code tries to use it.
+
+The pattern's strength is that plug-in authors don't have to know about the host's class hierarchy. They write classes that match the shape. The host validates at runtime and reports failures cleanly. A new plug-in needs no inheritance, no registration call (unlike `ABC` with `register`), no boilerplate. Only the methods.
+
+A few design notes for real plug-in systems:
+
+- **Document the protocol clearly.** The shape is the API. A docstring on the protocol class is the canonical reference for plug-in authors.
+- **Version the protocol.** Adding required methods is a breaking change. Optional methods (declared as `Optional` or with sensible defaults) are safer for evolution.
+- **Validate early.** Check `isinstance` once at load time, not on every method call. Plug-ins that pass the initial check are trusted afterward.
+
+<h1 id="dependency-injection-contracts">Dependency Injection Contracts</h1>
+
+Another use for protocols is dependency injection. Functions and classes that depend on something abstract (a database, a logger, a notifier, a clock) can declare their dependency as a protocol, accept any concrete implementation, and stay easy to test.
+
+```python
+from typing import Protocol
+
+class Clock(Protocol):
+    def now(self) -> str: ...
+
+class Logger(Protocol):
+    def info(self, message: str) -> None: ...
+
+class OrderService:
+    def __init__(self, clock: Clock, logger: Logger):
+        self.clock = clock
+        self.logger = logger
+
+    def place_order(self, order_id: str):
+        timestamp = self.clock.now()
+        self.logger.info(f"Order {order_id} placed at {timestamp}")
+        return order_id
+
+# Production implementations
+import datetime
+class SystemClock:
+    def now(self):
+        return datetime.datetime.now().isoformat()
+
+class StdoutLogger:
+    def info(self, message):
+        print(f"[INFO] {message}")
+
+# Test implementations
+class FakeClock:
+    def now(self):
+        return "2024-01-01T00:00:00"
+
+class CapturingLogger:
+    def __init__(self):
+        self.messages = []
+    def info(self, message):
+        self.messages.append(message)
+
+# Production usage
+prod_service = OrderService(SystemClock(), StdoutLogger())
+prod_service.place_order("ORD-1")
+
+# Test usage
+fake_clock = FakeClock()
+logger = CapturingLogger()
+test_service = OrderService(fake_clock, logger)
+test_service.place_order("ORD-TEST")
+
+assert logger.messages == ["Order ORD-TEST placed at 2024-01-01T00:00:00"]
+print("Test passed")
+```
+
+`OrderService` doesn't care which clock or logger it gets, only that they match the protocols. In production it gets real implementations; in tests it gets fakes that record what happened or return fixed values. The fakes don't inherit from anything special; they have the matching methods.
+
+The contrast with abstract base classes shows up clearly here. With `ABC`, every implementation has to inherit from your base, which means production code, test fakes, and any third-party logger you might want to plug in all have to bend to your hierarchy. With `Protocol`, third-party loggers fit without modification, test fakes are tiny throwaway classes, and the contract sits in one place where readers can find it.
+
+For library authors, the rule of thumb is: declare dependencies as protocols, not concrete classes. Callers can plug in whatever they have. For application authors, the rule is similar but flipped: write your dependencies once as protocols at the boundary, then build everything inside the application against those protocols. The result is a codebase where dependencies are explicit, swappable, and trivial to test.
+
+| Need                                 | Use `Protocol`                                                  | Use `ABC`                                      |
+| ------------------------------------ | --------------------------------------------------------------- | ---------------------------------------------- |
+| Accept third-party classes           | Yes                                                             | Only with `register`, and no method validation |
+| Test fakes without inheritance       | Yes                                                             | Requires inheritance or `register`             |
+| Runtime enforcement on instantiation | No (without `@runtime_checkable`, and even then only for names) | Yes, `TypeError` on missing methods            |
+| Default method implementations       | Only if implementing class inherits                             | Yes, all subclasses inherit defaults           |
+| Compose protocols (multi-base)       | Yes, with explicit `Protocol` base                              | Yes, with multiple inheritance                 |
+| Express `is-a` relationship          | No, only "looks-like"                                           | Yes, by inheritance                            |
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

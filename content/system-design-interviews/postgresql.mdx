@@ -1,0 +1,1017 @@
+---
+title: "PostgreSQL Deep Dive"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "PostgreSQL explained with clear examples, visuals, and practice questions in Mindflare's System Design Interviews course."
+---
+
+<LessonCard>
+
+PostgreSQL is a strong default for the system of record: it gives you transactions, constraints, joins, mature indexing, and enough extensibility to handle many product requirements without adding another datastore.
+
+The important part is knowing where that default stops being enough. Payment flows need correct isolation and idempotency. JSONB fields need the right indexes. Large tables need partitioning choices tied to query patterns. Read replicas help read throughput, but they also introduce lag and failover questions.
+
+This chapter focuses on those decisions.
+
+<h1 id="postgresql-architecture-overview">PostgreSQL Architecture Overview</h1>
+
+The diagram traces the path a client request takes from application servers through PgBouncer, into the primary's query pipeline, and out to storage and streaming replicas, showing how each layer fits together:
+
+Client applications (App Server 1..N) often do not connect to PostgreSQL directly. They go through **PgBouncer**, which maintains a smaller pool of database connections and multiplexes many client requests onto them. This keeps connection overhead low and improves throughput under high concurrency.
+
+PgBouncer is a connection pooler, not a SQL-aware read/write router. If an architecture uses read replicas, the application or a separate proxy layer decides whether a query should use the primary or a replica.
+
+Inside the primary, each SQL statement flows through the core execution pipeline:
+
+- **Query Parser**: validates SQL and builds an internal representation (parse tree).
+- **Query Optimizer**: picks an efficient plan (index scan vs seq scan, join strategy, etc.).
+- **Executor**: runs the chosen plan and produces results.
+
+As the executor reads/writes data, it interacts with the **Buffer Manager**, which serves pages from memory when possible and fetches from **Storage** when needed. For durability, changes are recorded in the **WAL** (Write-Ahead Log): PostgreSQL ensures the WAL is safely written before considering a transaction committed.
+
+For scaling reads, applications can route safe read-only queries to replicas (Replica 1/2). The replicas stay up to date via **streaming replication**, where a WAL sender process on the primary ships **WAL records** to replicas. This lets you offload read traffic, while keeping the primary as the source of truth for writes.
+
+<h1 id="1-when-to-choose-postgresql">1. When to Choose PostgreSQL</h1>
+
+Choose PostgreSQL when correctness and query flexibility matter more than easy horizontal write scaling. It is usually a good fit for transactional product data, relational models, reporting-style queries over operational data, and workloads that benefit from constraints.
+
+<h3 id="11-choose-postgresql-when-you-have">
+  1.1 Choose PostgreSQL When You Have
+</h3>
+
+<h4 id="complex-queries-and-relationships">
+  Complex queries and relationships
+</h4>
+
+Most real-world data is relational. Users have orders. Orders have products. Products have categories. When your queries need to traverse these relationships, PostgreSQL's full SQL support with JOINs, subqueries, CTEs, and window functions makes complex questions straightforward.
+
+A query like "find all users who ordered a product in category X but never in category Y" is natural in SQL but awkward in most NoSQL databases.
+
+<h4 id="acid-transaction-requirements">ACID transaction requirements</h4>
+
+When a payment transfer must either complete fully or not happen at all, you need atomicity. When your inventory count must never go negative, you need consistency.
+
+PostgreSQL provides these guarantees by default, making it the natural choice for financial systems, inventory management, and booking platforms.
+
+<h4 id="flexible-querying-needs">Flexible querying needs</h4>
+
+NoSQL databases often require you to know your query patterns upfront and design your data model around them. PostgreSQL inverts this: you model your data naturally, and with proper indexing, the database handles whatever queries you throw at it.
+
+This flexibility proves invaluable as requirements evolve.
+
+<h4 id="json-and-semi-structured-data">JSON and semi-structured data</h4>
+
+PostgreSQL's JSONB type bridges the gap between rigid schemas and document flexibility. You can store complex nested objects, query into them efficiently, and index specific fields, all while maintaining the relational guarantees you need for the rest of your data.
+
+<h4 id="full-text-search">Full-text search</h4>
+
+For many applications, PostgreSQL's built-in text search is sufficient, eliminating the operational complexity of maintaining a separate search engine.
+
+When your search needs grow beyond what PostgreSQL handles well, you can add Elasticsearch incrementally.
+
+<h4 id="geospatial-data">Geospatial data</h4>
+
+The PostGIS extension transforms PostgreSQL into a powerful geospatial database. If you are building anything location-aware, from delivery routing to store finders, PostGIS provides the primitives you need.
+
+<h3 id="12-when-postgresql-is-not-the-right-fit">
+  1.2 When PostgreSQL Is Not the Right Fit
+</h3>
+
+PostgreSQL is a strong default, but not a universal answer. Call out the cases where another system is simpler or scales more naturally.
+
+<h4 id="extreme-write-throughput">Extreme write throughput</h4>
+
+PostgreSQL's ACID guarantees come with overhead. The database must coordinate transactions, maintain indexes, and ensure durability on every write.
+
+For append-only workloads with millions of writes per second, such as event logging or IoT telemetry, databases like Cassandra or ClickHouse that sacrifice some consistency for write performance are better suited.
+
+<h4 id="massive-horizontal-scaling">Massive horizontal scaling</h4>
+
+PostgreSQL was designed as a single-node database. While you can shard it manually or with extensions like Citus, this adds significant operational complexity.
+
+If your data will grow to hundreds of terabytes and require automatic horizontal scaling, native distributed databases like CockroachDB, Cassandra, or DynamoDB handle this more gracefully.
+
+<h4 id="simple-key-value-access-patterns">Simple key-value access patterns</h4>
+
+If your access pattern is purely "get value by key" and "set key to value," PostgreSQL's query parser, planner, and executor are unnecessary overhead.
+
+Redis provides sub-millisecond latency for these patterns, and DynamoDB offers managed key-value storage at scale.
+
+<h4 id="high-volume-time-series-data">High-volume time-series data</h4>
+
+PostgreSQL can store time-series data, but it was not optimized for the append-heavy, time-windowed query patterns common in observability and IoT applications.
+
+TimescaleDB (a PostgreSQL extension) or purpose-built databases like InfluxDB handle these workloads more efficiently.
+
+<h4 id="caching-layer">Caching layer</h4>
+
+PostgreSQL reads from disk. Even with aggressive caching, it cannot match the microsecond latencies of in-memory stores.
+
+When you need sub-millisecond reads for hot data, Redis or Memcached belong in front of PostgreSQL, not instead of it.
+
+<h3 id="13-common-interview-systems-using-postgresql">
+  1.3 Common Interview Systems Using PostgreSQL
+</h3>
+
+| System                         | Why PostgreSQL Works                         |
+| ------------------------------ | -------------------------------------------- |
+| Payment System                 | ACID transactions prevent double-spending    |
+| E-commerce (orders, inventory) | Complex relationships, transactions          |
+| User Management                | Flexible queries, relationships              |
+| Booking System                 | Prevents double-booking with transactions    |
+| Financial Ledger               | Audit trails, consistency guarantees         |
+| Content Management             | JSONB for flexible content, full-text search |
+| Multi-tenant SaaS              | Row-level security, schemas for isolation    |
+
+<h1 id="2-acid-transactions-deep-dive">2. ACID Transactions Deep Dive</h1>
+
+ACID describes the guarantees PostgreSQL gives around transactions. For payments, bookings, inventory, and ledgers, these guarantees are the reason the database can prevent partial updates, invalid states, and unsafe concurrent changes.
+
+<h3 id="21-what-acid-means">2.1 What ACID Means</h3>
+
+**Atomicity** ensures that transactions are all-or-nothing. Consider a money transfer: deducting from one account and crediting another. If the system crashes between these operations, atomicity guarantees you will never end up with money deducted but not credited. Either both operations complete, or neither does.
+
+```sql
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE user_id = 1;
+UPDATE accounts SET balance = balance + 100 WHERE user_id = 2;
+COMMIT;  -- Both succeed or both fail
+```
+
+**Consistency** means the database moves from one valid state to another. PostgreSQL enforces this through constraints: foreign keys that prevent orphaned records, check constraints that keep values in valid ranges, unique constraints that prevent duplicates. A transaction that would violate any constraint is rejected entirely.
+
+**Isolation** addresses what happens when multiple transactions run concurrently. Without isolation, two transactions reading and modifying the same data could corrupt it. Isolation ensures each transaction operates as if it were the only one running, even when thousands execute simultaneously.
+
+**Durability** promises that committed data survives failures. PostgreSQL achieves this through the Write-Ahead Log (WAL): before acknowledging a commit, the database writes the changes to durable storage. If the server crashes immediately after returning success, the data is safe.
+
+<h3 id="22-isolation-levels">2.2 Isolation Levels</h3>
+
+Isolation is where things get interesting, and where interviews often probe your understanding.
+
+Perfect isolation (every transaction behaves as if it ran alone) is expensive. Weaker isolation improves performance but allows certain anomalies. Understanding these trade-offs is essential for choosing the right level for each use case.
+
+PostgreSQL supports four isolation levels, arranged from weakest to strongest:
+
+Before examining each level, let us understand the anomalies they prevent:
+
+| Isolation Level          | Dirty Read | Non-Repeatable Read | Phantom Read | Performance            |
+| ------------------------ | ---------- | ------------------- | ------------ | ---------------------- |
+| Read Uncommitted         | No\*       | Possible            | Possible     | Same as Read Committed |
+| Read Committed (default) | No         | Possible            | Possible     | Fast                   |
+| Repeatable Read          | No         | No                  | No\*         | Medium                 |
+| Serializable             | No         | No                  | No           | Slowest                |
+
+\*PostgreSQL accepts `READ UNCOMMITTED`, but internally treats it as `READ COMMITTED`, so dirty reads are not possible. PostgreSQL's Repeatable Read also prevents phantom reads, going beyond the SQL standard requirement.
+
+The three anomalies above are the SQL standard's list, but two more matter in practice and explain why the stronger levels exist:
+
+- **Lost update:** two transactions read the same row, both modify it based on the value they read, and the second commit overwrites the first. Repeatable Read catches this by aborting the second transaction with a serialization error. This is the anomaly the optimistic-locking pattern (covered later) guards against at the application level.
+- **Write skew:** two transactions read an overlapping set of rows, each checks a condition that still holds, and each writes a different row. Individually both look valid, but together they violate an invariant (for example, two on-call engineers each marking themselves off-duty because the other is still on). Repeatable Read does **not** prevent write skew. Only Serializable does.
+
+**Read Committed (Default):** Each statement sees only committed data, but different statements within the same transaction may see different database states as other transactions commit.
+
+```sql
+-- Transaction 1
+BEGIN;
+SELECT balance FROM accounts WHERE user_id = 1;  -- Returns 100
+-- Transaction 2 commits: UPDATE balance to 150
+SELECT balance FROM accounts WHERE user_id = 1;  -- Returns 150 (different!)
+COMMIT;
+```
+
+**Repeatable Read:** Transaction sees a consistent snapshot from start. No changes from other transactions visible.
+
+```sql
+-- Transaction 1
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT balance FROM accounts WHERE user_id = 1;  -- Returns 100
+-- Transaction 2 commits: UPDATE balance to 150
+SELECT balance FROM accounts WHERE user_id = 1;  -- Still returns 100
+COMMIT;
+```
+
+**Serializable:** The strongest level. PostgreSQL ensures transactions execute as if they ran one at a time, in some serial order. It accomplishes this by detecting potential conflicts and aborting transactions that would cause anomalies. This is the only level that prevents write skew, which is why it is the right choice for invariants that span multiple rows.
+
+```sql
+-- Imagine two concurrent transactions, each computing a total
+-- and storing it. Without serializable isolation, they could
+-- each miss the other's changes.
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+SELECT SUM(balance) FROM accounts;
+UPDATE totals SET sum = ...;  -- May fail with serialization error
+COMMIT;
+```
+
+When PostgreSQL detects that two serializable transactions would conflict, it aborts one with a serialization error. Your application must be prepared to retry.
+
+<h3 id="23-when-to-use-each-isolation-level">
+  2.3 When to Use Each Isolation Level
+</h3>
+
+| Use Case                      | Isolation Level                 | Why                       |
+| ----------------------------- | ------------------------------- | ------------------------- |
+| Most read queries             | Read Committed                  | Default, good performance |
+| Reports requiring consistency | Repeatable Read                 | Consistent snapshot       |
+| Balance transfers             | Repeatable Read or Serializable | Prevent inconsistencies   |
+| Inventory management          | Serializable                    | Prevent overselling       |
+| Audit logs                    | Read Committed                  | Append-only, no conflicts |
+
+<h3 id="24-handling-serialization-failures">
+  2.4 Handling Serialization Failures
+</h3>
+
+Serializable isolation may abort transactions due to conflicts. Your application must retry:
+
+```python
+import time
+import random
+
+def transfer_funds(from_id, to_id, amount):
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            with connection.cursor() as cur:
+                # Serializable handles concurrency conflicts on its own,
+                # so no explicit row locking (FOR UPDATE) is needed here.
+                cur.execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+                cur.execute("SELECT balance FROM accounts WHERE id = %s", (from_id,))
+                balance = cur.fetchone()[0]
+                if balance < amount:
+                    cur.execute("ROLLBACK")
+                    raise InsufficientFunds()
+                cur.execute("UPDATE accounts SET balance = balance - %s WHERE id = %s", (amount, from_id))
+                cur.execute("UPDATE accounts SET balance = balance + %s WHERE id = %s", (amount, to_id))
+                cur.execute("COMMIT")
+                return True
+        except SerializationFailure:
+            cur.execute("ROLLBACK")
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(random.uniform(0.01, 0.1))  # Backoff before retry
+```
+
+<h3 id="25-select-for-update">2.5 SELECT FOR UPDATE</h3>
+
+For explicit row-level locking, use `SELECT FOR UPDATE`:
+
+```sql
+BEGIN;
+SELECT * FROM inventory WHERE product_id = 123 FOR UPDATE;
+-- Row is locked, other transactions wait
+UPDATE inventory SET quantity = quantity - 1 WHERE product_id = 123;
+COMMIT;  -- Lock released
+```
+
+**Variants:**
+
+| Lock Type         | Behavior                                     |
+| ----------------- | -------------------------------------------- |
+| FOR UPDATE        | Exclusive lock, blocks all other locks       |
+| FOR NO KEY UPDATE | Blocks updates but allows foreign key checks |
+| FOR SHARE         | Shared lock, allows reads, blocks writes     |
+| FOR KEY SHARE     | Weakest, only blocks exclusive locks         |
+
+> **Design note:** For critical financial operations like balance transfers, Serializable isolation can remove race conditions at the database level. The trade-off is retry logic for serialization failures.
+>
+> In most workloads, these failures are rare because truly conflicting transactions are uncommon. The few milliseconds of retry latency are acceptable for the guarantee that money never disappears or appears from nowhere.
+
+<h3 id="26-mvcc-and-vacuum">2.6 MVCC and VACUUM</h3>
+
+The consistent snapshots that isolation levels rely on are not magic. They come from **MVCC (Multi-Version Concurrency Control)**, which is the mechanism behind almost everything in this section, and a frequent interview topic in its own right.
+
+The core idea: PostgreSQL never overwrites a row in place. An `UPDATE` writes a **new version** of the row and marks the old version as expired. A `DELETE` only marks the existing version as expired.
+
+Each version carries the transaction IDs that created and expired it, so every transaction can be shown the version that was valid as of its snapshot.
+
+This is why readers and writers do not block each other in PostgreSQL. A long-running `SELECT` keeps reading the old row versions while a concurrent `UPDATE` writes new ones. There is no shared read lock to contend on.
+
+The cost of this design is **dead tuples**. Every update and delete leaves behind an expired row version that still occupies space on disk. Without cleanup, tables and indexes grow indefinitely even when the live row count is flat.
+
+This wasted space is called **bloat**, and it slows down scans because the database reads more pages to find the same live rows.
+
+**VACUUM** reclaims this space by removing dead tuples that are no longer visible to any active transaction. PostgreSQL runs **autovacuum** in the background to do this automatically, but on large, frequently updated tables it can fall behind, which is a common production issue worth naming in an interview.
+
+Two related points come up often:
+
+- **Long-running transactions block cleanup.** VACUUM can only remove a dead tuple once no transaction can still see it. A single transaction left open for hours holds back cleanup across the whole database, causing bloat to accumulate.
+- **Transaction ID wraparound.** Transaction IDs are a finite 32-bit space. VACUUM also "freezes" old rows to keep these IDs from wrapping around. If autovacuum falls far enough behind, PostgreSQL forces a protective shutdown to avoid data corruption. This rarely surfaces day to day, but it is the reason VACUUM is not optional.
+
+The practical takeaway for a design discussion: PostgreSQL trades extra background maintenance for lock-free reads. When you mention update-heavy tables, also mention autovacuum tuning and bloat as the operational cost.
+
+<h1 id="3-indexing-strategies">3. Indexing Strategies</h1>
+
+A query without an appropriate index forces PostgreSQL to examine every row in the table. On a million-row table, that means reading millions of rows to find potentially only one.
+
+Proper indexing transforms this from a sequential scan taking seconds to an index lookup taking milliseconds.
+
+Indexes improve reads by adding work to writes. PostgreSQL must update every relevant index when the row changes, and each index consumes storage. Create indexes for real query patterns and verify them with query plans.
+
+<h3 id="31-b-tree-index-default">3.1 B-Tree Index (Default)</h3>
+
+B-tree is the workhorse index type, suitable for the vast majority of use cases. It organizes data in a balanced tree structure that supports both equality lookups and range queries efficiently.
+
+```sql
+CREATE INDEX idx_users_email ON users(email);
+
+-- All of these queries benefit from the B-tree index:
+SELECT * FROM users WHERE email = 'john@example.com';  -- Equality
+SELECT * FROM users WHERE email LIKE 'john%';           -- Prefix match
+SELECT * FROM users WHERE email > 'a' AND email < 'b';  -- Range
+SELECT * FROM users ORDER BY email LIMIT 10;            -- Sorting
+```
+
+**How B-tree works:**
+
+The tree structure ensures that lookups, inserts, and deletes all complete in O(log N) time. For a table with a million rows, that means roughly 20 comparisons to find any value.
+
+<h3 id="32-hash-index">3.2 Hash Index</h3>
+
+When you know you will only ever need equality lookups, hash indexes offer slightly faster performance than B-trees.
+
+The trade-off is: hash indexes cannot support range queries, ordering, or prefix matching.
+
+```sql
+CREATE INDEX idx_users_uuid ON users USING hash(uuid);
+
+-- Uses hash index:
+SELECT * FROM users WHERE uuid = 'abc-123';
+
+-- Does NOT use hash index:
+SELECT * FROM users WHERE uuid > 'abc';  -- Falls back to seq scan
+```
+
+B-tree indexes are usually the better choice. The performance difference is small, and you keep the option to support range queries later without recreating the index.
+
+<h3 id="33-gin-index-generalized-inverted-index">
+  3.3 GIN Index (Generalized Inverted Index)
+</h3>
+
+B-tree indexes work for scalar values. But what about columns containing arrays, JSON documents, or text that needs full-text search? These require a different approach.
+
+GIN (Generalized Inverted Index) indexes are designed for composite values. They work by indexing each element within the value separately, allowing efficient queries like "find all documents containing this key" or "find all posts with this tag."
+
+```sql
+-- JSONB indexing
+CREATE INDEX idx_products_attrs ON products USING gin(attributes);
+
+-- Query JSONB
+SELECT * FROM products WHERE attributes @> '{"color": "red"}';
+SELECT * FROM products WHERE attributes ? 'size';
+
+-- Full-text search
+CREATE INDEX idx_articles_search ON articles USING gin(to_tsvector('english', content));
+
+-- Array containment
+CREATE INDEX idx_tags ON posts USING gin(tags);
+SELECT * FROM posts WHERE tags @> ARRAY['postgresql', 'database'];
+```
+
+The trade-off with GIN indexes is write performance. When you insert or update a row, PostgreSQL must update the index for every element in the array or JSON document. For write-heavy workloads with large composite values, this overhead can be significant.
+
+<h3 id="34-gist-index-generalized-search-tree">
+  3.4 GiST Index (Generalized Search Tree)
+</h3>
+
+Some queries ask questions that B-tree cannot answer: "Do these two time ranges overlap?" or "Which locations are within 5 kilometers of this point?" GiST indexes support these geometric and range-based queries.
+
+```sql
+-- Range types
+CREATE INDEX idx_reservations_during ON reservations USING gist(during);
+
+-- Overlap query
+SELECT * FROM reservations
+WHERE during && '[2024-01-15, 2024-01-20]'::daterange;
+
+-- Geospatial (PostGIS)
+CREATE INDEX idx_locations_point ON locations USING gist(point);
+
+SELECT * FROM locations
+WHERE ST_DWithin(point, ST_MakePoint(-122.4, 37.8), 1000);
+```
+
+<h3 id="35-brin-index-block-range-index">3.5 BRIN Index (Block Range Index)</h3>
+
+For time-series data, there is often a natural correlation between when data was inserted and its value. Events from January are stored near other January events because they were inserted around the same time. BRIN indexes exploit this physical ordering.
+
+Instead of indexing every row, BRIN stores the minimum and maximum values for each block of pages. When you query for a date range, PostgreSQL can skip entire blocks that cannot contain matching data.
+
+```sql
+-- Time-series data (naturally ordered by time)
+CREATE INDEX idx_events_time ON events USING brin(created_at);
+
+-- Query benefits from BRIN
+SELECT * FROM events
+WHERE created_at >= '2024-01-01' AND created_at < '2024-01-02';
+```
+
+BRIN indexes shine when three conditions are met: the data is physically ordered by the indexed column (typically true for timestamp columns), the table is large (millions of rows), and some imprecision is acceptable (BRIN may scan a few extra blocks).
+
+The size advantage is dramatic:
+
+```text
+Table: 100 million rows, timestamp column
+
+B-tree index: ~2 GB
+BRIN index:   ~200 KB  (roughly 10,000x smaller)
+```
+
+This makes BRIN ideal for time-series data where you rarely query by exact timestamp but frequently query by time ranges.
+
+<h3 id="36-composite-indexes">3.6 Composite Indexes</h3>
+
+Real queries often filter on multiple columns. A composite index on those columns can be far more effective than separate indexes on each.
+
+```sql
+CREATE INDEX idx_orders_user_date ON orders(user_id, created_at);
+
+-- Uses index efficiently (leftmost columns)
+SELECT * FROM orders WHERE user_id = 123;
+SELECT * FROM orders WHERE user_id = 123 AND created_at > '2024-01-01';
+
+-- Does NOT use this index efficiently
+SELECT * FROM orders WHERE created_at > '2024-01-01';  -- Missing user_id
+```
+
+Column order matters critically. PostgreSQL can use a composite index when you query by the leftmost columns, but not when you skip them. Think of it like a phone book: you can find all Smiths, or all Smiths named John, but you cannot efficiently find all Johns regardless of last name.
+
+The general rule: place equality columns first, then range columns. Place the most selective column (the one that eliminates the most rows) first.
+
+<h3 id="37-partial-indexes">3.7 Partial Indexes</h3>
+
+Why index rows you will never query? Partial indexes include only a subset of table rows, making them smaller and faster.
+
+```sql
+-- Only index active users (90% of queries target active users)
+CREATE INDEX idx_active_users ON users(email) WHERE status = 'active';
+
+-- Only index recent orders (old orders rarely queried)
+CREATE INDEX idx_recent_orders ON orders(user_id, created_at)
+WHERE created_at > '2024-01-01';
+
+-- Only index non-null values (most phones are null)
+CREATE INDEX idx_phone ON users(phone) WHERE phone IS NOT NULL;
+```
+
+Partial indexes are particularly powerful when your queries always include a specific filter. If 90% of your queries look for active users, a partial index on active users is smaller, faster to maintain, and faster to query.
+
+<h3 id="38-covering-indexes-index-only-scans">
+  3.8 Covering Indexes (Index-Only Scans)
+</h3>
+
+After finding a row through an index, PostgreSQL normally needs to read the actual table row to get other column values. A covering index includes additional columns, allowing PostgreSQL to answer queries entirely from the index.
+
+```sql
+-- Include columns needed by query
+CREATE INDEX idx_orders_covering ON orders(user_id) INCLUDE (total, status);
+
+-- Index-only scan (no table access needed)
+SELECT user_id, total, status FROM orders WHERE user_id = 123;
+```
+
+This eliminates random I/O to fetch table rows, which can dramatically improve performance for queries that only need a few columns.
+
+<h3 id="39-index-selection-guide">3.9 Index Selection Guide</h3>
+
+Choosing the right index type comes down to understanding your query patterns:
+
+| Query Pattern            | Index Type     | Example                      |
+| ------------------------ | -------------- | ---------------------------- |
+| Equality (=)             | B-tree or Hash | `WHERE email = 'x'`          |
+| Range (&lt;, >, BETWEEN) | B-tree         | `WHERE date > '2024-01-01'`  |
+| Prefix match (LIKE 'x%') | B-tree         | `WHERE name LIKE 'John%'`    |
+| JSONB containment        | GIN            | `WHERE attrs @> '{"a":1}'`   |
+| Full-text search         | GIN            | `WHERE tsv @@ query`         |
+| Array containment        | GIN            | `WHERE tags @> ARRAY['x']`   |
+| Geometric/Range overlap  | GiST           | `WHERE range && other_range` |
+| Naturally ordered data   | BRIN           | Time-series `created_at`     |
+
+<h1 id="4-partitioning-for-scale">4. Partitioning for Scale</h1>
+
+As tables grow into hundreds of millions of rows, several problems emerge. Queries slow down even with indexes because the indexes themselves become massive. Maintenance operations like VACUUM take hours. Deleting old data requires scanning the entire table.
+
+Partitioning addresses these problems by dividing a large table into smaller, more manageable pieces. From the application's perspective, it is still one table. PostgreSQL automatically routes queries to the relevant partitions and combines results transparently.
+
+<h3 id="41-why-partition">4.1 Why Partition?</h3>
+
+Partitioning replaces one large, unwieldy table with a set of smaller physical pieces that PostgreSQL manages as a unit. The diagram contrasts a single monolithic table against a quarterly range-partitioned version of the same data:
+
+The benefits compound as data grows:
+
+<h4 id="query-performance">Query performance</h4>
+
+When queries filter on the partition key, PostgreSQL skips irrelevant partitions entirely. A query for January's data touches only the January partition, not the entire year.
+
+<h4 id="maintenance-efficiency">Maintenance efficiency</h4>
+
+Operations like VACUUM, REINDEX, and backup work on individual partitions. Vacuuming a 10 million row partition takes minutes; vacuuming a 500 million row table takes hours.
+
+<h4 id="data-lifecycle-management">Data lifecycle management</h4>
+
+Deleting old data becomes trivial: drop the partition. This is instantaneous regardless of partition size, compared to DELETE which must scan and log every row.
+
+<h4 id="parallel-operations">Parallel operations</h4>
+
+PostgreSQL can parallelize queries across partitions, using multiple CPU cores to scan different partitions simultaneously.
+
+<h3 id="42-partition-types">4.2 Partition Types</h3>
+
+PostgreSQL supports three partitioning strategies, each suited to different access patterns.
+
+**Range Partitioning** divides data by ranges of values, most commonly dates. This is the natural choice for time-series data where queries typically filter by time periods.
+
+```sql
+CREATE TABLE orders (
+    id BIGSERIAL,
+    user_id BIGINT,
+    total DECIMAL,
+    created_at TIMESTAMP
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE orders_2024_q1 PARTITION OF orders
+    FOR VALUES FROM ('2024-01-01') TO ('2024-04-01');
+
+CREATE TABLE orders_2024_q2 PARTITION OF orders
+    FOR VALUES FROM ('2024-04-01') TO ('2024-07-01');
+```
+
+**List Partitioning** groups data by discrete values. This works well for multi-region deployments or categorical data where queries typically target specific categories.
+
+```sql
+CREATE TABLE customers (
+    id BIGSERIAL,
+    name TEXT,
+    region TEXT
+) PARTITION BY LIST (region);
+
+CREATE TABLE customers_us PARTITION OF customers
+    FOR VALUES IN ('us-east', 'us-west');
+
+CREATE TABLE customers_eu PARTITION OF customers
+    FOR VALUES IN ('eu-west', 'eu-central');
+```
+
+**Hash Partitioning** distributes data evenly across a fixed number of partitions using a hash function. This is useful when you have a high-cardinality column (like user_id) and want balanced partition sizes without natural range boundaries.
+
+```sql
+CREATE TABLE events (
+    id BIGSERIAL,
+    user_id BIGINT,
+    event_type TEXT
+) PARTITION BY HASH (user_id);
+
+CREATE TABLE events_0 PARTITION OF events
+    FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+
+CREATE TABLE events_1 PARTITION OF events
+    FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+-- ... partitions 2 and 3
+```
+
+Hash partitioning ensures even distribution, but unlike range or list partitioning, you cannot drop a single partition to remove a subset of data.
+
+<h3 id="43-partition-key-selection">4.3 Partition Key Selection</h3>
+
+| Data Pattern               | Partition Strategy | Key                            |
+| -------------------------- | ------------------ | ------------------------------ |
+| Time-series (logs, events) | Range by time      | created_at (monthly/quarterly) |
+| Multi-tenant               | List or Hash       | tenant_id                      |
+| Geographic                 | List               | region                         |
+| High cardinality           | Hash               | user_id, entity_id             |
+
+<h4 id="guidelines">Guidelines</h4>
+
+1. **Partition by query pattern:** Most queries should filter on partition key
+2. **Avoid too many partitions:** Each partition has overhead. Aim for &lt;1000 partitions.
+3. **Partition size:** Each partition should be 10GB-100GB for optimal performance
+
+<h3 id="44-partition-maintenance">4.4 Partition Maintenance</h3>
+
+**Adding partitions:**
+
+```sql
+-- Create future partition before data arrives
+CREATE TABLE orders_2024_q3 PARTITION OF orders
+    FOR VALUES FROM ('2024-07-01') TO ('2024-10-01');
+```
+
+**Dropping old data:**
+
+```sql
+-- Instant deletion (no row-by-row delete)
+DROP TABLE orders_2022_q1;
+
+-- Or detach and archive
+ALTER TABLE orders DETACH PARTITION orders_2022_q1;
+```
+
+<h3 id="45-partition-pruning">4.5 Partition Pruning</h3>
+
+PostgreSQL automatically skips irrelevant partitions:
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE created_at = '2024-03-15';
+
+-- Output shows only orders_2024_q1 is scanned
+Append
+  ->  Seq Scan on orders_2024_q1
+        Filter: (created_at = '2024-03-15')
+```
+
+Without partition key in WHERE, all partitions are scanned.
+
+<h3 id="46-partitioning-limitations">4.6 Partitioning Limitations</h3>
+
+- **Unique constraints and primary keys** must include all partition key columns, so there is no global uniqueness on a non-key column (enforce that in application logic if needed)
+- **Updating the partition key** moves the row to a different partition. PostgreSQL handles this automatically (as an internal delete plus insert), but it is more expensive than an in-place update
+- **Query complexity** increases with partition count, and too many partitions add planning overhead
+
+<h1 id="5-replication-and-high-availability">
+  5. Replication and High Availability
+</h1>
+
+A single PostgreSQL server is a **single point of failure**. And servers do fail. When the primary goes down, your application goes down with it.
+
+**Replication** solves this by keeping one or more **replicas** in sync with the primary. If the primary fails, a replica can be promoted and the system can continue operating.
+
+Replication also helps with **read scaling**. One PostgreSQL instance can serve only so many queries. By sending **read traffic** to replicas while keeping **writes** on the primary, you can scale read capacity roughly with the number of replicas.
+
+<h3 id="51-streaming-replication">5.1 Streaming Replication</h3>
+
+PostgreSQL streaming replication continuously ships **WAL (Write-Ahead Log)** records from the primary to replicas. Every change is first written to WAL on the primary; replicas receive the WAL stream and replay it to apply the same changes locally.
+
+The key tradeoff is commit semantics: **when does PostgreSQL consider a transaction committed?**
+
+**Asynchronous replication (default)** commits transactions as soon as they are durable on the primary. The primary does not wait for replicas to acknowledge. This provides the best write latency but risks data loss: if the primary fails before WAL records reach the replica, recent transactions may be lost.
+
+**Synchronous replication** waits for at least one replica to confirm receiving and writing the WAL records before acknowledging the commit. This guarantees no data loss on primary failure but increases write latency by the round-trip time to the replica.
+
+For systems where data loss is unacceptable (financial transactions, for example), synchronous replication is essential despite the latency cost.
+
+<h3 id="52-failover-strategy">5.2 Failover Strategy</h3>
+
+A strong HA answer does not stop at "use replicas." A primary/replica topology needs an answer for how a replica is promoted when the primary fails, how applications discover the new primary, whether any acknowledged writes can be lost, and how long writes are unavailable during failover.
+
+Manual failover is simple but slow and error-prone. Managed Postgres, Patroni-style automation, or a database proxy can reduce recovery time, but they add operational complexity. If the system cannot tolerate data loss, pair failover with synchronous replication or a managed HA setup.
+
+<h3 id="53-logical-replication">5.3 Logical Replication</h3>
+
+Physical (streaming) replication copies the **entire cluster**. Logical replication is more granular: it replicates **selected tables** (or sets of tables) via publications/subscriptions.
+
+This makes it useful for upgrading PostgreSQL versions with minimal downtime, replicating to different PostgreSQL versions, and selective replication of only specific tables.
+
+The distinction is what matters: streaming replication is the normal HA/read-replica mechanism, while logical replication is useful when you need selective table-level movement or version/shape changes.
+
+<h3 id="54-read-scaling-with-replicas">5.4 Read Scaling with Replicas</h3>
+
+A common pattern is: write to primary and route read queries to replicas:
+
+<h4 id="implementation-options">Implementation options</h4>
+
+- Application-level routing (separate connection pools)
+- A SQL-aware proxy/load balancer such as Pgpool-II, HAProxy with separate endpoints, or another routing layer
+- PgBouncer on each target endpoint for connection pooling
+
+**Replication lag consideration:** replicas are usually slightly behind the primary. If a user must read their own write immediately, route that user's reads to the primary for a short window or wait until the replica has caught up.
+
+<h3 id="55-high-availability-comparison">5.5 High Availability Comparison</h3>
+
+| Approach                | Interview takeaway                                                     |
+| ----------------------- | ---------------------------------------------------------------------- |
+| Manual failover         | Simple, but recovery is slower and more error-prone                    |
+| Automated failover      | Better recovery time, but adds coordination and operational complexity |
+| Managed HA              | Good default when operating the database is not the core problem       |
+| Synchronous replication | Reduces data-loss risk, but increases write latency                    |
+
+<h1 id="6-connection-pooling">6. Connection Pooling</h1>
+
+PostgreSQL follows a **process-per-connection** model: every client connection is served by a dedicated backend process. This design gives strong isolation and predictable behavior, but it comes with real overhead. Each connection consumes memory, often ~10MB+ baseline depending on workload and settings. Opening a new connection is also relatively expensive because it involves process setup and authentication, often tens of milliseconds.
+
+At small scale, you don't notice. At microservices scale, it becomes a bottleneck fast.
+
+Consider a system with **50 services**. Each service runs **10 instances**, and each instance keeps a modest pool of **10 connections**. That works out to 50 × 10 × 10 = **5,000 connections**.
+
+That's _before_ bursts, admin tools, cron jobs, migrations, and retries. PostgreSQL will struggle long before this point and even if it survives, the memory footprint is wasteful.
+
+**Connection pooling** fixes the problem by letting thousands of client connections share a much smaller number of actual database connections. Instead of "one app connection = one DB process," you get **multiplexing**.
+
+<h3 id="61-what-to-explain">6.1 What to Explain</h3>
+
+The design point is simple: do not let every service instance open an unbounded number of database connections. Use local application pools for per-process reuse and a fleet-level pooler such as PgBouncer when connection pressure grows.
+
+PgBouncer has three pool modes:
+
+| Mode        | Description                              | Use Case                        |
+| ----------- | ---------------------------------------- | ------------------------------- |
+| Session     | Connection held for entire session       | Session variables needed        |
+| Transaction | Connection returned after transaction    | Most applications (recommended) |
+| Statement   | Connection returned after each statement | Simple queries, maximum sharing |
+
+In most designs, "use transaction pooling unless the application depends on session state" is enough. The main trade-off is queueing: too small a pool increases latency, while too large a pool overwhelms PostgreSQL.
+
+<h1 id="7-common-patterns-and-use-cases">7. Common Patterns and Use Cases</h1>
+
+Once you understand PostgreSQL fundamentals, the next level is knowing the **patterns that show up repeatedly in real systems and system design interviews**.
+
+These patterns solve the same handful of problems again and again:
+
+- **Concurrency control**: prevent updates from silently overwriting each other
+- **Coordination**: ensure only one worker/process performs a critical action
+- **Idempotency**: make writes safe to retry
+- **Correctness guarantees**: prevent invalid states (like double-bookings)
+- **Operational visibility**: track changes to sensitive data
+
+<h3 id="71-optimistic-locking">7.1 Optimistic Locking</h3>
+
+When two users update the same row at the same time, the "last write wins" model can silently overwrite someone's work. **Optimistic locking** detects this by attaching a **version number** to the row.
+
+```sql
+-- Schema
+CREATE TABLE products (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT,
+    price DECIMAL,
+    version INT DEFAULT 1
+);
+
+-- Read
+SELECT id, name, price, version FROM products WHERE id = 123;
+-- Returns: id=123, name="Widget", price=10.00, version=5
+
+-- Update with version check
+UPDATE products
+SET price = 12.00, version = version + 1
+WHERE id = 123 AND version = 5;
+
+-- If 0 rows affected, another transaction updated it first
+-- Application should reload and retry
+```
+
+The core idea: **conflicts are detected, not prevented**. Most updates succeed with no blocking. If a conflict happens, the application must reload and retry (or show the user a merge/conflict message). This works best when conflicts are **rare**.
+
+<h3 id="72-advisory-locks">7.2 Advisory Locks</h3>
+
+Not all coordination maps neatly to "lock a row." Sometimes the thing you need to protect is **business logic**, not a specific record. PostgreSQL's **advisory locks** let you define your own lock keys without locking any actual data.
+
+```sql
+-- Acquire lock (blocks if held)
+SELECT pg_advisory_lock(hashtext('process_user_123'));
+
+-- Do work...
+
+-- Release lock
+SELECT pg_advisory_unlock(hashtext('process_user_123'));
+
+-- Non-blocking version
+SELECT pg_try_advisory_lock(hashtext('process_user_123'));
+-- Returns true if acquired, false if already held
+```
+
+Common use cases include ensuring only one worker processes a job, serializing access to a logical resource so there is only one in-flight operation per key, and preventing concurrent workflows on the same entity such as "payout_user_123".
+
+<h3 id="73-upsert-insert-on-conflict">7.3 UPSERT (INSERT ON CONFLICT)</h3>
+
+**UPSERT** makes writes idempotent by combining insert + update into a single atomic statement. It's a go-to tool for "safe retries."
+
+```sql
+-- Insert or update user
+INSERT INTO users (email, name, updated_at)
+VALUES ('john@example.com', 'John Doe', NOW())
+ON CONFLICT (email)
+DO UPDATE SET
+    name = EXCLUDED.name,
+    updated_at = EXCLUDED.updated_at;
+
+-- Insert or ignore
+INSERT INTO page_views (page_id, user_id, viewed_at)
+VALUES (123, 456, NOW())
+ON CONFLICT DO NOTHING;
+```
+
+This pattern shows up everywhere: user upserts, event ingestion, deduplication, idempotency keys.
+
+<h3 id="74-returning-clause">7.4 RETURNING Clause</h3>
+
+The `RETURNING` clause lets you get results from `INSERT/UPDATE/DELETE` **without an extra query**. Useful for generated IDs, timestamps, and updated values.
+
+```sql
+-- Get inserted row with generated ID
+INSERT INTO orders (user_id, total)
+VALUES (123, 99.99)
+RETURNING id, created_at;
+
+-- Get all deleted rows
+DELETE FROM expired_sessions
+WHERE expires_at < NOW()
+RETURNING session_id, user_id;
+
+-- Get updated values
+UPDATE inventory
+SET quantity = quantity - 1
+WHERE product_id = 123
+RETURNING quantity;
+```
+
+It's cleaner, faster, and avoids race conditions between "write" and "read back."
+
+<h3 id="75-ctes-for-complex-queries">7.5 CTEs for Complex Queries</h3>
+
+Complex SQL often becomes unreadable when everything is nested. **CTEs (WITH clauses)** turn the query into a pipeline of named steps.
+
+```sql
+-- Calculate user stats with multiple steps
+WITH user_orders AS (
+    SELECT user_id, COUNT(*) as order_count, SUM(total) as total_spent
+    FROM orders
+    WHERE created_at > NOW() - INTERVAL '1 year'
+    GROUP BY user_id
+),
+user_segments AS (
+    SELECT user_id,
+           CASE
+               WHEN total_spent > 10000 THEN 'platinum'
+               WHEN total_spent > 1000 THEN 'gold'
+               ELSE 'standard'
+           END as segment
+    FROM user_orders
+)
+SELECT u.id, u.name, us.segment, uo.order_count
+FROM users u
+JOIN user_orders uo ON u.id = uo.user_id
+JOIN user_segments us ON u.id = us.user_id;
+```
+
+CTEs are especially useful in analytics-style queries, reporting, and multi-step transformations.
+
+<h3 id="76-preventing-double-booking">7.6 Preventing Double-Booking</h3>
+
+For booking systems (rooms, seats, appointments), the hard requirement is: **no overlapping reservations**.
+
+PostgreSQL can enforce this at the database level using range types + an exclusion constraint.
+
+```sql
+-- Schema with exclusion constraint
+CREATE EXTENSION btree_gist;
+
+CREATE TABLE reservations (
+    id BIGSERIAL PRIMARY KEY,
+    resource_id BIGINT NOT NULL,
+    time_range TSTZRANGE NOT NULL,
+    user_id BIGINT NOT NULL,
+    EXCLUDE USING GIST (resource_id WITH =, time_range WITH &&)
+);
+
+-- Attempt to book
+INSERT INTO reservations (resource_id, time_range, user_id)
+VALUES (
+    123,
+    '[2024-01-15 10:00, 2024-01-15 11:00)'::tstzrange,
+    456
+);
+-- Fails if overlapping reservation exists
+```
+
+This is powerful because it makes correctness **non-negotiable**. Even if two requests race, the database guarantees that only one wins.
+
+<h3 id="77-audit-logging-with-triggers">7.7 Audit Logging with Triggers</h3>
+
+For sensitive tables (accounts, permissions, payouts), you often need an immutable history of changes. Triggers can automatically log writes into an audit table.
+
+```sql
+-- Audit table
+CREATE TABLE audit_log (
+    id BIGSERIAL PRIMARY KEY,
+    table_name TEXT,
+    operation TEXT,
+    old_data JSONB,
+    new_data JSONB,
+    changed_by TEXT,
+    changed_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Trigger function
+CREATE OR REPLACE FUNCTION audit_trigger()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO audit_log (table_name, operation, old_data, new_data, changed_by)
+    VALUES (
+        TG_TABLE_NAME,
+        TG_OP,
+        CASE WHEN TG_OP = 'DELETE' THEN row_to_json(OLD)::jsonb ELSE NULL END,
+        CASE WHEN TG_OP IN ('INSERT', 'UPDATE') THEN row_to_json(NEW)::jsonb ELSE NULL END,
+        current_user
+    );
+    RETURN COALESCE(NEW, OLD);
+END;
+$$ LANGUAGE plpgsql;
+
+-- Attach to table
+CREATE TRIGGER accounts_audit
+AFTER INSERT OR UPDATE OR DELETE ON accounts
+FOR EACH ROW EXECUTE FUNCTION audit_trigger();
+```
+
+This gives you a consistent audit trail without relying on every application code path to "remember to log."
+
+<h3 id="78-pattern-summary">7.8 Pattern Summary</h3>
+
+| Pattern              | Use Case                   | Key Feature          |
+| -------------------- | -------------------------- | -------------------- |
+| Optimistic locking   | Concurrent updates         | Version column       |
+| Advisory locks       | Cross-process coordination | pg_advisory_lock     |
+| UPSERT               | Idempotent writes          | ON CONFLICT          |
+| RETURNING            | Avoid extra query          | Get result inline    |
+| CTEs                 | Complex queries            | Readable, composable |
+| Exclusion constraint | Prevent overlaps           | Range types          |
+| Audit triggers       | Change tracking            | Automatic logging    |
+
+<h1 id="8-performance-optimization">8. Performance Optimization</h1>
+
+When queries slow down, "add an index" is rarely the right first move. Use a simple workflow: **observe -> explain -> fix -> verify**.
+
+<h3 id="81-explain-analyze">8.1 EXPLAIN ANALYZE</h3>
+
+Before you tune anything, you need to know **where time is spent**. `EXPLAIN ANALYZE` executes the query and shows the real plan PostgreSQL used, along with timings. Adding `BUFFERS` tells you whether time is going into **CPU** or **I/O**.
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT * FROM orders
+WHERE user_id = 123 AND created_at > '2024-01-01';
+```
+
+**Key metrics to examine:**
+
+| Metric           | Meaning                | Action                |
+| ---------------- | ---------------------- | --------------------- |
+| Seq Scan         | Full table scan        | Add index             |
+| Index Scan       | Using index            | Good                  |
+| Bitmap Heap Scan | Index + table lookup   | Normal for many rows  |
+| Nested Loop      | O(n\*m) join           | Check join conditions |
+| Hash Join        | Build hash table       | Good for large joins  |
+| Sort             | Sorting in memory/disk | Check memory settings |
+| actual time      | Real execution time    | Optimize slow steps   |
+| rows             | Actual vs estimated    | Update statistics     |
+
+A practical rule: optimize the step with the biggest **actual time**, not the one that "looks suspicious." If row estimates are far off, mention stale statistics and `ANALYZE`; if scans are slow despite indexes, mention table/index bloat and vacuum.
+
+<h3 id="82-common-performance-anti-patterns">
+  8.2 Common Performance Anti-Patterns
+</h3>
+
+| Anti-Pattern      | Problem                   | Solution                          |
+| ----------------- | ------------------------- | --------------------------------- |
+| SELECT \*         | Unnecessary data transfer | Select only needed columns        |
+| N+1 queries       | Many small queries        | Use JOINs or batch queries        |
+| Missing indexes   | Slow queries              | Add appropriate indexes           |
+| Over-indexing     | Slow writes               | Remove unused indexes             |
+| Long transactions | Lock contention           | Keep transactions short           |
+| Large IN lists    | Poor optimization         | Use ANY(ARRAY[...]) or temp table |
+| OFFSET pagination | Scans skipped rows        | Use keyset pagination             |
+
+**Keyset pagination (cursor-based):**
+
+```sql
+-- Bad: OFFSET pagination
+SELECT * FROM products ORDER BY id LIMIT 20 OFFSET 10000;
+-- Must scan 10,000 rows to skip them
+
+-- Good: Keyset pagination
+SELECT * FROM products WHERE id > 12345 ORDER BY id LIMIT 20;
+-- Directly seeks to correct position
+```
+
+<h3 id="83-performance-checklist">8.3 Performance Checklist</h3>
+
+A concise answer should cover:
+
+- find high-impact queries with aggregate query stats, not only one-off slow requests
+- inspect query plans with `EXPLAIN ANALYZE`
+- add or adjust indexes based on real access patterns
+- avoid `SELECT *`, N+1 queries, large offsets, and long transactions
+- watch for bloat and stale statistics on large, frequently updated tables
+
+> **Design note:** Start optimization with the queries that consume the most total time. `pg_stat_statements` is usually more useful than chasing the single slowest query because frequency matters: a query running 10,000 times at 50 ms can cost more than one query running once at 2 seconds.
+>
+> For the top offenders, use EXPLAIN ANALYZE to understand execution plans, then add indexes or rewrite queries as needed. Monitor the impact after changes to verify improvements.
+
+<h1 id="9-postgresql-vs-other-databases">9. PostgreSQL vs Other Databases</h1>
+
+Use this comparison to justify PostgreSQL against common alternatives:
+
+| Alternative         | Prefer PostgreSQL when...                                                   | Prefer the alternative when...                                               |
+| ------------------- | --------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| MySQL               | You need richer SQL, JSONB indexing, extensions, or stricter data integrity | The workload is simple, read-heavy, and the team already operates MySQL well |
+| MongoDB             | Relationships, joins, and transactions are central                          | The data is naturally document-shaped and schema changes frequently          |
+| DynamoDB            | Queries are flexible and transactional correctness matters                  | Access patterns are simple, predictable, and need managed horizontal scale   |
+| CockroachDB / Citus | A single PostgreSQL primary is enough                                       | You need distributed SQL or horizontal write scaling                         |
+
+<h1 id="summary">Summary</h1>
+
+Use PostgreSQL when the system needs relational queries, strong consistency, and room for requirements to evolve. The main trade-offs are connection management, write scaling, vacuum/maintenance, and replica lag.
+
+Anchor the answer on four points: transaction guarantees, query/index strategy, scaling plan, and failure handling. Mention PgBouncer for connection pressure, replicas for read scaling, partitioning for large tables, and retries when using Serializable isolation.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,495 @@
+---
+title: "HTTP Requests"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "HTTP Requests explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="the-shape-of-a-request">The Shape of a Request</h1>
+
+A single HTTP request has four parts:
+
+| Part    | Example                                 | Role                       |
+| ------- | --------------------------------------- | -------------------------- |
+| Method  | `GET`, `POST`, `PUT`, `PATCH`, `DELETE` | What operation to perform  |
+| URL     | `https://shop.example.com/products/101` | Which resource to act on   |
+| Headers | `Authorization: Bearer abc123`          | Metadata about the request |
+| Body    | `{"qty": 2}` (for `POST`/`PUT`/`PATCH`) | The payload, if any        |
+
+`GET` and `DELETE` typically have no body. `POST`, `PUT`, and `PATCH` usually do. The headers describe both the body (its format and size) and the request itself (who's calling, what they accept, what auth they bring).
+
+When building a request with `urllib.request`, set these four pieces explicitly. The library wraps them in the matching text format and sends them over a TCP connection to the server.
+
+The diagram shows the layers. The Python code creates a request object. The library serialises it into the HTTP text format. That text travels over a TCP (or TLS) connection to the server. The server processes it and writes back response bytes that travel the same path in reverse. `urllib.request` handles the middle two boxes; the request object is the caller's responsibility.
+
+<h1 id="a-first-get-request">A First GET Request</h1>
+
+The smallest useful request is a `GET` for a single URL. `urllib.request.urlopen` takes a URL string or a `Request` object and returns a response.
+
+```python
+from urllib.request import urlopen
+
+with urlopen("https://httpbin.org/get") as response:
+    print(response.status)
+    print(response.headers["Content-Type"])
+    body = response.read().decode("utf-8")
+
+print(body[:80])
+```
+
+`urlopen` opens the connection, sends the request, and returns a response object that works like a file (so it's wrapped in `with`). `response.status` is the HTTP status code. `response.headers` behaves like a case-insensitive dict of response headers. `response.read()` gives the raw bytes of the body, decoded to a string with the response's character encoding. `httpbin.org` is a public test server that echoes back the request details, useful for examples.
+
+Calling `urlopen` with only a URL defaults to a `GET` request. There's no body, no extra headers beyond what the library adds, and no auth. For trying out a public endpoint, this one line is enough.
+
+`urlopen` opens a fresh TCP (and TLS) connection on every call. Calling it in a tight loop pays the connection setup cost every time. For more than a handful of requests, the `requests` library's `Session` reuses the connection.
+
+<h1 id="building-a-request-object">Building a Request Object</h1>
+
+For anything more than a default `GET`, build a `Request` object explicitly and pass it to `urlopen`. The `Request` constructor takes a URL, an optional body (`data`), a headers dict, and the HTTP method.
+
+```python
+from urllib.request import Request, urlopen
+
+req = Request(
+    url="https://httpbin.org/get",
+    headers={
+        "Accept": "application/json",
+        "User-Agent": "shop-sync/1.0",
+    },
+    method="GET",
+)
+
+with urlopen(req) as response:
+    print(response.status)
+    print(response.headers["Content-Type"])
+```
+
+This is the same call as before, but now with explicit headers. `Accept: application/json` tells the server "give me JSON if you have it." `User-Agent` identifies the calling program. Servers sometimes log this, and some block requests with the default `Python-urllib/3.x` user agent because it's a common scraping signature.
+
+The `method` argument is optional. If `data` is provided, the method defaults to `POST`. Otherwise, it defaults to `GET`. Either can be overridden by setting `method` explicitly.
+
+<h1 id="reading-the-response">Reading the Response</h1>
+
+The object `urlopen` returns has a small but useful interface. The common methods and attributes:
+
+| Attribute / Method  | Returns       | Notes                                                                  |
+| ------------------- | ------------- | ---------------------------------------------------------------------- |
+| `response.status`   | `int`         | The HTTP status code, e.g. `200`.                                      |
+| `response.reason`   | `str`         | The status text, e.g. `"OK"`.                                          |
+| `response.headers`  | `HTTPMessage` | Acts like a case-insensitive dict of response headers.                 |
+| `response.read()`   | `bytes`       | The full body as raw bytes.                                            |
+| `response.url`      | `str`         | The final URL (different from the request URL if a redirect happened). |
+| `response.geturl()` | `str`         | Same as `response.url`.                                                |
+
+The body is always returned as bytes. For text content, decode it with the matching encoding. Most JSON APIs use UTF-8, so `response.read().decode("utf-8")` is the default move.
+
+```python
+import json
+from urllib.request import Request, urlopen
+
+req = Request(
+    url="https://httpbin.org/get",
+    headers={"Accept": "application/json"},
+)
+
+with urlopen(req) as response:
+    raw = response.read()
+    data = json.loads(raw)
+
+print(data["url"])
+print(data["headers"]["Accept"])
+```
+
+`response.read()` returns bytes, and `json.loads` accepts bytes (since Python 3.6) and figures out the encoding from the JSON itself. The end result is a Python dict ready to index into. `httpbin.org/get` echoes back the request, so the `Accept` header is visible in the response.
+
+To check the encoding the server reported, look at `Content-Type`:
+
+```python
+from urllib.request import urlopen
+
+with urlopen("https://httpbin.org/encoding/utf8") as response:
+    content_type = response.headers["Content-Type"]
+    charset = response.headers.get_content_charset() or "utf-8"
+    text = response.read().decode(charset)
+
+print(content_type)
+print(charset)
+print(text[:40])
+```
+
+The `Content-Type` header sometimes carries a `charset=` parameter. `get_content_charset()` extracts it. When the server doesn't say, UTF-8 is a safe default for modern text APIs.
+
+<h1 id="query-strings-and-url-encoding">Query Strings and URL Encoding</h1>
+
+A `GET` request often carries parameters in the URL's query string. The query can be written manually, but anything with special characters needs to be percent-encoded. Use `urllib.parse.urlencode` for that.
+
+```python
+from urllib.parse import urlencode
+from urllib.request import urlopen
+
+params = {
+    "category": "audio gear",
+    "max_price": 100,
+    "in_stock": True,
+}
+query = urlencode(params)
+url = f"https://httpbin.org/get?{query}"
+
+print(url)
+
+with urlopen(url) as response:
+    print(response.status)
+```
+
+`urlencode` takes a dict and produces a query string with the correct escaping. The space in `"audio gear"` became a `+` (the form-encoding shorthand for space), and the dict's keys got joined with `&`. For a list value (`{"tag": ["sale", "new"]}`), pass `doseq=True` so it expands to `tag=sale&tag=new` instead of stringifying the list.
+
+For percent-encoding a single value (a path segment, not a query), use `urllib.parse.quote`.
+
+```python
+from urllib.parse import quote
+
+product_name = "cafÃ© latte mug"
+path = f"/products/{quote(product_name)}"
+print(path)
+```
+
+`quote` percent-encodes everything that isn't a "safe" URL character. The accented `Ã©` became `%C3%A9` (its UTF-8 bytes), and the spaces became `%20`. There's a `quote_plus` variant that encodes spaces as `+` instead of `%20`, which is what `urlencode` uses internally.
+
+<h1 id="sending-a-body-form-encoded-vs-json-vs-multipart">
+  Sending a Body: Form-Encoded vs JSON vs Multipart
+</h1>
+
+For methods that carry a body (`POST`, `PUT`, `PATCH`), the body's format depends on the API. Three encodings cover almost everything:
+
+| Content-Type                        | When                                    | What the Body Looks Like                      |
+| ----------------------------------- | --------------------------------------- | --------------------------------------------- |
+| `application/x-www-form-urlencoded` | Traditional HTML forms; some older APIs | `name=ria&email=ria%40example.com`            |
+| `application/json`                  | Most modern APIs                        | `{"name": "ria", "email": "ria@example.com"}` |
+| `multipart/form-data`               | Forms with file uploads                 | A multi-part body with boundaries             |
+
+<h3 id="form-encoded">Form-Encoded</h3>
+
+This is the format an HTML `<form>` sends by default. The body looks like a query string.
+
+```python
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+form_data = {
+    "name": "ria",
+    "email": "ria@example.com",
+    "newsletter": "yes",
+}
+body = urlencode(form_data).encode("utf-8")
+
+req = Request(
+    url="https://httpbin.org/post",
+    data=body,
+    headers={"Content-Type": "application/x-www-form-urlencoded"},
+    method="POST",
+)
+
+with urlopen(req) as response:
+    print(response.status)
+```
+
+The body has to be bytes, not a string, which is why `.encode("utf-8")` follows `urlencode`. The `Content-Type` header tells the server how to parse it. `urlencode` and the matching content type together imitate a browser form submission.
+
+<h3 id="json">JSON</h3>
+
+Modern APIs almost always want JSON. The pattern is the same shape: serialise the body, set the content type, send.
+
+```python
+import json
+from urllib.request import Request, urlopen
+
+payload = {
+    "customer_id": 1,
+    "items": [
+        {"product_id": 101, "qty": 2},
+        {"product_id": 103, "qty": 1},
+    ],
+}
+body = json.dumps(payload).encode("utf-8")
+
+req = Request(
+    url="https://httpbin.org/post",
+    data=body,
+    headers={
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    },
+    method="POST",
+)
+
+with urlopen(req) as response:
+    data = json.loads(response.read())
+
+print(data["json"]["customer_id"])
+print(len(data["json"]["items"]))
+```
+
+`json.dumps` produces a string, `.encode("utf-8")` turns it into bytes for the body, and `Content-Type: application/json` tells the server how to parse it. The server (in this case `httpbin.org/post`) echoes the parsed body back under the `json` key, confirming it arrived intact.
+
+This is the most common API call shape. The `requests` library has a one-liner for it (`requests.post(url, json=payload)`), but the underlying mechanics are what's shown above.
+
+<h3 id="multipart-file-uploads">Multipart (File Uploads)</h3>
+
+When the body needs to include both fields and files (a product photo upload, for example), the format is `multipart/form-data`. Building this by hand is painful with `urllib.request`, which is one of the strongest reasons to use the `requests` library. `multipart/form-data` is the matching content type for uploading a file alongside form fields.
+
+<h1 id="common-request-headers">Common Request Headers</h1>
+
+Three headers carry most of the weight on real API calls:
+
+| Header          | Purpose                           | Typical Value         |
+| --------------- | --------------------------------- | --------------------- |
+| `Content-Type`  | What format the body is in        | `application/json`    |
+| `Authorization` | Who's making the call             | `Bearer abc123def456` |
+| `Accept`        | What format the client wants back | `application/json`    |
+| `User-Agent`    | Identifies the client software    | `shop-sync/1.0`       |
+
+Setting them is a matter of passing a `headers` dict to `Request`. There are no special methods; headers are arbitrary string key/value pairs.
+
+```python
+from urllib.request import Request, urlopen
+
+req = Request(
+    url="https://httpbin.org/headers",
+    headers={
+        "Accept": "application/json",
+        "Authorization": "Bearer abc123def456",
+        "User-Agent": "shop-sync/1.0",
+    },
+)
+
+with urlopen(req) as response:
+    import json
+    echoed = json.loads(response.read())
+
+for name, value in echoed["headers"].items():
+    print(f"{name}: {value}")
+```
+
+The server echoes the headers it received. `Accept-Encoding: identity` was added by `urllib.request` itself; the library disables compression by default unless asked. The other three were set in code, exactly as configured.
+
+A note on case: HTTP header names are case-insensitive, and most servers normalise them. Python's `urllib.request` stores them with the case passed in, but the server doesn't distinguish between `Authorization` and `authorization`. Pick one style and stick with it.
+
+<h1 id="authentication-basic-and-bearer">Authentication: Basic and Bearer</h1>
+
+Two auth flavours cover most APIs called from Python.
+
+**Basic auth** sends a username and password on every request, base64-encoded in the `Authorization` header. It's the oldest scheme, still used by some internal tools and CI systems.
+
+```python
+import base64
+from urllib.request import Request, urlopen
+
+username = "alex"
+password = "s3cret!"
+credentials = f"{username}:{password}".encode("utf-8")
+encoded = base64.b64encode(credentials).decode("ascii")
+
+req = Request(
+    url="https://httpbin.org/basic-auth/alex/s3cret!",
+    headers={"Authorization": f"Basic {encoded}"},
+)
+
+with urlopen(req) as response:
+    print(response.status)
+    print(response.read().decode("utf-8"))
+```
+
+The username and password are joined with a colon, base64-encoded, and prefixed with `Basic `. Base64 is encoding, not encryption: anyone who sees the header can decode it back to the original. Basic auth must always travel over HTTPS, or those credentials are visible to anyone on the network.
+
+**Bearer auth** sends a token issued by the server. Most modern APIs use this, often with OAuth or a similar system handing out the tokens.
+
+```python
+from urllib.request import Request, urlopen
+
+token = "abc123def456"  # obtained via login, OAuth, etc.
+
+req = Request(
+    url="https://httpbin.org/bearer",
+    headers={"Authorization": f"Bearer {token}"},
+)
+
+with urlopen(req) as response:
+    print(response.status)
+    print(response.read().decode("utf-8")[:80])
+```
+
+The structure is similar: `Authorization: Bearer <token>`. The token itself is opaque to the client; the server knows what it means. Like Basic, Bearer relies on HTTPS to keep the token from leaking in transit.
+
+Logging a request that includes the `Authorization` header is a common way tokens leak into log files and bug reports. Strip or redact that header before logging request details.
+
+<h1 id="handling-errors-httperror-and-urlerror">
+  Handling Errors: HTTPError and URLError
+</h1>
+
+`urlopen` raises an exception when the request fails. There are two main exception types in `urllib.error`:
+
+| Exception                | When                                                                           | Has                                       |
+| ------------------------ | ------------------------------------------------------------------------------ | ----------------------------------------- |
+| `urllib.error.HTTPError` | Server returned an error status (4xx or 5xx)                                   | `.code`, `.reason`, `.headers`, `.read()` |
+| `urllib.error.URLError`  | The request couldn't be made at all (DNS failure, connection refused, timeout) | `.reason`                                 |
+
+`HTTPError` is a subclass of `URLError`, so catching `URLError` catches both. Handling them separately is often appropriate because they mean different things.
+
+```python
+from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+
+try:
+    with urlopen("https://httpbin.org/status/404") as response:
+        print(response.status)
+except HTTPError as e:
+    print(f"server returned {e.code} {e.reason}")
+except URLError as e:
+    print(f"could not reach server: {e.reason}")
+```
+
+A 404 raised `HTTPError`, not a returned response object. That's a quirk of `urllib.request`: any 4xx or 5xx is an exception, not a value. The `requests` library is more forgiving here, returning the response and leaving status checking to the caller.
+
+A connection-level failure is different:
+
+```python
+from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+
+try:
+    with urlopen("https://no-such-domain-12345.example") as response:
+        print(response.status)
+except HTTPError as e:
+    print(f"http error {e.code}")
+except URLError as e:
+    print(f"could not reach server: {e.reason}")
+```
+
+The DNS lookup failed, so the request never reached a server. That's `URLError`, not `HTTPError`. Distinguishing the two matters for retry logic: a 503 might warrant a retry, but a DNS failure suggests checking the URL, not retrying.
+
+<h1 id="timeouts">Timeouts</h1>
+
+`urlopen` accepts a `timeout` argument in seconds. Without one, a request will hang forever if the server stops responding, which is rarely the intended behaviour.
+
+```python
+from urllib.request import urlopen
+from urllib.error import URLError
+import socket
+
+try:
+    with urlopen("https://httpbin.org/delay/5", timeout=2) as response:
+        print(response.status)
+except URLError as e:
+    print(f"failed: {e.reason}")
+except socket.timeout:
+    print("request timed out")
+```
+
+`/delay/5` makes the server wait 5 seconds before responding. The 2-second timeout cuts the connection first, and `urlopen` raises `URLError` with a `"timed out"` reason. In modern Python the timeout shows up wrapped as `URLError`, though `socket.timeout` is the underlying exception type.
+
+Always set a timeout on real code. The matching value depends on the API; somewhere between 5 and 30 seconds is typical for normal APIs, with shorter values (1 to 2 seconds) for fast internal services.
+
+<h1 id="redirects">Redirects</h1>
+
+`urlopen` follows HTTP redirects automatically. If a request to `/old-product` returns `301 Moved Permanently` with `Location: /products/101`, the library issues a second request to `/products/101` and returns that response.
+
+```python
+from urllib.request import urlopen
+
+with urlopen("https://httpbin.org/redirect-to?url=https://httpbin.org/get") as response:
+    print(response.status)
+    print(response.url)
+```
+
+`response.status` is `200` (the final response, not the `302` that triggered the redirect). `response.url` is the URL the client ended up at, which differs from the URL originally requested. That's a useful debugging hint: an unexpected URL in `response.url` often means a redirect happened.
+
+Most of the time this automatic behaviour is fine. For some uses (auditing, security), the redirect itself needs to be visible. Disabling it requires installing a custom redirect handler, which is one place `urllib.request` shows its age. The `requests` library has a one-line `allow_redirects=False`, another nudge toward it for non-trivial work.
+
+<h1 id="when-to-use-requests-instead">When to Use requests Instead</h1>
+
+`urllib.request` is in the standard library, which means no dependencies. That matters when writing a small script, a constrained-deployment environment, or a library that doesn't want to drag dependencies onto its users. For those cases, it does the job.
+
+For most real application code, the third-party `requests` library is what people use. It cleans up almost every wart this lesson has touched:
+
+| Thing                       | `urllib.request`                                             | `requests`                                                                                   |
+| --------------------------- | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------- |
+| GET with params             | Build query string with `urlencode`, append to URL           | `requests.get(url, params={...})`                                                            |
+| POST JSON                   | `json.dumps`, `.encode`, set `Content-Type`, build `Request` | `requests.post(url, json=payload)`                                                           |
+| Read JSON response          | `json.loads(response.read())`                                | `response.json()`                                                                            |
+| 4xx/5xx                     | Raises `HTTPError`                                           | Returns response; check `r.status_code` or call `r.raise_for_status()` for an explicit check |
+| Sessions / connection reuse | Manual with `http.client`                                    | `requests.Session()`                                                                         |
+| Multipart uploads           | Build the multipart body by hand                             | `requests.post(url, files={...})`                                                            |
+| Cookie persistence          | Manual or via `http.cookiejar`                               | Built into `Session`                                                                         |
+| Timeouts                    | `timeout=` argument                                          | `timeout=` argument                                                                          |
+
+The mechanics covered here carry over to the `requests` library. A `requests.post(url, json=payload)` ultimately produces a request with `Content-Type: application/json`, a JSON body, and a `POST` method. Knowing what's happening underneath makes the higher-level library make sense.
+
+<h1 id="quiz">Quiz</h1>
+
+<h1 id="quiz-questions">Quiz Questions</h1>
+
+**Question 1: When using urllib.request.urlopen, what does response.read() return?**
+
+- [x] A bytes object containing the raw response body.
+- [ ] A str decoded automatically from Content-Type.
+- [ ] A dict when the server returns JSON data.
+- [ ] A list of lines split on newline bytes.
+
+**Question 2: How does urllib.request.Request choose a default HTTP method?**
+
+- [x] It uses GET without data and POST when data is supplied.
+- [ ] It always uses GET unless the URL has a query string.
+- [ ] It uses POST only when Content-Type is application/json.
+- [ ] It chooses PUT when the data argument contains bytes.
+
+**Question 3: Which request header says what response format the client prefers?**
+
+- [x] Accept
+- [ ] Content-Type
+- [ ] User-Agent
+- [ ] Authorization
+
+**Question 4: What is urllib.parse.urlencode mainly used for in a GET request?**
+
+- [x] It builds a percent-encoded query string from key-value pairs.
+- [ ] It opens the URL over HTTP and returns the response bytes.
+- [ ] It converts a Python dict into a JSON request body for POST.
+- [ ] It sets custom request headers on a urllib Request object.
+
+**Question 5: You need to make many calls to the same HTTPS API. Which approach matches the chapter's guidance?**
+
+- [x] Use requests.Session so connections can be reused.
+- [ ] Call urlopen repeatedly because it pools sockets.
+- [ ] Decode each body early to keep TLS connections open.
+- [ ] Set Accept to keep-alive to enable pooling.
+
+**Question 6: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 7: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 8: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+<QuizCard />
+
+<CommentsSection />
+
+</LessonCard>

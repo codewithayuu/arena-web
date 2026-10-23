@@ -1,0 +1,677 @@
+---
+title: "Memory Leaks"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Memory Leaks explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+This lesson walks through the canonical leak patterns in Java code (each shown with broken and fixed e-commerce examples), the tools you use to spot a leak in a running JVM, and the prevention habits that stop most leaks before they ever ship.
+
+<h1 id="what-a-java-memory-leak-actually-is">
+  What a Java Memory Leak Actually Is
+</h1>
+
+Every running JVM has a set of **GC roots**: the local variables of every live thread's stack frames, every static field of every loaded class, JNI references, and a handful of internal structures. The garbage collector treats anything reachable from a root as live, and everything else as garbage. A leak happens when the application keeps a reachable path to an object that it no longer logically uses.
+
+Three conditions have to hold for an object to leak:
+
+1. The object exists.
+2. There's a chain of references from some GC root to that object.
+3. The program will never touch the object again, but the GC has no way to know that.
+
+The GC has no insight into application intent. If a `static List<Order>` is still pointing at an order from three months ago, the GC has to assume the order is still in use. That's a leak even though no normal Java method ever calls a "free" function.
+
+The diagram shows the shape of every leak: a root, an intermediate holder (often a collection or a registry), and a set of objects that nobody intends to use anymore but the GC can still reach. The fix in every case is to break one of the edges so the unreachable objects can be collected.
+
+A leak's signature is also predictable. Heap usage rises across GC cycles instead of returning to a baseline. A healthy server's heap chart sawtooths up and down: it climbs during allocation, drops sharply at each GC, and the post-GC floor stays roughly flat over hours and days. A leaking server's chart also sawtooths, but the floor climbs steadily upward. Eventually the old generation fills and the JVM throws `OutOfMemoryError: Java heap space`.
+
+If that drift shows up in monitoring before the JVM dies, there's a chance to grab a heap dump while the leak is still small and easy to analyze.
+
+<h1 id="pattern-1-unbounded-static-collection">
+  Pattern 1: Unbounded Static Collection
+</h1>
+
+The simplest leak is a static collection that only grows. A static field is a GC root, so anything it points to lives until the class is unloaded (which means never, for the main classloader). Adding to a static `List` or `Map` without ever removing entries causes the heap to grow linearly with time.
+
+**What's wrong with this code?**
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class OrderHistory {
+
+    private static final List<Order> ALL_ORDERS = new ArrayList<>();
+
+    public static void recordOrder(Order order) {
+        ALL_ORDERS.add(order);
+    }
+
+    public static int totalOrders() {
+        return ALL_ORDERS.size();
+    }
+
+    record Order(long id, String customerEmail, double total) {}
+}
+```
+
+`ALL_ORDERS` is a static field, so it's a GC root. Every call to `recordOrder` appends another `Order` and nothing ever removes one. If the store processes ten thousand orders an hour, that's ten thousand `Order` objects added to the heap every hour, forever. The intent might be "keep a recent history for reporting," but the code says "remember every order ever placed."
+
+**Fix:**
+
+Either store only what is actually needed (recent orders), or move the history to a database and keep the in-memory structure bounded.
+
+```java
+import java.util.ArrayDeque;
+import java.util.Deque;
+
+public class RecentOrderHistory {
+
+    private static final int MAX_ORDERS = 1000;
+    private static final Deque<Order> RECENT = new ArrayDeque<>();
+
+    public static synchronized void recordOrder(Order order) {
+        RECENT.addLast(order);
+        if (RECENT.size() > MAX_ORDERS) {
+            RECENT.removeFirst();
+        }
+    }
+
+    public static synchronized int recentCount() {
+        return RECENT.size();
+    }
+
+    record Order(long id, String customerEmail, double total) {}
+}
+```
+
+The bounded deque drops the oldest entry when the cap is reached, so heap usage stabilizes around `MAX_ORDERS` entries. The shape of the fix is always the same: decide on a maximum and enforce it.
+
+A bounded structure trades memory for completeness. A full history belongs in a database, not on the JVM heap. The heap is for working state, not durable storage.
+
+The hardest part of this pattern is recognizing it. A `static final` collection looks innocuous, especially when its first hundred entries fit comfortably in memory during testing. The leak only shows up after the application has been running for days.
+
+<h1 id="pattern-2-forgotten-removal-from-a-map-cache">
+  Pattern 2: Forgotten Removal from a Map Cache
+</h1>
+
+Another common leak is a `Map` used as a cache where entries are added but never removed. A session map keyed by customer ID is a classic example. Logins add an entry; logout is supposed to remove it; but if logout doesn't always happen (the user closes the tab, the connection drops, the cleanup path throws), the entry sticks around.
+
+**What's wrong with this code?**
+
+```java
+import java.util.HashMap;
+import java.util.Map;
+
+public class SessionStore {
+
+    private static final Map<String, Session> SESSIONS = new HashMap<>();
+
+    public static synchronized void login(String customerId, Session session) {
+        SESSIONS.put(customerId, session);
+    }
+
+    public static synchronized Session lookup(String customerId) {
+        return SESSIONS.get(customerId);
+    }
+
+    public static synchronized void logout(String customerId) {
+        SESSIONS.remove(customerId);
+    }
+
+    static class Session {
+        String customerId;
+        long loginTimeMillis;
+        byte[] cartSnapshot;
+    }
+}
+```
+
+`SESSIONS` is static, so every `Session` object stays alive until something calls `logout` for its customer ID. Real users don't always log out cleanly. A user who closes the tab, loses Wi-Fi, or has a session token expire silently leaves the entry behind. After a month of traffic, `SESSIONS` has tens of thousands of entries that no living request will ever look up again.
+
+**Fix:**
+
+Use a cache with an eviction policy. The right answer depends on the use case: time-based eviction (sessions expire after 30 minutes of inactivity), size-based eviction (keep at most N sessions), or both.
+
+```java
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+public class BoundedSessionStore {
+
+    private static final int MAX_SESSIONS = 10_000;
+
+    // LinkedHashMap in access-order with removeEldestEntry gives a simple LRU.
+    private static final Map<String, Session> SESSIONS =
+        new LinkedHashMap<>(16, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<String, Session> eldest) {
+                return size() > MAX_SESSIONS;
+            }
+        };
+
+    public static synchronized void login(String customerId, Session session) {
+        SESSIONS.put(customerId, session);
+    }
+
+    public static synchronized Session lookup(String customerId) {
+        return SESSIONS.get(customerId);
+    }
+
+    public static synchronized void logout(String customerId) {
+        SESSIONS.remove(customerId);
+    }
+
+    static class Session {
+        String customerId;
+        long loginTimeMillis;
+        byte[] cartSnapshot;
+    }
+}
+```
+
+`LinkedHashMap` in access-order mode plus `removeEldestEntry` gives a simple in-memory LRU cache. Production code more often uses a real cache library like Caffeine, which handles concurrency, time-based expiration, statistics, and weight-based eviction without the manual `synchronized` plumbing. The principle is identical: bound the cache and pick an eviction rule.
+
+If the cache should follow object identity (keep the entry only as long as someone else still references the key), Java's `WeakHashMap` is purpose-built for that. The keys are held weakly, so the entry disappears once the key is no longer reachable from anywhere else. For the leak-prevention angle, `WeakHashMap` is a sensible default for caches keyed by long-lived objects that the cache does not own.
+
+The diagram captures why the unfixed version leaks. The "happy path" of clean logout is one branch; every unhappy path strands the entry. Production traffic exercises every unhappy path, often.
+
+<h1 id="pattern-3-threadlocal-not-cleaned-up">
+  Pattern 3: ThreadLocal Not Cleaned Up
+</h1>
+
+`ThreadLocal` is a per-thread storage slot. It's useful for things like "the current user's locale during this request" or a per-thread `SimpleDateFormat` to avoid the formatter's lack of thread safety. The leak risk comes from the combination of `ThreadLocal` with a thread pool.
+
+Each thread in a pool is long-lived (the whole point of pooling is to reuse threads). Each thread has a `ThreadLocalMap` that holds whatever values `ThreadLocal.set` put there. If a task sets a value and never removes it, the value sits in that thread's `ThreadLocalMap` until the next task on the same thread either overwrites it or removes it. When the value is large (say, a cached customer profile or a session blob), and the pool has dozens of threads, that's dozens of large objects pinned for the life of the pool.
+
+**What's wrong with this code?**
+
+```java
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+public class CheckoutPipeline {
+
+    private static final ThreadLocal<CustomerContext> CONTEXT = new ThreadLocal<>();
+
+    public static void main(String[] args) throws InterruptedException {
+        ExecutorService pool = Executors.newFixedThreadPool(4);
+
+        for (int i = 0; i < 100; i++) {
+            final int orderId = i;
+            pool.submit(() -> {
+                CONTEXT.set(loadCustomerContext(orderId));
+                processCheckout(orderId);
+                // Forgot to call CONTEXT.remove()
+            });
+        }
+
+        pool.shutdown();
+        pool.awaitTermination(10, java.util.concurrent.TimeUnit.SECONDS);
+    }
+
+    static CustomerContext loadCustomerContext(int orderId) {
+        return new CustomerContext(orderId, new byte[64 * 1024]); // 64 KB profile
+    }
+
+    static void processCheckout(int orderId) {
+        CustomerContext ctx = CONTEXT.get();
+        // ... uses ctx ...
+    }
+
+    record CustomerContext(int orderId, byte[] profileBlob) {}
+}
+```
+
+Each task `set`s a fresh `CustomerContext`, but no task ever calls `CONTEXT.remove()`. The thread that ran task 1 still has task 1's `CustomerContext` in its `ThreadLocalMap` until task 2 happens to run on that same thread and overwrite it. With 100 tasks and 4 threads, four `CustomerContext` objects (the last one each thread saw) stay pinned for the life of the pool. In a long-running web server with hundreds of pooled threads and complex per-request state, this is a slow but reliable leak.
+
+There's a second problem. If the `ThreadLocal` itself becomes unreachable but the threads stay alive, the entries in each thread's `ThreadLocalMap` are not freed automatically. The map's keys are `WeakReference` to the `ThreadLocal`, but the values are strong. Stale entries only get cleared when the same thread calls `get`, `set`, or `remove` on a `ThreadLocal` later (the map prunes on operations). On a quiet thread, the stale values can sit indefinitely.
+
+**Fix:**
+
+Always pair `set` with `remove` in a `try/finally`, the same way `lock` is paired with `unlock`.
+
+```java
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+public class CheckoutPipelineFixed {
+
+    private static final ThreadLocal<CustomerContext> CONTEXT = new ThreadLocal<>();
+
+    public static void main(String[] args) throws InterruptedException {
+        ExecutorService pool = Executors.newFixedThreadPool(4);
+
+        for (int i = 0; i < 100; i++) {
+            final int orderId = i;
+            pool.submit(() -> {
+                CONTEXT.set(loadCustomerContext(orderId));
+                try {
+                    processCheckout(orderId);
+                } finally {
+                    CONTEXT.remove();
+                }
+            });
+        }
+
+        pool.shutdown();
+        pool.awaitTermination(10, java.util.concurrent.TimeUnit.SECONDS);
+    }
+
+    static CustomerContext loadCustomerContext(int orderId) {
+        return new CustomerContext(orderId, new byte[64 * 1024]);
+    }
+
+    static void processCheckout(int orderId) {
+        CustomerContext ctx = CONTEXT.get();
+        // ... uses ctx ...
+    }
+
+    record CustomerContext(int orderId, byte[] profileBlob) {}
+}
+```
+
+The `try/finally` ensures `remove` runs no matter how the task ends (success, exception, anything). Once the value is removed from the thread's `ThreadLocalMap`, nothing in the JVM holds the `CustomerContext`, and the GC reclaims it on the next cycle.
+
+The reference chain in the diagram is what the GC sees: a live thread points at its `ThreadLocalMap`, which strongly references the stored value. Until the thread dies or someone calls `remove`, the value cannot be collected. Pool threads almost never die during the life of the JVM, so `remove` is the only practical exit.
+
+`ThreadLocal.get` and `set` are cheap but not free. They hash and look up in a per-thread table. The bigger concern is the retention: anything stored in a `ThreadLocal` is one reference away from every future task on that thread until it is removed.
+
+<h1 id="pattern-4-listeners-and-observers-not-unregistered">
+  Pattern 4: Listeners and Observers Not Unregistered
+</h1>
+
+The publish-subscribe pattern is a leak factory. A publisher holds a list of subscribers and calls back into them when something happens. If a subscriber is short-lived (a single page in a UI, a temporary connection) but the publisher is long-lived (an application-scoped event bus), and the subscriber never unregisters, the publisher keeps it alive forever.
+
+**What's wrong with this code?**
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class PriceChangePublisher {
+
+    private final List<PriceChangeListener> listeners = new ArrayList<>();
+
+    public void subscribe(PriceChangeListener listener) {
+        listeners.add(listener);
+    }
+
+    public void onPriceChange(String productId, double newPrice) {
+        for (PriceChangeListener listener : listeners) {
+            listener.priceChanged(productId, newPrice);
+        }
+    }
+}
+
+interface PriceChangeListener {
+    void priceChanged(String productId, double newPrice);
+}
+
+class ProductPageView implements PriceChangeListener {
+
+    private final String productId;
+    private final byte[] cachedImage;
+
+    public ProductPageView(String productId, PriceChangePublisher publisher) {
+        this.productId = productId;
+        this.cachedImage = new byte[256 * 1024];
+        publisher.subscribe(this); // registers, but never unregisters
+    }
+
+    @Override
+    public void priceChanged(String productId, double newPrice) {
+        if (this.productId.equals(productId)) {
+            // refresh the view
+        }
+    }
+}
+```
+
+Every `ProductPageView` constructor adds `this` to the publisher's `listeners` list. When the user navigates away from the product page, the view object is logically dead. But the publisher (which lives for the entire application) still holds the view in its list, so the 256 KB cached image and everything else the view holds stay on the heap. Open ten thousand product pages, leak ten thousand views.
+
+**Fix:**
+
+Unregister the listener when it's no longer needed. One approach is for the subscriber to expose a `close` method (or implement `AutoCloseable`) and for the caller to use `try-with-resources` or invoke `close` in a lifecycle hook.
+
+```java
+class ProductPageViewFixed implements PriceChangeListener, AutoCloseable {
+
+    private final String productId;
+    private final byte[] cachedImage;
+    private final PriceChangePublisher publisher;
+
+    public ProductPageViewFixed(String productId, PriceChangePublisher publisher) {
+        this.productId = productId;
+        this.cachedImage = new byte[256 * 1024];
+        this.publisher = publisher;
+        publisher.subscribe(this);
+    }
+
+    @Override
+    public void priceChanged(String productId, double newPrice) {
+        if (this.productId.equals(productId)) {
+            // refresh the view
+        }
+    }
+
+    @Override
+    public void close() {
+        publisher.unsubscribe(this);
+    }
+}
+```
+
+And the publisher needs an `unsubscribe`:
+
+```java
+public void unsubscribe(PriceChangeListener listener) {
+    listeners.remove(listener);
+}
+```
+
+Now the caller can do:
+
+```java
+try (ProductPageViewFixed view = new ProductPageViewFixed("BOOK-123", publisher)) {
+    // user interacts with the page
+}
+// view auto-unsubscribes on close
+```
+
+There's a second school of thought: have the publisher hold listeners weakly so an inactive subscriber gets collected automatically. That works, but it makes the contract harder to reason about (a listener can be dropped at any time). Explicit unsubscribe is usually cleaner. Use weak references when the lifecycle truly is "as long as someone else holds the listener," and use the explicit-close pattern otherwise.
+
+<h1 id="pattern-5-inner-classes-capturing-the-outer-instance">
+  Pattern 5: Inner Classes Capturing the Outer Instance
+</h1>
+
+A non-static inner class (including anonymous inner classes) holds an implicit reference to its enclosing instance. If the inner class outlives the outer one, the outer instance is pinned alive too. Lambdas behave differently: a lambda only captures what it actually uses, so a lambda that doesn't reference `this` does not pin the outer instance.
+
+**What's wrong with this code?**
+
+```java
+import java.util.Timer;
+import java.util.TimerTask;
+
+public class CheckoutCart {
+
+    private final byte[] cartContents = new byte[512 * 1024];
+    private final String customerEmail;
+
+    public CheckoutCart(String customerEmail) {
+        this.customerEmail = customerEmail;
+    }
+
+    public void scheduleReminder(Timer timer) {
+        timer.schedule(new TimerTask() {
+            @Override
+            public void run() {
+                System.out.println("Reminder: complete your checkout, " + customerEmail);
+            }
+        }, 30 * 60 * 1000); // 30 minutes
+    }
+}
+```
+
+The anonymous `TimerTask` is a non-static inner class, so it captures an implicit `CheckoutCart.this`. The `Timer` keeps the `TimerTask` scheduled for 30 minutes, and through it, the entire `CheckoutCart` instance, including its 512 KB `cartContents` array. If a million carts schedule reminders over the day, the `Timer` is pinning around 500 GB of carts at any one time. Even when each cart only needs to know the customer's email to fire the reminder, the inner class drags the whole cart along.
+
+**Fix:**
+
+Use a `static` nested class (or a lambda) that captures only the fields it actually needs.
+
+```java
+import java.util.Timer;
+import java.util.TimerTask;
+
+public class CheckoutCartFixed {
+
+    private final byte[] cartContents = new byte[512 * 1024];
+    private final String customerEmail;
+
+    public CheckoutCartFixed(String customerEmail) {
+        this.customerEmail = customerEmail;
+    }
+
+    public void scheduleReminder(Timer timer) {
+        String emailSnapshot = this.customerEmail; // capture just the value
+        timer.schedule(new ReminderTask(emailSnapshot), 30 * 60 * 1000);
+    }
+
+    private static final class ReminderTask extends TimerTask {
+        private final String customerEmail;
+
+        ReminderTask(String customerEmail) {
+            this.customerEmail = customerEmail;
+        }
+
+        @Override
+        public void run() {
+            System.out.println("Reminder: complete your checkout, " + customerEmail);
+        }
+    }
+}
+```
+
+The `static` nested class holds only the email string, not the enclosing `CheckoutCart`. The cart can be collected as soon as the rest of the application is done with it. The lambda version is shorter and behaves the same way:
+
+```java
+public void scheduleReminder(Timer timer) {
+    String emailSnapshot = this.customerEmail;
+    timer.schedule(new TimerTask() {
+        @Override public void run() {
+            System.out.println("Reminder: complete your checkout, " + emailSnapshot);
+        }
+    }, 30 * 60 * 1000);
+}
+```
+
+Even though this is still an anonymous inner class, it only references `emailSnapshot` (a local), not `this.customerEmail`, so it does **not** capture the enclosing instance. The compiler is precise about what gets captured: only the names used inside the body. The general rule is to keep inner classes static unless they truly need access to the enclosing instance. Anonymous-inner-class-with-implicit-`this`-reference is a common way to accidentally extend an object's lifetime.
+
+Capturing the enclosing instance is free at the moment of creation but expensive across the lifetime of the inner object. Anything reachable from the outer instance becomes ineligible for collection until the inner object is collected too.
+
+<h1 id="pattern-6-string-intern-overuse">Pattern 6: String intern() Overuse</h1>
+
+`String.intern()` adds a string to the JVM's internal string table and returns the canonical instance. It's useful for deduplicating large numbers of equal-but-distinct string objects. It becomes a leak when `intern()` is called on strings that are unique per request, because every interned string lives in the string table for the life of the JVM (or until the string table itself prunes it, which happens but is not guaranteed for arbitrary content).
+
+**What's wrong with this code?**
+
+```java
+public class OrderRouter {
+
+    public void routeOrder(String orderId, String warehouseRegion) {
+        // intern() the orderId so map lookups are fast?
+        String key = (orderId + ":" + warehouseRegion).intern();
+        // ... uses key as a map lookup ...
+    }
+}
+```
+
+Every order produces a unique `orderId`, so every call to `intern()` adds a new entry to the string table. The string table is a hash table inside the JVM (in modern HotSpot it lives in native memory rather than the heap, but it's still bounded by the JVM's memory limits). After a million orders, the string table has a million entries that nothing else will ever look up. The application doesn't see the growth in a normal heap dump; it sees increasing native memory pressure and eventually `OutOfMemoryError: Compressed class space` or similar native-memory errors.
+
+**Fix:**
+
+Don't `intern()` strings that are unique or near-unique per call. Reserve `intern()` for heavily repeated strings, and even then, prefer a regular `HashMap<String, String>` to deduplicate within the application's scope.
+
+```java
+import java.util.concurrent.ConcurrentHashMap;
+
+public class OrderRouterFixed {
+
+    private static final ConcurrentHashMap<String, String> KEY_POOL = new ConcurrentHashMap<>();
+
+    public void routeOrder(String orderId, String warehouseRegion) {
+        String composite = orderId + ":" + warehouseRegion;
+        // No intern(). Either use the string directly, or deduplicate in a bounded structure.
+        // If deduplication actually matters here, scope the pool:
+        String key = KEY_POOL.computeIfAbsent(composite, k -> k);
+        // ... uses key as a map lookup ...
+    }
+}
+```
+
+If the pool needs a size limit (because the inputs are unbounded), wrap it in a real cache with eviction. The principle is the same as for the session cache: never use an unbounded structure for unbounded input.
+
+`String.intern()` is a fine tool when the universe of strings is small and shared (a few status names, a fixed set of country codes). Treating it as automatic deduplication causes leaks.
+
+<h1 id="pattern-7-classloader-leaks-in-long-lived-containers">
+  Pattern 7: ClassLoader Leaks in Long-Lived Containers
+</h1>
+
+Web application servers (Tomcat, Jetty) load each deployed application in its own classloader. When the application is redeployed without restarting the server, the old classloader should become unreachable so the GC can unload all the classes, statics, and threads it created. ClassLoader leaks happen when something the server itself holds onto keeps a reference into the old application, pinning the entire classloader.
+
+Common culprits include:
+
+- A `ThreadLocal` set in an application thread, where the value's class was loaded by the application classloader. If the thread belongs to the server (a worker thread in the server's pool) and the application doesn't `remove()` the thread-local before the request ends, the thread still has a `ThreadLocalMap` entry whose value points at an application class, which points at the application classloader.
+- A JDBC driver or other library that registers itself with a static registry (`DriverManager`, JNDI, the logging framework). If the driver class was loaded by the application classloader and isn't unregistered on shutdown, the static registry pins the driver class, which pins the classloader.
+- A background thread started by the application that never exits. Threads are GC roots. As long as the thread is alive, everything reachable from its stack and its `ThreadLocalMap` is alive too.
+
+A minimal sketch of the pattern. The goal isn't to fix it in detail, but to recognize the shape in a heap dump.
+
+```java
+import javax.sql.DataSource;
+import java.sql.Driver;
+import java.sql.DriverManager;
+import java.sql.SQLException;
+
+public class ApplicationStartupLeaky {
+
+    public void start() throws SQLException {
+        Driver myDriver = new com.example.MyJdbcDriver();
+        DriverManager.registerDriver(myDriver);
+        // ... application runs ...
+        // On shutdown, the application does not call DriverManager.deregisterDriver(myDriver).
+    }
+}
+```
+
+`DriverManager` keeps a static list of registered drivers. If the application classloader loaded `MyJdbcDriver` and didn't deregister it on shutdown, the static list still references the driver instance, which references its class, which references the application classloader. The classloader can't be collected, so every class it loaded (potentially thousands of classes, plus everything statically initialized) stays alive. The fix is symmetric: register on start, deregister on stop.
+
+```java
+public class ApplicationStartupFixed {
+
+    private Driver myDriver;
+
+    public void start() throws SQLException {
+        myDriver = new com.example.MyJdbcDriver();
+        DriverManager.registerDriver(myDriver);
+    }
+
+    public void stop() throws SQLException {
+        if (myDriver != null) {
+            DriverManager.deregisterDriver(myDriver);
+            myDriver = null;
+        }
+    }
+}
+```
+
+The general rule for long-lived containers is **anything registered on startup must be deregistered on shutdown**: drivers, listeners, MBeans, scheduled tasks, background threads. The container will call the shutdown hook; use it.
+
+<h1 id="pattern-8-off-heap-bytes-pinned-by-directbytebuffer">
+  Pattern 8: Off-Heap Bytes Pinned by DirectByteBuffer
+</h1>
+
+`java.nio.ByteBuffer.allocateDirect(int)` allocates memory outside the Java heap. The JVM tracks the buffer through a small heap object (a `DirectByteBuffer`), but the actual bytes live in native memory. The native memory is freed when the `DirectByteBuffer` is garbage-collected, via a `Cleaner` (or a `Finalizer` on older JVMs).
+
+The leak happens when many direct buffers are allocated and the small heap objects never become eligible for collection, or do, but only on full GCs. From the heap's perspective, the leak is tiny: a few hundred bytes per buffer. From the OS's perspective, the leak is massive: gigabytes of native memory pinned by buffers the JVM hasn't gotten around to collecting.
+
+```java
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
+
+public class DirectBufferLeaky {
+
+    private static final List<ByteBuffer> CACHE = new ArrayList<>();
+
+    public static void cacheImage(byte[] imageBytes) {
+        ByteBuffer buffer = ByteBuffer.allocateDirect(imageBytes.length);
+        buffer.put(imageBytes);
+        CACHE.add(buffer);
+    }
+}
+```
+
+The static `CACHE` pins every `DirectByteBuffer`, which pins its native bytes. The Java heap looks small but the JVM process's resident set size grows by the size of every cached image. Diagnosing this from `jmap -histo` is confusing because the `DirectByteBuffer` entries look small. Native memory usage (via `jcmd <pid> VM.native_memory` if NMT is enabled, or by reading `/proc/<pid>/status`) shows where the bytes really went.
+
+The fix is the same as for any other unbounded cache: bound it. And when a direct buffer is no longer needed, drop the reference promptly so the `Cleaner` can free the native bytes on the next GC cycle. Don't rely on direct buffers to be reclaimed quickly; an old generation that doesn't collect for an hour leaves the native memory pinned for an hour.
+
+The diagram shows why these leaks hide. The heap-side object is tiny; the native-side allocation is what hurts. Standard heap-dump tools see only the tip.
+
+<h1 id="detection-workflow">Detection Workflow</h1>
+
+When a server's heap usage drifts upward over hours or days, the diagnosis goes through a few standard steps. The goal is to find the reference chain from a GC root to whatever is accumulating.
+
+**Step 1: Confirm the leak.** Look at heap usage after each GC. In monitoring, that's the "after-GC" or "post-GC" heap line. Rising linearly while throughput is stable indicates a leak. Climbing and then stabilizing is a load increase, not a leak.
+
+`jcmd <pid> GC.heap_info` prints a snapshot of the heap regions:
+
+```text
+$$ jcmd 12345 GC.heap_info
+12345:
+ garbage-first heap   total 4194304K, used 3892015K [0x00000006c0000000, 0x00000007c0000000)
+  region size 2048K, 1843 young (3774464K), 12 survivors (24576K)
+ Metaspace       used 84531K, capacity 86412K, committed 86528K, reserved 1132544K
+  class space    used 9982K, capacity 10374K, committed 10496K, reserved 1048576K
+```
+
+Old generation used roughly 3.7 GB out of 4 GB. Taking this snapshot every minute and watching the number trend upward across GCs confirms the leak.
+
+**Step 2: Identify the dominant classes.** `jmap -histo:live <pid>` (the `:live` triggers a GC first, so you only see surviving objects) prints a histogram of class instances:
+
+```text
+$$ jmap -histo:live 12345 | head -20
+ num     #instances         #bytes  class name (module)
+-------------------------------------------------------
+   1:       3142081     1503198768  [B (java.base@21)
+   2:       3142019      125680760  java.lang.String (java.base@21)
+   3:        980212      117625440  com.shop.Session (app)
+   4:        980212       62733568  com.shop.CartItem (app)
+   5:        980212       47050176  com.shop.CustomerProfile (app)
+```
+
+When `com.shop.Session` has 980,000 instances on a site that has 50,000 active users, the gap (930,000 stale sessions) is the leak. An unfamiliar class that dominates the heap is the next place to look.
+
+**Step 3: Take a heap dump.** Once the accumulating class is known, capture a dump for analysis:
+
+```text
+$$ jmap -dump:live,format=b,file=heap.hprof <pid>
+```
+
+The `:live` flag triggers a GC before the dump so the file contains only surviving objects. The dump is binary, of size equal to the live heap, and is analyzed offline.
+
+**Step 4: Analyze with Eclipse MAT or VisualVM.** Open the dump in Eclipse Memory Analyzer (MAT) and let it build the **dominator tree**. A dominator of object X is an object that every path from a GC root to X must pass through. The retained size of a dominator is the total size of everything it would free if it were collected. The dominator tree sorts the heap by "if this one object disappeared, how many bytes would the JVM reclaim?" That sort surfaces the leak.
+
+In the dominator tree above, the orange node retains 1.2 GB. Collecting it would free everything underneath. MAT shows the chain of references from the GC root down to the dominator, which identifies which static field or which long-lived thread is the culprit. MAT also offers "leak suspects" reports that take a guess based on heuristics; they're worth a look but not a substitute for reading the dominator tree directly.
+
+**Step 5: Read the path to the GC root.** For the dominator, MAT shows the "path to GC roots" with the option to exclude weak/soft references. If the chain ends at `class com.shop.SessionStore` (a static field), that's the leak. If it ends at `Thread main` or a pool thread, look at what's in that thread's stack or `ThreadLocalMap`.
+
+**Step 6: Continuous monitoring.** Production systems should already track post-GC heap size. The signature of a leak (rising old-gen utilization across GC cycles) is the alert trigger. When the climb shows up in dev or staging, take a dump while it's small; small dumps are much easier to analyze than 32 GB ones.
+
+<h1 id="prevention-principles">Prevention Principles</h1>
+
+The patterns above all have the same shape: an object stays reachable longer than the program needs it. The defenses are equally general.
+
+**Bound every cache.** Caches are the most common leak source because their whole point is to retain things. A cache without an eviction policy is a leak with a friendly name. Use a real cache library (Caffeine in production code) with size or time-based eviction. For a custom cache, write the eviction policy first, not last.
+
+**Use `try-with-resources` for anything `AutoCloseable`.** Streams, JDBC connections, scoped contexts. The construct guarantees `close` runs no matter how the block exits. The same pattern applies to anything else with a paired register/unregister or set/remove: wrap it in `try/finally`.
+
+**Pair every `ThreadLocal.set` with `ThreadLocal.remove`.** In thread-pool code, this is non-negotiable. Treat the `ThreadLocal` like a lock: acquire it on entry, release it in `finally`. When code review can't enforce the pattern, write a helper that does both in a single call.
+
+**Audit static state.** Any static collection or static cache is a permanent root. Periodically grep the codebase for `static final.*Map` or `static final.*List` and ask, for each one, "what's the eviction policy?" If the answer is "none," that's a bug.
+
+**Be explicit about lifecycle.** A class that subscribes to anything (event bus, scheduler, JNDI) should expose a `close` method that unsubscribes, and the caller should invoke it. The GC cannot break the chain on its own; the publisher is, by design, holding a strong reference.
+
+**Watch for inner-class capture.** Prefer `static` nested classes when the inner class doesn't need the enclosing instance. Lambdas are usually safer than anonymous inner classes because they capture only what they use, but a lambda that uses `this` still captures the enclosing object.
+
+**Use weak references when ownership is ambiguous.** When a collection should not extend the lifetime of its entries, `WeakHashMap` (and the weak reference machinery) is appropriate. Use it when the lifecycle truly is "someone else owns the keys, this code just wants to look them up by identity."
+
+**Run with monitoring from day one.** Post-GC heap size, GC frequency, GC duration. Charting heap usage after each GC over hours and days makes a leak's signature obvious. Without it, leaks only become visible when the JVM dies.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

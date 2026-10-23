@@ -1,0 +1,569 @@
+---
+title: "Deadlocks"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Deadlocks explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+A deadlock is when two or more threads are stuck waiting for each other, with no way out. The program doesn't crash, doesn't raise, doesn't print a helpful error. It hangs. Threads that should be doing useful work sit blocked on locks they'll never get, because the threads that hold those locks are themselves blocked. This lesson covers the classic two-lock deadlock, the four conditions that make any deadlock possible, the standard ways to prevent them, and how to detect a deadlock when one shows up in production code.
+
+<h1 id="the-classic-two-lock-deadlock">The Classic Two-Lock Deadlock</h1>
+
+The simplest deadlock involves two threads and two locks. Thread A acquires lock 1 and then wants lock 2. Thread B acquires lock 2 and then wants lock 1. Each one is waiting for the lock the other holds, and neither will release until it gets the lock it wants.
+
+Consider an e-commerce app where one operation transfers a balance between two customer accounts, and another operation moves stock between two warehouses. Both operations need to lock two things at once.
+
+```python
+import threading
+import time
+
+order_lock = threading.Lock()
+customer_lock = threading.Lock()
+
+def update_order_first():
+    with order_lock:
+        print("A: holds order_lock, wants customer_lock")
+        time.sleep(0.1)
+        with customer_lock:
+            print("A: holds both")
+
+def update_customer_first():
+    with customer_lock:
+        print("B: holds customer_lock, wants order_lock")
+        time.sleep(0.1)
+        with order_lock:
+            print("B: holds both")
+
+t1 = threading.Thread(target=update_order_first)
+t2 = threading.Thread(target=update_customer_first)
+t1.start()
+t2.start()
+t1.join(timeout=2)
+t2.join(timeout=2)
+
+print(f"Thread A alive: {t1.is_alive()}")
+print(f"Thread B alive: {t2.is_alive()}")
+```
+
+Both threads are still alive after the join timeouts because neither can make progress. Thread A is blocked inside `with customer_lock:`, waiting for B to release. Thread B is blocked inside `with order_lock:`, waiting for A to release. Neither will release until it gets the lock it wants. The program is stuck.
+
+Thread A grabs `order_lock`. Thread B grabs `customer_lock`. Thread A tries to grab `customer_lock` and blocks because B holds it. Thread B tries to grab `order_lock` and blocks because A holds it. Neither lock will ever be released, because each holder is blocked waiting on the other.
+
+This kind of bug is easy to write by accident. Each thread, on its own, is straightforward and correct. Both follow the obvious pattern of "lock what's needed, do the work, then release." The deadlock only emerges when both run at the same time and happen to grab their first locks before either tries for the second. Many runs of the program might work fine; the deadlock only shows up under specific timing.
+
+<h1 id="the-four-conditions-for-deadlock">The Four Conditions for Deadlock</h1>
+
+Every deadlock, in any language, on any operating system, requires four conditions to be true simultaneously. These are known as the **Coffman conditions**, named after Edward Coffman who formalized them in 1971. If any one of them is missing, deadlock is impossible.
+
+**1. Mutual exclusion.** A resource can be held by only one thread at a time. Locks have this by design; a locked resource can't be locked again.
+
+**2. Hold and wait.** A thread holds at least one resource while waiting to acquire another. If threads released their existing locks before asking for new ones, they couldn't be holding lock 1 while waiting for lock 2.
+
+**3. No preemption.** A resource can be released only by the thread holding it. The OS, or another thread, can't take a lock away from its owner. Python locks have this property: `release()` must be called from the holding thread (for `RLock`) or any thread (for `Lock`, though releasing from a different thread is bad practice).
+
+**4. Circular wait.** There exists a cycle of threads where each is waiting for a resource held by the next thread in the cycle. In the two-lock example, A waits for B, B waits for A. With three threads, A waits for B, B waits for C, C waits for A. The cycle can be any length.
+
+| Condition        | What it means                           | Why removing it prevents deadlock                                                   |
+| ---------------- | --------------------------------------- | ----------------------------------------------------------------------------------- |
+| Mutual exclusion | Only one thread at a time               | If resources are shareable, no thread blocks waiting                                |
+| Hold and wait    | Hold one lock while waiting for another | If threads acquire everything at once or release before requesting more, no holding |
+| No preemption    | Locks can't be taken away               | If the OS could break a deadlock by revoking a lock, the cycle breaks               |
+| Circular wait    | A cycle of waiting threads exists       | If there's no cycle, someone can always make progress                               |
+
+In practice, mutual exclusion and no preemption are baked into the design of locks and can't be removed. So the standard defenses target hold-and-wait and circular wait. The most common attack is on circular wait, through consistent lock ordering.
+
+<h1 id="prevention-strategy-1-lock-ordering">
+  Prevention Strategy 1: Lock Ordering
+</h1>
+
+If every thread acquires its locks in the same global order, no circular wait can form. A cycle requires some thread to hold a "higher" lock while waiting for a "lower" one, but if every thread takes the lower lock first, that situation can't happen.
+
+The fixed version of the earlier example has both threads acquire `order_lock` first:
+
+```python
+import threading
+import time
+
+order_lock = threading.Lock()
+customer_lock = threading.Lock()
+
+def update_order_first():
+    with order_lock:
+        time.sleep(0.1)
+        with customer_lock:
+            print("A: holds both")
+
+def update_customer_first():
+    with order_lock:  # acquire in the same order as the other thread
+        time.sleep(0.1)
+        with customer_lock:
+            print("B: holds both")
+
+t1 = threading.Thread(target=update_order_first)
+t2 = threading.Thread(target=update_customer_first)
+t1.start()
+t2.start()
+t1.join()
+t2.join()
+```
+
+When one thread holds `order_lock`, the other waits for it instead of grabbing `customer_lock` and creating a cycle. The two threads now serialize on `order_lock`, which is the desired behavior when they both need both resources.
+
+For a small number of named locks, the ordering is a convention to document and enforce: "always acquire order_lock before customer_lock." For a larger set of locks (one per customer ID, for example), a real ordering function is needed. `id()` of the lock object works, or any deterministic total order over the lock collection:
+
+```python
+import threading
+import time
+
+def transfer(account_a, account_b, amount):
+    # Always acquire the lower-id lock first, regardless of source/destination
+    first, second = sorted([account_a, account_b], key=lambda a: id(a.lock))
+    with first.lock:
+        with second.lock:
+            account_a.balance -= amount
+            account_b.balance += amount
+
+class Account:
+    def __init__(self, name, balance):
+        self.name = name
+        self.balance = balance
+        self.lock = threading.Lock()
+
+alice = Account("alice", 100)
+bob = Account("bob", 100)
+
+# Two threads transferring in opposite directions
+t1 = threading.Thread(target=transfer, args=(alice, bob, 10))
+t2 = threading.Thread(target=transfer, args=(bob, alice, 5))
+t1.start()
+t2.start()
+t1.join()
+t2.join()
+
+print(f"alice: {alice.balance}, bob: {bob.balance}")
+```
+
+The first transfer moves money from alice to bob; the second from bob to alice. Without the sorting, the two threads could acquire locks in opposite orders and deadlock. With `sorted(..., key=lambda a: id(a.lock))`, both threads acquire the lower-id lock first, regardless of which account is the source or destination. No cycle, no deadlock.
+
+The diagram contrasts the two situations. With opposite orders, deadlock is possible. With the same order, the worst case is that one thread waits for the other to finish, which is normal contention.
+
+Lock ordering is the cheapest deadlock defense to implement. It's also the most robust: once code follows a consistent order, the deadlock category goes away entirely. The downside is that the order has to be followed every time. Code review and a comment near the locks help. So does documenting the order explicitly:
+
+```python
+# Lock acquisition order:
+#   1. order_lock
+#   2. customer_lock
+#   3. inventory_lock
+# Always acquire in this order. Never hold a lower-numbered lock
+# while waiting for a higher-numbered one.
+```
+
+<h1 id="prevention-strategy-2-timeouts">Prevention Strategy 2: Timeouts</h1>
+
+When a consistent order isn't possible, the next best defense is to refuse to wait forever. `Lock.acquire(timeout=...)` returns `False` if it can't get the lock in time, which lets the thread back off, release what it already holds, and try again later.
+
+```python
+import threading
+import time
+import random
+
+order_lock = threading.Lock()
+customer_lock = threading.Lock()
+
+def update_with_timeout(name, first_lock, second_lock):
+    while True:
+        if first_lock.acquire(timeout=0.5):
+            try:
+                if second_lock.acquire(timeout=0.5):
+                    try:
+                        print(f"{name}: holds both, doing work")
+                        return
+                    finally:
+                        second_lock.release()
+                else:
+                    print(f"{name}: couldn't get second lock, backing off")
+            finally:
+                first_lock.release()
+        time.sleep(random.uniform(0.1, 0.3))  # back off randomly
+
+t1 = threading.Thread(target=update_with_timeout, args=("A", order_lock, customer_lock))
+t2 = threading.Thread(target=update_with_timeout, args=("B", customer_lock, order_lock))
+t1.start()
+t2.start()
+t1.join()
+t2.join()
+```
+
+When a thread can't acquire its second lock within the timeout, it releases the first lock and sleeps for a random short interval before trying again. The random back-off matters: if both threads back off and retry at the same instant, they'll deadlock again. Adding random jitter makes the retry pattern asymmetric.
+
+Timeouts are less robust than lock ordering. Under heavy load, threads can spend more time retrying than doing actual work, and the random back-off doesn't guarantee progress (a thread can theoretically lose the race repeatedly). They're a reasonable fallback when a consistent order isn't achievable (third-party code, locks created dynamically), but lock ordering is the better first choice.
+
+Timeouts add latency on the contended path. Every failed acquire wastes the timeout duration. A 500-millisecond timeout that fails twice has already cost a full second of wall-clock time, even before the actual work runs. Tune the timeout to be slightly longer than the legitimate hold time, not generous.
+
+<h1 id="prevention-strategy-3-try-locks">Prevention Strategy 3: Try-Locks</h1>
+
+A try-lock is a non-blocking acquire: `lock.acquire(blocking=False)` returns `True` if it grabbed the lock immediately, `False` if the lock was already held. This expresses "if both locks are available right now, do the work; otherwise skip or retry."
+
+```python
+import threading
+import time
+
+order_lock = threading.Lock()
+customer_lock = threading.Lock()
+
+def try_update(name, first_lock, second_lock):
+    for attempt in range(10):
+        if first_lock.acquire(blocking=False):
+            try:
+                if second_lock.acquire(blocking=False):
+                    try:
+                        print(f"{name}: got both on attempt {attempt}")
+                        return
+                    finally:
+                        second_lock.release()
+            finally:
+                first_lock.release()
+        time.sleep(0.05)
+    print(f"{name}: gave up after 10 attempts")
+
+t1 = threading.Thread(target=try_update, args=("A", order_lock, customer_lock))
+t2 = threading.Thread(target=try_update, args=("B", customer_lock, order_lock))
+t1.start()
+t2.start()
+t1.join()
+t2.join()
+```
+
+The non-blocking acquire means a thread never holds one lock while waiting for another. If it can't get both at once, it releases the first one immediately and tries again from scratch. The pattern is sometimes called the "all-or-nothing" acquire.
+
+Try-locks are useful when the work is optional or the caller can retry at a higher level (a web request handler that can return "busy, try again" to the client). They're not a great fit for work that must complete, because the number of retries can't be bounded. For work that has to happen, lock ordering or timeouts are usually the better choice.
+
+<h1 id="prevention-strategy-4-avoid-nested-locks">
+  Prevention Strategy 4: Avoid Nested Locks
+</h1>
+
+The best deadlock defense is to not need two locks at once. If code can be restructured to hold at most one lock at a time, deadlock becomes structurally impossible. This often requires rethinking the design rather than tweaking the acquisition pattern.
+
+Two examples of what that looks like in practice.
+
+**Example 1: Split the data so each lock protects a different concern.** Consider one big lock around a `Cart` and another around an `Inventory`, with adding an item to the cart requiring an inventory check. One option is to read the inventory snapshot first (with only the inventory lock), then update the cart (with only the cart lock):
+
+```python
+import threading
+
+class Inventory:
+    def __init__(self):
+        self.stock = {"mouse": 10, "cable": 5}
+        self.lock = threading.Lock()
+
+    def get_stock(self, product):
+        with self.lock:
+            return self.stock.get(product, 0)
+
+    def deduct(self, product, qty):
+        with self.lock:
+            if self.stock.get(product, 0) >= qty:
+                self.stock[product] -= qty
+                return True
+            return False
+
+class Cart:
+    def __init__(self):
+        self.items = []
+        self.lock = threading.Lock()
+
+    def add(self, product, qty):
+        with self.lock:
+            self.items.append((product, qty))
+
+def add_if_in_stock(inv, cart, product, qty):
+    # No nested locking: read inventory, then deduct, then update cart
+    if inv.deduct(product, qty):
+        cart.add(product, qty)
+        return True
+    return False
+
+inv = Inventory()
+cart = Cart()
+
+threads = [threading.Thread(target=add_if_in_stock, args=(inv, cart, "mouse", 1)) for _ in range(5)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+
+print(f"Cart: {cart.items}")
+print(f"Stock: {inv.stock}")
+```
+
+Each operation grabs at most one lock at a time. The deduct happens atomically inside the inventory lock; the cart update happens atomically inside the cart lock. No thread ever holds both locks, so no deadlock is possible. The cost is that the inventory and cart can briefly disagree (the inventory is decremented before the cart is updated), but that's usually an acceptable trade-off, and it's easier to reason about than the cross-lock alternative.
+
+**Example 2: Use higher-level primitives.** Standard library tools like `queue.Queue` and `concurrent.futures` already encapsulate the locking. Work is handed off through a clean API, and the locking happens inside, where it's already debugged.
+
+```python
+import threading
+import queue
+
+orders = queue.Queue()
+
+def producer():
+    for i in range(5):
+        orders.put(f"order-{i}")
+
+def consumer():
+    while True:
+        order = orders.get()
+        if order is None:
+            return
+        print(f"processed {order}")
+        orders.task_done()
+
+producer_thread = threading.Thread(target=producer)
+consumer_thread = threading.Thread(target=consumer)
+producer_thread.start()
+consumer_thread.start()
+producer_thread.join()
+orders.put(None)  # poison pill to stop the consumer
+consumer_thread.join()
+```
+
+`queue.Queue` internally uses a `Condition` to coordinate `put` and `get` between threads, but the caller never deals with locks. There's no nested locking, no acquisition order to remember, no deadlock to worry about (within the queue itself; deadlocks can still occur if `Queue` is mixed badly with custom locks).
+
+The general principle: deadlocks happen at the boundaries where code holds multiple locks. Push the locking inside well-tested abstractions and the deadlock risk usually goes with it.
+
+<h1 id="livelock-and-starvation">Livelock and Starvation</h1>
+
+Two cousins of deadlock that don't fit the strict definition but cause similar pain.
+
+**Livelock** is when threads are actively running but not making progress. They keep changing state in response to each other, like two people in a corridor stepping aside in the same direction over and over. A classic example is two threads with try-locks plus retries that always retry at the same instant:
+
+```python
+import threading
+import time
+
+lock_a = threading.Lock()
+lock_b = threading.Lock()
+
+def task(name, first, second):
+    for _ in range(20):
+        if first.acquire(blocking=False):
+            try:
+                if second.acquire(blocking=False):
+                    try:
+                        print(f"{name}: got both")
+                        return
+                    finally:
+                        second.release()
+                else:
+                    pass  # let go and retry
+            finally:
+                first.release()
+        time.sleep(0.01)  # both threads retry at the same rate
+    print(f"{name}: gave up")
+
+t1 = threading.Thread(target=task, args=("A", lock_a, lock_b))
+t2 = threading.Thread(target=task, args=("B", lock_b, lock_a))
+t1.start()
+t2.start()
+t1.join()
+t2.join()
+```
+
+If both threads happen to retry in perfect lockstep, they keep grabbing their first lock, failing on the second, releasing, sleeping, and starting over forever. CPU is spinning; no thread is blocked; no progress is made. The classic fix is randomized back-off, which makes the retry intervals diverge:
+
+```python
+import random
+
+time.sleep(random.uniform(0.005, 0.05))
+```
+
+**Starvation** is when one or more threads make progress but a particular thread doesn't, because it keeps losing the race for a lock. A high-priority writer and many readers, for example, can starve the writer if readers always slip in just before the writer's turn. Python's `Lock` is FIFO-ish in practice on most platforms, so simple starvation is rare, but it can show up in custom synchronization patterns.
+
+| Symptom    | What's happening                              | Common fix                                             |
+| ---------- | --------------------------------------------- | ------------------------------------------------------ |
+| Deadlock   | All involved threads blocked, no CPU activity | Consistent lock ordering, timeouts, fewer nested locks |
+| Livelock   | Threads running, no progress, CPU active      | Randomized back-off, exponential back-off              |
+| Starvation | One thread never advances while others do     | Fair locks (e.g., `queue.Queue` ordering), priorities  |
+
+Most of the time, "the program is hung" turns out to be a deadlock. CPU at 100% but nothing finishing usually means livelock. CPU split among threads but one thread sitting at zero progress means starvation. The right fix depends on which one applies.
+
+<h1 id="detecting-deadlocks">Detecting Deadlocks</h1>
+
+A deadlock in production is silent. The program doesn't crash, doesn't log anything special. The only symptom is that requests stop completing, or a worker stops producing output. Detecting and diagnosing one comes down to looking at what every thread is currently doing.
+
+The simplest tool is `faulthandler.dump_traceback_later`, which schedules a traceback dump of every thread after a delay. If the program is healthy, the dump never happens, because the program exits cleanly. If the program is stuck, the dump shows where each thread is blocked.
+
+```python
+import faulthandler
+import threading
+import time
+
+faulthandler.dump_traceback_later(timeout=3.0, repeat=False)
+
+lock_a = threading.Lock()
+lock_b = threading.Lock()
+
+def task_a():
+    with lock_a:
+        time.sleep(0.5)
+        with lock_b:
+            pass
+
+def task_b():
+    with lock_b:
+        time.sleep(0.5)
+        with lock_a:
+            pass
+
+t1 = threading.Thread(target=task_a, name="task_a")
+t2 = threading.Thread(target=task_b, name="task_b")
+t1.start()
+t2.start()
+t1.join()
+t2.join()
+```
+
+The dump shows every thread's current call stack. `task_a` is inside the `with lock_b:` line, waiting on the lock acquire, and `task_b` is inside `with lock_a:`, also waiting. That's enough to identify the deadlock and the two locks involved.
+
+For a deeper look at a live process, on Linux and macOS attach with `py-spy`:
+
+```text
+py-spy dump --pid <pid>
+```
+
+`py-spy` is a separate tool (install with `pip install py-spy`) that prints the current Python call stack of every thread in a running process, without modifying the program. It's especially useful when the deadlock only shows up in production and can't be reproduced locally.
+
+A simpler in-process technique is to log every lock acquire and release, with the thread name and lock identity. The pattern often jumps out in the log: the same lock acquired by two different threads in opposite order. This logging is too expensive to leave on in production, but it's a useful debugging mode that can be enabled temporarily.
+
+The right strategy depends on the situation:
+
+| Situation                        | Best tool                                                                |
+| -------------------------------- | ------------------------------------------------------------------------ |
+| Local development, can reproduce | `faulthandler.dump_traceback_later`, breakpoint debugger                 |
+| Live production process          | `py-spy dump --pid`                                                      |
+| Recurring but hard to reproduce  | Log acquisitions and releases with thread/lock identity, look for cycles |
+| Architectural review             | Code search for nested `with lock:` blocks                               |
+
+The fastest fixes come from finding the pattern in the code, not from runtime tools. Two `with lock_x:` blocks that can be entered in opposite orders by different threads is the deadlock recipe. The runtime tools point at the line.
+
+<h1 id="a-real-world-example-two-carts-sharing-a-coupon">
+  A Real-World Example: Two Carts Sharing a Coupon
+</h1>
+
+A more grounded scenario: an e-commerce app has shoppers who can apply a shared discount coupon to their cart. The coupon has a limited supply ("100 uses left") and the cart tracks its own total. Updating either one needs a lock. A "use coupon" operation needs both: it deducts from the coupon and updates the cart's total.
+
+A naive implementation might lock the cart first, then the coupon:
+
+```python
+import threading
+import time
+
+class Coupon:
+    def __init__(self, code, uses_left):
+        self.code = code
+        self.uses_left = uses_left
+        self.lock = threading.Lock()
+
+class CartA:
+    def __init__(self):
+        self.total = 100.0
+        self.lock = threading.Lock()
+
+    def apply(self, coupon, discount):
+        with self.lock:
+            time.sleep(0.1)
+            with coupon.lock:
+                if coupon.uses_left > 0:
+                    coupon.uses_left -= 1
+                    self.total -= discount
+
+class CartB:
+    """Buggy version: locks coupon first, then cart."""
+    def __init__(self):
+        self.total = 100.0
+        self.lock = threading.Lock()
+
+    def apply(self, coupon, discount):
+        with coupon.lock:
+            time.sleep(0.1)
+            with self.lock:
+                if coupon.uses_left > 0:
+                    coupon.uses_left -= 1
+                    self.total -= discount
+
+coupon = Coupon("SAVE10", 100)
+cart_a = CartA()
+cart_b = CartB()
+
+ta = threading.Thread(target=cart_a.apply, args=(coupon, 10))
+tb = threading.Thread(target=cart_b.apply, args=(coupon, 10))
+ta.start()
+tb.start()
+ta.join(timeout=2)
+tb.join(timeout=2)
+
+print(f"CartA alive: {ta.is_alive()}")
+print(f"CartB alive: {tb.is_alive()}")
+```
+
+Two carts in the same app, two different orderings, classic deadlock. `CartA.apply` takes the cart lock first; `CartB.apply` takes the coupon lock first. If both run concurrently, each one holds its first lock and waits for the other forever.
+
+The fix is to pick one order and stick to it across every method that touches both locks:
+
+```python
+import threading
+import time
+
+class Coupon:
+    def __init__(self, code, uses_left):
+        self.code = code
+        self.uses_left = uses_left
+        self.lock = threading.Lock()
+
+class Cart:
+    """Fixed: always acquire coupon.lock first, then self.lock."""
+    def __init__(self):
+        self.total = 100.0
+        self.lock = threading.Lock()
+
+    def apply(self, coupon, discount):
+        with coupon.lock:
+            time.sleep(0.1)
+            with self.lock:
+                if coupon.uses_left > 0:
+                    coupon.uses_left -= 1
+                    self.total -= discount
+
+coupon = Coupon("SAVE10", 100)
+cart1 = Cart()
+cart2 = Cart()
+
+t1 = threading.Thread(target=cart1.apply, args=(coupon, 10))
+t2 = threading.Thread(target=cart2.apply, args=(coupon, 10))
+t1.start()
+t2.start()
+t1.join()
+t2.join()
+
+print(f"Coupon uses left: {coupon.uses_left}")
+print(f"Cart1 total: {cart1.total}")
+print(f"Cart2 total: {cart2.total}")
+```
+
+Both carts apply the discount and exit cleanly. Both methods take `coupon.lock` first, so no thread can hold the coupon while another holds it from the other direction. The pattern works because the coupon is the shared resource; locking it first regardless of which cart is involved is the sensible choice.
+
+An important detail: the rule is "always acquire coupon.lock first." That has to hold for every method on every class, not just `apply`. If some other method on `Cart` locks `self.lock` first and then needs the coupon lock for any reason, the same deadlock returns. Lock ordering rules apply program-wide.
+
+<h1 id="putting-it-together">Putting It Together</h1>
+
+A deadlock is what happens when threads can wait on each other in a cycle and no one can break out. The recipe is four conditions: mutual exclusion, hold-and-wait, no preemption, and circular wait. Take any one away and deadlock becomes impossible. The cheapest attack is on circular wait, through a consistent lock-acquisition order across every code path that holds more than one lock. When an order isn't possible, fall back to timeouts or try-locks, and accept the cost of retries. The deepest fix is structural: arrange code so it holds at most one lock at a time, often by pushing the synchronization into a higher-level primitive like `queue.Queue`.
+
+When a deadlock does sneak in, `faulthandler.dump_traceback_later` and `py-spy dump` are how to find it in a live process. The output points at the locked region, and the fix is almost always changing the order, removing a nested acquire, or replacing the hand-rolled coordination with something from the standard library.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

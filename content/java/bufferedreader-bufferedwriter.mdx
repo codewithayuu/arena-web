@@ -1,0 +1,551 @@
+---
+title: "BufferedReader & BufferedWriter"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "BufferedReader & BufferedWriter explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+The caller still makes a million `read()` calls, but only about 120 of them reach the OS. The rest are served from the in-memory buffer. That's the whole idea.
+
+Unbuffered single-character reads cost roughly one system call each. For a 1 MB text file, that's about a million context switches versus about 120 with an 8 KB buffer. The wrapper has low cost; the absence of it is what's expensive.
+
+The same logic applies to writing. `FileWriter.write(char)` without a buffer can mean a system call per character. `BufferedWriter` accumulates characters in a `char[]` and flushes them to the underlying writer in chunks. Writing a 1 MB log goes from a million OS calls to about a hundred.
+
+<h1 id="the-wrapping-decorator-pattern">The Wrapping (Decorator) Pattern</h1>
+
+`BufferedReader` doesn't read from disk on its own. It wraps another `Reader` and delegates the actual I/O to it. This is the **decorator pattern**: a class that takes another instance of the same type in its constructor and adds behavior on top. Java's `java.io` package is built around this pattern.
+
+The constructor signature makes it explicit:
+
+```java
+public BufferedReader(Reader in)
+public BufferedReader(Reader in, int sz)
+```
+
+You give it a `Reader`. It gives you a `Reader` that happens to be buffered. The wrapped reader does the real work; the wrapper adds the buffer and a few useful methods like `readLine()`.
+
+Read it left to right. Bytes leave the file, the `FileReader` decodes them into characters, the `BufferedReader` buffers those characters and exposes `readLine()`, and your code reads from the buffered wrapper. Each layer has one job.
+
+The minimal correct construction looks like this:
+
+```java
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.IOException;
+
+public class WrapReader {
+    public static void main(String[] args) throws IOException {
+        FileReader fr = new FileReader("orders.csv");
+        BufferedReader br = new BufferedReader(fr);
+
+        int firstChar = br.read();
+        System.out.println("First char: " + (char) firstChar);
+
+        br.close(); // closing the wrapper closes the wrapped reader
+    }
+}
+```
+
+**Output (given `orders.csv` starting with `O`):**
+
+```text
+First char: O
+```
+
+Closing `br` also closes `fr`. The wrapper owns the underlying reader for cleanup purposes, which matters when you switch to `try-with-resources` in a moment.
+
+You'll almost never see the two-line construction in real code. The idiomatic form chains the constructors:
+
+```java
+BufferedReader br = new BufferedReader(new FileReader("orders.csv"));
+```
+
+Same thing, one line. The `FileReader` is constructed first, then passed straight into the `BufferedReader` constructor. There's no need to keep a separate reference to the `FileReader`; the wrapper holds it.
+
+The same pattern applies on the write side:
+
+```java
+BufferedWriter bw = new BufferedWriter(new FileWriter("wishlist.txt"));
+```
+
+A `FileWriter` that writes characters to disk, wrapped in a `BufferedWriter` that adds a buffer. Whoever holds the `BufferedWriter` doesn't need to know about the `FileWriter` underneath.
+
+<h1 id="bufferedreader-api">BufferedReader API</h1>
+
+`BufferedReader` extends `Reader` and adds two things that matter: a buffer (for speed) and `readLine()` (for convenience). The full constructor list is short.
+
+| Constructor                         | What it does                                                |
+| ----------------------------------- | ----------------------------------------------------------- |
+| `BufferedReader(Reader in)`         | Wraps `in` with the default buffer size of 8192 characters. |
+| `BufferedReader(Reader in, int sz)` | Wraps `in` with a buffer of `sz` characters.                |
+
+The default buffer size is **8192 characters**, defined in the JDK source as `defaultCharBufferSize`. For most files that's a reasonable default. Tune it up only if you have measured evidence that bigger reads help on your specific workload, and tune it down only if memory is tight (rare for an 8 KB allocation).
+
+The core read methods:
+
+| Method                                    | Returns          | Behaviour                                                                                 |
+| ----------------------------------------- | ---------------- | ----------------------------------------------------------------------------------------- |
+| `int read()`                              | `int`            | Reads one character, returns its code point as an `int`, or `-1` at end of stream.        |
+| `int read(char[] cbuf)`                   | `int`            | Reads up to `cbuf.length` characters into `cbuf`, returns the count read, or `-1` at EOF. |
+| `int read(char[] cbuf, int off, int len)` | `int`            | Reads up to `len` characters starting at offset `off`.                                    |
+| `String readLine()`                       | `String`         | Reads a line of text, or returns `null` at end of stream.                                 |
+| `Stream<String> lines()`                  | `Stream<String>` | Returns the remaining lines as a `Stream<String>`. Added in Java 8.                       |
+| `boolean ready()`                         | `boolean`        | Returns `true` if the next `read()` is guaranteed not to block.                           |
+| `void close()`                            | `void`           | Closes the buffer and the wrapped reader.                                                 |
+
+A small program that touches the basics, reading the first two characters and then the rest of the first line:
+
+```java
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.IOException;
+
+public class BufferedReaderBasics {
+    public static void main(String[] args) throws IOException {
+        try (BufferedReader br = new BufferedReader(new FileReader("orders.csv"))) {
+            int first = br.read();
+            int second = br.read();
+            String restOfFirstLine = br.readLine();
+
+            System.out.println("First: " + (char) first);
+            System.out.println("Second: " + (char) second);
+            System.out.println("Rest of line: " + restOfFirstLine);
+        }
+    }
+}
+```
+
+**Output (given `orders.csv` whose first line is `Order-1001,Notebook,4.99`):**
+
+```text
+First: O
+Second: r
+Rest of line: der-1001,Notebook,4.99
+```
+
+`read()` advances the position by one character at a time, and `readLine()` picks up from wherever the cursor sits, reading until a line terminator or end of file. The line terminator itself (whether `\n`, `\r`, or `\r\n`) is consumed but not included in the returned `String`. Three different line endings, one consistent behaviour, which is one benefit of using `readLine()` over rolling your own.
+
+`readLine()` returns `null` at end of stream. That `null` is the signal you've run out of data. It's not an error and it's not an empty string. An empty line in the file shows up as `""` (a zero-length `String`); `null` only appears once, at the very end. That distinction is the entire reason the canonical loop is shaped the way it is.
+
+`read()` and `readLine()` on a `BufferedReader` are normal method calls that hit the buffer. They only become system calls when the buffer is empty and needs refilling. Don't conflate "reading a million characters" with "making a million OS calls"; with a buffer in the picture, those are different numbers.
+
+The optional `int sz` constructor lets you pick a custom buffer size. The signature accepts a positive `int`. There's no upper limit beyond available memory, but the returns flatten out quickly past 16 KB.
+
+```java
+// 32 KB buffer for very large files where the default felt small in profiling
+BufferedReader br = new BufferedReader(new FileReader("clickstream.log"), 32 * 1024);
+```
+
+That's it for the API surface. The rest of the value of `BufferedReader` comes from how you compose `readLine()` into a loop.
+
+<h1 id="reading-a-file-line-by-line">Reading a File Line by Line</h1>
+
+This is the most common use of `BufferedReader`. Almost every Java file-reading task uses this loop shape.
+
+```java
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.IOException;
+
+public class CountOrders {
+    public static void main(String[] args) throws IOException {
+        try (BufferedReader br = new BufferedReader(new FileReader("orders.csv"))) {
+            int orderCount = 0;
+            String line;
+            while ((line = br.readLine()) != null) {
+                orderCount++;
+            }
+            System.out.println("Orders in file: " + orderCount);
+        }
+    }
+}
+```
+
+**Output (given a file with 1,243 order lines):**
+
+```text
+Orders in file: 1243
+```
+
+There are three things going on in that loop header:
+
+1. `br.readLine()` reads the next line and returns it.
+2. The result is assigned to `line`.
+3. The result is compared to `null`. If it's `null`, the loop exits.
+
+The parentheses around `(line = br.readLine())` are mandatory. Java evaluates the assignment, the whole assignment expression has the value of the right-hand side, and that value is what `!= null` compares against. Without the parens, the precedence is wrong and the code won't compile.
+
+The state machine has four states. `CALL` invokes `readLine()` and stores its result. `CHECK` compares against `null`. If the line is real, control moves to `BODY` where you process it, then back to `CALL` for the next iteration. If the line is `null`, control moves to `DONE` and the loop exits.
+
+Why not a `for` loop or `forEach`? The `while` shape exists because there's no clear "next" without actually trying to read. You don't know the file has more lines until you ask for one and either get a `String` or `null`. A `for` loop with a counter would force you to know the line count up front, which defeats the point of streaming through the file.
+
+A more realistic version counts how many orders mention a specific product:
+
+```java
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.IOException;
+
+public class CountProductOrders {
+    public static void main(String[] args) throws IOException {
+        String product = "Notebook";
+        int matches = 0;
+
+        try (BufferedReader br = new BufferedReader(new FileReader("orders.csv"))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (line.contains(product)) {
+                    matches++;
+                }
+            }
+        }
+
+        System.out.println("Orders mentioning " + product + ": " + matches);
+    }
+}
+```
+
+**Output (given an `orders.csv` with 312 lines containing "Notebook"):**
+
+```text
+Orders mentioning Notebook: 312
+```
+
+This version processes a file of arbitrary size without ever holding the whole file in memory. At any given moment, only one line lives in `String line`, plus the 8 KB buffer. A 2 GB log file works the same as a 200-line one, just slower.
+
+<h1 id="bufferedwriter-api">BufferedWriter API</h1>
+
+`BufferedWriter` is the mirror image of `BufferedReader`. It extends `Writer`, wraps another `Writer`, and buffers writes. The constructors follow the same pattern:
+
+| Constructor                          | What it does                                        |
+| ------------------------------------ | --------------------------------------------------- |
+| `BufferedWriter(Writer out)`         | Wraps `out` with the default 8192-character buffer. |
+| `BufferedWriter(Writer out, int sz)` | Wraps `out` with a buffer of `sz` characters.       |
+
+The core methods you'll use:
+
+| Method                                      | Behaviour                                          |
+| ------------------------------------------- | -------------------------------------------------- |
+| `void write(int c)`                         | Writes a single character.                         |
+| `void write(char[] cbuf, int off, int len)` | Writes part of a `char[]`.                         |
+| `void write(String s)`                      | Writes a whole `String`.                           |
+| `void write(String s, int off, int len)`    | Writes part of a `String`.                         |
+| `void newLine()`                            | Writes the platform's line separator.              |
+| `void flush()`                              | Forces the buffer to the underlying writer.        |
+| `void close()`                              | Flushes and closes (including the wrapped writer). |
+
+A short example that writes a wishlist, one item per line, using `newLine()` for the line breaks:
+
+```java
+import java.io.BufferedWriter;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.util.List;
+
+public class WriteWishlist {
+    public static void main(String[] args) throws IOException {
+        List<String> wishlist = List.of("Notebook", "Pen", "Eraser", "Backpack");
+
+        try (BufferedWriter bw = new BufferedWriter(new FileWriter("wishlist.txt"))) {
+            for (String item : wishlist) {
+                bw.write(item);
+                bw.newLine();
+            }
+        }
+
+        System.out.println("Wrote " + wishlist.size() + " items.");
+    }
+}
+```
+
+**`wishlist.txt` contents:**
+
+```text
+Notebook
+Pen
+Eraser
+Backpack
+```
+
+Two things. `newLine()` writes the platform's line separator, which is `\r\n` on Windows and `\n` on Linux and macOS. If you hard-code `bw.write("\n")` instead, the file will work fine on Unix systems but may look wrong in some Windows tools. `newLine()` is the portable choice for files that stay on the same machine. For interoperable formats (CSV, JSON, anything moved across systems), pick `\n` explicitly and use `bw.write("\n")`, because mixed line endings are their own form of bug.
+
+Second, nothing reaches disk until the buffer fills or you flush or close. If your program crashes mid-write, the last partial buffer is lost. That's the price of buffered writing, and it's usually fine because `close()` flushes for you. `try-with-resources` makes this automatic.
+
+`flush()` exists for cases where you want intermediate guarantees. If a long-running program writes log lines and you want them visible to `tail -f` immediately, call `bw.flush()` after each line. Without a flush, the buffer holds onto those lines until it fills or the program ends.
+
+A buffered writer is fast because it batches small writes into one OS call. The trade-off is that data is in memory until flushed. If you need durability after every line (an audit log, say), call `flush()` per line or use an unbuffered `PrintWriter` with auto-flush. For most files, accept the trade and rely on `close()` to flush at the end.
+
+A larger example that combines several writes per line, useful for CSV output:
+
+```java
+import java.io.BufferedWriter;
+import java.io.FileWriter;
+import java.io.IOException;
+
+public class WriteOrdersCsv {
+    public static void main(String[] args) throws IOException {
+        String[][] orders = {
+            {"1001", "Notebook", "4.99"},
+            {"1002", "Pen", "1.49"},
+            {"1003", "Eraser", "0.79"}
+        };
+
+        try (BufferedWriter bw = new BufferedWriter(new FileWriter("orders.csv"))) {
+            bw.write("order_id,product,price");
+            bw.newLine();
+
+            for (String[] order : orders) {
+                bw.write(order[0]);
+                bw.write(",");
+                bw.write(order[1]);
+                bw.write(",");
+                bw.write(order[2]);
+                bw.newLine();
+            }
+        }
+
+        System.out.println("Wrote " + orders.length + " orders.");
+    }
+}
+```
+
+**`orders.csv` contents:**
+
+```text
+order_id,product,price
+1001,Notebook,4.99
+1002,Pen,1.49
+1003,Eraser,0.79
+```
+
+Each `write` call hits the buffer, not the disk. With 4 lines that's negligible, but with 4 million lines the buffered version finishes in seconds while an unbuffered version takes much longer.
+
+<h1 id="the-lines-stream">The lines() Stream</h1>
+
+Java 8 added `BufferedReader.lines()`, which returns the remaining lines as a `Stream<String>`. The result is lazy: lines are read from the file as the stream is consumed, not all at once. That keeps memory usage flat even on large files, while letting you use the stream API for filtering, mapping, and counting.
+
+```java
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.IOException;
+
+public class CountWithStream {
+    public static void main(String[] args) throws IOException {
+        try (BufferedReader br = new BufferedReader(new FileReader("orders.csv"))) {
+            long count = br.lines()
+                           .filter(line -> line.contains("Notebook"))
+                           .count();
+
+            System.out.println("Notebook orders: " + count);
+        }
+    }
+}
+```
+
+**Output (given an `orders.csv` with 312 matching lines):**
+
+```text
+Notebook orders: 312
+```
+
+The pipeline reads from the buffered reader on demand. The terminal operation `count()` pulls lines through the filter one at a time, never building an intermediate list. That's the same streaming behaviour you'd get from a `while` loop, expressed as a pipeline.
+
+One point about resource management. The `Stream<String>` returned by `lines()` is backed by the `BufferedReader`. If the reader is closed while the stream is being consumed, you'll get an exception. The clean pattern is to do all the work inside the `try-with-resources` block, as the example above does. Once the block ends, the reader closes and any further use of the stream would fail.
+
+The file feeds the buffered reader, the buffered reader feeds the stream, and the stream feeds the pipeline. Each level pulls only what the next level asks for. A 50 GB log with three matching lines doesn't load 50 GB into memory; it streams through, character by character, line by line.
+
+For very large inputs where you want a stream but don't need the buffered reader for anything else, `Files.lines(Path)` is shorter. The factory methods `Files.newBufferedReader(path)` and `Files.newBufferedWriter(path)` build a `BufferedReader` or `BufferedWriter` with sensible defaults (UTF-8 charset, line separator handled correctly).
+
+<h1 id="try-with-resources-and-chained-wrappers">
+  try-with-resources and Chained Wrappers
+</h1>
+
+For `BufferedReader` and `BufferedWriter`, `try-with-resources` is the standard. The pattern handles cleanup, exceptions, and the awkward question of "what do I do if `close()` itself throws?".
+
+```java
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.IOException;
+
+public class CleanRead {
+    public static void main(String[] args) throws IOException {
+        try (BufferedReader br = new BufferedReader(new FileReader("orders.csv"))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                System.out.println(line);
+            }
+        }
+    }
+}
+```
+
+**Output (given a 3-line `orders.csv`):**
+
+```text
+1001,Notebook,4.99
+1002,Pen,1.49
+1003,Eraser,0.79
+```
+
+The `try (...)` declares the `BufferedReader` as a managed resource. Whether the block exits normally or by exception, `br.close()` runs. And because closing a wrapper closes its underlying reader, the `FileReader` is cleaned up too. One declaration, one cleanup, no leaks.
+
+A common question: if you wrap a `FileReader` in a `BufferedReader`, do you need to declare both in the `try` header? The answer is no. The outer wrapper's `close()` closes the inner one. Declaring both is harmless but verbose:
+
+```java
+// Functional but unnecessary
+try (FileReader fr = new FileReader("orders.csv");
+     BufferedReader br = new BufferedReader(fr)) {
+    // ...
+}
+```
+
+The single-declaration form is cleaner:
+
+```java
+try (BufferedReader br = new BufferedReader(new FileReader("orders.csv"))) {
+    // ...
+}
+```
+
+There's one edge case where the two-declaration form matters. If the `BufferedReader` constructor itself throws (very rare, but theoretically possible if `sz` is non-positive in the two-arg form), the `FileReader` is left open because it was never assigned to a managed variable. Declaring both in the `try` header guarantees cleanup even in that case. For everyday code, the single-line form is fine.
+
+The writing side mirrors the read side exactly:
+
+```java
+import java.io.BufferedWriter;
+import java.io.FileWriter;
+import java.io.IOException;
+
+public class CleanWrite {
+    public static void main(String[] args) throws IOException {
+        try (BufferedWriter bw = new BufferedWriter(new FileWriter("wishlist.txt"))) {
+            bw.write("Notebook");
+            bw.newLine();
+            bw.write("Pen");
+            bw.newLine();
+        }
+        System.out.println("Wishlist saved.");
+    }
+}
+```
+
+**`wishlist.txt` contents:**
+
+```text
+Notebook
+Pen
+```
+
+`close()` flushes the buffer before releasing the file handle. If you forget the `try-with-resources` and your program ends without closing the writer, the buffered (but unflushed) data is lost forever. That's the most common buffered-writer bug, and `try-with-resources` makes it impossible.
+
+Forgetting to close a `BufferedWriter` doesn't just leak a file handle. It loses any data sitting in the buffer at exit. Buffered writes are not safe until flushed, and the JVM does not flush writers on shutdown automatically.
+
+<h1 id="a-realistic-example-filter-a-log">A Realistic Example: Filter a Log</h1>
+
+A program that reads a clickstream log, keeps only the lines for a specific product, and writes them to a new file. It uses a `BufferedReader` to read and a `BufferedWriter` to write, both in one `try-with-resources` block.
+
+```java
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.FileReader;
+import java.io.FileWriter;
+import java.io.IOException;
+
+public class FilterClickstream {
+    public static void main(String[] args) throws IOException {
+        String product = "Notebook";
+        int written = 0;
+
+        try (BufferedReader br = new BufferedReader(new FileReader("clickstream.log"));
+             BufferedWriter bw = new BufferedWriter(new FileWriter("clicks-notebook.log"))) {
+
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (line.contains(product)) {
+                    bw.write(line);
+                    bw.newLine();
+                    written++;
+                }
+            }
+        }
+
+        System.out.println("Wrote " + written + " matching lines.");
+    }
+}
+```
+
+**Output (given a clickstream with 18 matching lines):**
+
+```text
+Wrote 18 matching lines.
+```
+
+Two resources, one `try-with-resources` header (separated by `;`), both closed in reverse order at the end. The reader streams the input file one line at a time. The writer buffers the matching lines and flushes them on close. Memory usage is constant regardless of input size, which is the whole point.
+
+If the input file has 100 million lines, this program still works without changes. Memory stays flat because only one `String line` is alive at a time, plus the two 8 KB buffers. Compare that to `Files.readAllLines(...)`, which loads the entire file into a `List<String>` before you do anything: fine for small files, ruinous for big ones.
+
+The byte-oriented equivalents `BufferedInputStream` and `BufferedOutputStream` exist for non-text data (images, archives, anything binary). They follow the same wrap-for-speed pattern but work in `byte[]` instead of `char[]`. Use the character classes for text; use the byte classes for binary. Mixing them is how files end up corrupted.
+
+<h1 id="common-pitfalls">Common Pitfalls</h1>
+
+A short tour of common mistakes.
+
+**Forgetting to close the writer.** Without `close()` (or `try-with-resources`), buffered data sits in memory and is lost when the program exits. The output file looks truncated or empty.
+
+```java
+// What's wrong with this code?
+BufferedWriter bw = new BufferedWriter(new FileWriter("wishlist.txt"));
+bw.write("Notebook");
+bw.newLine();
+// program ends here, the buffer is never flushed
+```
+
+**Fix:**
+
+```java
+try (BufferedWriter bw = new BufferedWriter(new FileWriter("wishlist.txt"))) {
+    bw.write("Notebook");
+    bw.newLine();
+} // close() flushes the buffer before the file is released
+```
+
+**Treating `null` from `readLine()` as an error.** `null` means "end of stream", not "something went wrong". Checking against `null` exits the loop cleanly; throwing or logging on `null` adds noise.
+
+**Forgetting the parentheses in the loop header.**
+
+```java
+// What's wrong with this code?
+String line;
+while (line = br.readLine() != null) { // does not compile
+    System.out.println(line);
+}
+```
+
+The compiler reads this as `line = (br.readLine() != null)`, which tries to assign a `boolean` to a `String` variable. The error is "incompatible types: boolean cannot be converted to String".
+
+**Fix:**
+
+```java
+String line;
+while ((line = br.readLine()) != null) {
+    System.out.println(line);
+}
+```
+
+The outer parentheses around the assignment fix the precedence.
+
+**Wrapping a writer twice.** Wrapping a `BufferedWriter` in another `BufferedWriter` doesn't double the speed; it just adds a useless layer and an extra buffer. Wrap once, near the file.
+
+**Mixing `newLine()` with hard-coded `"\n"` in the same file.** Use one or the other consistently. Mixed line endings show up as files that look fine in your editor but break in someone else's tools.
+
+**Reading with `read()` in a tight loop and expecting buffering to help on its own.** It does help, but if you call `read()` 10 million times to read 10 MB, you still pay for 10 million method calls and 10 million bounds checks. `readLine()` or `read(char[])` is faster for bulk reads because it moves more data per call.
+
+Single-character `read()` even on a buffered reader is faster than unbuffered single-character `read()`, but slower than `readLine()` or `read(char[])`. The buffer eliminates the OS overhead; it doesn't eliminate the per-call Java overhead. For bulk reads, prefer batch methods.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

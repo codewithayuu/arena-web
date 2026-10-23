@@ -1,0 +1,535 @@
+---
+title: "Sockets"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Sockets explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="what-a-tcp-socket-actually-is">What a TCP Socket Actually Is</h1>
+
+When two programs talk over TCP, each side has an endpoint that consists of an IP address and a port number. The pair `(client IP, client port, server IP, server port)` identifies one connection uniquely on the network. A Java `Socket` object is the handle your program holds onto one of those endpoints. Writing to the socket sends bytes to the other side. Reading from it pulls bytes that the other side has sent.
+
+TCP gives you three guarantees on top of raw IP packets. The connection is bidirectional, so both sides can send at any time. It is a byte stream, which means the bytes you write arrive in the same order on the other side, with no message boundaries preserved. And it is reliable: if a packet is lost, TCP retransmits it; if packets arrive out of order, TCP reorders them; if the connection breaks, both sides eventually find out.
+
+The "byte stream with no message boundaries" point is worth pinning down. If you write `"GET /price\n"` in one call and `"GET /stock\n"` in the next, the other side might read all 22 bytes in one `read()`, or 5 bytes one call and 17 the next, or one byte at a time. TCP only promises that the bytes come out in the same order you put them in. Framing the byte stream into messages is your job, usually by using a delimiter like `\n` or a length prefix.
+
+The diagram shows the three-way handshake that opens the connection, the back-and-forth byte exchange in the middle, and the orderly close at the end. Every `new Socket(host, port)` call you make in Java triggers that handshake internally. The handshake costs one network round trip before your first byte of data can flow, which matters for performance and for choosing whether to reuse a connection.
+
+A TCP handshake adds one round-trip time of latency before your first byte goes out. On a 30 ms link to a server in another region, that is 30 ms of pure wait. Reuse a connection across requests when you can. Opening a new socket per request is one of the most common reasons a client app feels slow.
+
+<h1 id="the-socket-class">The Socket Class</h1>
+
+`java.net.Socket` is the client-side TCP endpoint. You create one, the JVM performs the three-way handshake with the server, and once the call returns you can read and write bytes. The class has several constructors, but two cover most cases.
+
+`new Socket(String host, int port)` connects synchronously to the given host on the given port. The constructor does not return until the handshake completes or fails. If the host name does not resolve, you get `UnknownHostException`. If the server refuses the connection (nothing is listening on that port), you get `ConnectException`. If the TCP handshake just stalls because the network is broken, the call blocks until the operating system gives up, which can be a minute or more.
+
+```java
+import java.net.Socket;
+
+public class FirstSocket {
+    public static void main(String[] args) throws Exception {
+        Socket socket = new Socket("example.com", 80);
+        System.out.println("Connected to " + socket.getInetAddress());
+        System.out.println("Local port:  " + socket.getLocalPort());
+        System.out.println("Remote port: " + socket.getPort());
+        socket.close();
+    }
+}
+```
+
+The output is illustrative; your local port will be a different number each run because the operating system picks a free ephemeral port for the client side. The remote port is always the one you asked for, which is `80` here for plain HTTP.
+
+The second constructor pattern uses an empty `Socket` and `connect` with a timeout. This is the version you actually want in production code, because the no-timeout constructor lets the JVM block for the system's default, which is far too long for most user-facing apps.
+
+```java
+import java.net.InetSocketAddress;
+import java.net.Socket;
+
+public class SocketWithTimeout {
+    public static void main(String[] args) throws Exception {
+        Socket socket = new Socket();
+        socket.connect(new InetSocketAddress("example.com", 80), 2000);
+        System.out.println("Connected within 2 seconds");
+        socket.close();
+    }
+}
+```
+
+The `2000` argument is a connect timeout in milliseconds. If the handshake does not complete within two seconds, the call throws `SocketTimeoutException` instead of waiting on the OS default. This timeout governs only the handshake. Once the connection is open, reads can still hang forever unless you set a separate read timeout, which the later sections cover.
+
+The default operating-system connect timeout on Linux is around 130 seconds. A user staring at a spinner for over two minutes is a bad experience. Always pass an explicit timeout to `connect`. A few seconds is reasonable for most public services.
+
+<h1 id="getting-streams">Getting Streams</h1>
+
+Once a socket is open, the data flows through two streams that the socket exposes. `getOutputStream()` returns the side you write to; bytes you write here travel to the server. `getInputStream()` returns the side you read from; bytes the server sent arrive here. Both are plain `java.io.InputStream` and `java.io.OutputStream` objects, so everything that applies to Java byte streams applies here too.
+
+The diagram shows the round trip from your code's point of view. The two streams are independent channels into the same socket. You can write and read in any order, and the JVM does not block one direction while the other is in use. Closing the socket closes both streams; closing one stream closes the socket.
+
+Raw byte streams work fine, but most protocols are easier to handle through the wrappers Java already provides. For line-based text protocols use `BufferedReader` to read and `PrintWriter` to write. For binary protocols with fixed-width fields use `DataInputStream` and `DataOutputStream`.
+
+The text-protocol pattern. A simple stock-price service listens on port `7001`. The client opens a socket, sends a request line, and reads back a response line.
+
+```java
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+
+public class StockPriceClient {
+    public static void main(String[] args) throws Exception {
+        Socket socket = new Socket();
+        socket.connect(new InetSocketAddress("localhost", 7001), 2000);
+
+        PrintWriter out = new PrintWriter(
+                new java.io.OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8),
+                true);
+        BufferedReader in = new BufferedReader(
+                new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+
+        out.println("PRICE SKU-1");
+        String response = in.readLine();
+        System.out.println("Server said: " + response);
+
+        socket.close();
+    }
+}
+```
+
+A few things matter here. The `true` argument to `PrintWriter` turns on **auto-flush**, which means every call to `println` calls `flush` internally. Without auto-flush, the bytes sit in the `PrintWriter`'s internal buffer and never reach the network until you flush or close the writer, and the server is left waiting for a request that never arrives. This bug appears in detail below.
+
+The charsets matter too. The bytes on the wire are not text; they are bytes. The two sides have to agree on how to encode characters as bytes and back. UTF-8 is the safe default for almost every modern protocol. If you wrap with the default constructors and your server uses a different charset, you will see mojibake for any character outside ASCII.
+
+For binary protocols the right wrapper is `DataInputStream` and `DataOutputStream`. These read and write fixed-width values in network byte order, which is what binary protocols like Memcached's binary mode or many game protocols expect.
+
+```java
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+
+public class BinaryStockClient {
+    public static void main(String[] args) throws Exception {
+        Socket socket = new Socket();
+        socket.connect(new InetSocketAddress("localhost", 7002), 2000);
+
+        DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+        DataInputStream in = new DataInputStream(socket.getInputStream());
+
+        // Request: 4 bytes for the SKU id.
+        out.writeInt(101);
+        out.flush();
+
+        // Response: 4 bytes for status, 8 bytes for price.
+        int status = in.readInt();
+        double price = in.readDouble();
+        System.out.println("status=" + status + " price=$" + price);
+
+        socket.close();
+    }
+}
+```
+
+`writeInt` writes exactly 4 bytes, big-endian (network order). `readInt` reads exactly 4 bytes and reconstructs the integer. The two sides have to agree on the byte layout in advance; there is no self-description in a binary stream. The flush after `writeInt` is necessary because `DataOutputStream` does not auto-flush.
+
+<h1 id="closing-properly">Closing Properly</h1>
+
+A socket holds a file descriptor in the kernel, a slot in the JVM's I/O machinery, and a buffer of bytes that may not have been sent yet. Forgetting to close one leaks all of those, and the OS will eventually refuse to open more sockets when the count gets high enough. The right answer is `try-with-resources`, which closes the socket whether the body finishes normally or throws.
+
+```java
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+
+public class StockPriceClientTwr {
+    public static void main(String[] args) throws Exception {
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress("localhost", 7001), 2000);
+
+            try (PrintWriter out = new PrintWriter(
+                         new java.io.OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8),
+                         true);
+                 BufferedReader in = new BufferedReader(
+                         new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+
+                out.println("PRICE SKU-1");
+                String response = in.readLine();
+                System.out.println("Server said: " + response);
+            }
+        }
+    }
+}
+```
+
+Closing the outer `Socket` is enough on its own; the inner streams are closed by the socket close. The nested `try-with-resources` makes the intent explicit. When an exception escapes the inner block, the JVM still walks back through both layers and releases the file descriptor. That is the whole point of using the construct.
+
+One behavior of socket close: it tears down both directions at once. If your client has written a request but the server has not finished sending its response, closing now drops the response and the server sees its write fail. In most request-response protocols, read the full response first, then close.
+
+Sometimes you want to tell the server "I am done sending, but I still want to read your reply." That is a half-close, and `Socket` exposes it through `shutdownOutput()` and `shutdownInput()`.
+
+```java
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+
+public class HalfCloseClient {
+    public static void main(String[] args) throws Exception {
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress("localhost", 7001), 2000);
+
+            PrintWriter out = new PrintWriter(
+                    new java.io.OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8),
+                    true);
+            BufferedReader in = new BufferedReader(
+                    new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+
+            out.println("PRICE SKU-1");
+            out.println("PRICE SKU-2");
+            socket.shutdownOutput();  // No more requests from us.
+
+            String line;
+            while ((line = in.readLine()) != null) {
+                System.out.println(line);
+            }
+        }
+    }
+}
+```
+
+`shutdownOutput` sends a TCP FIN on the write side, telling the server "no more bytes coming." The server's `read` returns `-1`, which lets it know to finish writing its reply and close its side. The client keeps reading until `readLine` returns `null`, which happens when the server closes its write side. Then the outer `try-with-resources` closes the socket fully.
+
+The half-close pattern is what HTTP/1.0 used to use to signal "end of request" before `Content-Length` headers became standard. It is still useful when you want a simple "send everything, then read everything" protocol without inventing your own framing.
+
+The state diagram lays out the full lifecycle: create, connect, exchange bytes, optionally half-close, then fully close. Every socket your code ever opens walks through some subset of those states. `try-with-resources` makes sure you never leave one stuck in `DATA` or `HALF_CLOSED` because of an exception.
+
+<h1 id="configuration">Configuration</h1>
+
+Past the basic open-read-write-close flow, the `Socket` class has three knobs to use in production code: read timeout, keep-alive, and Nagle's algorithm. The defaults are wrong for almost every real client, so it pays to understand what each one does.
+
+`setSoTimeout(int ms)` sets the maximum time a `read()` will block before throwing `SocketTimeoutException`. The default is zero, which means "wait forever." A server that hangs or a network that drops the connection both look the same to your client: `read()` blocks, and the user sees an unresponsive app. A read timeout converts that into a clear error you can handle.
+
+```java
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.net.SocketTimeoutException;
+import java.nio.charset.StandardCharsets;
+
+public class ReadTimeoutClient {
+    public static void main(String[] args) throws Exception {
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress("localhost", 7001), 2000);
+            socket.setSoTimeout(3000);  // No read may block over 3 seconds.
+
+            PrintWriter out = new PrintWriter(
+                    new java.io.OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8),
+                    true);
+            BufferedReader in = new BufferedReader(
+                    new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+
+            out.println("PRICE SKU-SLOW");
+            try {
+                String line = in.readLine();
+                System.out.println(line);
+            } catch (SocketTimeoutException e) {
+                System.out.println("Server took too long. Giving up.");
+            }
+        }
+    }
+}
+```
+
+The timeout applies to each individual `read` call, not to the whole conversation. If the server sends one byte every two seconds and your timeout is three seconds, you will keep reading forever, because each read gets its byte within the budget. To bound the whole exchange you have to track elapsed time yourself and check it after each read.
+
+`setKeepAlive(true)` tells the OS to send TCP keep-alive probes on the connection when it has been idle for a while. The OS default idle time is two hours on most systems, so this is not a substitute for application-level heartbeats. What it does help with is detecting dead peers on long-lived idle connections, like a database pool that holds connections open across a firewall that drops idle sessions. Without keep-alive, the next write into that connection succeeds locally and then hangs, because the firewall has long since forgotten the session.
+
+`setTcpNoDelay(true)` turns off Nagle's algorithm. Nagle's algorithm is a kernel optimization that buffers small writes for a few milliseconds so they can be coalesced into a larger packet, reducing the per-packet overhead. Good for batch transfers, bad for interactive request-response protocols where every millisecond matters. If you write a small request and then wait for the reply, Nagle's algorithm might hold your request in the kernel buffer for up to 40 ms looking for more data to bundle with it. Turning it off makes small writes go out immediately.
+
+```java
+import java.net.InetSocketAddress;
+import java.net.Socket;
+
+public class TunedSocket {
+    public static void main(String[] args) throws Exception {
+        try (Socket socket = new Socket()) {
+            socket.setTcpNoDelay(true);     // Send small packets immediately.
+            socket.setKeepAlive(true);      // Detect dead peers eventually.
+            socket.connect(new InetSocketAddress("localhost", 7001), 2000);
+            socket.setSoTimeout(5000);      // Read timeout, set after connect.
+
+            System.out.println("Configured. Ready to talk.");
+        }
+    }
+}
+```
+
+You can set most options before connecting or after. `setSoTimeout` is conventionally set after `connect` because the connect call has its own timeout via the second argument to `connect`. The order does not affect correctness; it is a style convention that keeps connect-time and read-time concerns separate.
+
+Nagle's algorithm can add up to 40 ms of latency per small write on Linux, because the kernel waits for either more data, an ACK from the other side, or the timer to fire. Interactive clients should almost always set `setTcpNoDelay(true)`.
+
+<h1 id="common-exceptions">Common Exceptions</h1>
+
+The exceptions thrown while working with sockets each tell you something specific about what went wrong. Knowing which is which saves time when debugging.
+
+| Exception                | What it means                                                            | Typical cause                                                                            |
+| ------------------------ | ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
+| `UnknownHostException`   | DNS could not resolve the hostname.                                      | Typo, broken DNS, host does not exist.                                                   |
+| `ConnectException`       | TCP handshake reached the host but was rejected.                         | Nothing is listening on that port (most common: server is down).                         |
+| `SocketTimeoutException` | A timeout elapsed before the operation completed.                        | Slow or unresponsive peer.                                                               |
+| `SocketException`        | A generic socket-level error, often "Connection reset" or "Broken pipe". | Peer closed abruptly, network dropped the connection, you wrote to a half-closed socket. |
+| `IOException`            | The base class for everything above.                                     | Catch this when you do not need to distinguish.                                          |
+
+The distinction between `ConnectException` and `UnknownHostException` is one of the most useful: it tells you whether the problem is the name (DNS broken, hostname wrong) or the service (server is down, wrong port, firewall blocking the port). They look the same to users, but they need very different fixes.
+
+```java
+import java.io.IOException;
+import java.net.ConnectException;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.net.SocketTimeoutException;
+import java.net.UnknownHostException;
+
+public class ClassifyError {
+    public static void main(String[] args) {
+        tryConnect("does-not-exist.example", 7001);
+        tryConnect("localhost", 1);            // Nothing listens on port 1.
+        tryConnect("10.255.255.1", 7001);      // Non-routable, will time out.
+    }
+
+    static void tryConnect(String host, int port) {
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress(host, port), 1500);
+            System.out.println("Connected to " + host + ":" + port);
+        } catch (UnknownHostException e) {
+            System.out.println(host + ": DNS lookup failed");
+        } catch (ConnectException e) {
+            System.out.println(host + ":" + port + ": server refused (nothing listening)");
+        } catch (SocketTimeoutException e) {
+            System.out.println(host + ":" + port + ": handshake timed out");
+        } catch (IOException e) {
+            System.out.println(host + ":" + port + ": " + e.getClass().getSimpleName() + " - " + e.getMessage());
+        }
+    }
+}
+```
+
+`SocketException` with the message `Connection reset` is worth calling out separately. It means the peer sent a TCP RST packet, which is the network equivalent of slamming the door. Common causes: the server process crashed, the server closed the socket without reading what you sent, a load balancer killed an idle connection, or a firewall middle box decided your session was stale. The fix depends on the cause, but the right first move is to log the message and the remote address, then retry once with backoff.
+
+<h1 id="a-complete-worked-example">A Complete Worked Example</h1>
+
+A client that talks to a stock-price service over TCP. The service listens on `localhost:7001`. The client sends one request line per product, reads one response line per request, and prints the price.
+
+```java
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.net.SocketTimeoutException;
+import java.nio.charset.StandardCharsets;
+
+public class PriceLookupClient {
+
+    public static void main(String[] args) {
+        String[] products = { "SKU-1", "SKU-2", "SKU-3" };
+
+        try (Socket socket = new Socket()) {
+            socket.setTcpNoDelay(true);
+            socket.connect(new InetSocketAddress("localhost", 7001), 2000);
+            socket.setSoTimeout(3000);
+
+            PrintWriter out = new PrintWriter(
+                    new java.io.OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8),
+                    true);
+            BufferedReader in = new BufferedReader(
+                    new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+
+            for (String sku : products) {
+                out.println("PRICE " + sku);
+                try {
+                    String reply = in.readLine();
+                    if (reply == null) {
+                        System.out.println(sku + ": server closed early");
+                        break;
+                    }
+                    System.out.println(sku + " -> " + reply);
+                } catch (SocketTimeoutException e) {
+                    System.out.println(sku + ": no reply in 3 seconds");
+                }
+            }
+        } catch (Exception e) {
+            System.out.println("Connection problem: " + e.getMessage());
+        }
+    }
+}
+```
+
+This is what most production TCP clients look like at the core. Connect with a timeout. Set sensible socket options. Wrap the streams. Loop over the work, framing each request and reading each response. Handle the per-request timeout separately from the connection-level error. Close everything through `try-with-resources`.
+
+The two design decisions worth highlighting are the timeouts and the loop structure. The connect timeout protects against a dead server. The read timeout protects against a slow one. The loop reuses one socket for three requests, which avoids three handshakes and three sets of TCP slow-start. Reusing a connection across multiple requests is one of the easiest wins for client latency.
+
+Each new socket pays a handshake round trip plus the cost of TCP slow-start ramping up the congestion window. Three requests on three new sockets cost roughly three times the round-trip time before the first byte; three requests on one socket cost only one round trip. Connection pooling exists for this reason.
+
+<h1 id="whats-wrong-with-this-code">What's Wrong With This Code?</h1>
+
+A few mistakes show up often in client code.
+
+**Missing close:**
+
+```java
+public class LeakySocket {
+    public static void main(String[] args) throws Exception {
+        Socket socket = new Socket("localhost", 7001);
+        PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
+        BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+        out.println("PRICE SKU-1");
+        System.out.println(in.readLine());
+        // No close. Socket leaks until the JVM exits.
+    }
+}
+```
+
+The program "works" in the sense that it prints the right answer. But it leaks a file descriptor every time it runs. In a server that handles many requests, the leak adds up and you eventually see `Too many open files`. The fix is `try-with-resources`:
+
+```java
+public class FixedClose {
+    public static void main(String[] args) throws Exception {
+        try (Socket socket = new Socket("localhost", 7001);
+             PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
+             BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
+            out.println("PRICE SKU-1");
+            System.out.println(in.readLine());
+        }
+    }
+}
+```
+
+**Not flushing the writer:**
+
+```java
+public class ForgotFlush {
+    public static void main(String[] args) throws Exception {
+        try (Socket socket = new Socket("localhost", 7001);
+             PrintWriter out = new PrintWriter(socket.getOutputStream());   // No auto-flush.
+             BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
+            out.println("PRICE SKU-1");
+            System.out.println(in.readLine());   // Hangs forever.
+        }
+    }
+}
+```
+
+The single-argument `PrintWriter` constructor leaves auto-flush off, so `println` writes into the writer's buffer but never sends the bytes. The server is still waiting for its first byte. The fix is to either pass `true` for auto-flush or call `out.flush()` after every line:
+
+```java
+PrintWriter out = new PrintWriter(socket.getOutputStream(), true);   // Auto-flush on.
+```
+
+**Not setting a read timeout:**
+
+```java
+public class ForgotTimeout {
+    public static void main(String[] args) throws Exception {
+        try (Socket socket = new Socket("localhost", 7001);
+             PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
+             BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
+            out.println("PRICE SKU-MISSING");
+            System.out.println(in.readLine());   // Hangs if the server never replies.
+        }
+    }
+}
+```
+
+The connect call timed out fine, but the read does not. If the server accepts the connection and then never sends anything, the client blocks indefinitely. The fix is one line:
+
+```java
+socket.setSoTimeout(3000);
+```
+
+A blocked `read()` does not just wait for I/O; it ties up a thread. The Java thread that called `read` cannot do anything else until the read returns. In a one-thread-per-connection design, every hung peer costs a whole thread plus its stack memory.
+
+<h1 id="a-hand-written-http-get-over-a-socket">
+  A Hand-Written HTTP GET Over a Socket
+</h1>
+
+HTTP is text over TCP. The high-level `HttpClient` is appropriate for real apps, but writing one request by hand is the best way to understand what happens underneath. The client opens port 80, sends a request line plus a blank line, and reads everything the server sends back.
+
+```java
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+
+public class HandWrittenHttpGet {
+    public static void main(String[] args) throws Exception {
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress("example.com", 80), 3000);
+            socket.setSoTimeout(5000);
+
+            PrintWriter out = new PrintWriter(
+                    new java.io.OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8),
+                    true);
+            BufferedReader in = new BufferedReader(
+                    new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+
+            out.print("GET / HTTP/1.0\r\n");
+            out.print("Host: example.com\r\n");
+            out.print("Connection: close\r\n");
+            out.print("\r\n");
+            out.flush();
+
+            String line;
+            int lineCount = 0;
+            while ((line = in.readLine()) != null && lineCount < 6) {
+                System.out.println(line);
+                lineCount++;
+            }
+        }
+    }
+}
+```
+
+**Output (abridged):**
+
+```text
+HTTP/1.0 200 OK
+Content-Type: text/html; charset=UTF-8
+Date: Mon, 01 Jan 2026 12:00:00 GMT
+Content-Length: 1256
+Connection: close
+
+<!doctype html>
+```
+
+The exact dates and lengths vary, but the structure is fixed. The request is a request line, some headers, and a blank line. The response is a status line, some headers, a blank line, and a body. The `\r\n` line endings matter; HTTP requires CRLF, not plain `\n`, and a server that is strict about the spec will reject `\n`-only lines.
+
+The `Connection: close` header asks the server to close the socket after sending the response. Without it, the server might keep the connection open waiting for another request, and your `readLine` loop would block on the read timeout instead of getting a clean `null`. For one-shot scripts, "close" is the simplest option. For repeated requests to the same server, you want connection reuse, which is most of what `HttpClient` does for you.
+
+<h1 id="the-blocking-io-model">The Blocking I/O Model</h1>
+
+Every method we have used blocks. `connect` blocks until the handshake completes or fails. `read` blocks until at least one byte is available or the timeout expires. `write` can block too, when the OS send buffer is full and the receiver has not drained it. While a thread is blocked in a socket call, that thread is doing nothing else; the OS will not schedule it onto a CPU until the I/O is ready.
+
+This is the natural model for a single client doing one request at a time. It falls apart fast when a server has to handle many connections at once. The traditional answer was one thread per connection, which gives each connection its own blocking stack. The catch is that threads cost real memory (around 1 MB of stack each by default), and the OS scheduler does not handle switching between thousands of threads efficiently. At a few thousand concurrent connections, the per-thread overhead dominates the actual work.
+
+Java has had a non-blocking alternative since version 1.4: `java.nio` with channels and selectors, where one thread can multiplex thousands of sockets. Frameworks like Netty hide most of the rough edges. The simple `Socket` class is fine for clients with a handful of connections and easy to reason about, but for handling 50,000 sockets in one process, blocking I/O is the wrong tool.
+
+A modern JVM can comfortably run a few thousand threads, but each one consumes a megabyte of stack. One thread per connection caps out around 5,000 to 10,000 concurrent sockets on a typical server. NIO with selectors, or virtual threads since Java 21, push that ceiling much higher.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

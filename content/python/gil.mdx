@@ -1,0 +1,268 @@
+---
+title: "Global Interpreter Lock (GIL)"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "Global Interpreter Lock (GIL) explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="what-the-gil-is">What the GIL Is</h1>
+
+The Global Interpreter Lock is a mutex inside the CPython interpreter that guarantees only **one thread** can execute Python bytecode at a time. Even on a machine with 16 cores, a pure-Python program with 16 threads will have exactly one of them running Python code at any given moment. The other 15 are waiting for the GIL.
+
+That's it. That's the whole definition. The complications come from what "Python bytecode" includes and what counts as "running" it.
+
+A few clarifications up front:
+
+- The GIL belongs to **CPython**, the reference implementation you almost certainly use. Jython and IronPython have no GIL. PyPy has one. The free-threaded build of Python 3.13 is starting to remove it, more on that later.
+- The GIL is **per interpreter**, not per process. Each subinterpreter (a newer feature) has its own GIL, which is part of why subinterpreters are interesting.
+- The GIL protects the **interpreter's internal state**, not your data. Your shared list is still going to need its own lock when multiple threads mutate it.
+
+```python
+import sys
+import threading
+
+print(f"Python: {sys.version_info.major}.{sys.version_info.minor}")
+print(f"Active threads: {threading.active_count()}")
+print(f"GIL present in this build: {sys._is_gil_enabled() if hasattr(sys, '_is_gil_enabled') else True}")
+```
+
+The `sys._is_gil_enabled()` function was added in Python 3.13 for the experimental free-threaded build. On any normal CPython install, the GIL is on and there's no way to turn it off at the language level.
+
+<h1 id="why-the-gil-exists">Why the GIL Exists</h1>
+
+The GIL is a design decision that goes back to the early 1990s, and it pays for three things CPython gets in return.
+
+**Reference counting safety.** CPython uses reference counting to manage memory. Every Python object has a counter that tracks how many names point to it. When the counter hits zero, the object is freed. If two threads incremented or decremented the counter at the same time on different cores, the counter would corrupt and objects would leak or get freed too early. The GIL makes every `Py_INCREF` and `Py_DECREF` automatically thread-safe because only one thread can run interpreter code at a time.
+
+**Simpler C extensions.** Thousands of third-party C extensions (NumPy, lxml, Pillow, database drivers) were written assuming the GIL exists. They use Python's C API freely, modify reference counts, and touch interpreter state without locking anything themselves. Removing the GIL means every one of those extensions has to be audited and probably rewritten. The GIL is the contract that lets the C ecosystem stay simple.
+
+**Single-threaded performance.** Fine-grained locking inside the interpreter would slow down single-threaded code, which is what almost all Python programs actually do. Past attempts to remove the GIL produced an interpreter that ran threaded code faster but single-threaded code 30 to 50% slower. That trade was unacceptable for the language as a whole.
+
+The trade-off is brutal but clear: CPython chose simplicity, C compatibility, and single-threaded speed over true thread-level parallelism. For most Python use cases (scripts, web servers handling I/O, data pipelines built on NumPy) the trade pays off. For pure-Python CPU-heavy work, it hurts.
+
+<h1 id="threads-still-dont-run-python-in-parallel">
+  Threads Still Don't Run Python in Parallel
+</h1>
+
+The clearest way to see the GIL is to run the same CPU-heavy work sequentially, then with two threads, then with two processes. The threaded version should not get faster. The process version should.
+
+The CPU-heavy task here is computing a "recommendation score" for many products by repeatedly multiplying and summing floats. It's deliberately pure Python so the GIL applies the whole time.
+
+```python
+import time
+from threading import Thread
+
+def compute_recommendations(product_count: int) -> float:
+    score = 0.0
+    for i in range(product_count):
+        score += (i * 1.0001) ** 0.5
+    return score
+
+# Sequential: one batch after the other
+def run_sequential() -> float:
+    start = time.perf_counter()
+    compute_recommendations(5_000_000)
+    compute_recommendations(5_000_000)
+    return time.perf_counter() - start
+
+# Threaded: two threads, one batch each
+def run_threaded() -> float:
+    start = time.perf_counter()
+    t1 = Thread(target=compute_recommendations, args=(5_000_000,))
+    t2 = Thread(target=compute_recommendations, args=(5_000_000,))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    return time.perf_counter() - start
+
+print(f"Sequential: {run_sequential():.2f}s")
+print(f"Threaded:   {run_threaded():.2f}s")
+```
+
+Two threads, two cores, same work, no speedup. The threaded version is even slightly slower because of GIL contention overhead. The two threads spend their time taking turns holding the GIL, not running in parallel.
+
+Now the same workload with processes instead:
+
+```python
+import time
+from multiprocessing import Process
+
+def compute_recommendations(product_count: int) -> None:
+    score = 0.0
+    for i in range(product_count):
+        score += (i * 1.0001) ** 0.5
+
+def run_multiprocess() -> float:
+    start = time.perf_counter()
+    p1 = Process(target=compute_recommendations, args=(5_000_000,))
+    p2 = Process(target=compute_recommendations, args=(5_000_000,))
+    p1.start()
+    p2.start()
+    p1.join()
+    p2.join()
+    return time.perf_counter() - start
+
+if __name__ == "__main__":
+    print(f"Multiprocess: {run_multiprocess():.2f}s")
+```
+
+Roughly half the time. Each process has its **own** Python interpreter, its **own** GIL, and runs on a separate core in genuine parallel. The threaded version was capped at one core's worth of Python, the multiprocess version was not.
+
+The same pattern holds whether the work is matrix math written in Python, parsing JSON with the standard library, or compressing data with a pure-Python implementation. Anything that's "Python running bytecode on a CPU" gets serialized by the GIL.
+
+> **Cost:** Spawning a process is much heavier than spawning a thread. On Linux the difference is small (fork is cheap), on Windows and macOS it's significant because each process boots a fresh interpreter. Use processes for long-running CPU work, not for tasks that finish in microseconds.
+
+<h1 id="when-the-gil-is-released">When the GIL Is Released</h1>
+
+The GIL is not a single uninterruptible lock for the lifetime of a thread. It gets released and reacquired constantly. There are three main moments to know about.
+
+**During I/O.** When a thread calls into the operating system to read a file, send a network request, wait on a socket, or sleep, the C code that performs the syscall releases the GIL **before** the call and reacquires it **after**. The OS does the waiting, the GIL stays free for other threads to grab. This is the entire reason threading works well for I/O-bound code.
+
+**Around long-running C extensions.** Library code written in C can voluntarily release the GIL when it does work that doesn't touch Python objects. NumPy releases the GIL around array operations on numeric data. lxml releases it around parsing. The standard `hashlib` releases it around large hash computations. The C extension promises "I won't touch Python state for a while", drops the GIL, does its work, and reacquires the lock.
+
+**Every "check interval".** Even when a thread is in pure Python bytecode, it doesn't hold the GIL forever. Periodically (every 100 bytecodes in older Python, or every 5 milliseconds in 3.2+) the running thread releases the GIL to give other threads a chance. You can read and tune this with `sys.getswitchinterval()` and `sys.setswitchinterval()`.
+
+```python
+import sys
+
+print(f"GIL switch interval: {sys.getswitchinterval()} seconds")
+```
+
+That 5 ms interval is why a pure-Python loop on one thread doesn't completely starve the others. Every 5 ms or so, the running thread surrenders the GIL, the OS picks a waiting thread, that thread acquires the GIL and runs for a while, and so on.
+
+The I/O case is where threads actually help. Consider fetching product details from a slow source. Each fetch sits waiting on a response, doing nothing on the CPU. While one thread waits, the GIL is free, so another thread can run.
+
+```python
+import time
+from threading import Thread
+
+def fetch_product_details(product_id: int) -> None:
+    # Simulate a slow network call for product details
+    time.sleep(1.0)
+
+def run_sequential() -> float:
+    start = time.perf_counter()
+    for pid in [1, 2, 3, 4]:
+        fetch_product_details(pid)
+    return time.perf_counter() - start
+
+def run_threaded() -> float:
+    start = time.perf_counter()
+    threads = [Thread(target=fetch_product_details, args=(pid,)) for pid in [1, 2, 3, 4]]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return time.perf_counter() - start
+
+print(f"Sequential: {run_sequential():.2f}s")
+print(f"Threaded:   {run_threaded():.2f}s")
+```
+
+Four fetches, each takes one second, but the threaded version finishes in one second total. While each thread is parked inside `time.sleep` (a syscall, GIL released), the other three threads can do their own waiting. The GIL is not the bottleneck because nobody is running Python bytecode.
+
+This is the rule of thumb: **threads help when threads spend their time waiting, not when they spend their time computing.**
+
+<h1 id="visualizing-gil-contention">Visualizing GIL Contention</h1>
+
+Picture the GIL as a single microphone in a room of four people. They can all be present, but only one of them can be speaking into the microphone at a time. The others wait for the microphone, take their turn, and pass it back.
+
+The diagram below shows four threads on a four-core machine, all wanting to run pure Python code. Only one holds the GIL at any moment. The others are runnable but parked, waiting for the lock.
+
+Now compare that to threads doing I/O. Three of them are parked inside `recv()` or `read()`, the GIL is free, and the fourth holds it while it does whatever small amount of Python work it has to do.
+
+The first picture is the CPU-bound case: four threads, four cores, one runs at a time. The second picture is the I/O-bound case: four threads, four cores, three are waiting on the network, the fourth runs unimpeded. Same number of threads, completely different parallelism story, and the difference is entirely about whether the work releases the GIL or not.
+
+<h1 id="c-extensions-that-release-the-gil">
+  C Extensions That Release the GIL
+</h1>
+
+A subset of CPU-heavy work in Python does scale with threads, and it's the subset that runs inside a C extension that has chosen to release the GIL during its compute phase. The most common examples are NumPy, SciPy, pandas (for some operations), and image libraries like Pillow.
+
+A NumPy element-wise multiply on a 10-million-element array spends almost all its time inside a C loop that has dropped the GIL. While one thread is inside that loop, another thread can hold the GIL and start its own NumPy call, which immediately drops the GIL again. Both threads end up doing real work on different cores at the same time.
+
+```python
+import time
+import numpy as np
+from threading import Thread
+
+def heavy_numpy_work(size: int) -> None:
+    # NumPy releases the GIL during this multiply
+    arr = np.arange(size, dtype=np.float64)
+    for _ in range(20):
+        arr = arr * 1.0001
+
+def run_sequential() -> float:
+    start = time.perf_counter()
+    heavy_numpy_work(10_000_000)
+    heavy_numpy_work(10_000_000)
+    return time.perf_counter() - start
+
+def run_threaded() -> float:
+    start = time.perf_counter()
+    t1 = Thread(target=heavy_numpy_work, args=(10_000_000,))
+    t2 = Thread(target=heavy_numpy_work, args=(10_000_000,))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    return time.perf_counter() - start
+
+print(f"Sequential NumPy: {run_sequential():.2f}s")
+print(f"Threaded NumPy:   {run_threaded():.2f}s")
+```
+
+That's roughly a 1.8x speedup on two threads, close to what you'd hope for. The pure-Python loop earlier saw zero speedup on the same hardware. The only difference is whether the CPU-heavy work is happening inside Python bytecode (GIL held) or inside a C extension that has released the GIL.
+
+This is why threading is not a dead concept for CPU work. It's just that the work has to live in a library that releases the GIL. The list of major libraries that do is short but covers a lot of real-world numeric and image work.
+
+A simple mental model: if the inner loop of your hot path is in `for x in some_list: ...` in Python, threading won't help. If the inner loop is in `numpy.dot(a, b)` or `Image.filter(...)`, threading might.
+
+> **Cost:** The GIL is released and reacquired with overhead. Threading a workload that spends only a few microseconds per call inside a C extension can be slower than running sequentially, because the GIL traffic dominates. The C extension speedup only shows up when the work per call is large.
+
+<h1 id="what-this-means-for-choosing-threads-vs-processes">
+  What This Means for Choosing Threads vs Processes
+</h1>
+
+The GIL doesn't kill concurrency in Python, it just shapes the choice. Most decisions reduce to a few rules of thumb that follow directly from what you've seen above.
+
+**Use threads when work is dominated by waiting.** Network calls, file I/O, database queries, slow APIs. Threads spend almost all their time outside the GIL, so multiple of them can wait in parallel. A web server fetching data from 10 backends benefits enormously from this.
+
+**Use processes when work is dominated by Python bytecode.** Pure-Python data transformations, parsing, simulations, anything where your hot loop is `for x in items: ... compute ...` in Python. Each process gets its own interpreter and its own GIL, so they run on different cores in genuine parallel.
+
+**Threads can also work for CPU-bound code in C extensions that release the GIL.** NumPy, SciPy, Pillow, lxml, and similar libraries are the main examples. If your hot path is mostly inside one of these, threads can give real speedup. Don't assume it, measure it.
+
+**Use asyncio when you have thousands of concurrent waits.** Threads have OS-level overhead per thread (memory for stacks, scheduling cost). Asyncio handles thousands of concurrent I/O operations on a single thread without that overhead.
+
+The table below summarizes the choices, GIL-flavored.
+
+| Workload                             | GIL impact              | Threads      | Processes    | asyncio        |
+| ------------------------------------ | ----------------------- | ------------ | ------------ | -------------- |
+| Fetching from many slow APIs         | GIL released during I/O | Good         | Overkill     | Best at scale  |
+| Pure-Python CPU loops                | Fully GIL-bound         | No speedup   | Big speedup  | No speedup     |
+| NumPy / SciPy / image compute        | GIL released in C       | Real speedup | Real speedup | No (sync work) |
+| Mix of small CPU and I/O             | Partial                 | Modest gain  | Modest gain  | Best           |
+| Many short tasks (microseconds each) | Overhead dominates      | Use a pool   | Avoid        | Best           |
+
+The takeaway is not "threads are useless" or "always use processes". It's that the GIL pushes you toward different concurrency models for different workloads, and the wrong model gives zero speedup or worse.
+
+<h1 id="free-threaded-python-experimental">
+  Free-Threaded Python (Experimental)
+</h1>
+
+The story above describes every CPython release up to and including 3.12. Python 3.13 introduced an **experimental** free-threaded build, often called "no-GIL" Python, based on PEP 703. In a free-threaded build, the global lock is removed and CPython uses fine-grained locking and biased reference counting to keep the interpreter safe across threads.
+
+In the free-threaded build, the CPU-bound threading example from earlier would actually scale. Two threads doing pure-Python work on two cores would take roughly half the time of one. The trade is real: single-threaded code in 3.13 free-threaded is currently 5 to 10% slower than the regular build, and some C extensions don't work yet because they assume the GIL. The PEP plans for a multi-year transition where the free-threaded build is opt-in, then default-but-opt-out, then standard.
+
+For now, treat free-threaded Python as a research preview. Production code should still assume the GIL exists. The patterns in the rest of this section, including processes for CPU work, hold regardless of whether the free-threaded build eventually replaces the regular one.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

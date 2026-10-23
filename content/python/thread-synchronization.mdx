@@ -1,0 +1,551 @@
+---
+title: "Thread Synchronization (Lock, RLock, Semaphore, Event, Condition, Barrier)"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "Thread Synchronization explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+When two threads touch the same data at the same time, they can step on each other in ways that produce nonsense values, silently lose updates, or cause your program to hang. Python's `threading` module ships a small toolkit for keeping threads out of each other's way: `Lock`, `RLock`, `Semaphore`, `Event`, `Condition`, and `Barrier`. This lesson walks through what each of those primitives is for, how to use them, and how to avoid deadlocks.
+
+<h1 id="why-synchronization-is-needed">Why Synchronization Is Needed</h1>
+
+The fastest way to see the problem is to write a thread-unsafe program and watch it produce a wrong answer. Picture a shared stock counter for a popular product. Many threads are processing orders, and each one decrements `stock` by 1 when an order goes through. Start with 100,000 units of stock and run 10 threads, each processing 10,000 orders. The final count should be zero.
+
+```python
+import threading
+
+stock = 100_000
+
+def process_orders(count: int) -> None:
+    global stock
+    for _ in range(count):
+        stock -= 1
+
+threads = [threading.Thread(target=process_orders, args=(10_000,)) for _ in range(10)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+
+print(f"Final stock: {stock}")
+```
+
+$L49
+
+The line `stock -= 1` looks atomic, but it isn't. At the bytecode level it splits into three steps: load the current value, subtract one, store it back. If thread A loads `42` and gets paused before storing, thread B can also load `42`, subtract one, and store `41`. When A resumes, it stores `41` too. Two decrements happened, but the counter only went down by one. That's a lost update.
+
+The diagram shows two threads racing through the same three-step decrement. Both load `42`, both write `41`, and the second write silently overwrites the first. The fix is to make those three steps run as one indivisible unit, which is exactly what a `Lock` gives you.
+
+<h1 id="lock-the-basic-mutex">Lock: The Basic Mutex</h1>
+
+A `Lock` is a binary primitive with two states: locked and unlocked. Only one thread can hold the lock at a time. Other threads that try to acquire it block until the holder releases it. That's enough to fix the stock counter.
+
+```python
+import threading
+
+stock = 100_000
+stock_lock = threading.Lock()
+
+def process_orders(count: int) -> None:
+    global stock
+    for _ in range(count):
+        stock_lock.acquire()
+        try:
+            stock -= 1
+        finally:
+            stock_lock.release()
+
+threads = [threading.Thread(target=process_orders, args=(10_000,)) for _ in range(10)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+
+print(f"Final stock: {stock}")
+```
+
+Every run produces the same answer. The lock turns "read, subtract, write" into one step that no other thread can break into. While Thread A holds the lock, Thread B blocks on `acquire()` until A calls `release()`.
+
+Two threads competing for a lock look like this:
+
+Thread B sits in a blocked state until Thread A releases. Once released, B wakes up, acquires the lock, and runs its own update. The protected region (between `acquire()` and `release()`) is called a **critical section**.
+
+The `try/finally` pattern matters. If the protected code raises an exception, you still need to release the lock, otherwise every other thread blocks forever. Python's `with` statement does this for you because `Lock` implements the context manager protocol:
+
+```python
+import threading
+
+stock = 100_000
+stock_lock = threading.Lock()
+
+def process_orders(count: int) -> None:
+    global stock
+    for _ in range(count):
+        with stock_lock:
+            stock -= 1
+
+threads = [threading.Thread(target=process_orders, args=(10_000,)) for _ in range(10)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+
+print(f"Final stock: {stock}")
+```
+
+The `with stock_lock:` form is the idiomatic spelling. It acquires on entry and releases on exit, even if the body raises. Use it everywhere unless you have a specific reason to call `acquire`/`release` directly (for example, when the acquire and release happen in different functions).
+
+A subtle point: keep the critical section small. Anything you do inside the `with` block runs serially, with all other threads blocked. If you read from the network or compute for a long time while holding a lock, you've turned a multi-threaded program into a single-threaded one with extra overhead.
+
+> **Cost:** `acquire()` and `release()` are cheap on an uncontested lock (a handful of microseconds). Under heavy contention they become much more expensive because waiting threads sleep and wake up. The fix is usually to shrink the critical section or to shard data so different threads touch different locks.
+
+`Lock.acquire()` also takes an optional `timeout` and `blocking` parameter. `lock.acquire(blocking=False)` returns immediately with `True` if the lock was free or `False` if it was already held. `lock.acquire(timeout=2.0)` waits at most 2 seconds. Both are useful when you want to attempt work without blocking indefinitely.
+
+<h1 id="rlock-reentrant-lock">RLock: Reentrant Lock</h1>
+
+A regular `Lock` doesn't know who owns it. If the same thread tries to acquire a `Lock` it already holds, it deadlocks against itself. That sounds avoidable until you write code where a locked method calls another locked method on the same object.
+
+Consider a cart that protects its internal state with a lock. The `add_item` method locks, the `total` method locks, and there's a helper `add_with_total` that wants to call both:
+
+```python
+import threading
+
+class Cart:
+    def __init__(self) -> None:
+        self.items: list[tuple[str, float]] = []
+        self.lock = threading.Lock()
+
+    def add_item(self, name: str, price: float) -> None:
+        with self.lock:
+            self.items.append((name, price))
+
+    def total(self) -> float:
+        with self.lock:
+            return sum(price for _, price in self.items)
+
+    def add_with_total(self, name: str, price: float) -> float:
+        with self.lock:
+            self.add_item(name, price)  # This will deadlock
+            return self.total()
+
+cart = Cart()
+cart.add_with_total("Wireless Mouse", 24.99)  # hangs forever
+```
+
+The outer `with self.lock:` in `add_with_total` acquires the lock. Then `add_item` tries to acquire the same lock, but `Lock` doesn't grant a second acquisition to the same thread. The thread blocks against itself, waiting for itself to release. The program hangs.
+
+`RLock` solves this. It tracks the owning thread and a counter. The same thread can call `acquire()` multiple times in a row without blocking; each call bumps the counter. The lock is fully released only when `release()` has been called the same number of times.
+
+```python
+import threading
+
+class Cart:
+    def __init__(self) -> None:
+        self.items: list[tuple[str, float]] = []
+        self.lock = threading.RLock()
+
+    def add_item(self, name: str, price: float) -> None:
+        with self.lock:
+            self.items.append((name, price))
+
+    def total(self) -> float:
+        with self.lock:
+            return sum(price for _, price in self.items)
+
+    def add_with_total(self, name: str, price: float) -> float:
+        with self.lock:
+            self.add_item(name, price)
+            return self.total()
+
+cart = Cart()
+print(f"${cart.add_with_total('Wireless Mouse', 24.99):.2f}")
+print(f"${cart.add_with_total('HDMI Cable', 12.50):.2f}")
+print(f"${cart.total():.2f}")
+```
+
+The outer `with self.lock:` in `add_with_total` increments the counter to 1. The inner call from `add_item` bumps it to 2. When `add_item`'s `with` block exits, the counter goes back to 1. The outer block exits, the counter goes to 0, and the lock is fully released. Other threads waiting on the `RLock` can now acquire it.
+
+When should you reach for `RLock` over `Lock`? The honest answer is: prefer `Lock` if your design allows it, because plain locks are slightly cheaper and make accidental re-entry surface as a deadlock instead of silently working. Use `RLock` when:
+
+- Your locked methods naturally call each other on the same object.
+- You're writing a library where callers may legitimately re-enter your code under the lock.
+- You can't restructure the code to avoid the nested acquisition without ugly contortions.
+
+| Feature                          | `Lock`                   | `RLock`                                             |
+| -------------------------------- | ------------------------ | --------------------------------------------------- |
+| Reentrant by same thread         | No, deadlocks            | Yes, counted                                        |
+| Tracks owner                     | No                       | Yes                                                 |
+| Overhead                         | Lower                    | Slightly higher                                     |
+| `acquire`/`release` must balance | Per acquisition          | Per acquisition (counter must reach zero)           |
+| Use case                         | Simple critical sections | Methods that call each other while holding the lock |
+
+A common mistake with `RLock` is releasing it from a different thread than the one that acquired it. That raises `RuntimeError`. Both `Lock` and `RLock` require the holding thread to release.
+
+<h1 id="semaphore-limiting-concurrent-access">
+  Semaphore: Limiting Concurrent Access
+</h1>
+
+A lock allows exactly one thread through at a time. A semaphore allows up to `N` threads through at a time. You pass `N` to the constructor, each `acquire()` decrements an internal counter, and each `release()` increments it. If the counter is at zero, `acquire()` blocks until someone releases.
+
+The classic use case is rate-limiting a shared resource. Say the product-pricing service caps you at 5 simultaneous requests. More than 5 outstanding calls and it starts rejecting. You want many threads to be able to call it, but at most 5 at any moment.
+
+```python
+import threading
+import time
+import random
+
+api_semaphore = threading.Semaphore(5)
+
+def fetch_price(product_id: int) -> None:
+    with api_semaphore:
+        print(f"Thread {threading.current_thread().name} fetching price for product {product_id}")
+        time.sleep(random.uniform(0.1, 0.3))
+        print(f"Thread {threading.current_thread().name} done with product {product_id}")
+
+threads = [
+    threading.Thread(target=fetch_price, args=(pid,), name=f"T{pid}")
+    for pid in range(12)
+]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+```
+
+Twelve threads start, but only five make it inside the `with` block at once. The other seven block on `api_semaphore.acquire()` until a slot frees up.
+
+A semaphore initialised with `Semaphore(1)` behaves like a lock, but there's a key difference: `Semaphore.release()` can be called by any thread, not just the one that acquired. That makes it useful for signaling patterns where one thread acquires a slot and another releases it after the work completes. If you want lock-like behavior, use `Lock`; if you want a counted resource, use `Semaphore`.
+
+A common gotcha: a plain `Semaphore` lets `release()` be called more times than `acquire()`. That bumps the internal counter above its initial value, which means future acquires won't block when you expect them to. `BoundedSemaphore` is the safer version: it raises `ValueError` if `release()` would push the counter above the initial value.
+
+```python
+import threading
+
+slots = threading.BoundedSemaphore(3)
+
+slots.acquire()
+slots.release()
+slots.release()  # one too many
+```
+
+If you're using a semaphore to model a fixed pool of resources (3 connections to a payment service, 5 worker slots, 10 cached database handles), `BoundedSemaphore` will catch the bug where some code path releases without a matching acquire.
+
+<h1 id="event-one-shot-signaling">Event: One-Shot Signaling</h1>
+
+An `Event` is a thread-safe boolean flag with a built-in wait. One or more threads can call `event.wait()` and block until another thread calls `event.set()`. Once set, the flag stays set until `event.clear()` is called.
+
+This is the right tool when you want to broadcast "something has happened" to any number of waiting threads. A simple example: order workers wait for a "system ready" signal before they start processing.
+
+```python
+import threading
+import time
+
+system_ready = threading.Event()
+
+def order_worker(worker_id: int) -> None:
+    print(f"Worker {worker_id} waiting for system to be ready")
+    system_ready.wait()
+    print(f"Worker {worker_id} processing orders")
+
+workers = [threading.Thread(target=order_worker, args=(i,)) for i in range(3)]
+for w in workers:
+    w.start()
+
+print("Main thread: warming up caches")
+time.sleep(1)
+print("Main thread: system ready, releasing workers")
+system_ready.set()
+
+for w in workers:
+    w.join()
+```
+
+All three workers block on `wait()`. The main thread does its warmup, then `set()` releases all of them at once. After `set()`, any subsequent `wait()` returns immediately, because the flag is still set.
+
+`event.wait(timeout=5.0)` waits up to 5 seconds and returns the current flag value (`True` if set, `False` if the timeout fired). That's the standard way to wait for a signal but bail out if it never arrives.
+
+Events are one-way by default: set it and forget it. If you want to reuse the same event for repeated cycles, you `clear()` it before each round. Be careful: clearing while another thread is in the middle of `wait()` can cause races. If you need repeated synchronization with reuse, look at `Condition` or `Barrier`.
+
+| Use case                                              | Right primitive                   |
+| ----------------------------------------------------- | --------------------------------- |
+| One thread tells many threads "go"                    | `Event`                           |
+| Threads wait for a state change with a predicate      | `Condition`                       |
+| N threads must all reach a point before any continues | `Barrier`                         |
+| One thread at a time inside a critical section        | `Lock` or `RLock`                 |
+| Limit N threads inside a region                       | `Semaphore` or `BoundedSemaphore` |
+
+<h1 id="condition-producerconsumer">Condition: Producer/Consumer</h1>
+
+`Condition` is the heavyweight signaling primitive. It combines a lock with the ability to wait for a state change and notify waiters when the state changes. The classic use is producer/consumer: producers add items to a shared buffer, consumers take them out, and each side blocks gracefully when the buffer is in the wrong state for them.
+
+Think of an order queue. Producer threads accept new orders and push them onto a list. Consumer threads pull orders off and process them. The consumer should wait if the list is empty. The producer should wait if the list is at capacity.
+
+```python
+import threading
+import time
+import random
+
+orders: list[str] = []
+MAX_ORDERS = 5
+condition = threading.Condition()
+
+def producer(name: str) -> None:
+    for i in range(3):
+        with condition:
+            while len(orders) >= MAX_ORDERS:
+                print(f"{name} waiting, queue is full")
+                condition.wait()
+            order = f"{name}-order-{i}"
+            orders.append(order)
+            print(f"{name} added {order} (queue size: {len(orders)})")
+            condition.notify_all()
+        time.sleep(random.uniform(0.05, 0.15))
+
+def consumer(name: str) -> None:
+    for _ in range(3):
+        with condition:
+            while not orders:
+                print(f"{name} waiting, queue is empty")
+                condition.wait()
+            order = orders.pop(0)
+            print(f"{name} processed {order} (queue size: {len(orders)})")
+            condition.notify_all()
+        time.sleep(random.uniform(0.1, 0.2))
+
+threads = [
+    threading.Thread(target=producer, args=("P1",)),
+    threading.Thread(target=producer, args=("P2",)),
+    threading.Thread(target=consumer, args=("C1",)),
+    threading.Thread(target=consumer, args=("C2",)),
+]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+```
+
+Three things happen on each iteration. First, the thread acquires the condition's lock with `with condition:`. Second, it checks the state in a `while` loop and calls `condition.wait()` if it's not ready to proceed. `wait()` atomically releases the lock and blocks, then re-acquires the lock when woken. Third, after doing its work, the thread calls `notify_all()` to wake any threads waiting on the condition so they can re-check their predicate.
+
+The `while` loop around `wait()` is not optional. A waiter can be woken without the state actually matching what it needs, either because of "spurious wakeups" or because another waiter raced ahead and grabbed the new item first. Always re-check the predicate after `wait()` returns.
+
+The choice between `notify()` and `notify_all()`:
+
+| Method         | What it does      | When to use                                                                                   |
+| -------------- | ----------------- | --------------------------------------------------------------------------------------------- |
+| `notify()`     | Wakes one waiter  | When any single waiter can handle the change (e.g., one new item, one waiting consumer)       |
+| `notify_all()` | Wakes all waiters | When the state change affects many waiters, or when waiters are checking different predicates |
+
+`notify()` is more efficient when you're sure exactly one waiter can proceed. `notify_all()` is safer when in doubt, because no waiter is left stranded if the predicate matters to several of them. For a beginner, prefer `notify_all()` and optimize later if profiling shows it matters.
+
+> **Cost:** Each `notify_all()` wakes every waiter, which means N threads wake up, re-check, and possibly go back to sleep. If only one of them can actually proceed, that's wasted work. For tight inner loops, use `notify()` when you can prove only one waiter benefits.
+
+In production code, the `queue.Queue` standard-library class wraps a `Condition` and gives you a clean producer/consumer API with `put` and `get` already implemented. That's the right choice for most real work. Reach for `Condition` directly when you need predicates more complex than "queue not empty" or "queue not full".
+
+<h1 id="barrier-all-threads-meet-here">Barrier: All Threads Meet Here</h1>
+
+A `Barrier` is a synchronization point for a fixed number of threads. You initialize it with a count `N`. Each thread that reaches the barrier calls `barrier.wait()` and blocks. Once `N` threads have called `wait()`, all of them are released together to continue. The barrier then resets and can be reused for the next round.
+
+A practical use: a batch order-processing system that pulls orders in phases. Each phase, workers fetch their slice of orders and process it. The next phase shouldn't start until every worker has finished the current one. A barrier makes that easy.
+
+```python
+import threading
+import time
+import random
+
+NUM_WORKERS = 3
+barrier = threading.Barrier(NUM_WORKERS)
+
+def worker(name: str) -> None:
+    for phase in range(3):
+        time.sleep(random.uniform(0.1, 0.4))
+        print(f"{name} finished phase {phase}")
+        barrier.wait()
+        if name == "W0":
+            print(f"--- All workers synced after phase {phase} ---")
+
+workers = [threading.Thread(target=worker, args=(f"W{i}",)) for i in range(NUM_WORKERS)]
+for w in workers:
+    w.start()
+for w in workers:
+    w.join()
+```
+
+Each phase, all three workers finish in some order. Whoever finishes first blocks on `barrier.wait()` until the slowest worker arrives. Then all three are released at once and the next phase starts. The barrier resets automatically between rounds, so the same object handles every phase.
+
+`Barrier` has a couple of extra knobs:
+
+- `barrier.wait(timeout=2.0)` raises `BrokenBarrierError` if the timeout expires before all parties arrive. It also breaks the barrier for all other parties, so they get the same exception.
+- `barrier.abort()` lets you break the barrier intentionally if something goes wrong, freeing any waiters with `BrokenBarrierError`.
+- `barrier.reset()` returns a broken barrier to its initial state so it can be reused.
+- The constructor accepts an optional `action` argument: a callable that runs in one thread (the last to arrive) before all waiters are released. Handy for end-of-phase cleanup that should run exactly once.
+
+```python
+import threading
+
+def cleanup() -> None:
+    print("Phase complete, flushing logs")
+
+barrier = threading.Barrier(3, action=cleanup)
+```
+
+When `cleanup` runs, the other two threads are already at the barrier waiting. They'll be released only after `cleanup` returns. That keeps the "end of phase" code single-threaded and the "next phase" code parallel.
+
+<h1 id="deadlocks">Deadlocks</h1>
+
+A deadlock is when two or more threads are each waiting on a lock the other holds, and none of them can move. The textbook recipe is two locks acquired in opposite orders.
+
+Imagine a shared order ID generator and a shared customer record. Two threads each want to acquire both: one needs the order lock first and the customer lock second; the other does it the other way around.
+
+```python
+import threading
+import time
+
+order_lock = threading.Lock()
+customer_lock = threading.Lock()
+
+def thread_a() -> None:
+    with order_lock:
+        print("A: holds order_lock, wants customer_lock")
+        time.sleep(0.1)
+        with customer_lock:
+            print("A: holds both")
+
+def thread_b() -> None:
+    with customer_lock:
+        print("B: holds customer_lock, wants order_lock")
+        time.sleep(0.1)
+        with order_lock:
+            print("B: holds both")
+
+t1 = threading.Thread(target=thread_a)
+t2 = threading.Thread(target=thread_b)
+t1.start()
+t2.start()
+t1.join()
+t2.join()
+```
+
+Thread A holds `order_lock` and is blocked waiting for `customer_lock`. Thread B holds `customer_lock` and is blocked waiting for `order_lock`. Neither will release until it gets the other lock, which will never happen.
+
+The standard fix is **consistent lock ordering**: pick a global order for your locks and always acquire them in that order. If every thread acquires `order_lock` before `customer_lock`, the deadlock can't happen, because no thread will ever hold `customer_lock` while waiting for `order_lock`.
+
+```python
+import threading
+
+order_lock = threading.Lock()
+customer_lock = threading.Lock()
+
+def thread_a() -> None:
+    with order_lock:
+        with customer_lock:
+            print("A: holds both")
+
+def thread_b() -> None:
+    with order_lock:  # always acquire order_lock first
+        with customer_lock:
+            print("B: holds both")
+
+t1 = threading.Thread(target=thread_a)
+t2 = threading.Thread(target=thread_b)
+t1.start()
+t2.start()
+t1.join()
+t2.join()
+```
+
+When one thread holds `order_lock`, the other waits for it instead of acquiring `customer_lock`. There's no cycle, so no deadlock.
+
+Other defenses are worth knowing:
+
+| Strategy                    | What it does                                                                                                            |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| Consistent lock ordering    | Always acquire locks in the same global order. Cheapest to implement.                                                   |
+| Use `with` everywhere       | Guarantees release on exception, prevents one common deadlock cause.                                                    |
+| Use `acquire(timeout=...)`  | If you can't get the lock in time, back off and retry instead of blocking forever. Lets you detect potential deadlocks. |
+| Hold one lock at a time     | If you don't need both locks at once, don't take both. Split the work.                                                  |
+| Use higher-level primitives | `queue.Queue`, `concurrent.futures`, and `asyncio` push the locking inside the library, where it's already debugged.    |
+
+The trickiest deadlocks involve more than two locks, or locks combined with `RLock`, `Condition`, and external resources like file handles. The rule of thumb stays the same: if you take more than one lock at the same time, document the order and stick to it.
+
+<h1 id="putting-it-together">Putting It Together</h1>
+
+Here's a quick reference for picking the right primitive based on the shape of the problem.
+
+| Problem                                                                 | Primitive                                          |
+| ----------------------------------------------------------------------- | -------------------------------------------------- |
+| Protect a shared mutable value from concurrent updates                  | `Lock`                                             |
+| Same as above, but the protected code may re-enter on the same thread   | `RLock`                                            |
+| Cap the number of threads inside a region (rate limit, connection pool) | `Semaphore` / `BoundedSemaphore`                   |
+| Tell waiting threads "go" once a one-time condition is true             | `Event`                                            |
+| Producer/consumer pattern with a buffer and predicates                  | `Condition` (or `queue.Queue` for the common case) |
+| Synchronize a fixed group of threads at a checkpoint                    | `Barrier`                                          |
+
+When in doubt, reach for the higher-level tool. `queue.Queue` saves you from rolling your own producer/consumer. `concurrent.futures.ThreadPoolExecutor` handles thread lifecycle and result collection. Hand-rolled locks are powerful, but they're also where most concurrency bugs live.
+
+<h1 id="quiz">Quiz</h1>
+
+<h1 id="quiz-questions">Quiz Questions</h1>
+
+**Question 1: In the shared stock counter example, what does a Lock protect against?**
+
+- [x] Two threads interleaving the read-compute-write steps of stock -= 1
+- [ ] The global name stock being collected while a thread still refers to it
+- [ ] The integer object changing in place while another name aliases it
+- [ ] The operating system running Python bytecode with no GIL present
+
+**Question 2: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 3: What is the main advantage of using with lock instead of calling acquire() and release() manually?**
+
+- [x] It calls acquire on entry and release on exit, including exceptions.
+- [ ] It makes every operation in the program run as one bytecode step.
+- [ ] It lets several threads hold the same mutex during the block.
+- [ ] It copies shared objects before the block and writes them back.
+
+**Question 5: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 6: Which situation calls for RLock rather than a regular Lock?**
+
+- [x] A method holding the lock calls another method that also locks it.
+- [ ] A fixed number of worker threads may enter the same section together.
+- [ ] One thread must broadcast that a setup step has finished.
+- [ ] A group of threads must reach the same checkpoint before moving on.
+
+**Question 8: Which statement about Condition.wait() is correct?**
+
+- [x] It releases the condition's lock while waiting, then re-acquires it.
+- [ ] It keeps the lock held so producers cannot change the predicate.
+- [ ] It wakes exactly one waiting thread whenever the predicate changes.
+- [ ] It replaces the need to check a shared predicate in a loop.
+
+**Question 9: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 10: Two functions need to acquire a_lock and b_lock. Which rule best prevents a deadlock?**
+
+- [x] Always acquire shared locks in a single agreed order.
+- [ ] Acquire the lock for the object created most recently first.
+- [ ] Hold both locks during slow network calls, then release them.
+- [ ] Use time.sleep() between acquire calls so the scheduler can run.
+
+<QuizCard />
+
+<CommentsSection />
+
+</LessonCard>

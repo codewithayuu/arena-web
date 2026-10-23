@@ -1,0 +1,457 @@
+---
+title: "CyclicBarrier"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "CyclicBarrier explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+`CyclicBarrier` lives in `java.util.concurrent`. It has been in the JDK since Java 5, alongside the rest of the `java.util.concurrent` family.
+
+<h1 id="what-a-barrier-is-concretely">What a Barrier Is, Concretely</h1>
+
+Consider four workers that each compute part of a daily report. Worker A summarizes orders. Worker B summarizes customers. Worker C summarizes refunds. Worker D summarizes inventory. None of them can move to the next stage (writing the combined PDF) until all four partial reports are ready. Each worker needs a place to say "I'm done with my part, I'll wait until the others are done with theirs."
+
+That place is the barrier. The barrier is created with a known participant count, here 4. Each worker calls `await()` when it finishes its part. The first three calls block. The fourth call does not block, because at that moment the barrier's count of arrivals equals the participant count, and the barrier trips. All four threads wake up and move on together.
+
+The diagram captures the shape of a single trip. Four workers feed into one barrier, the barrier counts arrivals, and once the fourth arrival comes in, all four threads exit together. The word "cyclic" in the name means the same barrier object can be reused. After it trips, the count resets to zero automatically, and the next round of four `await()` calls trips it again.
+
+That is the concept. Everything else in this lesson is mechanics around it.
+
+<h1 id="creating-a-barrier-and-calling-await">
+  Creating a Barrier and Calling await
+</h1>
+
+The simplest constructor takes the number of parties:
+
+```java
+import java.util.concurrent.CyclicBarrier;
+
+public class BarrierBasics {
+    public static void main(String[] args) throws Exception {
+        CyclicBarrier barrier = new CyclicBarrier(4);
+
+        Runnable worker = () -> {
+            try {
+                System.out.println(Thread.currentThread().getName() + " arrived");
+                barrier.await();
+                System.out.println(Thread.currentThread().getName() + " proceeding");
+            } catch (Exception e) {
+                Thread.currentThread().interrupt();
+            }
+        };
+
+        for (int i = 1; i <= 4; i++) {
+            new Thread(worker, "Worker-" + i).start();
+        }
+    }
+}
+```
+
+The order of the "arrived" lines and the "proceeding" lines depends on thread scheduling. What is guaranteed: no thread prints "proceeding" until all four have printed "arrived", because none of them can return from `await()` until the fourth arrival trips the barrier.
+
+A few details about `await()`:
+
+| Method                  | Returns                                                           | Throws                                                               |
+| ----------------------- | ----------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `await()`               | The arrival index (0 means last to arrive, parties-1 means first) | `InterruptedException`, `BrokenBarrierException`                     |
+| `await(long, TimeUnit)` | Same arrival index                                                | `InterruptedException`, `BrokenBarrierException`, `TimeoutException` |
+
+The arrival index has a specific structure. `await()` returns `parties - 1` to the very first thread that arrives, `parties - 2` to the second, and `0` to the last thread (the one that trips the barrier). This is useful when exactly one of the threads should do something special after the trip, like log a summary, without using a separate `barrierAction`. Most code ignores the return value.
+
+A `CyclicBarrier` is built on `ReentrantLock` and `Condition` internally. Every `await()` call acquires the lock, updates the count, and either parks the thread or signals the others. For 4 to a few hundred parties, the overhead is tiny. For thousands of parties hitting the barrier in tight loops, the lock contention becomes the dominant cost; that is the regime where `Phaser` or lock-free designs start to make sense.
+
+<h1 id="a-multi-stage-daily-report">A Multi-Stage Daily Report</h1>
+
+A barrier is useful for multiple stages where everyone needs to sync between stages. A daily-report job: four workers each compute a partial result, sync at the barrier, then move to the next stage and sync again. The same `CyclicBarrier` object is used twice, which is the "cyclic" part of the name.
+
+```java
+import java.util.concurrent.CyclicBarrier;
+
+public class DailyReport {
+
+    public static void main(String[] args) throws Exception {
+        int workers = 4;
+        CyclicBarrier barrier = new CyclicBarrier(workers);
+
+        for (int id = 1; id <= workers; id++) {
+            int workerId = id;
+            new Thread(() -> runWorker(workerId, barrier), "Worker-" + id).start();
+        }
+    }
+
+    static void runWorker(int workerId, CyclicBarrier barrier) {
+        try {
+            // Stage 1: gather raw counts
+            int rawCount = 100 * workerId;
+            System.out.println("Worker-" + workerId + " stage 1 raw=" + rawCount);
+            barrier.await();
+
+            // Stage 2: turn counts into a summary line
+            String summary = "Worker-" + workerId + " summary: " + (rawCount * 2);
+            System.out.println("Worker-" + workerId + " stage 2 " + summary);
+            barrier.await();
+
+            // Stage 3: write the line
+            System.out.println("Worker-" + workerId + " stage 3 wrote line");
+        } catch (Exception e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+}
+```
+
+The interleaving inside each stage varies between runs, but the stages are always cleanly separated. No thread prints a stage-2 line before all four stage-1 lines are out, and no thread prints a stage-3 line before all four stage-2 lines are out. The barrier enforces that fence with no extra coordination code in the workers.
+
+The diagram shows the stage structure. Every worker walks down the same path. The two barriers are the same `CyclicBarrier` object, used twice. After the first trip, its internal counter resets to zero, ready for the second trip.
+
+This is the property the name points to. A `CountDownLatch(4)` would fire once when its count hits zero and never again. A `CyclicBarrier(4)` resets after every trip, so any number of synchronized rounds can use one object.
+
+<h1 id="the-barrieraction-run-code-when-the-barrier-trips">
+  The barrierAction: Run Code When the Barrier Trips
+</h1>
+
+The second constructor takes an optional `Runnable` called the `barrierAction`. When the barrier trips, the framework runs the action exactly once, on the thread that supplied the final arrival, before any waiting thread is released. The action fits "between-stage" work: roll up partial results, log a checkpoint, swap buffers, anything that needs to happen exactly once and to happen before the next stage starts.
+
+```java
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class ReportWithBarrierAction {
+
+    static final AtomicInteger totalOrders = new AtomicInteger(0);
+    static int stage = 1;
+
+    public static void main(String[] args) throws Exception {
+        int workers = 4;
+
+        Runnable rollUp = () -> {
+            System.out.println(">> barrierAction: stage " + stage
+                + " total orders so far = " + totalOrders.get());
+            stage++;
+        };
+
+        CyclicBarrier barrier = new CyclicBarrier(workers, rollUp);
+
+        for (int id = 1; id <= workers; id++) {
+            int workerId = id;
+            new Thread(() -> {
+                try {
+                    int found = 50 * workerId;
+                    totalOrders.addAndGet(found);
+                    System.out.println("Worker-" + workerId + " found " + found + " orders");
+                    barrier.await();
+
+                    int audited = workerId;
+                    totalOrders.addAndGet(audited);
+                    System.out.println("Worker-" + workerId + " audited " + audited + " more");
+                    barrier.await();
+                } catch (Exception e) {
+                    Thread.currentThread().interrupt();
+                }
+            }, "Worker-" + id).start();
+        }
+    }
+}
+```
+
+The first four lines are interleaved (the workers run in parallel), but the `>> barrierAction` line always appears after all four stage-1 lines and before any stage-2 line. The framework guarantees this. The `Runnable` runs on the thread that supplied the final arrival, inside the barrier's internal critical section, with all other parties still parked. By the time any worker returns from `await()`, the action has already finished.
+
+A few rules about the `barrierAction`:
+
+- **Runs once per trip.** Not per arrival, not per worker. Exactly once.
+- **Runs synchronously on the last-arriving thread.** That thread does not skip ahead while the action runs.
+- **No exceptions allowed.** If the `Runnable` throws, every party (including the one running the action) sees a `BrokenBarrierException`, and the barrier is left broken. That case is covered below.
+- **Counter resets after the action.** The framework only releases the parked threads after the action finishes cleanly, and the count is back to zero before the first thread returns.
+
+Use the action for cross-cutting work that belongs to the trip itself: a log line, a summary, swapping which buffer is "current". For per-worker work between stages, put that in the worker code, not in the action.
+
+The `barrierAction` extends the critical section. Three idle threads are parked while it runs. Keep it short. For heavy work between stages, do it after `await()` returns, in parallel across the workers, not inside the action.
+
+<h1 id="broken-barriers-when-things-go-wrong">
+  Broken Barriers: When Things Go Wrong
+</h1>
+
+A barrier is "broken" when something disrupts a trip mid-flight. The common causes are:
+
+- A waiting thread is **interrupted** while parked in `await()`.
+- A waiting thread **times out** in `await(timeout, unit)`.
+- The **`barrierAction` throws** an unchecked exception.
+- Someone calls **`reset()`** while threads are waiting.
+
+When any of these happen, the barrier marks itself broken and wakes every party. The cause-thread sees the original exception (`InterruptedException`, `TimeoutException`, or whatever the action threw). Every other waiter sees `BrokenBarrierException`. Future `await()` calls on the same barrier also throw `BrokenBarrierException` until someone calls `reset()`.
+
+```java
+import java.util.concurrent.BrokenBarrierException;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.TimeUnit;
+
+public class BrokenByTimeout {
+
+    public static void main(String[] args) throws Exception {
+        CyclicBarrier barrier = new CyclicBarrier(3);
+
+        Runnable patient = () -> {
+            try {
+                System.out.println(Thread.currentThread().getName() + " waiting");
+                barrier.await(500, TimeUnit.MILLISECONDS);
+                System.out.println(Thread.currentThread().getName() + " proceeded");
+            } catch (BrokenBarrierException e) {
+                System.out.println(Thread.currentThread().getName() + " saw BrokenBarrierException");
+            } catch (Exception e) {
+                System.out.println(Thread.currentThread().getName() + " saw " + e.getClass().getSimpleName());
+            }
+        };
+
+        new Thread(patient, "A").start();
+        new Thread(patient, "B").start();
+        // Only two threads arrive. The third never shows up.
+    }
+}
+```
+
+Worker A's timer expires first. Its call throws `TimeoutException`, the barrier is marked broken, and Worker B's parked thread is woken with `BrokenBarrierException`. From that moment on, the barrier is unusable. Any new `await()` on it would throw `BrokenBarrierException` immediately without waiting.
+
+A barrier is an all-or-nothing rendezvous. If even one party cannot make it, none of the others should proceed as if the meeting happened, because the contract was that everyone meets. The framework enforces that by breaking the barrier for everyone.
+
+The diagram shows the lifecycle of a broken barrier. Any one of the four red-box causes flips the barrier into the broken state. From there, all parked waiters wake up with `BrokenBarrierException` (or the original exception for the cause thread), and any new `await()` fails immediately. The only way back is `reset()`.
+
+Interruption is the same story:
+
+```java
+import java.util.concurrent.BrokenBarrierException;
+import java.util.concurrent.CyclicBarrier;
+
+public class BrokenByInterrupt {
+
+    public static void main(String[] args) throws Exception {
+        CyclicBarrier barrier = new CyclicBarrier(3);
+
+        Thread a = new Thread(() -> {
+            try {
+                barrier.await();
+            } catch (InterruptedException e) {
+                System.out.println("A interrupted");
+            } catch (BrokenBarrierException e) {
+                System.out.println("A saw BrokenBarrierException");
+            }
+        }, "A");
+
+        Thread b = new Thread(() -> {
+            try {
+                barrier.await();
+            } catch (Exception e) {
+                System.out.println("B saw " + e.getClass().getSimpleName());
+            }
+        }, "B");
+
+        a.start();
+        b.start();
+        Thread.sleep(100);
+        a.interrupt();
+        a.join();
+        b.join();
+    }
+}
+```
+
+Same pattern: the cause-thread sees its specific exception (`InterruptedException` here), every other waiter sees `BrokenBarrierException`, and the barrier is left in the broken state until `reset()` is called.
+
+A broken barrier is sticky. Once any thread breaks it, every future `await()` fails fast with `BrokenBarrierException` until someone calls `reset()`. Without a reset, the barrier is dead weight for the rest of the program.
+
+<h1 id="reset-bringing-the-barrier-back">reset(): Bringing the Barrier Back</h1>
+
+`reset()` clears the broken state and resets the arrival count to zero. It also does one more thing: if there are any threads currently parked in `await()` at the moment of the reset, those threads are woken up with `BrokenBarrierException`. Calling `reset()` mid-flight breaks the in-progress trip and only then unbreaks the barrier for future use.
+
+```java
+import java.util.concurrent.CyclicBarrier;
+
+public class ResetExample {
+
+    public static void main(String[] args) throws Exception {
+        CyclicBarrier barrier = new CyclicBarrier(3);
+
+        // Two threads start waiting.
+        new Thread(() -> awaitSafely(barrier, "A"), "A").start();
+        new Thread(() -> awaitSafely(barrier, "B"), "B").start();
+        Thread.sleep(100);
+
+        System.out.println("Parties waiting before reset: " + barrier.getNumberWaiting());
+        barrier.reset();
+        Thread.sleep(100);
+
+        System.out.println("Broken after reset? " + barrier.isBroken());
+        System.out.println("Parties waiting after reset: " + barrier.getNumberWaiting());
+
+        // Barrier is fresh; we can use it normally now.
+        new Thread(() -> awaitSafely(barrier, "X"), "X").start();
+        new Thread(() -> awaitSafely(barrier, "Y"), "Y").start();
+        new Thread(() -> awaitSafely(barrier, "Z"), "Z").start();
+        Thread.sleep(200);
+    }
+
+    static void awaitSafely(CyclicBarrier barrier, String name) {
+        try {
+            barrier.await();
+            System.out.println(name + " proceeded");
+        } catch (Exception e) {
+            System.out.println(name + " saw " + e.getClass().getSimpleName());
+        }
+    }
+}
+```
+
+The first two threads were parked when `reset()` ran, so they both saw `BrokenBarrierException` (the framework could not keep them waiting on a counter that just got cleared). After the reset, `isBroken()` returns `false` and `getNumberWaiting()` returns `0`. The next three threads can use the barrier normally and trip it cleanly.
+
+This behavior is intentional. `reset()` is for recovering from a confirmed bad state, not for shortcutting a trip. To "skip ahead" mid-trip, a different primitive fits better, like a `Phaser` (which supports more flexible party counts) or direct condition variables.
+
+| Method                 | Effect                                                                     |
+| ---------------------- | -------------------------------------------------------------------------- |
+| `await()`              | Wait at the barrier; trip when the count reaches parties                   |
+| `await(timeout, unit)` | Same, but throw `TimeoutException` if no trip happens in time              |
+| `getParties()`         | Total parties needed to trip                                               |
+| `getNumberWaiting()`   | Current count of threads parked in `await()`                               |
+| `isBroken()`           | True if a thread broke the barrier and no `reset()` has been called yet    |
+| `reset()`              | Clear the broken state, reset arrival count, break any in-flight `await()` |
+
+<h1 id="load-test-rendezvous-after-every-batch">
+  Load-Test Rendezvous After Every Batch
+</h1>
+
+The other place a `CyclicBarrier` fits cleanly is a load-test scenario where a fixed pool of workers all need to start each batch at the same instant. Consider a tool that simulates N customers placing orders against an online store. All workers should launch their batch together (no head-start advantage), measure the batch, sync up, then launch the next batch.
+
+```java
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.ThreadLocalRandom;
+
+public class LoadTest {
+
+    public static void main(String[] args) throws Exception {
+        int workers = 4;
+        int batches = 3;
+        int ordersPerBatch = 5;
+        AtomicLong totalLatencyMicros = new AtomicLong(0);
+        AtomicLong totalOrders = new AtomicLong(0);
+
+        Runnable batchSummary = () -> {
+            long latency = totalLatencyMicros.getAndSet(0);
+            long orders = totalOrders.getAndSet(0);
+            long avg = orders == 0 ? 0 : latency / orders;
+            System.out.println(">> batch done: " + orders + " orders, avg " + avg + " us/order");
+        };
+
+        CyclicBarrier barrier = new CyclicBarrier(workers, batchSummary);
+
+        for (int id = 1; id <= workers; id++) {
+            int workerId = id;
+            new Thread(() -> runWorker(workerId, batches, ordersPerBatch,
+                                       barrier, totalLatencyMicros, totalOrders),
+                       "LoadWorker-" + id).start();
+        }
+    }
+
+    static void runWorker(int workerId, int batches, int ordersPerBatch,
+                          CyclicBarrier barrier,
+                          AtomicLong latencyAccumulator,
+                          AtomicLong ordersAccumulator) {
+        try {
+            for (int b = 1; b <= batches; b++) {
+                // All workers wait for the previous batch to be summarized before starting.
+                barrier.await();
+
+                long batchStart = System.nanoTime();
+                for (int o = 0; o < ordersPerBatch; o++) {
+                    placeOrder();
+                }
+                long elapsed = (System.nanoTime() - batchStart) / 1_000;
+
+                latencyAccumulator.addAndGet(elapsed);
+                ordersAccumulator.addAndGet(ordersPerBatch);
+                System.out.println("Worker-" + workerId + " batch " + b
+                                   + " took " + elapsed + " us");
+            }
+            // Final rendezvous so the last batch gets summarized too.
+            barrier.await();
+        } catch (Exception e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    static void placeOrder() {
+        // Pretend to place an order. Replace with a real HTTP call in a real test.
+        try {
+            Thread.sleep(ThreadLocalRandom.current().nextInt(5, 15));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+}
+```
+
+Exact microsecond numbers vary every run. The structural property: each `>> batch done` line is printed after all four `Worker-X batch B` lines for that batch and before any `Worker-X batch B+1` line. The first `>> batch done` reads "0 orders" because the first trip synchronizes the start; nothing has been measured yet. Each subsequent trip rolls up the previous batch's numbers and resets the accumulators for the next one.
+
+Two patterns to point out:
+
+1. The first `barrier.await()` inside the worker loop is at the **top**, so all workers wait for the previous batch's summary before starting the next one. The final `barrier.await()` after the loop ensures the very last batch is summarized.
+2. The `barrierAction` reads and resets the shared accumulators in one move (`getAndSet(0)`). Because the action runs inside the barrier's critical section with all other parties parked, no worker is touching those accumulators while the summary runs. The "read totals then zero them" idiom is safe without extra locking.
+
+This kind of synchronized batching is hard to write with raw `wait/notify` and possible but awkward with `CountDownLatch` (a new latch per batch). `CyclicBarrier` makes it natural.
+
+<h1 id="cyclicbarrier-vs-countdownlatch">CyclicBarrier vs CountDownLatch</h1>
+
+`CyclicBarrier` and `CountDownLatch` look similar at first glance: both involve threads, both involve a count, both have a notion of "I'm done waiting." The differences are sharp once you put them side by side.
+
+| Property                  | `CountDownLatch`                                                                  | `CyclicBarrier`                                                         |
+| ------------------------- | --------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| Reusable?                 | No, one-shot. Once count reaches 0, the latch is open forever                     | Yes. The count resets after every trip                                  |
+| Semantics                 | Finish gate: some threads `await()`, other threads `countDown()`. Different roles | Rendezvous: every party calls `await()`. Same role                      |
+| Who decrements the count? | `countDown()` callers (often different from waiters)                              | The barrier itself, when a party calls `await()`                        |
+| What "0" means            | Released. All waiters proceed                                                     | The barrier trips. All parties proceed together. The next round starts  |
+| Failure mode              | A waiter can be interrupted, but the latch isn't "broken" for others              | One thread breaking out of `await()` breaks the barrier for every party |
+| Optional callback         | None                                                                              | `barrierAction` runs once per trip on the last-arriving thread          |
+| Best fit                  | "Wait for N initialization tasks to finish before serving traffic"                | "Four workers run staged work and meet between every stage"             |
+| Reset                     | Impossible (build a new one)                                                      | `reset()` brings a broken or in-progress barrier back                   |
+
+A useful rule of thumb: if the threads that wait are **different** from the threads that signal "done", use `CountDownLatch`. If the same threads do both, meaning every party has to both arrive and wait for everyone else to arrive, use `CyclicBarrier`.
+
+Consider a startup gate. A request handler waits for "config loaded", "cache warmed", and "DB connection pool ready" before serving requests. Three background tasks each call `countDown()` once they finish. The handler calls `await()` once and is freed when all three counts are in. That is a one-shot, asymmetric problem; that is `CountDownLatch`.
+
+Consider the daily report. Four workers compute partial results, and each one needs to wait for the other three to finish their part of the same stage. All four play the same role. They each `await()`. That is a symmetric, repeatable problem; that is `CyclicBarrier`.
+
+The side-by-side diagram shows the asymmetry of `CountDownLatch` (one waiter, three counters, different roles) against the symmetry of `CyclicBarrier` (four parties, same role, all calling `await()`).
+
+When the party count needs to change between rounds, or when parties need to be deregistered dynamically, the JDK has `Phaser`. For everything in this lesson, `CyclicBarrier` fits.
+
+<h1 id="when-to-use-which">When to Use Which</h1>
+
+A decision guide from the comparison above:
+
+- **Use `CountDownLatch`** when one or more threads have to wait for a set of asynchronous events to finish. Initialization gates. Test scaffolding ("wait for the server to start before running these probes"). One-shot. Different roles.
+- **Use `CyclicBarrier`** when a fixed group of threads has to march in lockstep through stages. Parallel pipeline stages. Batch-based load tests. Simulations where every actor moves one step and then waits for the others. Repeatable. Same role.
+- **Look elsewhere** when the party count needs to change between rounds (try `Phaser`), when a counted semaphore is needed (`Semaphore`), or when the coordination is "produce-consume" and a `BlockingQueue` would be simpler.
+
+Most real codebases use both `CountDownLatch` and `CyclicBarrier` in different places. They are not competitors. They are tools for two different coordination shapes, and picking the wrong one usually means a tangle of helper code that tries to bend one into the other.
+
+<h1 id="common-pitfalls">Common Pitfalls</h1>
+
+A few traps to flag before using `CyclicBarrier` in real code.
+
+**Mismatched party count.** Creating `new CyclicBarrier(4)` and only having three threads call `await()` blocks those three threads forever. The barrier is waiting for a fourth arrival that is never coming. Always cross-check the constructor's number against the number of threads that share the barrier.
+
+**Holding a lock across `await()`.** `await()` can park the calling thread for a long time. Calling it while holding a `ReentrantLock` or inside a `synchronized` block locks out every other thread that wants that lock. Either restructure so the lock is released before the await, or accept that the lock is part of the rendezvous.
+
+**Forgetting the final `await()` in batched loops.** In the load-test example, the workers call `await()` at the top of each batch and once more after the loop. Dropping the trailing one means the last batch's numbers are never summarized because the barrier never trips for that round.
+
+**Treating the barrier action as "fast".** The action runs inside the critical section with all other parties parked. Heavy work in the action (write a file, call an external service) serializes that work and wastes the other workers' time. Keep the action short or move the work out of the action and let it run in parallel after `await()` returns.
+
+**Catching and swallowing `BrokenBarrierException`.** A broken barrier means the trip did not really happen. Code that keeps going as if it did processes partial or inconsistent state. Treat `BrokenBarrierException` as a real problem: log it, decide whether to `reset()` and retry, or shut the job down cleanly.
+
+A `CyclicBarrier` is cheaper than `Object.wait/notify` for this pattern but more expensive than a single atomic counter. In the absolute hottest paths (millions of trips per second across thousands of parties), the lock inside the barrier becomes the bottleneck. Profile first, switch to lock-free designs only if the data says so.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

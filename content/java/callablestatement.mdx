@@ -1,0 +1,662 @@
+---
+title: "CallableStatement"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "CallableStatement explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="why-push-logic-into-the-database">Why Push Logic Into the Database?</h1>
+
+Most SQL covered so far runs from the application: build a query as text, send it to the server, read the rows back, process them in Java. That model works well for straightforward reads and writes. It starts to hurt when a single business operation needs many queries glued together with branching logic.
+
+Consider the discount on an order. The workflow has to look up the customer's loyalty tier, count how many past orders they have placed, check whether any items in the cart are already on sale, apply a percentage based on the total, and return the final price. With five separate queries, every query is a round trip to the database server. On a connection that is 5 milliseconds away from the application, that is 25 milliseconds of pure wait before any real work happens. Multiply by every page load and the latency adds up fast.
+
+A stored procedure moves that logic onto the database server. The application sends one call, the database runs all five queries locally, and one answer comes back. The round-trip count drops from five to one. The database also gets to plan and cache the procedure once, instead of parsing five separate statements per request.
+
+The diagram shows the trade. On the left, the application drives the workflow and pays for every hop. On the right, the procedure drives it and pays only for the final answer. The bigger the chain of dependent queries, the more obvious the win.
+
+Procedures also give a few other benefits. The database can enforce permissions at the procedure level, so an application user can run `place_order` without having raw `INSERT` access to the `orders` table. That tightens the blast radius if the application is compromised. The procedure body can also be the single source of truth for "how is a discount calculated," instead of every microservice reimplementing the same rules.
+
+Each network round trip to the database costs at least one network RTT. On a typical cloud setup that is around 1-5 ms inside a data center and tens of milliseconds across regions. A workflow that needs 10 dependent queries from the application takes 10x longer than the same logic in one procedure call.
+
+There is a cost on the other side. Procedure bodies are written in a database-specific language (PL/pgSQL for Postgres, PL/SQL for Oracle, T-SQL for SQL Server, Java for H2 in this lesson). The logic does not live in the application's Git repository alongside the rest of the application code unless put there deliberately. It also does not move between database vendors without a rewrite.
+
+<h1 id="procedures-vs-functions">Procedures vs Functions</h1>
+
+The database world has two flavors of stored code, and JDBC handles them with the same `CallableStatement` interface but with slightly different syntax.
+
+A **stored procedure** is a routine invoked for its effects. It can update tables, return zero or more values through output parameters, and produce result sets. It does not have a "return value" in the function sense. It's called like a void method.
+
+A **stored function** is a routine that returns a single value. It's called as part of an expression. SQL functions and procedures are not interchangeable in standard SQL; calling syntax, where they can appear, and how the result comes back are all different.
+
+| Aspect           | Stored Procedure              | Stored Function                       |
+| ---------------- | ----------------------------- | ------------------------------------- |
+| Return value     | None (uses OUT parameters)    | Single value via `RETURN`             |
+| Usage in SQL     | `CALL proc(...)` only         | Inside `SELECT`, `WHERE`, expressions |
+| JDBC escape      | `{call name(?, ?)}`           | `{? = call name(?)}`                  |
+| Multiple outputs | OUT parameters or result sets | Only the return value                 |
+| Side effects     | Common (modifies data)        | Often discouraged, but allowed        |
+
+JDBC has a vendor-neutral **escape syntax** for both forms. The braces tell the driver "this is a callable, translate it to whatever this database expects." A procedure call looks like `{call calculateDiscount(?, ?)}` and a function call looks like `{? = call calculateDiscount(?)}` where the leading `?` is bound as the return value placeholder. Drivers rewrite this to the native syntax (`CALL calculateDiscount(...)`, `EXEC calculateDiscount(...)`, `SELECT calculateDiscount(...)`, depending on the vendor) so the same Java code keeps working across databases.
+
+The escape syntax is a portability tool. The procedure body itself, written in PL/pgSQL or PL/SQL or T-SQL, is not portable. Only the call site is.
+
+<h1 id="setting-up-h2-with-create-alias">Setting Up H2 With CREATE ALIAS</h1>
+
+To run the examples without installing a real database, the examples use **H2** in embedded in-memory mode. H2 ships with the JVM toolchain in many setups and is one Maven dependency away otherwise. It supports JDBC the same way Postgres and Oracle do, and it has a feature called `CREATE ALIAS` that registers a static Java method as a stored function or procedure. That keeps the examples self-contained: the "stored function" is just a Java method H2 points at.
+
+To make the lessons runnable, every example uses the URL `jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1`. The `mem:shop` part says "in-memory database named shop." The `DB_CLOSE_DELAY=-1` flag keeps the database alive for the lifetime of the JVM even after the last connection closes; without it, H2 drops the data the moment the connection ends.
+
+Here is the bootstrap class that other examples assume. It creates the schema, seeds a few rows, and registers two H2 aliases that act as the stored function and stored procedure.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.Statement;
+
+public class ShopSetup {
+
+    public static final String URL = "jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1";
+    public static final String USER = "sa";
+    public static final String PASSWORD = "";
+
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection(URL, USER, PASSWORD);
+             Statement st = conn.createStatement()) {
+
+            st.execute("DROP ALL OBJECTS");
+
+            st.execute("""
+                CREATE TABLE orders (
+                    id INT PRIMARY KEY,
+                    customer_id INT,
+                    total DECIMAL(10, 2),
+                    status VARCHAR(20)
+                )
+            """);
+
+            st.execute("INSERT INTO orders VALUES (1, 100, 250.00, 'PLACED')");
+            st.execute("INSERT INTO orders VALUES (2, 100, 750.00, 'SHIPPED')");
+            st.execute("INSERT INTO orders VALUES (3, 200,  49.99, 'PLACED')");
+
+            st.execute("""
+                CREATE ALIAS calculate_discount FOR
+                "com.example.shop.ShopFunctions.calculateDiscount"
+            """);
+
+            st.execute("""
+                CREATE ALIAS get_order_status FOR
+                "com.example.shop.ShopFunctions.getOrderStatus"
+            """);
+
+            System.out.println("Shop database ready.");
+        }
+    }
+}
+```
+
+The two aliases point to a `ShopFunctions` class that holds the actual logic. Real production code would write these in PL/pgSQL or PL/SQL, but with H2 the body is plain Java. This lesson is about the JDBC client side, not procedure authoring, so the Java body keeps the focus on the client API.
+
+```java
+package com.example.shop;
+
+import java.math.BigDecimal;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+
+public class ShopFunctions {
+
+    // Stored function: returns the discount percentage for an order total.
+    public static BigDecimal calculateDiscount(BigDecimal total) {
+        if (total == null) return BigDecimal.ZERO;
+        if (total.compareTo(new BigDecimal("500")) >= 0) return new BigDecimal("0.15");
+        if (total.compareTo(new BigDecimal("100")) >= 0) return new BigDecimal("0.05");
+        return BigDecimal.ZERO;
+    }
+
+    // Stored function: returns the status string for an order id.
+    public static String getOrderStatus(Connection conn, int orderId) throws SQLException {
+        String sql = "SELECT status FROM orders WHERE id = ?";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setInt(1, orderId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) return rs.getString(1);
+                return "UNKNOWN";
+            }
+        }
+    }
+}
+```
+
+The `calculateDiscount` function takes a total and returns a discount percentage. The `getOrderStatus` function takes an order id and reads the status out of the database. H2 passes the current `Connection` as the first argument automatically when a method declares one, which is how the function reaches into the same database it is running inside.
+
+`CREATE ALIAS` in H2 is a runtime registration. The class must be on the classpath the JVM is running with. Real deployments ship a JAR that contains both the application and the "stored" code.
+
+<h1 id="in-parameters-calling-a-procedure">
+  IN Parameters: Calling a Procedure
+</h1>
+
+The simplest case is a procedure that takes input values, does something on the server, and returns nothing through OUT parameters. Register one that updates an order's status.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.Statement;
+
+public class RegisterUpdateStatus {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection(
+                "jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1", "sa", "");
+             Statement st = conn.createStatement()) {
+
+            st.execute("""
+                CREATE ALIAS update_order_status FOR
+                "com.example.shop.ShopFunctions.updateOrderStatus"
+            """);
+
+            System.out.println("Procedure registered.");
+        }
+    }
+}
+```
+
+The body for `updateOrderStatus` lives in the same `ShopFunctions` class. It runs an `UPDATE`, returns nothing useful, and would be a `CREATE PROCEDURE` block in Postgres.
+
+```java
+// In com.example.shop.ShopFunctions
+public static void updateOrderStatus(Connection conn, int orderId, String newStatus)
+        throws SQLException {
+    String sql = "UPDATE orders SET status = ? WHERE id = ?";
+    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+        ps.setString(1, newStatus);
+        ps.setInt(2, orderId);
+        ps.executeUpdate();
+    }
+}
+```
+
+From the Java client side, calling this procedure looks almost exactly like a `PreparedStatement`. Ask the connection for a `CallableStatement` with the escape syntax, bind the IN parameters, then call `execute`.
+
+```java
+import java.sql.CallableStatement;
+import java.sql.Connection;
+import java.sql.DriverManager;
+
+public class CallUpdateOrderStatus {
+    public static void main(String[] args) throws Exception {
+        String url = "jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1";
+
+        try (Connection conn = DriverManager.getConnection(url, "sa", "");
+             CallableStatement cs = conn.prepareCall("{call update_order_status(?, ?)}")) {
+
+            cs.setInt(1, 1);
+            cs.setString(2, "SHIPPED");
+            cs.execute();
+
+            System.out.println("Order 1 marked as SHIPPED.");
+        }
+    }
+}
+```
+
+The escape syntax `{call update_order_status(?, ?)}` is the portable form. The parameter binders are the same `setInt`, `setString`, `setBigDecimal`, and so on from `PreparedStatement`, because `CallableStatement` extends it. Parameter indexes start at 1, not 0, just like every other JDBC index.
+
+`execute` is the generic call. `executeUpdate` works for procedures that primarily change data and `executeQuery` for ones that return a `ResultSet`. When the kind isn't known, `execute` is the safe choice; check the return values afterward to figure out what came back.
+
+<h1 id="out-parameters-reading-values-back">
+  OUT Parameters: Reading Values Back
+</h1>
+
+A procedure can return values through **output parameters**. The pattern has three steps. Before executing, tell JDBC the SQL type of each OUT parameter with `registerOutParameter`. Then execute the call. After execution, read each OUT parameter with the matching `getXxx` method.
+
+To demonstrate, register a procedure that takes an order id, calculates the discount, and returns both the discount percentage and the final price as OUT parameters.
+
+```java
+// In com.example.shop.ShopFunctions
+public static void priceOrder(
+        Connection conn,
+        int orderId,
+        BigDecimal[] discountOut,   // OUT parameter (H2 uses arrays for OUT)
+        BigDecimal[] finalPriceOut  // OUT parameter
+) throws SQLException {
+    String sql = "SELECT total FROM orders WHERE id = ?";
+    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+        ps.setInt(1, orderId);
+        try (ResultSet rs = ps.executeQuery()) {
+            if (rs.next()) {
+                BigDecimal total = rs.getBigDecimal(1);
+                BigDecimal discount = calculateDiscount(total);
+                BigDecimal finalPrice = total.multiply(BigDecimal.ONE.subtract(discount));
+                discountOut[0] = discount;
+                finalPriceOut[0] = finalPrice;
+            }
+        }
+    }
+}
+```
+
+H2's quirk is that it uses single-element arrays to model OUT parameters in Java, because plain Java parameters are pass-by-value. In a real PL/pgSQL or PL/SQL procedure, OUT parameters are a first-class language feature. The JDBC side is identical either way.
+
+Register and call:
+
+```java
+import java.math.BigDecimal;
+import java.sql.CallableStatement;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.Statement;
+import java.sql.Types;
+
+public class CallPriceOrder {
+    public static void main(String[] args) throws Exception {
+        String url = "jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1";
+
+        try (Connection conn = DriverManager.getConnection(url, "sa", "")) {
+
+            try (Statement st = conn.createStatement()) {
+                st.execute("""
+                    CREATE ALIAS price_order FOR
+                    "com.example.shop.ShopFunctions.priceOrder"
+                """);
+            }
+
+            try (CallableStatement cs = conn.prepareCall("{call price_order(?, ?, ?)}")) {
+                cs.setInt(1, 2);                                  // IN: order id
+                cs.registerOutParameter(2, Types.DECIMAL);        // OUT: discount
+                cs.registerOutParameter(3, Types.DECIMAL);        // OUT: final price
+
+                cs.execute();
+
+                BigDecimal discount = cs.getBigDecimal(2);
+                BigDecimal finalPrice = cs.getBigDecimal(3);
+
+                System.out.println("Discount:    " + discount);
+                System.out.println("Final price: " + finalPrice);
+            }
+        }
+    }
+}
+```
+
+The three new lines compared to a regular `PreparedStatement` are the two `registerOutParameter` calls and the two `getXxx` calls after `execute`. The shape of the call is:
+
+1. Get a `CallableStatement` with the escape syntax.
+2. For each IN parameter, call `setXxx(index, value)`.
+3. For each OUT parameter, call `registerOutParameter(index, java.sql.Types.XXX)`.
+4. Call `execute` (or `executeUpdate` / `executeQuery`).
+5. For each OUT parameter, call `getXxx(index)` to read the value.
+
+The `java.sql.Types` constant tells JDBC the SQL type, not the Java type. `Types.DECIMAL` means a fixed-precision decimal, read with `getBigDecimal`. `Types.INTEGER` is read with `getInt`, `Types.VARCHAR` with `getString`, `Types.TIMESTAMP` with `getTimestamp`, and so on. The mapping is the standard JDBC SQL-to-Java type table.
+
+The sequence diagram shows why OUT parameters need the explicit `registerOutParameter` step. The driver has to allocate space and tell the database what to send back. Without the registration call, the driver does not know which positional parameters are inputs versus outputs.
+
+OUT parameters do not save round trips compared to inputs alone, but they let one CALL return many values without a result set. A procedure that returns five OUT parameters is one round trip; the same data as five `SELECT` queries is five round trips.
+
+<h1 id="inout-parameters">INOUT Parameters</h1>
+
+An **INOUT parameter** is one that the application initializes with a value, the procedure reads it, modifies it, and the application reads the modified value back. JDBC handles INOUT with both `setXxx` and `registerOutParameter` on the same index.
+
+Use case: a procedure that takes the customer's current cart total, applies a loyalty multiplier in place, and returns the adjusted value through the same parameter.
+
+```java
+// In com.example.shop.ShopFunctions
+public static void applyLoyaltyMultiplier(
+        Connection conn,
+        int customerId,
+        BigDecimal[] totalInOut   // INOUT parameter
+) throws SQLException {
+    // Look up loyalty tier; for demo, customer 100 gets 0.9x, others 1.0x.
+    BigDecimal multiplier = (customerId == 100)
+            ? new BigDecimal("0.90")
+            : BigDecimal.ONE;
+    totalInOut[0] = totalInOut[0].multiply(multiplier);
+}
+```
+
+Java side:
+
+```java
+import java.math.BigDecimal;
+import java.sql.CallableStatement;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.Statement;
+import java.sql.Types;
+
+public class CallLoyaltyMultiplier {
+    public static void main(String[] args) throws Exception {
+        String url = "jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1";
+
+        try (Connection conn = DriverManager.getConnection(url, "sa", "")) {
+            try (Statement st = conn.createStatement()) {
+                st.execute("""
+                    CREATE ALIAS apply_loyalty FOR
+                    "com.example.shop.ShopFunctions.applyLoyaltyMultiplier"
+                """);
+            }
+
+            try (CallableStatement cs = conn.prepareCall("{call apply_loyalty(?, ?)}")) {
+                cs.setInt(1, 100);
+                cs.setBigDecimal(2, new BigDecimal("250.00"));     // IN side
+                cs.registerOutParameter(2, Types.DECIMAL);         // OUT side
+
+                cs.execute();
+
+                BigDecimal adjusted = cs.getBigDecimal(2);
+                System.out.println("Adjusted total: " + adjusted);
+            }
+        }
+    }
+}
+```
+
+Both calls on parameter 2 are required. `setBigDecimal` provides the input value the procedure starts with; `registerOutParameter` reserves space for the value it leaves behind. Skip either one and the procedure will see a missing input or there will be nothing to read after `execute`.
+
+INOUT parameters are less common than pure IN or OUT in modern code. They show up in legacy stored procedures and in cases that amend a value rather than compute a fresh one. Treat them as a notation, not a different mechanism: an INOUT is just an IN and an OUT that share an index.
+
+<h1 id="calling-stored-functions">Calling Stored Functions</h1>
+
+A function returns a single value, and the JDBC escape syntax for one looks like `{? = call funcName(?)}`. The leading `?` is the return value slot, bound at index 1; the regular `?` parameters start at index 2.
+
+The earlier setup registered `calculate_discount` and `get_order_status`. Call them from JDBC:
+
+```java
+import java.math.BigDecimal;
+import java.sql.CallableStatement;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.Types;
+
+public class CallCalculateDiscount {
+    public static void main(String[] args) throws Exception {
+        String url = "jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1";
+
+        try (Connection conn = DriverManager.getConnection(url, "sa", "");
+             CallableStatement cs = conn.prepareCall("{? = call calculate_discount(?)}")) {
+
+            cs.registerOutParameter(1, Types.DECIMAL);             // return value
+            cs.setBigDecimal(2, new BigDecimal("750.00"));         // input total
+
+            cs.execute();
+
+            BigDecimal discount = cs.getBigDecimal(1);
+            System.out.println("Discount for $750.00: " + discount);
+        }
+    }
+}
+```
+
+Index 1 is the return value, index 2 is the first declared parameter. The return slot still needs `registerOutParameter` because, from JDBC's perspective, it is an OUT parameter that the function fills in.
+
+A second example with a different return type:
+
+```java
+import java.sql.CallableStatement;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.Types;
+
+public class CallGetOrderStatus {
+    public static void main(String[] args) throws Exception {
+        String url = "jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1";
+
+        try (Connection conn = DriverManager.getConnection(url, "sa", "");
+             CallableStatement cs = conn.prepareCall("{? = call get_order_status(?)}")) {
+
+            cs.registerOutParameter(1, Types.VARCHAR);
+            cs.setInt(2, 2);
+
+            cs.execute();
+
+            String status = cs.getString(1);
+            System.out.println("Order 2 status: " + status);
+        }
+    }
+}
+```
+
+`Types.VARCHAR` plus `getString` is the standard pairing for text values. The H2 `getOrderStatus` body queries the orders table on the same connection, which is why order 2's original status reads as `PLACED`, not the `SHIPPED` set earlier (that change happened in a separate JVM/connection in the previous example, so this fresh in-memory database starts from the seed data).
+
+The flow for a function is shorter than for a procedure with OUT parameters: only one slot to register, one slot to read. The shape stays the same as procedures otherwise. This is why `CallableStatement` covers both.
+
+<h1 id="returning-a-resultset-from-a-procedure">
+  Returning a ResultSet From a Procedure
+</h1>
+
+Procedures can also return rows. The pattern is the same as a `SELECT`: call `executeQuery` and iterate the `ResultSet`. The example here is minimal.
+
+Register a procedure that returns every order for a customer.
+
+```java
+// In com.example.shop.ShopFunctions
+public static ResultSet ordersForCustomer(Connection conn, int customerId)
+        throws SQLException {
+    String sql = "SELECT id, total, status FROM orders WHERE customer_id = ?";
+    PreparedStatement ps = conn.prepareStatement(sql);
+    ps.setInt(1, customerId);
+    return ps.executeQuery();
+}
+```
+
+H2 alias and JDBC call:
+
+```java
+import java.sql.CallableStatement;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class CallOrdersForCustomer {
+    public static void main(String[] args) throws Exception {
+        String url = "jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1";
+
+        try (Connection conn = DriverManager.getConnection(url, "sa", "")) {
+            try (Statement st = conn.createStatement()) {
+                st.execute("""
+                    CREATE ALIAS orders_for_customer FOR
+                    "com.example.shop.ShopFunctions.ordersForCustomer"
+                """);
+            }
+
+            try (CallableStatement cs = conn.prepareCall("{call orders_for_customer(?)}")) {
+                cs.setInt(1, 100);
+
+                try (ResultSet rs = cs.executeQuery()) {
+                    while (rs.next()) {
+                        System.out.printf(
+                                "id=%d total=%s status=%s%n",
+                                rs.getInt("id"),
+                                rs.getBigDecimal("total"),
+                                rs.getString("status"));
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+The procedure returns rows even though no OUT parameter is declared. The result set comes back through `executeQuery` directly, the same way it does from a `PreparedStatement`. A procedure can also return both a `ResultSet` and OUT parameters. In that case call `execute`, walk the result set first (or use `getResultSet`), and only read the OUT parameters after.
+
+Procedures that return large result sets do not save bytes on the wire compared to a plain `SELECT`. The win is hiding the SQL behind a stable interface and centralizing logic, not bandwidth.
+
+<h1 id="putting-it-together-an-end-to-end-discount-workflow">
+  Putting It Together: An End-to-End Discount Workflow
+</h1>
+
+Stored procedures bundle multiple steps into one call. Here is a slightly larger example: a procedure that takes an order id, looks up the order's total, applies the discount function, updates the order's `final_total` column, and returns both the discount percentage and the new total to the caller through OUT parameters.
+
+First, add the column the workflow uses:
+
+```java
+// Schema extension run by setup code.
+st.execute("ALTER TABLE orders ADD COLUMN final_total DECIMAL(10, 2)");
+```
+
+The procedure body, in `ShopFunctions`:
+
+```java
+public static void finalizeOrder(
+        Connection conn,
+        int orderId,
+        BigDecimal[] discountOut,
+        BigDecimal[] finalTotalOut
+) throws SQLException {
+    BigDecimal total;
+    try (PreparedStatement ps = conn.prepareStatement(
+            "SELECT total FROM orders WHERE id = ?")) {
+        ps.setInt(1, orderId);
+        try (ResultSet rs = ps.executeQuery()) {
+            if (!rs.next()) throw new SQLException("No order " + orderId);
+            total = rs.getBigDecimal(1);
+        }
+    }
+
+    BigDecimal discount = calculateDiscount(total);
+    BigDecimal finalTotal = total.multiply(BigDecimal.ONE.subtract(discount));
+
+    try (PreparedStatement ps = conn.prepareStatement(
+            "UPDATE orders SET final_total = ? WHERE id = ?")) {
+        ps.setBigDecimal(1, finalTotal);
+        ps.setInt(2, orderId);
+        ps.executeUpdate();
+    }
+
+    discountOut[0] = discount;
+    finalTotalOut[0] = finalTotal;
+}
+```
+
+And the JDBC call:
+
+```java
+import java.math.BigDecimal;
+import java.sql.CallableStatement;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.Statement;
+import java.sql.Types;
+
+public class CallFinalizeOrder {
+    public static void main(String[] args) throws Exception {
+        String url = "jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1";
+
+        try (Connection conn = DriverManager.getConnection(url, "sa", "")) {
+            try (Statement st = conn.createStatement()) {
+                st.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS final_total DECIMAL(10, 2)");
+                st.execute("""
+                    CREATE ALIAS IF NOT EXISTS finalize_order FOR
+                    "com.example.shop.ShopFunctions.finalizeOrder"
+                """);
+            }
+
+            try (CallableStatement cs = conn.prepareCall("{call finalize_order(?, ?, ?)}")) {
+                cs.setInt(1, 2);
+                cs.registerOutParameter(2, Types.DECIMAL);
+                cs.registerOutParameter(3, Types.DECIMAL);
+
+                cs.execute();
+
+                BigDecimal discount = cs.getBigDecimal(2);
+                BigDecimal finalTotal = cs.getBigDecimal(3);
+
+                System.out.println("Discount applied: " + discount);
+                System.out.println("Final total:      " + finalTotal);
+            }
+        }
+    }
+}
+```
+
+One call replaced three round trips: read the order, compute the price, write the result. The application still gets the answer it needs, but the network cost dropped from three RTTs to one, and the discount rules now live in one place.
+
+Compare this to the same workflow done from the application: select, then update, then return. Each arrow in that version goes to the database and back. One CALL versus three queries is the small-scale version of why high-volume systems still find a place for stored procedures.
+
+A workflow that needs N dependent queries from the application takes N round trips. The same workflow in one stored procedure takes 1. The savings are largest when the client and database sit in different data centers.
+
+<h1 id="trade-offs-when-to-use-callablestatement">
+  Trade-offs: When to Use CallableStatement
+</h1>
+
+`CallableStatement` is a tool, not a default. The decision to push logic into the database is bigger than the decision to use JDBC at all.
+
+**Reasons to use stored procedures:**
+
+- A single business operation needs many dependent queries. Each round trip saved is real latency removed.
+- The same logic is called from multiple applications or services. One procedure body is easier to maintain than copies in three codebases.
+- Permissions need to be enforced at the operation level rather than the table level. The procedure runs with elevated rights; the caller only gets to invoke it.
+- Heavy data processing benefits from running close to the data. A procedure that scans a million rows and returns a summary moves bytes once, not a million times.
+
+**Reasons to avoid them:**
+
+- The procedure body is vendor-specific. Postgres `PL/pgSQL`, Oracle `PL/SQL`, SQL Server T-SQL, and H2 Java aliases are not interchangeable. Migration between databases means rewriting every procedure.
+- The code does not live in the application's Git repository by default. Script the `CREATE PROCEDURE` statements alongside migrations, run them in CI, and keep them in sync with the calling code.
+- Debugging stored procedures is harder. Stack traces, debuggers, unit tests, and observability tools available for Java do not extend into the database the same way.
+- Stored procedure languages are usually less ergonomic than Java. PL/pgSQL is fine; PL/SQL has corners; T-SQL has its own quirks. None are the obvious choice for new general-purpose code.
+- Scaling stored procedures means scaling the database. Application code is easy to run more copies of; database CPU is expensive and harder to add.
+
+The pragmatic answer in modern application stacks is to prefer plain SQL via `PreparedStatement` for most queries, and use `CallableStatement` only when one of the "reasons to use" above clearly applies. A discount calculation that needs five queries is a fair candidate. A simple `SELECT * FROM products WHERE id = ?` is not.
+
+| Situation                                              | Better tool                               |
+| ------------------------------------------------------ | ----------------------------------------- |
+| Single read or write                                   | `PreparedStatement`                       |
+| Single read that joins a few tables                    | `PreparedStatement` with the join inlined |
+| Workflow with many dependent queries                   | `CallableStatement` (procedure)           |
+| Same calculation reused across multiple apps           | `CallableStatement` (function)            |
+| Logic that changes often based on product requirements | Application code, not the database        |
+| Operations that need permission isolation              | `CallableStatement`                       |
+
+<h1 id="common-mistakes">Common Mistakes</h1>
+
+**Forgetting `registerOutParameter`.**
+
+```java
+CallableStatement cs = conn.prepareCall("{call price_order(?, ?, ?)}");
+cs.setInt(1, 2);
+// Missing registerOutParameter calls.
+cs.execute();
+BigDecimal d = cs.getBigDecimal(2);   // Throws.
+```
+
+The fix is to register every OUT parameter before `execute`. JDBC has no way to guess which positional placeholders are outputs.
+
+**Wrong `java.sql.Types` constant.**
+
+```java
+cs.registerOutParameter(2, Types.INTEGER);   // Wrong: column is DECIMAL.
+cs.execute();
+int d = cs.getInt(2);                        // Wrong: silently truncates.
+```
+
+`Types.INTEGER` paired with `getInt` truncates a decimal to its integer part on most drivers, and may throw on others. Match the SQL type of the underlying value. `Types.DECIMAL` with `getBigDecimal`, `Types.VARCHAR` with `getString`, `Types.TIMESTAMP` with `getTimestamp`.
+
+**Using native syntax instead of the escape syntax.**
+
+```java
+CallableStatement cs = conn.prepareCall("CALL price_order(2, ?, ?)");
+```
+
+The string is hard-coded to PostgreSQL/H2 syntax. Oracle wants `BEGIN price_order(2, ?, ?); END;`, SQL Server wants `EXEC price_order ?, ?`. Use `{call price_order(?, ?, ?)}` and let the driver translate.
+
+**Reading OUT parameters before `execute`.**
+
+```java
+cs.registerOutParameter(2, Types.DECIMAL);
+BigDecimal d = cs.getBigDecimal(2);   // Before execute, value is null/undefined.
+cs.execute();
+```
+
+The registration only reserves the slot. The value does not exist until `execute` runs. Always order the calls register, set inputs, execute, read outputs.
+
+**Not closing the `CallableStatement`.** Like every JDBC resource, `CallableStatement` holds server-side cursors and driver-side memory. Wrap it in `try-with-resources` so it closes whether the call succeeds or throws.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

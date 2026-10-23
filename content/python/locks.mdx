@@ -1,0 +1,493 @@
+---
+title: "Locks"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Locks explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="when-you-need-a-lock">When You Need a Lock</h1>
+
+The short answer: whenever two or more threads can write the same mutable state, or one writes while another reads. To make this concrete, consider a stock counter for a popular product. Each thread decrements it as orders come in. The final count after 10 threads each processing 10,000 orders should be exactly 100,000 down from the starting point.
+
+Without any lock:
+
+```python
+import threading
+
+stock = 100_000
+
+def process_orders(count):
+    global stock
+    for _ in range(count):
+        stock -= 1
+
+threads = [threading.Thread(target=process_orders, args=(10_000,)) for _ in range(10)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+
+print(f"Final stock: {stock}")
+```
+
+Final stock should be zero. It isn't. Running the same script three times produces three different non-zero numbers. That's a **race condition**: the result depends on how the OS happens to schedule the threads.
+
+The line `stock -= 1` looks atomic, but Python compiles it to three bytecode operations: load the current value of `stock`, subtract one, store the result back. The interpreter can switch threads between any two of those steps. If thread A loads `42`, gets paused, and thread B loads `42`, subtracts, and stores `41`, then thread A resumes and stores `41` as well, one decrement is lost. Two threads decremented, but the value only went down by one.
+
+Both threads see `42`, both write `41`, and the second write overwrites the first with no warning. Over millions of iterations across many threads, the lost updates pile up and produce wrong totals.
+
+A lock fixes this by making the read-compute-write sequence one indivisible step. Only one thread can be inside the protected region at a time. The others wait their turn.
+
+<h1 id="lock-basics-acquire-and-release">Lock Basics: acquire and release</h1>
+
+A `Lock` is a binary primitive with two states: locked and unlocked. Only one thread can hold the lock at a time. Other threads that call `acquire()` block until the holder calls `release()`.
+
+```python
+import threading
+
+stock = 100_000
+stock_lock = threading.Lock()
+
+def process_orders(count):
+    global stock
+    for _ in range(count):
+        stock_lock.acquire()
+        stock -= 1
+        stock_lock.release()
+
+threads = [threading.Thread(target=process_orders, args=(10_000,)) for _ in range(10)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+
+print(f"Final stock: {stock}")
+```
+
+Every run produces zero. The lock turns "read, subtract, write" into a critical section no other thread can break into. While thread A holds the lock, thread B blocks on `acquire()` until A calls `release()`.
+
+The region between `acquire()` and `release()` is the **critical section**. Inside it, only one thread is running, so the shared state is safe from concurrent updates. Outside it, threads run in parallel as usual.
+
+Thread A acquires the lock and runs its update. Thread B calls `acquire()` and blocks until A releases. Once A releases, B wakes up, acquires the lock, and runs its own update. The hand-off is automatic; no extra code is needed to wake B up.
+
+The raw `acquire()`/`release()` form has a serious flaw: if the protected code raises an exception between the two calls, the lock is never released and every other thread blocks forever. The fix is `try/finally`:
+
+```python
+def process_orders(count):
+    global stock
+    for _ in range(count):
+        stock_lock.acquire()
+        try:
+            stock -= 1
+        finally:
+            stock_lock.release()
+```
+
+That works, but it's verbose and easy to get wrong. Python has a cleaner way.
+
+<h1 id="the-with-lock-pattern">The with lock: Pattern</h1>
+
+`Lock` implements the context manager protocol, so it works with a `with` statement. The lock is acquired when the block starts and released when the block ends, even if the body raises an exception:
+
+```python
+import threading
+
+stock = 100_000
+stock_lock = threading.Lock()
+
+def process_orders(count):
+    global stock
+    for _ in range(count):
+        with stock_lock:
+            stock -= 1
+
+threads = [threading.Thread(target=process_orders, args=(10_000,)) for _ in range(10)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+
+print(f"Final stock: {stock}")
+```
+
+This is the spelling found in almost all Python code. `with stock_lock:` is shorter than `acquire/try/finally`, harder to mess up, and just as fast. Use it everywhere unless there's a specific reason to call `acquire` and `release` separately (for example, when the acquire and release happen in different functions, which is rare).
+
+The `with` form also handles a subtle case: an exception during the protected work. Suppose the order processing can fail partway through:
+
+```python
+import threading
+
+stock = 100
+stock_lock = threading.Lock()
+errors = []
+
+def process_order(order_id):
+    global stock
+    with stock_lock:
+        if stock <= 0:
+            raise RuntimeError(f"Out of stock for order {order_id}")
+        stock -= 1
+        print(f"Order {order_id} processed, stock now {stock}")
+
+threads = []
+for order_id in range(1, 103):
+    t = threading.Thread(target=process_order, args=(order_id,))
+    threads.append(t)
+    t.start()
+
+for t in threads:
+    t.join()
+
+print(f"Final stock: {stock}")
+```
+
+When the 101st order finds the stock at zero and raises, the `with` block exits and the lock is released. The 102nd order acquires it without blocking forever. With a bare `acquire`/`release`, the program would hang at the first exception because the lock would still be held.
+
+<h1 id="what-the-gil-protects-and-what-it-doesnt">
+  What the GIL Protects (and What It Doesn't)
+</h1>
+
+A common source of confusion: if Python has the GIL, why is a lock needed at all? The GIL prevents two threads from running Python bytecode at the same instant. It doesn't prevent a thread from being paused mid-statement.
+
+The rule: the GIL makes a single bytecode operation atomic, but most Python statements compile to many bytecodes. The interpreter can switch threads between any two bytecodes. So `counter += 1` (read, add, store) can be interrupted, but a single attribute load like `obj.x` cannot be split across threads.
+
+| Operation                                            | Atomic? | Why                                                                  |
+| ---------------------------------------------------- | ------- | -------------------------------------------------------------------- |
+| `x = 1` (simple assignment)                          | Yes     | Single bytecode                                                      |
+| `x.append(item)` (list append of an existing object) | Yes     | One C call                                                           |
+| `x += 1`                                             | No      | Load, add, store                                                     |
+| `x = x + 1`                                          | No      | Load, add, store                                                     |
+| `dict[key] = value` (new key)                        | Yes     | One C call                                                           |
+| `dict[key] += 1`                                     | No      | Load, add, store                                                     |
+| `if x in dict: dict[x] = ...`                        | No      | Two separate operations, another thread can change `dict` in between |
+
+The pattern: anything that compiles to one indivisible C-level call is safe. Anything that needs multiple steps (read-modify-write, check-then-act) is not. The first two columns of the table cover the common cases, but the rule itself is what matters: if the operation has to read something, decide something, and write something back, a lock is required.
+
+This whole discussion applies to CPython, the reference implementation. PyPy and the experimental free-threaded build of Python 3.13+ behave differently. The free-threaded build removes the GIL entirely, which makes even single-bytecode operations potentially unsafe without locks. On a free-threaded build, treat all shared mutable state as needing explicit synchronization. For CPython with the GIL (the default through 3.14), the rules in the table above hold.
+
+A concrete example of a deceptively unsafe pattern. To count how often each product appears in a stream of orders using a dict:
+
+```python
+import threading
+
+product_counts = {}
+
+def process_orders(product_id, count):
+    for _ in range(count):
+        if product_id in product_counts:
+            product_counts[product_id] += 1
+        else:
+            product_counts[product_id] = 1
+
+threads = []
+for product_id in [101, 102, 101, 102, 101]:
+    t = threading.Thread(target=process_orders, args=(product_id, 50_000))
+    threads.append(t)
+    t.start()
+
+for t in threads:
+    t.join()
+
+print(product_counts)
+```
+
+The expected counts are `{101: 150_000, 102: 100_000}`. The numbers are off because the `if ... in dict` check, the `dict[key] += 1`, and the `dict[key] = 1` initialization are all separate operations. Two threads can pass the `in` check before either initializes the key, race on the increment, and lose updates.
+
+The fix is a lock around the read-modify-write block.
+
+```python
+import threading
+
+product_counts = {}
+counts_lock = threading.Lock()
+
+def process_orders(product_id, count):
+    for _ in range(count):
+        with counts_lock:
+            product_counts[product_id] = product_counts.get(product_id, 0) + 1
+```
+
+Now every update of `product_counts` is serialized. The total runtime goes up because threads block on the lock, but the counts are correct.
+
+<h1 id="rlock-when-a-thread-acquires-twice">
+  RLock: When a Thread Acquires Twice
+</h1>
+
+A plain `Lock` doesn't track its owner. If the same thread tries to acquire a `Lock` it already holds, it blocks against itself and deadlocks. This sounds avoidable until a class has one locked method that calls another locked method.
+
+Consider a `Cart` class. `add_item` locks while it appends. `total` locks while it sums. A helper `add_and_total` calls both:
+
+```python
+import threading
+
+class Cart:
+    def __init__(self):
+        self.items = []
+        self.lock = threading.Lock()
+
+    def add_item(self, name, price):
+        with self.lock:
+            self.items.append((name, price))
+
+    def total(self):
+        with self.lock:
+            return sum(price for _, price in self.items)
+
+    def add_and_total(self, name, price):
+        with self.lock:
+            self.add_item(name, price)  # tries to acquire self.lock again
+            return self.total()
+
+cart = Cart()
+cart.add_and_total("Wireless Mouse", 24.99)  # hangs forever
+```
+
+The outer `with self.lock:` in `add_and_total` acquires the lock. Then `add_item` tries to acquire the same lock from the same thread. `Lock` has no concept of an owner; it sees the lock is held and blocks the thread waiting for it. The thread is now waiting on itself. The program hangs.
+
+`RLock` (reentrant lock) solves this. It tracks the owning thread and a counter. The same thread can call `acquire()` multiple times in a row without blocking; each call increments the counter. The lock is fully released only when `release()` has been called the same number of times.
+
+```python
+import threading
+
+class Cart:
+    def __init__(self):
+        self.items = []
+        self.lock = threading.RLock()
+
+    def add_item(self, name, price):
+        with self.lock:
+            self.items.append((name, price))
+
+    def total(self):
+        with self.lock:
+            return sum(price for _, price in self.items)
+
+    def add_and_total(self, name, price):
+        with self.lock:
+            self.add_item(name, price)
+            return self.total()
+
+cart = Cart()
+print(f"${cart.add_and_total('Wireless Mouse', 24.99):.2f}")
+print(f"${cart.add_and_total('HDMI Cable', 12.50):.2f}")
+print(f"${cart.total():.2f}")
+```
+
+The outer `with self.lock:` in `add_and_total` bumps the counter to 1. The inner call from `add_item` bumps it to 2. When `add_item`'s `with` exits, the counter goes back to 1. The outer `with` exits, the counter goes to 0, and the lock is fully released. Other threads can now acquire it.
+
+| Feature                          | `Lock`             | `RLock`                                   |
+| -------------------------------- | ------------------ | ----------------------------------------- |
+| Same thread can re-acquire       | No, deadlocks      | Yes, counted                              |
+| Tracks owner                     | No                 | Yes                                       |
+| Overhead                         | Lower              | Slightly higher                           |
+| `acquire`/`release` must balance | Per acquisition    | Per acquisition (counter must reach zero) |
+| Release from a different thread  | OS-level undefined | Raises `RuntimeError`                     |
+
+When to use which? Prefer `Lock` when the design allows it. Plain locks are slightly cheaper, and accidental re-entry surfaces as an obvious hang that's easy to debug, rather than working without warning. Use `RLock` when:
+
+- Locked methods on a class naturally call each other.
+- A library's callers may re-enter the code while holding the lock.
+- The code can't be restructured to avoid the nested acquisition without contortions.
+
+One important caveat: `RLock` only helps when the same thread re-acquires. It does not help with two different threads acquiring two different locks in opposite orders. That's a deadlock.
+
+<h1 id="try-finally-vs-the-with-statement">
+  try-finally vs the with Statement
+</h1>
+
+The `with` form is syntactic sugar over `try/finally`. Both spellings are correct, but they're not always interchangeable. Three places where the explicit form is needed:
+
+**One: when acquire and release happen in different functions.** Sometimes one function grabs the lock and a different function releases it (for example, a producer that locks until a consumer wakes up). The `with` form won't work because the two halves are in different scopes:
+
+```python
+import threading
+
+lock = threading.Lock()
+
+def acquire_for_writing():
+    lock.acquire()
+    # ... do some setup
+    return "ready"
+
+def release_after_writing():
+    # ... do some teardown
+    lock.release()
+```
+
+This pattern is rare and usually a warning sign that the code wants a different primitive (`Condition`, `Event`, or `Semaphore`), but when it's needed, the bare calls are how.
+
+**Two: when an acquire attempt should not block.** `acquire(blocking=False)` returns `True` if it got the lock and `False` if the lock was already held. This can't be expressed with `with` directly:
+
+```python
+import threading
+
+lock = threading.Lock()
+
+def try_to_update():
+    if lock.acquire(blocking=False):
+        try:
+            print("got the lock, doing work")
+        finally:
+            lock.release()
+    else:
+        print("lock was busy, skipping")
+
+# Holder thread
+def hold_lock():
+    with lock:
+        import time
+        time.sleep(1)
+
+threading.Thread(target=hold_lock).start()
+import time
+time.sleep(0.1)  # let the holder grab it first
+try_to_update()
+```
+
+The non-blocking acquire is useful for opportunistic work: "if I can grab the lock, do this thing; otherwise skip it and come back later." A common case is updating a status display that doesn't need to wait for the data to be free.
+
+**Three: when a timeout is needed.** `acquire(timeout=2.0)` waits at most 2 seconds for the lock. It returns `True` if it got the lock within the timeout, `False` if it didn't:
+
+```python
+import threading
+
+lock = threading.Lock()
+
+def try_with_timeout():
+    if lock.acquire(timeout=0.5):
+        try:
+            print("got the lock")
+        finally:
+            lock.release()
+    else:
+        print("timed out waiting for the lock")
+```
+
+Timeouts are an early-warning sign for deadlock-prone code. If a lock is held for longer than expected, something is wrong, and bailing out with a `False` is better than blocking forever.
+
+For everything else, including the vast majority of code, `with lock:` is the correct spelling.
+
+<h1 id="lock-granularity-coarse-vs-fine">Lock Granularity: Coarse vs Fine</h1>
+
+Once locks come into play, a design question shows up: how big should the critical section be? Two extremes, both with trade-offs.
+
+**Coarse-grained locking** wraps a lot of work in one lock. One big lock for the whole `Cart`, one big lock for the whole `Inventory`. Simple to reason about, easy to get right, but every thread that touches the protected region serializes on the same lock. Under heavy load, threads spend their time waiting instead of working.
+
+**Fine-grained locking** uses many small locks, one per resource. One lock per cart, one lock per product, one lock per customer. Higher throughput, because threads working on different resources don't block each other. The cost is complexity: more locks to manage, more opportunities to acquire them in the wrong order, more deadlocks.
+
+A practical example: tracking review counts for many products. A coarse-grained version uses one lock for the whole dict:
+
+```python
+import threading
+
+review_counts = {}
+counts_lock = threading.Lock()
+
+def add_review(product_id):
+    with counts_lock:
+        review_counts[product_id] = review_counts.get(product_id, 0) + 1
+```
+
+Every thread, no matter which product, contends for the same lock. With a million products and 100 threads adding reviews, 99 of them are typically waiting on the one thread inside the lock.
+
+A fine-grained version uses one lock per product. To avoid running out of locks, sharding is common: hash the key into a fixed number of buckets, and use one lock per bucket:
+
+```python
+import threading
+
+NUM_SHARDS = 16
+review_counts = [{} for _ in range(NUM_SHARDS)]
+shard_locks = [threading.Lock() for _ in range(NUM_SHARDS)]
+
+def add_review(product_id):
+    shard = product_id % NUM_SHARDS
+    with shard_locks[shard]:
+        review_counts[shard][product_id] = review_counts[shard].get(product_id, 0) + 1
+```
+
+Now threads working on products in different shards don't block each other. 16 threads can update 16 different shards in parallel. The complexity goes up: the shard mapping has to be tracked, and reading the total review count across all products requires acquiring every shard's lock or accepting some inconsistency.
+
+| Strategy                        | Pros                                                   | Cons                                                             |
+| ------------------------------- | ------------------------------------------------------ | ---------------------------------------------------------------- |
+| Coarse-grained (one big lock)   | Simple, hard to mess up                                | Serializes everything, poor throughput under load                |
+| Fine-grained (many small locks) | High throughput, threads on different data don't block | More complexity, more deadlock potential, harder to reason about |
+| Sharded (lock per bucket)       | Middle ground, scales well                             | Operations spanning shards become awkward                        |
+
+For most code, start coarse-grained. Add fine-grained locking only after measuring contention as a real problem. Premature fine-grained locking is a common source of nasty concurrency bugs.
+
+<h1 id="what-a-lock-costs">What a Lock Costs</h1>
+
+A lock is not free, but on modern hardware an uncontested one is cheap. `acquire()` and `release()` together take roughly a microsecond when the lock is available. The OS doesn't even get involved; the work happens in user space.
+
+Contention is where things get expensive. When a thread can't acquire a lock immediately, the OS puts it to sleep, and the kernel has to wake it up later when the lock becomes available. That round-trip is much slower (tens of microseconds at least, sometimes hundreds), and the more threads contending, the more time everyone spends in the wait queue.
+
+A small benchmark to make this concrete:
+
+```python
+import threading
+import time
+
+NUM_THREADS = 10
+ITERATIONS = 100_000
+
+lock = threading.Lock()
+counter = 0
+
+def increment():
+    global counter
+    for _ in range(ITERATIONS):
+        with lock:
+            counter += 1
+
+start = time.perf_counter()
+threads = [threading.Thread(target=increment) for _ in range(NUM_THREADS)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+elapsed = time.perf_counter() - start
+
+print(f"Final counter: {counter}")
+print(f"Time: {elapsed:.2f}s")
+print(f"Operations per second: {NUM_THREADS * ITERATIONS / elapsed:,.0f}")
+```
+
+Ten threads incrementing a shared counter under a lock manage roughly 1.5 million increments per second. Without the lock (and risking a wrong answer), the same code runs about 5x faster. With the lock but a smaller critical section, some of that can be reclaimed. The general rule: every microsecond inside the lock is a microsecond no other thread can do anything in that region.
+
+Uncontested `acquire`/`release` is roughly 1 microsecond. Contested acquire (thread has to sleep and wake up) is typically tens of microseconds. Heavy contention can scale super-linearly: doubling the threads can more than double the wait time per acquire. The fix is usually a smaller critical section or sharded locking.
+
+Two practical lessons from this:
+
+**Keep critical sections small.** Anything that doesn't strictly need to be under the lock should be outside it. Compute values, format strings, do logging, all outside. Only the read-modify-write of shared state belongs inside.
+
+```python
+# Bad: lock held while doing slow work
+with stock_lock:
+    cost = fetch_cost_from_api(product_id)  # slow network call inside lock
+    total -= cost
+```
+
+```python
+# Better: lock held only for the update
+cost = fetch_cost_from_api(product_id)  # outside the lock
+with stock_lock:
+    total -= cost
+```
+
+If the network call takes 200 milliseconds, the first version blocks every other thread for those 200 milliseconds. The second version blocks them only for the microsecond it takes to do the subtraction.
+
+**Don't lock what doesn't need locking.** A thread-local variable, a local variable inside a function, an attribute on an object only one thread touches: no lock needed. Adding locks "just in case" wastes performance and obscures the design.
+
+<h1 id="putting-it-together">Putting It Together</h1>
+
+A lock is the basic tool for fixing race conditions. Use one whenever two or more threads can write the same mutable state, or one writes while another reads. The `with lock:` pattern is the correct spelling for almost every case, because it releases the lock even on exception. Use `RLock` only when the same thread legitimately needs to re-acquire a lock it already holds, usually because locked methods call each other. The GIL serializes individual bytecodes but does not protect multi-step operations, so even simple things like `counter += 1` need a lock when shared.
+
+Keep critical sections small, prefer coarse-grained locking until contention has been measured, and remember that every microsecond inside the lock is a microsecond every other waiting thread can't use.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

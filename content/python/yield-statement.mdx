@@ -1,0 +1,639 @@
+---
+title: "yield Statement"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "yield Statement explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="yield-vs-return">yield vs return</h1>
+
+A `return` statement ends a function and hands a value back to the caller. A `yield` statement hands a value back, but **pauses** the function instead of ending it. The function's local variables, loop position, and pending exception handlers all stay alive, frozen until the next value is requested.
+
+```python
+def with_return():
+    print("step 1")
+    return "a"
+    print("step 2")  # unreachable
+
+print(with_return())
+```
+
+The function ran exactly once, top to bottom, and `return "a"` ended it. Everything after `return` was unreachable.
+
+```python
+def with_yield():
+    print("step 1")
+    yield "a"
+    print("step 2")
+    yield "b"
+    print("step 3")
+
+g = with_yield()
+print(next(g))
+print(next(g))
+```
+
+Three differences stand out. Calling `with_yield()` didn't print anything; building the generator object alone doesn't run the body. The body ran in two chunks: `step 1` printed before the first `yield`, and `step 2` printed between the two `yield`s. The function paused at each `yield` and resumed exactly where it left off when the next `next` call arrived.
+
+A side-by-side comparison shows the contrast.
+
+| Aspect                                    | `return`                                  | `yield`                                                                                                                         |
+| ----------------------------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| When does the body run?                   | Top to bottom, once per call.             | One yield at a time, across many calls.                                                                                         |
+| What does the caller get?                 | The returned value.                       | A generator object; values come from `next` calls.                                                                              |
+| What happens after the value is produced? | Function ends, frame is discarded.        | Function pauses, frame is preserved.                                                                                            |
+| Can it appear multiple times?             | Yes, but only one actually runs per call. | Yes, and each one produces a value.                                                                                             |
+| Can both appear in the same function?     | A return-only function is normal.         | A function with `yield` is a generator, even if it also has `return` (which then doesn't yield a value, it ends the generator). |
+
+The diagram contrasts the two flows. `return` produces one value and the function's frame is gone. `yield` produces one value but keeps the frame around, ready to resume.
+
+One detail to flag: the **presence** of `yield` is what turns a function into a generator function. It doesn't matter where the `yield` is, or whether it ever runs. Python decides at compile time, by looking for any `yield` in the function body.
+
+```python
+def conditional():
+    if False:
+        yield "never"
+
+g = conditional()
+print(type(g))
+print(list(g))
+```
+
+The `yield` inside the `if False` branch never executes, but its presence is enough. `conditional()` returns a generator object, not `None`. It drains immediately because no value is ever yielded, but it's still a generator.
+
+<h1 id="suspending-and-resuming-what-happens-at-yield">
+  Suspending and Resuming: What Happens at yield
+</h1>
+
+When Python executes a `yield value`, three things happen in order. First, `value` is computed. Second, the generator's stack frame is frozen: every local variable, the value of any open loop counter, the current spot in any `try` block, even the exact bytecode instruction immediately after `yield`. Third, control returns to the caller, who receives `value` as the result of their `next` call.
+
+When the caller calls `next` again, Python thaws the frame, picks up at the instruction after the `yield`, and runs forward until the next `yield`, `return`, or end-of-function.
+
+```python
+def running_total(prices):
+    print("starting")
+    total = 0.0
+    for price in prices:
+        total += price
+        print(f"about to yield {total:.2f}")
+        yield round(total, 2)
+        print(f"woke up, total still {total:.2f}")
+    print("loop ended")
+
+g = running_total([10.00, 5.50, 2.25])
+print("---")
+print(next(g))
+print("---")
+print(next(g))
+print("---")
+print(next(g))
+```
+
+The `total` variable persists across yields because the frame is preserved. So does the loop's position in `prices`. The first `next` runs the function from the top up to the first `yield` and pauses **inside** the `for` loop. The second `next` resumes from that exact spot, increments `total`, and yields again.
+
+`"---"` printed first each time, before any output from inside the function. That's because the `next` call is what wakes the function up; the prints inside `running_total` happen during that wake-up.
+
+A generator's frame is a few hundred bytes regardless of how many values it produces. Streaming a billion order summaries through a generator costs the same in memory as streaming three. Building those summaries into a list up front costs a billion times more.
+
+<h1 id="yield-expressions-sending-values-back-in">
+  yield Expressions: Sending Values Back In
+</h1>
+
+A `yield` can also be used as an **expression**, on the right side of an assignment. The form `value = yield x` does two things: it yields `x` to the caller, and the next time the generator is resumed, the value the caller passes back becomes the result of the `yield` expression and is assigned to `value`.
+
+The caller doesn't pass values back through `next`. They use the generator's `send` method instead.
+
+```python
+def echo():
+    while True:
+        received = yield
+        print(f"got: {received}")
+
+g = echo()
+next(g)              # prime the generator: run up to the first yield
+g.send("Mouse")
+g.send("Cable")
+g.send("HDMI")
+```
+
+The first call has to be `next(g)` (or equivalently `g.send(None)`) to run the function up to the first `yield`. After that, each `g.send(value)` resumes the generator, delivers `value` as the result of the `yield`, and the generator runs forward until the next `yield`.
+
+A bidirectional version yields a result and receives an input on the same line:
+
+```python
+def cart_builder():
+    cart = []
+    while True:
+        item = yield cart
+        if item is None:
+            return
+        cart.append(item)
+
+g = cart_builder()
+print(next(g))                   # prime, get initial empty cart
+print(g.send("Mouse"))
+print(g.send("Cable"))
+print(g.send("HDMI"))
+```
+
+`yield cart` does two jobs at once: it sends the current cart out to the caller, and it parks the function waiting for the next sent value. When `g.send("Mouse")` runs, `"Mouse"` becomes the value of `item`, the function appends it to `cart`, and on the next loop iteration `yield cart` sends the updated cart back out.
+
+The priming call (`next(g)` or `g.send(None)`) is mandatory. A freshly-built generator has no `yield` to receive a value at yet, so `g.send("something")` before priming raises `TypeError`.
+
+```python
+def echo():
+    received = yield
+    print(received)
+
+g = echo()
+g.send("Mouse")
+```
+
+The error is clear once the cause is identified. The fix is to call `next(g)` first to advance the generator to its first `yield`, then start sending.
+
+This bidirectional behavior is the seed of how `async`/`await` was originally built on top of generators. In modern code, `yield` is mostly used as a statement, not an expression. The `send`-based pattern shows up in:
+
+- Coroutine-style code (older asyncio, `contextlib.contextmanager`).
+- Pipeline stages that receive control messages between values.
+- Pull-and-push hybrid producers.
+
+For most data streaming, plain `yield value` plus a `for` loop is enough.
+
+<h1 id="yield-inside-nested-contexts">yield Inside Nested Contexts</h1>
+
+A `yield` can sit inside loops, conditionals, `try`/`except`/`finally` blocks, and `with` blocks. The frame-suspension model handles all of them. What changes is when things execute relative to the yield.
+
+<h3 id="inside-a-loop">Inside a Loop</h3>
+
+This is the most common shape. The `yield` runs once per loop iteration; the function pauses inside the loop and resumes inside the loop on the next `next`.
+
+```python
+def order_ids(orders):
+    for order in orders:
+        yield order["id"]
+
+orders = [{"id": "A-1"}, {"id": "A-2"}, {"id": "A-3"}]
+for order_id in order_ids(orders):
+    print(order_id)
+```
+
+The `for` loop inside `order_ids` and the `for` loop in the caller take turns. The caller's loop calls `next`, which resumes the generator's `for` loop for one iteration, which yields a value back to the caller's loop.
+
+<h3 id="inside-a-conditional">Inside a Conditional</h3>
+
+A `yield` inside an `if` branch only produces a value when that branch runs. This is how filtering generators work.
+
+```python
+def in_stock(products):
+    for product in products:
+        if product["stock"] > 0:
+            yield product["name"]
+
+catalog = [
+    {"name": "Mouse", "stock": 5},
+    {"name": "Cable", "stock": 0},
+    {"name": "Speaker", "stock": 12},
+]
+
+print(list(in_stock(catalog)))
+```
+
+For `Cable`, the `yield` is skipped entirely. The generator's outer `for` moves on to the next product without producing a value. The caller never sees `Cable`.
+
+<h3 id="inside-tryexceptfinally">Inside try/except/finally</h3>
+
+A `yield` inside a `try` block pauses with the `try` still active. If the caller throws an exception into the generator (with `g.throw`, or by the generator being garbage-collected), the exception arrives at the `yield` and propagates through the `try`. The matching `except` or `finally` runs as normal.
+
+```python
+def safe_stream(items):
+    try:
+        for item in items:
+            yield item
+    except ValueError:
+        print("caller signaled a bad value")
+    finally:
+        print("cleaning up open resources")
+
+g = safe_stream(["a", "b", "c"])
+print(next(g))
+print(next(g))
+g.close()
+```
+
+`g.close()` raises `GeneratorExit` inside the generator at the current `yield`. The `try` doesn't catch `GeneratorExit` (it's not a `ValueError`), but `finally` always runs, so the cleanup message prints before the generator shuts down for good.
+
+If the caller uses `g.throw(ValueError)` instead, the `except ValueError` branch handles it.
+
+```python
+def safe_stream(items):
+    try:
+        for item in items:
+            yield item
+    except ValueError:
+        print("caller signaled a bad value")
+    finally:
+        print("cleaning up open resources")
+
+g = safe_stream(["a", "b", "c"])
+print(next(g))
+g.throw(ValueError)
+```
+
+`g.throw(ValueError)` resumes the generator by raising `ValueError` at the current `yield`. The `try` catches it, prints the message, then `finally` runs as the function ends.
+
+The `finally` block is the right place to release file handles, network sockets, or any other resource the generator owns. It runs whether the generator exits normally, by exception, or by `close`.
+
+`try`/`finally` around a `yield` is cheap. Python records the active block in the frame; the work happens on the way out. Resource cleanup that depends on `finally` running is reliable as long as the generator gets closed (either explicitly with `close`, implicitly when it's garbage-collected, or by hitting end-of-function).
+
+One subtle detail: a `return` inside a `try`/`finally` in a generator still triggers the `finally` block. The same is true of falling off the end of the function. So `finally` is the safest place to put cleanup logic.
+
+```python
+def with_cleanup():
+    try:
+        yield 1
+        yield 2
+        return
+        yield 3  # unreachable
+    finally:
+        print("finally ran")
+
+g = with_cleanup()
+print(next(g))
+print(next(g))
+try:
+    print(next(g))
+except StopIteration:
+    print("done")
+```
+
+After yielding `2`, the third `next` resumes and hits the `return`, which triggers `finally` before the generator officially ends with `StopIteration`. The unreachable `yield 3` never runs.
+
+<h1 id="yield-from-a-brief-mention">yield from: A Brief Mention</h1>
+
+`yield from iterable` is shorthand for "yield every value the iterable produces". It also forwards `send` and `throw` between the caller and the delegated generator, which is the part that makes it more than a simple loop.
+
+```python
+def first_half(items):
+    for item in items[:len(items) // 2]:
+        yield item
+
+def second_half(items):
+    for item in items[len(items) // 2:]:
+        yield item
+
+def all_items(items):
+    yield from first_half(items)
+    yield from second_half(items)
+
+print(list(all_items(["a", "b", "c", "d", "e"])))
+```
+
+The `yield from` form is cleaner than writing `for x in first_half(items): yield x`.
+
+<h1 id="yield-vs-building-a-list">yield vs Building a List</h1>
+
+The most common alternative to a generator is a function that builds a list and returns it. Same logical output, very different runtime profile.
+
+```python
+# List version
+def order_summaries_list(orders):
+    summaries = []
+    for order in orders:
+        summaries.append(f"{order['id']}: {order['status']}")
+    return summaries
+
+# Generator version
+def order_summaries_gen(orders):
+    for order in orders:
+        yield f"{order['id']}: {order['status']}"
+
+orders = [
+    {"id": "A-1", "status": "placed"},
+    {"id": "A-2", "status": "shipped"},
+    {"id": "A-3", "status": "delivered"},
+]
+
+print(order_summaries_list(orders))
+
+for summary in order_summaries_gen(orders):
+    print(summary)
+```
+
+Both produce the same data. The differences:
+
+| Aspect            | List version                                   | Generator version                                       |
+| ----------------- | ---------------------------------------------- | ------------------------------------------------------- |
+| When work happens | All up front                                   | Lazily, one value per `next`                            |
+| Memory cost       | Holds every value at once                      | Holds one value + frame state                           |
+| Reusable?         | Yes, iterate the list as often as needed       | One-shot; call the function again for a fresh generator |
+| Random access     | `summaries[2]` works                           | Requires walking to the position                        |
+| Early termination | Builds everything, then discards unused values | Stops as soon as the caller stops asking                |
+| Best fit          | Small data, multiple passes                    | Large or unbounded streams, single pass                 |
+
+The generator wins big when the data is large, when only a prefix of values is needed, or when generators are chained so each value flows through the pipeline once. The list wins for random access, multiple iteration passes, or `len()`.
+
+```python
+def order_ids(n):
+    for i in range(1, n + 1):
+        yield f"A-{i}"
+
+# Take just the first three from a huge stream.
+from itertools import islice
+print(list(islice(order_ids(1_000_000), 3)))
+```
+
+The generator would produce a million ids on demand, but `islice` only pulls the first three. The other 999,997 are never built. The list version would build all million up front before slicing.
+
+Generators don't make every algorithm faster. They cap memory at O(1) per stage of the pipeline, and they allow early bailout without doing the rest of the work. They don't help if the consumer immediately calls `list()` on them, which materializes the full sequence anyway.
+
+<h1 id="use-cases">Use Cases</h1>
+
+Patterns where `yield` is the obvious choice.
+
+<h3 id="streaming-large-or-infinite-data">Streaming Large or Infinite Data</h3>
+
+Reading a large file line by line, or producing an unbounded sequence on demand.
+
+```python
+def order_ids():
+    n = 1
+    while True:
+        yield f"A-{n}"
+        n += 1
+
+from itertools import islice
+
+print(list(islice(order_ids(), 5)))
+```
+
+The generator would run forever if asked. `islice` stops after five values. Building the equivalent list up front isn't possible, because the list would never finish growing.
+
+<h3 id="lazy-pipelines">Lazy Pipelines</h3>
+
+Multiple generators chained together, where each value passes through every stage before the next value is computed.
+
+```python
+def read_orders(orders):
+    for order in orders:
+        yield order
+
+def only_placed(stream):
+    for order in stream:
+        if order["status"] == "placed":
+            yield order
+
+def format_summary(stream):
+    for order in stream:
+        yield f"{order['id']} -> {order['status']}"
+
+orders = [
+    {"id": "A-1", "status": "placed"},
+    {"id": "A-2", "status": "shipped"},
+    {"id": "A-3", "status": "placed"},
+    {"id": "A-4", "status": "cancelled"},
+]
+
+pipeline = format_summary(only_placed(read_orders(orders)))
+for summary in pipeline:
+    print(summary)
+```
+
+Each stage is a generator. No intermediate list ever exists; one order at a time flows through the pipeline. For huge inputs (millions of records), this keeps memory flat regardless of total volume.
+
+<h3 id="producing-computed-values-with-state">
+  Producing Computed Values With State
+</h3>
+
+The running-total example from earlier is one shape. Anything where the next value depends on accumulated state across previous values fits naturally as a generator.
+
+```python
+def running_cart_total(prices):
+    total = 0.0
+    for price in prices:
+        total += price
+        yield round(total, 2)
+
+cart = [29.99, 14.99, 9.99]
+for snapshot in running_cart_total(cart):
+    print(snapshot)
+```
+
+The `total` variable persists across yields because the frame is preserved. Writing the equivalent as a regular function that builds a list works too, but the generator form composes well with downstream pipeline stages.
+
+<h3 id="coroutine-style-receivers">Coroutine-Style Receivers</h3>
+
+A stateful consumer that the caller drives with `send`. Less common in everyday code, but useful for things like running averages or rolling windows.
+
+```python
+def running_average():
+    total = 0.0
+    count = 0
+    average = None
+    while True:
+        value = yield average
+        total += value
+        count += 1
+        average = total / count
+
+g = running_average()
+next(g)                # prime
+print(g.send(10))
+print(g.send(20))
+print(g.send(30))
+```
+
+Each `g.send(value)` feeds in a number and gets back the running average across all numbers seen so far. The state lives entirely in the generator's frame.
+
+<h1 id="common-pitfalls">Common Pitfalls</h1>
+
+A few mistakes that show up in early uses of `yield`.
+
+<h3 id="forgetting-to-iterate">Forgetting to Iterate</h3>
+
+A generator function doesn't run by being called. Building the generator object does nothing on its own; the generator has to be driven.
+
+**What's wrong with this code?**
+
+```python
+def log_orders(orders):
+    for order in orders:
+        print(f"logging {order}")
+        yield order
+
+log_orders(["A-1", "A-2", "A-3"])
+print("done")
+```
+
+Nothing logged. The call `log_orders([...])` built a generator object and discarded it without iterating. The body never ran. The bug runs without a trace because the generator was garbage-collected without complaint.
+
+**Fix:**
+
+```python
+def log_orders(orders):
+    for order in orders:
+        print(f"logging {order}")
+        yield order
+
+for order in log_orders(["A-1", "A-2", "A-3"]):
+    pass
+print("done")
+```
+
+Wrapping the call in a `for` loop (or `list(...)`, or any other consumer) is what triggers the body to run. When a generator function exists purely for side effects (logging, writing to a file, sending notifications), a regular function with no `yield` is usually a better fit. Generators are for producing values.
+
+<h3 id="treating-yielded-values-as-a-side-effect-of-return">
+  Treating Yielded Values as a Side Effect of return
+</h3>
+
+Inside a generator, `return` doesn't yield. `return value` ends the generator and attaches `value` to `StopIteration.value`, which most callers never see.
+
+```python
+def confused():
+    yield "first"
+    return "second"
+
+g = confused()
+print(next(g))
+try:
+    print(next(g))
+except StopIteration as e:
+    print(f"got via StopIteration: {e.value}")
+```
+
+The first `next` produces `"first"`. The second `next` runs `return "second"`, which raises `StopIteration` with `"second"` attached. A normal `for` loop swallows `StopIteration` and never sees the value, so the `return value` form is mostly useful for `yield from` and for coroutine-style code.
+
+The fix, when the goal is both values, is to yield both:
+
+```python
+def correct():
+    yield "first"
+    yield "second"
+
+print(list(correct()))
+```
+
+<h3 id="modifying-state-mid-yield">Modifying State Mid-Yield</h3>
+
+State changes inside a generator are fine, but if external code changes the underlying data the generator is iterating, surprising things can happen.
+
+**What's wrong with this code?**
+
+```python
+def odd_indexed(items):
+    for i, item in enumerate(items):
+        if i % 2 == 1:
+            yield item
+
+items = ["a", "b", "c", "d", "e"]
+for value in odd_indexed(items):
+    items.append(value + "!")
+    print(value)
+```
+
+The generator iterates `items`, and the caller appends to the same list during iteration. The output happens to be correct because Python's list iteration grows as the list grows, but this is the territory where bugs hide. Behavior with mutating shared state mid-yield is brittle.
+
+**Fix:**
+
+```python
+def odd_indexed(items):
+    for i, item in enumerate(items):
+        if i % 2 == 1:
+            yield item
+
+items = ["a", "b", "c", "d", "e"]
+new_items = list(items)
+for value in odd_indexed(items):
+    new_items.append(value + "!")
+    print(value)
+
+items = new_items
+```
+
+The fix is to write to a separate list while iterating the original. The same rule applies in plain `for` loops, but generators make it easier to forget because the iteration is implicit.
+
+<h3 id="reusing-an-exhausted-generator">Reusing an Exhausted Generator</h3>
+
+A generator is one-shot. Once it raises `StopIteration`, every subsequent `next` raises `StopIteration` again. The body does not restart.
+
+```python
+def stream():
+    yield 1
+    yield 2
+    yield 3
+
+g = stream()
+print(list(g))
+print(list(g))
+```
+
+The first `list(g)` drains the generator. The second one sees an exhausted iterator and returns an empty list. For two iterations, call the generator function twice (`list(stream())` and `list(stream())`), or materialize into a list first.
+
+<h1 id="quiz">Quiz</h1>
+
+<h1 id="quiz-questions">Quiz Questions</h1>
+
+**Question 1: A function contains a yield statement inside an if False block. What does calling that function return?**
+
+- [x] A generator object, even though that yield never runs.
+- [ ] None, because the branch containing yield is skipped.
+- [ ] A list-like iterator containing one missing value.
+- [ ] A SyntaxError, because unreachable yield is invalid.
+
+**Question 2: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 3: What does return "done" do inside a generator function?**
+
+- [ ] It yields "done" as the final item before stopping.
+- [ ] It restarts iteration from the first yield point.
+- [x] It ends the generator and stores "done" on StopIteration.
+- [ ] It converts the generator back into a normal function.
+
+**Question 4: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 5: Why must a newly created generator usually be primed before sending a real value into it?**
+
+- [x] The generator must first run to a yield expression.
+- [ ] send() is disabled until the generator is exhausted.
+- [ ] Priming copies all local variables for later sends.
+- [ ] The first sent value becomes the function argument.
+
+**Question 7: For the expression received = yield "ready", which statement is correct?**
+
+- [ ] "ready" is returned by send(), and received gets None.
+- [x] "ready" is yielded first; a later send value becomes received.
+- [ ] received is assigned before anything reaches the caller.
+- [ ] The expression can receive only strings from the caller.
+
+**Question 8: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 10: What is the most accurate statement about yield inside a try/finally block?**
+
+- [x] The finally block can run when the generator is closed.
+- [ ] A yield statement is not allowed inside any try block.
+- [ ] The finally block always runs at the first yield.
+- [ ] close() skips finally to avoid running user code.
+
+<QuizCard />
+
+<CommentsSection />
+
+</LessonCard>

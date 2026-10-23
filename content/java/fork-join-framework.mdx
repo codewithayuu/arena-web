@@ -1,0 +1,583 @@
+---
+title: "Fork/Join Framework"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Fork/Join Framework explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+The previous chapter on `CyclicBarrier` showed how a fixed pool of threads can coordinate at synchronization points. Fork/Join is a different shape: the threads aren't symmetric workers waiting at a barrier, they're recursive workers that constantly split tasks and steal from each other when their own queue runs empty.
+
+<h1 id="why-a-specialized-pool">Why a Specialized Pool</h1>
+
+A plain `ExecutorService` with a fixed thread pool works fine for a long list of independent jobs. You submit each job, the executor parks it in a single shared queue, and any free worker pulls the next one. That model has a problem when the jobs themselves want to spawn more jobs.
+
+Consider a task that sums the totals of one million orders. The natural way to split this is recursive: take the middle, sum the left half, sum the right half, add. If you submit the root task to a fixed pool, the root runs on one worker. That worker then submits two halves and waits for their results. But waiting means parking the worker, and now the pool has lost one of its threads to a task that isn't doing any computation. If every level does this, the pool blocks itself trying to drain the recursion.
+
+The shape above is what Fork/Join is built for. Each node forks two subtasks, waits for them, then combines. The framework's `ForkJoinPool` knows that a worker is about to wait for child tasks, so instead of going idle it runs other available work, often the children of the very task it's waiting on. That keeps the CPU busy and the recursion moving.
+
+The framework also has a clever load-balancing trick called **work-stealing**. The short version: every worker has its own deque, and idle workers steal from busy workers. That's a much better fit for recursive workloads than the single shared queue a normal `ExecutorService` uses.
+
+<h1 id="the-common-pool">The Common Pool</h1>
+
+Before defining your own pool, note that the JVM already ships with one: `ForkJoinPool.commonPool()`. It's the default pool used by `parallelStream()` and by `CompletableFuture` when no executor is passed in. Its size defaults to `Runtime.getRuntime().availableProcessors() - 1` (one thread is left for the calling thread). You can override the size with the system property `java.util.concurrent.ForkJoinPool.common.parallelism`.
+
+```java
+import java.util.concurrent.ForkJoinPool;
+
+public class CommonPoolDemo {
+    public static void main(String[] args) {
+        ForkJoinPool pool = ForkJoinPool.commonPool();
+        System.out.println("Common pool parallelism: " + pool.getParallelism());
+        System.out.println("Available processors: " + Runtime.getRuntime().availableProcessors());
+    }
+}
+```
+
+The exact numbers depend on the machine running the code. On an 8-core machine the common pool defaults to 7 worker threads. The pool is already there, already sized, and shared across the JVM. When you write `list.parallelStream().reduce(...)`, those workers are doing the parallel work.
+
+That sharing has consequences. A long-running task hogging the common pool slows down every parallel stream in the same JVM. We'll come back to this when we discuss when Fork/Join fits.
+
+<h1 id="recursivetask-returning-a-result">RecursiveTask: Returning a Result</h1>
+
+`RecursiveTask<V>` is the base class for a Fork/Join task that produces a result. You extend it, override `compute()`, and inside `compute()` you decide whether the task is small enough to solve directly or big enough that it should fork into subtasks.
+
+The e-commerce example we'll use is summing order totals over a large list. Each `Order` has a total in dollars, and we want the grand total.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.RecursiveTask;
+
+public class OrderTotalSum {
+
+    record Order(int id, double total) {}
+
+    static class SumTask extends RecursiveTask<Double> {
+        private static final int THRESHOLD = 1000;
+        private final List<Order> orders;
+        private final int start;
+        private final int end;
+
+        SumTask(List<Order> orders, int start, int end) {
+            this.orders = orders;
+            this.start = start;
+            this.end = end;
+        }
+
+        @Override
+        protected Double compute() {
+            int length = end - start;
+            if (length <= THRESHOLD) {
+                double sum = 0.0;
+                for (int i = start; i < end; i++) {
+                    sum += orders.get(i).total();
+                }
+                return sum;
+            }
+            int mid = start + length / 2;
+            SumTask left = new SumTask(orders, start, mid);
+            SumTask right = new SumTask(orders, mid, end);
+            left.fork();
+            double rightResult = right.compute();
+            double leftResult = left.join();
+            return leftResult + rightResult;
+        }
+    }
+
+    public static void main(String[] args) {
+        List<Order> orders = new ArrayList<>();
+        for (int i = 0; i < 100_000; i++) {
+            orders.add(new Order(i, 10.0 + (i % 50)));
+        }
+
+        ForkJoinPool pool = ForkJoinPool.commonPool();
+        SumTask task = new SumTask(orders, 0, orders.size());
+        double total = pool.invoke(task);
+
+        System.out.println("Number of orders: " + orders.size());
+        System.out.println("Total: $" + total);
+    }
+}
+```
+
+Walk through what's happening. `SumTask` is a `RecursiveTask<Double>`, so its `compute` returns a `Double`. The method first checks if the slice from `start` to `end` is small (`<= THRESHOLD`). If yes, it just loops and sums. If no, it splits the slice into a left half and a right half, asks the framework to run the left half on another thread (`left.fork()`), runs the right half on the current thread (`right.compute()`), and joins the left result.
+
+The `pool.invoke(task)` call submits the root task, waits for it, and returns the result. The whole computation runs across the workers of the common pool, each picking up subtasks as they go.
+
+The framework picks which subtask to run on which thread. You just describe the recursion; the pool handles the scheduling.
+
+<h1 id="recursiveaction-no-result">RecursiveAction: No Result</h1>
+
+When the work doesn't produce a result, you extend `RecursiveAction` instead. The classic e-commerce example is applying a price markdown to every product in a huge catalog. Each product is updated in place; there's nothing to return.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.RecursiveAction;
+
+public class CatalogMarkdown {
+
+    static class Product {
+        final int id;
+        double price;
+
+        Product(int id, double price) {
+            this.id = id;
+            this.price = price;
+        }
+    }
+
+    static class MarkdownTask extends RecursiveAction {
+        private static final int THRESHOLD = 500;
+        private final List<Product> products;
+        private final int start;
+        private final int end;
+        private final double discount;
+
+        MarkdownTask(List<Product> products, int start, int end, double discount) {
+            this.products = products;
+            this.start = start;
+            this.end = end;
+            this.discount = discount;
+        }
+
+        @Override
+        protected void compute() {
+            int length = end - start;
+            if (length <= THRESHOLD) {
+                for (int i = start; i < end; i++) {
+                    Product p = products.get(i);
+                    p.price = p.price * (1 - discount);
+                }
+                return;
+            }
+            int mid = start + length / 2;
+            MarkdownTask left = new MarkdownTask(products, start, mid, discount);
+            MarkdownTask right = new MarkdownTask(products, mid, end, discount);
+            invokeAll(left, right);
+        }
+    }
+
+    public static void main(String[] args) {
+        List<Product> catalog = new ArrayList<>();
+        for (int i = 0; i < 50_000; i++) {
+            catalog.add(new Product(i, 100.0));
+        }
+
+        ForkJoinPool pool = ForkJoinPool.commonPool();
+        MarkdownTask task = new MarkdownTask(catalog, 0, catalog.size(), 0.10);
+        pool.invoke(task);
+
+        System.out.println("First product price: $" + catalog.get(0).price);
+        System.out.println("Last product price: $" + catalog.get(catalog.size() - 1).price);
+    }
+}
+```
+
+`RecursiveAction.compute()` returns `void`. The work is the side effect, which here is mutating each `Product`'s `price` in the list. The code uses `invokeAll(left, right)` instead of the fork/compute/join pattern from the previous example. `invokeAll` is a convenience that forks the first task, runs the second on the current thread, and waits for both. It's shorter when the two subtasks are symmetric and neither carries a result you need to combine manually.
+
+The pattern is otherwise identical: check the slice size, do the work directly if it's small, split and recurse if it's large. The threshold (500 here) decides where the split stops.
+
+The catalog is mutated in place, so it's safe only because each subtask owns a disjoint slice of the list. Two tasks never touch the same index, which means no synchronization is needed despite the parallel mutation.
+
+<h1 id="the-forkcomputejoin-pattern">The Fork/Compute/Join Pattern</h1>
+
+The two examples above use slightly different patterns. The first uses `fork`/`compute`/`join` explicitly; the second uses `invokeAll`. Both express the same idea, but it helps to see the explicit version once because that's what the convenience method abstracts.
+
+```java
+SumTask left = new SumTask(orders, start, mid);
+SumTask right = new SumTask(orders, mid, end);
+
+left.fork();                       // schedule left on the pool
+double rightResult = right.compute();   // run right on the current thread
+double leftResult = left.join();   // wait for left and get its result
+
+return leftResult + rightResult;
+```
+
+Three steps:
+
+1. **`fork()`** pushes the task onto the current worker's deque. Some other idle worker may steal it. If no one steals it, the current worker will run it later (when it has joined everything else).
+2. **`compute()`** runs the other subtask synchronously on the current thread. This is the small but important trick: instead of forking both halves and waiting, you fork one and run the other yourself. That keeps the current thread busy and avoids the overhead of a second fork.
+3. **`join()`** waits for the forked task and returns its result. If the task hasn't run yet, the framework may run it on the current thread now.
+
+The order matters. If you write `left.join(); right.compute();`, you serialize the work: you wait for `left` to finish before starting `right`, which defeats the whole point. The correct order is "fork the first, compute the second, then join the first."
+
+The diagram shows one level of the recursion. At every level above the threshold, the same shape repeats. At the bottom, the `length <= THRESHOLD` branch runs the sequential loop and returns directly.
+
+Calling `fork()` then `join()` immediately, with no work between them, serializes the two halves and adds overhead for nothing. Always run one branch on the current thread (`right.compute()`) between `fork` and `join`.
+
+<h1 id="work-stealing-how-the-pool-balances-load">
+  Work-Stealing: How the Pool Balances Load
+</h1>
+
+A `ForkJoinPool` doesn't have a single shared queue. Each worker thread has its own double-ended queue (a deque). When a worker calls `fork()`, the new task goes onto the **bottom** of that worker's own deque. The worker pulls from the bottom too (LIFO order, so the freshest work runs first, which usually gives better cache locality).
+
+When a worker finishes everything in its deque, it doesn't sit idle. It picks a random other worker and steals a task from the **top** of that worker's deque (FIFO order). The top of the deque has the oldest, largest tasks, the ones forked earliest and therefore most likely to themselves spawn more subtasks. Stealing from the top keeps the source worker's recent work cache-warm while spreading the broadest work to idle threads.
+
+In the picture, Worker 1 has forked three tasks and is currently working on `task C` (the most recent, taken from the bottom). Worker 2 has nothing to do, so it steals `task A` (the oldest, from the top of Worker 1's deque). The two workers now run in parallel without any explicit hand-off code.
+
+The reason this scheme works well for divide-and-conquer is that the tasks at the top of a worker's deque are the higher-up nodes of the recursion tree. Stealing one of those gives the idle worker a big chunk of work to do, which it then subdivides on its own deque. The recursion spreads naturally without ever needing a single central queue that all workers contend on.
+
+Two things follow from this design:
+
+- **Workers rarely contend on the same lock.** Each worker mostly touches its own deque, and steals are infrequent compared to local pushes and pops.
+- **The framework doesn't need to know how big your task is in advance.** It can balance load purely by reacting to which workers run out of work first.
+
+A normal `ExecutorService` with a single shared queue can't do either. Every submit and every poll locks the same queue, and all workers pull in FIFO order from the same place regardless of who submitted what.
+
+<h1 id="choosing-a-threshold">Choosing a Threshold</h1>
+
+The threshold is the size at which `compute` stops splitting and runs the work directly. Pick it too small and you create millions of tiny tasks that spend more time being scheduled than doing work. Pick it too large and the workload doesn't parallelize because there aren't enough subtasks to fill the pool's workers.
+
+A common rule of thumb: aim for the number of leaf tasks to be a few times the number of pool workers. On an 8-core machine with the common pool (7 workers), having 30 to 100 leaf tasks usually gives the pool enough flexibility for work-stealing without per-task overhead dominating.
+
+For a 100,000-element sum on 7 workers, a threshold of 1,000 yields about 100 leaf tasks. A threshold of 10,000 yields about 10 leaf tasks, which is too few for stealing to help much. A threshold of 50 yields 2,000 leaf tasks, which is more scheduling than the work justifies for a simple addition.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.RecursiveTask;
+
+public class ThresholdComparison {
+
+    static class SumTask extends RecursiveTask<Long> {
+        private final int threshold;
+        private final long[] data;
+        private final int start;
+        private final int end;
+
+        SumTask(long[] data, int start, int end, int threshold) {
+            this.data = data;
+            this.start = start;
+            this.end = end;
+            this.threshold = threshold;
+        }
+
+        @Override
+        protected Long compute() {
+            int length = end - start;
+            if (length <= threshold) {
+                long sum = 0;
+                for (int i = start; i < end; i++) {
+                    sum += data[i];
+                }
+                return sum;
+            }
+            int mid = start + length / 2;
+            SumTask left = new SumTask(data, start, mid, threshold);
+            SumTask right = new SumTask(data, mid, end, threshold);
+            left.fork();
+            long rightResult = right.compute();
+            long leftResult = left.join();
+            return leftResult + rightResult;
+        }
+    }
+
+    static long timeWithThreshold(long[] data, int threshold) {
+        ForkJoinPool pool = ForkJoinPool.commonPool();
+        long start = System.nanoTime();
+        SumTask task = new SumTask(data, 0, data.length, threshold);
+        pool.invoke(task);
+        return System.nanoTime() - start;
+    }
+
+    public static void main(String[] args) {
+        long[] data = new long[10_000_000];
+        for (int i = 0; i < data.length; i++) {
+            data[i] = i;
+        }
+
+        // Warm up the JIT
+        timeWithThreshold(data, 10_000);
+        timeWithThreshold(data, 10_000);
+
+        long tooSmall = timeWithThreshold(data, 10);
+        long good = timeWithThreshold(data, 10_000);
+        long tooLarge = timeWithThreshold(data, 5_000_000);
+
+        System.out.printf("Threshold 10:        %.2f ms%n", tooSmall / 1_000_000.0);
+        System.out.printf("Threshold 10,000:    %.2f ms%n", good / 1_000_000.0);
+        System.out.printf("Threshold 5,000,000: %.2f ms%n", tooLarge / 1_000_000.0);
+    }
+}
+```
+
+The numbers depend on the machine, but the shape is consistent. A threshold of 10 forces a million tiny tasks; the per-task overhead swamps the actual addition. A threshold of 5 million only produces two tasks, so on an 8-core machine six workers sit idle. The middle threshold gets the data divided across roughly 1,000 leaf tasks, which is enough for stealing to keep all workers busy without too much overhead.
+
+There's no universal right answer. Profile with your real workload if performance matters. The general advice is "start at a threshold that yields a few hundred leaf tasks, then tune."
+
+<h1 id="dont-block-inside-a-worker">Don't Block Inside a Worker</h1>
+
+A `ForkJoinPool` worker assumes it will either be computing or waiting for child tasks. The pool's load-balancing logic uses that assumption to keep cores busy. When a worker calls `join()` on a child task that hasn't started yet, the framework runs the child on the current thread or steals from another worker. The pool stays productive.
+
+That assumption breaks the moment a worker does something **blocking and unrelated** to the recursion: reading a file, waiting on a socket, calling `Thread.sleep`, holding a lock that another thread owns, doing a synchronous database call. The worker is parked, but it's not waiting on a Fork/Join task. The pool can't tell that the worker is unavailable for stealing, so a tied-up worker reduces the effective parallelism. Do this on every level of the recursion and the pool starves itself.
+
+```java
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.RecursiveAction;
+
+public class BlockingInside {
+
+    static class BadTask extends RecursiveAction {
+        private final int depth;
+
+        BadTask(int depth) {
+            this.depth = depth;
+        }
+
+        @Override
+        protected void compute() {
+            if (depth == 0) {
+                try {
+                    // Anti-pattern: blocks the worker for 100ms doing nothing useful
+                    Thread.sleep(100);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                return;
+            }
+            invokeAll(new BadTask(depth - 1), new BadTask(depth - 1));
+        }
+    }
+
+    public static void main(String[] args) {
+        ForkJoinPool pool = ForkJoinPool.commonPool();
+        long start = System.nanoTime();
+        pool.invoke(new BadTask(6));
+        long elapsed = (System.nanoTime() - start) / 1_000_000;
+        System.out.println("64 leaf tasks, each sleeping 100ms, took " + elapsed + " ms");
+        System.out.println("Workers: " + pool.getParallelism());
+    }
+}
+```
+
+The number varies by machine. On 7 workers, 64 leaf tasks each sleeping 100ms should ideally take about `64 * 100 / 7 = ~915ms`, but the actual elapsed time is higher because sleeping workers are not eligible to steal more work. With longer or more frequent blocking, the gap grows.
+
+The fix is one of three things:
+
+1. **Don't do blocking I/O inside Fork/Join tasks.** Use a separate `ExecutorService` for I/O-heavy work and a `ForkJoinPool` only for CPU-bound recursive work.
+2. **Wrap the blocking operation in `ManagedBlocker`**, an interface that tells the pool "I'm about to block on something external; spin up a replacement worker if you need to." This is what `CompletableFuture.get()` does internally when called from a Fork/Join worker.
+3. **Move the I/O outside the recursion.** Fetch the data first, then do the parallel computation on the in-memory result.
+
+A `Thread.sleep` or blocking I/O call inside a Fork/Join worker is an anti-pattern because the pool's scheduler cannot detect the block. The worker is unavailable for stealing, so the effective parallelism drops, and other tasks in the same pool (including parallel streams elsewhere in the JVM) slow down with it.
+
+<h1 id="the-common-pool-parallel-streams-and-completablefuture">
+  The Common Pool, Parallel Streams, and CompletableFuture
+</h1>
+
+The common pool is shared. When you write `list.parallelStream().map(...).reduce(...)`, the stream's parallel work runs on the common pool. When you write `CompletableFuture.supplyAsync(() -> heavyTask())` with no executor argument, the supplier runs on the common pool. Any custom `RecursiveTask` you submit to `ForkJoinPool.commonPool()` does too.
+
+That makes the common pool a contended resource. A single misbehaving task (one that blocks or runs forever) hurts every other parallel computation in the same JVM. Two anti-patterns are common when the pool's shared nature is overlooked:
+
+- A parallel stream that calls a slow API inside its `map` step blocks common-pool workers, which then slow down unrelated parallel streams elsewhere.
+- A library that uses `parallelStream` internally on a huge dataset hogs the pool for seconds, during which any other parallel work waits.
+
+For CPU-bound, predictable work that fits the divide-and-conquer pattern, the common pool is fine. For anything that does I/O, holds locks for a noticeable time, or has runtime characteristics you don't fully control, create a **dedicated** `ForkJoinPool`:
+
+```java
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.RecursiveTask;
+
+public class DedicatedPool {
+
+    static class Square extends RecursiveTask<Long> {
+        private final long n;
+
+        Square(long n) {
+            this.n = n;
+        }
+
+        @Override
+        protected Long compute() {
+            return n * n;
+        }
+    }
+
+    public static void main(String[] args) {
+        ForkJoinPool myPool = new ForkJoinPool(4);
+        try {
+            long result = myPool.invoke(new Square(12));
+            System.out.println("12 squared: " + result);
+            System.out.println("Pool parallelism: " + myPool.getParallelism());
+        } finally {
+            myPool.shutdown();
+        }
+    }
+}
+```
+
+`new ForkJoinPool(4)` creates a pool with four worker threads, independent of the common pool. The `try/finally` calls `shutdown()` to stop the threads when the program is done. The pool is shut down on JVM exit if it's a daemon pool (which is the default for `new ForkJoinPool()`), but explicit shutdown is good practice for short-lived applications and required for non-daemon configurations.
+
+You can also submit a parallel stream to a dedicated pool. The trick is to wrap the stream call inside a `submit(...)` on the pool:
+
+```java
+import java.util.List;
+import java.util.concurrent.ForkJoinPool;
+
+public class StreamOnCustomPool {
+    public static void main(String[] args) throws Exception {
+        List<Integer> orderTotals = List.of(10, 20, 30, 40, 50);
+        ForkJoinPool myPool = new ForkJoinPool(2);
+
+        int sum = myPool.submit(() ->
+            orderTotals.parallelStream().mapToInt(Integer::intValue).sum()
+        ).get();
+
+        myPool.shutdown();
+        System.out.println("Sum: " + sum);
+    }
+}
+```
+
+The parallel stream picks up whatever Fork/Join pool the current thread belongs to. Inside `myPool.submit(...)`, the thread is one of `myPool`'s workers, so the stream runs there instead of on the common pool. This is the standard workaround for isolating one parallel stream's load from the rest of the JVM.
+
+<h1 id="forkjoin-vs-plain-executorservice">
+  Fork/Join vs Plain ExecutorService
+</h1>
+
+The two are not competitors; they solve different problems. Picking the wrong one usually leads to mediocre performance or code that's harder to reason about than it needs to be.
+
+| Scenario                                                | Use                                                      |
+| ------------------------------------------------------- | -------------------------------------------------------- |
+| Long list of independent jobs, no recursion             | `ExecutorService` (e.g., `Executors.newFixedThreadPool`) |
+| Each job is short, mostly CPU-bound                     | `ExecutorService`                                        |
+| Each job may block on I/O                               | `ExecutorService` with enough threads to mask latency    |
+| Recursive divide-and-conquer over an in-memory data set | `ForkJoinPool` with `RecursiveTask` / `RecursiveAction`  |
+| Aggregating results over a large array or list          | `ForkJoinPool` or `parallelStream()`                     |
+| Tasks that spawn more tasks recursively                 | `ForkJoinPool`                                           |
+| Tasks that have heterogeneous, unpredictable durations  | `ForkJoinPool` (work-stealing balances naturally)        |
+
+The distinguishing question is "do my tasks fork more tasks?" If yes, Fork/Join is built for that. If no, a plain `ExecutorService` is simpler and avoids the assumptions Fork/Join makes about its workers.
+
+Two more practical pointers:
+
+- For one-off parallel aggregations, `parallelStream()` is usually clearer than hand-rolling a `RecursiveTask`. It uses the common pool internally, and the API is shorter. Drop down to `RecursiveTask` when you need control over the threshold or you're working with data structures that don't have a Stream view.
+- For I/O-heavy workloads (HTTP calls, database queries, file reads), use a regular `ExecutorService`, even though the calls look "independent and parallelizable." `ForkJoinPool` workers blocking on I/O is an anti-pattern.
+
+<h1 id="putting-it-together">Putting It Together</h1>
+
+A small end-to-end e-commerce example that exercises both task types and uses a dedicated pool to avoid touching the common pool. We compute the grand total of a list of orders and apply a markdown to a separate product catalog, then shut the pool down cleanly.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.RecursiveAction;
+import java.util.concurrent.RecursiveTask;
+
+public class CheckoutBatch {
+
+    record Order(int id, double total) {}
+
+    static class Product {
+        final int id;
+        double price;
+
+        Product(int id, double price) {
+            this.id = id;
+            this.price = price;
+        }
+    }
+
+    static class SumTask extends RecursiveTask<Double> {
+        private static final int THRESHOLD = 1_000;
+        private final List<Order> orders;
+        private final int start;
+        private final int end;
+
+        SumTask(List<Order> orders, int start, int end) {
+            this.orders = orders;
+            this.start = start;
+            this.end = end;
+        }
+
+        @Override
+        protected Double compute() {
+            int length = end - start;
+            if (length <= THRESHOLD) {
+                double sum = 0.0;
+                for (int i = start; i < end; i++) {
+                    sum += orders.get(i).total();
+                }
+                return sum;
+            }
+            int mid = start + length / 2;
+            SumTask left = new SumTask(orders, start, mid);
+            SumTask right = new SumTask(orders, mid, end);
+            left.fork();
+            double rightResult = right.compute();
+            double leftResult = left.join();
+            return leftResult + rightResult;
+        }
+    }
+
+    static class MarkdownTask extends RecursiveAction {
+        private static final int THRESHOLD = 500;
+        private final List<Product> products;
+        private final int start;
+        private final int end;
+        private final double discount;
+
+        MarkdownTask(List<Product> products, int start, int end, double discount) {
+            this.products = products;
+            this.start = start;
+            this.end = end;
+            this.discount = discount;
+        }
+
+        @Override
+        protected void compute() {
+            int length = end - start;
+            if (length <= THRESHOLD) {
+                for (int i = start; i < end; i++) {
+                    Product p = products.get(i);
+                    p.price = p.price * (1 - discount);
+                }
+                return;
+            }
+            int mid = start + length / 2;
+            invokeAll(
+                new MarkdownTask(products, start, mid, discount),
+                new MarkdownTask(products, mid, end, discount)
+            );
+        }
+    }
+
+    public static void main(String[] args) {
+        List<Order> orders = new ArrayList<>();
+        for (int i = 0; i < 20_000; i++) {
+            orders.add(new Order(i, 25.0 + (i % 10)));
+        }
+
+        List<Product> catalog = new ArrayList<>();
+        for (int i = 0; i < 10_000; i++) {
+            catalog.add(new Product(i, 50.0));
+        }
+
+        ForkJoinPool pool = new ForkJoinPool(4);
+        try {
+            double total = pool.invoke(new SumTask(orders, 0, orders.size()));
+            pool.invoke(new MarkdownTask(catalog, 0, catalog.size(), 0.15));
+
+            System.out.println("Order total: $" + total);
+            System.out.println("Marked-down price (sample): $" + catalog.get(0).price);
+        } finally {
+            pool.shutdown();
+        }
+    }
+}
+```
+
+The pool runs both jobs back to back. The sum task returns a value through `pool.invoke`. The markdown task returns nothing because its `compute` is `void`, but the side effect on the `catalog` list is visible after `invoke` returns. The `try/finally` makes sure the pool is shut down whether the work succeeds or throws. The common pool is never touched, so a parallel stream running elsewhere in the JVM at the same time would not be affected by this batch.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

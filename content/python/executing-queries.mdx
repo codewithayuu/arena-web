@@ -1,0 +1,650 @@
+---
+title: "Executing Queries"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "Executing Queries explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="the-shape-of-every-query">The Shape of Every Query</h1>
+
+The DB-API pattern is the same regardless of the target database.
+
+1. Get a cursor from the connection.
+2. Call `cur.execute(sql, params)` to run a single statement, or `cur.executemany(sql, rows)` to run the same statement against many parameter sets.
+3. For statements that return rows (`SELECT`, sometimes `INSERT ... RETURNING`), read them with `fetchone`, `fetchmany`, `fetchall`, or by iterating the cursor.
+4. For writes, call `conn.commit()` to make the changes durable, or `conn.rollback()` to throw them away.
+5. Close the cursor when finished with it. Close the connection when the work is over.
+
+```python
+import sqlite3
+
+conn = sqlite3.connect(":memory:")
+conn.row_factory = sqlite3.Row
+
+with conn:
+    conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL, in_stock INTEGER)")
+    conn.executemany(
+        "INSERT INTO products VALUES (?, ?, ?, ?)",
+        [
+            (101, "Wireless Mouse", 29.99, 42),
+            (102, "HDMI Cable", 9.99, 250),
+            (103, "Mechanical Keyboard", 89.00, 0),
+        ],
+    )
+
+for row in conn.execute("SELECT id, name, price FROM products WHERE in_stock > 0 ORDER BY name"):
+    print(row["name"], row["price"])
+
+conn.close()
+```
+
+Every example in this lesson builds on this pattern.
+
+<h1 id="select-reading-data">SELECT: Reading Data</h1>
+
+A `SELECT` returns rows. The cursor holds a pointer into the result set, and rows are read out as needed.
+
+```python
+import sqlite3
+
+conn = sqlite3.connect(":memory:")
+conn.row_factory = sqlite3.Row
+conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL)")
+conn.executemany("INSERT INTO products VALUES (?, ?, ?)", [
+    (101, "Wireless Mouse", 29.99),
+    (102, "HDMI Cable", 9.99),
+    (103, "Mechanical Keyboard", 89.00),
+])
+conn.commit()
+
+# Reading one row
+row = conn.execute("SELECT id, name, price FROM products WHERE id = ?", (101,)).fetchone()
+print(row["name"], row["price"])
+
+# Reading all rows
+rows = conn.execute("SELECT id, name FROM products ORDER BY id").fetchall()
+for row in rows:
+    print(row["id"], row["name"])
+
+# Iterating row by row
+for row in conn.execute("SELECT id, name FROM products ORDER BY id"):
+    print(row["id"], row["name"])
+
+conn.close()
+```
+
+Three styles, three trade-offs. `fetchone` returns one row or `None`. `fetchall` loads every remaining row into a list. Iterating the cursor reads row by row in constant memory and fits large result sets.
+
+`fetchall()` on a result set with a million rows pulls every row into a Python list before the code sees the first one. Switching to iteration (`for row in cur`) or `fetchmany(1000)` keeps memory roughly constant and lets the application start processing earlier.
+
+When the query returns no rows, `fetchone()` returns `None` and `fetchall()` returns `[]`. Check for `None` before unpacking, or the code will raise `TypeError: 'NoneType' is not subscriptable` on the next access.
+
+```python
+row = conn.execute("SELECT id FROM products WHERE id = ?", (999,)).fetchone()
+if row is None:
+    print("product not found")
+else:
+    print(row["id"])
+```
+
+<h1 id="parameter-binding-the-only-safe-way-to-use-values">
+  Parameter Binding: The Only Safe Way to Use Values
+</h1>
+
+Every value in a query that came from outside the code (a user, a file, a network response) must go in as a parameter, not as part of the SQL string. Here is the practical reason.
+
+```python
+# wrong, vulnerable to SQL injection
+name = "Wireless Mouse'); DROP TABLE products;--"
+conn.execute(f"INSERT INTO products (name) VALUES ('{name}')")
+
+# right
+conn.execute("INSERT INTO products (name) VALUES (?)", (name,))
+```
+
+The wrong form pastes the value directly into the SQL. The injected text closes the string, ends the statement with `)`, runs a destructive `DROP TABLE`, and comments out the rest. The right form sends the value separately, and the database stores the entire string (including the quotes and semicolons) as a single text value, which is harmless.
+
+Parameter binding also handles type conversion automatically. Python `None` becomes SQL `NULL`. Python `bool` becomes the database's boolean (or 0/1 in SQLite). Python `datetime` becomes an ISO 8601 string (or a native timestamp in PostgreSQL via `psycopg`). None of it needs manual formatting.
+
+Placeholder syntax differs per driver. The DB-API spec leaves it open and each driver picks one of five styles.
+
+| Driver                   | Style            | Example                                |
+| ------------------------ | ---------------- | -------------------------------------- |
+| `sqlite3`                | `qmark`, `named` | `WHERE id = ?` or `WHERE id = :id`     |
+| `psycopg` (v3)           | `pyformat`       | `WHERE id = %s` or `WHERE id = %(id)s` |
+| `mysql-connector-python` | `pyformat`       | `WHERE id = %s` or `WHERE id = %(id)s` |
+| `pyodbc`                 | `qmark`          | `WHERE id = ?`                         |
+| `oracledb`               | `named`          | `WHERE id = :id`                       |
+
+The `%s` in `psycopg` and `mysql-connector-python` looks like printf-style formatting, but it isn't. It's a placeholder, and the driver still does proper escaping. Never use Python's `%` operator or f-strings to fill those placeholders.
+
+A common pattern with a dict of values is the named form:
+
+```python
+data = {"id": 101, "name": "Wireless Mouse", "price": 29.99}
+conn.execute(
+    "INSERT INTO products (id, name, price) VALUES (:id, :name, :price)",
+    data,
+)
+```
+
+The named form makes the SQL self-documenting and allows reordering the dict freely without touching the SQL. For short queries, positional is fine. For long queries with many columns, named placeholders are easier to maintain.
+
+<h1 id="insert-adding-rows">INSERT: Adding Rows</h1>
+
+A basic `INSERT` writes one row. The DB-API's `execute` runs it.
+
+```python
+import sqlite3
+
+conn = sqlite3.connect(":memory:")
+conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL, in_stock INTEGER NOT NULL DEFAULT 0)")
+
+conn.execute(
+    "INSERT INTO products (id, name, price, in_stock) VALUES (?, ?, ?, ?)",
+    (101, "Wireless Mouse", 29.99, 42),
+)
+conn.commit()
+print(conn.execute("SELECT COUNT(*) FROM products").fetchone()[0])
+conn.close()
+```
+
+Columns left unspecified use their declared defaults (or `NULL` if there's no default and the column allows it). When the SQL lists columns, they can be reordered freely; when the column list is omitted, values must be provided for every column in the table in the order the schema defines.
+
+```python
+# Explicit column list, partial: in_stock falls back to DEFAULT 0
+conn.execute("INSERT INTO products (id, name, price) VALUES (?, ?, ?)", (102, "HDMI Cable", 9.99))
+
+# Implicit column list: must provide every column
+conn.execute("INSERT INTO products VALUES (?, ?, ?, ?)", (103, "Mechanical Keyboard", 89.00, 0))
+```
+
+The explicit column list is the safer style. It survives schema additions: if a `description` column gets added later with a default, the explicit form still works without changes. The implicit form breaks because the column count no longer matches.
+
+<h1 id="bulk-inserts-executemany-vs-looping">
+  Bulk Inserts: executemany vs Looping
+</h1>
+
+For inserting many rows, use `executemany`. It runs the same SQL against a sequence of parameter tuples in a single batch.
+
+```python
+import sqlite3
+
+conn = sqlite3.connect(":memory:")
+conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL)")
+
+products = [
+    (101, "Wireless Mouse", 29.99),
+    (102, "HDMI Cable", 9.99),
+    (103, "Mechanical Keyboard", 89.00),
+    (104, "USB-C Hub", 39.99),
+    (105, "Webcam", 79.99),
+]
+
+with conn:
+    conn.executemany("INSERT INTO products VALUES (?, ?, ?)", products)
+
+print(conn.execute("SELECT COUNT(*) FROM products").fetchone()[0])
+conn.close()
+```
+
+The difference between `executemany` and a loop matters more as the row count grows. A loop with one commit per row is the slowest combination: each commit forces a disk sync. A loop with one commit at the end (no `executemany`) is much faster because all the writes happen in one transaction. `executemany` inside one transaction is faster still because the driver can batch the statement preparation and send fewer round trips to the server.
+
+A rough benchmark for 10,000 inserts on a local PostgreSQL:
+
+| Pattern                                     | Approximate Time |
+| ------------------------------------------- | ---------------- |
+| Loop of `execute`, commit after each row    | 30+ seconds      |
+| Loop of `execute`, single commit at the end | 1-2 seconds      |
+| `executemany`, single commit                | 0.2-0.5 seconds  |
+| `COPY` (PostgreSQL bulk-load)               | 0.05 seconds     |
+
+For large bulk loads (millions of rows), PostgreSQL's `COPY` command (or MySQL's `LOAD DATA`) is faster than any DB-API loop because it skips per-row parsing. `psycopg` exposes `COPY` through `cur.copy(...)`. For day-to-day bulk inserts of thousands of rows at a time, `executemany` is the right balance of speed and simplicity.
+
+Commit frequency is a major performance lever for bulk writes. A commit per row is up to 100x slower than one commit per batch on databases with `fsync`. For very large batches, commit every few thousand rows so a crash doesn't lose hours of work.
+
+<h1 id="getting-back-the-id-after-an-insert">
+  Getting Back the ID After an Insert
+</h1>
+
+A common need: after inserting a row with an auto-generated primary key, the application wants the value the database assigned. Each database exposes this differently.
+
+For SQLite, the cursor has a `lastrowid` attribute that holds the id of the last inserted row.
+
+```python
+import sqlite3
+
+conn = sqlite3.connect(":memory:")
+conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT)")
+
+cur = conn.cursor()
+cur.execute("INSERT INTO products (name) VALUES (?)", ("Wireless Mouse",))
+new_id = cur.lastrowid
+print(f"new product id: {new_id}")
+conn.commit()
+conn.close()
+```
+
+`lastrowid` is a DB-API attribute, so most drivers support it. The catch is that for `executemany`, `lastrowid` is the id of the last row inserted, not all of them. For one-by-one inserts, it works as expected.
+
+For PostgreSQL, the idiomatic way is to add a `RETURNING` clause to the `INSERT`. The clause turns the insert into a statement that returns rows, so the result is read back with `fetchone`.
+
+```python
+# psycopg example
+with conn.cursor() as cur:
+    cur.execute(
+        "INSERT INTO products (name, price) VALUES (%s, %s) RETURNING id",
+        ("Wireless Mouse", 29.99),
+    )
+    new_id = cur.fetchone()[0]
+    print(f"new product id: {new_id}")
+```
+
+`RETURNING` is more flexible than `lastrowid` because it can return any column (including computed values from triggers or defaults), and it works correctly with bulk inserts: `RETURNING id` after an `executemany`-style `INSERT ... VALUES (...), (...), (...)` returns all the new ids. Most other databases now support `RETURNING` too: PostgreSQL has had it since 8.2, SQLite added it in 3.35, MariaDB has it, and SQL Server has the equivalent `OUTPUT` clause.
+
+For MySQL specifically, `lastrowid` (or `cursor.lastrowid` in `mysql-connector-python`) is the conventional approach because MySQL's `RETURNING` support is recent and not always available.
+
+```python
+# mysql-connector example
+cur = conn.cursor()
+cur.execute("INSERT INTO products (name, price) VALUES (%s, %s)", ("Wireless Mouse", 29.99))
+print(cur.lastrowid)
+```
+
+The table below summarizes the common pattern per database:
+
+| Database   | Idiomatic Way to Get the New ID                       |
+| ---------- | ----------------------------------------------------- |
+| SQLite     | `cur.lastrowid`                                       |
+| PostgreSQL | `INSERT ... RETURNING id` + `cur.fetchone()`          |
+| MySQL      | `cur.lastrowid`                                       |
+| SQL Server | `INSERT ... OUTPUT INSERTED.id` or `SCOPE_IDENTITY()` |
+
+<h1 id="update-and-delete-modifying-rows">UPDATE and DELETE: Modifying Rows</h1>
+
+`UPDATE` changes values in existing rows. `DELETE` removes them. Both follow the same `execute` pattern as `INSERT` and both return a row count through `cur.rowcount`.
+
+```python
+import sqlite3
+
+conn = sqlite3.connect(":memory:")
+conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL, in_stock INTEGER)")
+conn.executemany("INSERT INTO products VALUES (?, ?, ?, ?)", [
+    (101, "Wireless Mouse", 29.99, 42),
+    (102, "HDMI Cable", 9.99, 250),
+    (103, "Mechanical Keyboard", 89.00, 0),
+])
+conn.commit()
+
+cur = conn.cursor()
+cur.execute("UPDATE products SET price = ? WHERE id = ?", (24.99, 101))
+print(f"updated {cur.rowcount} row(s)")
+
+cur.execute("DELETE FROM products WHERE in_stock = 0")
+print(f"deleted {cur.rowcount} row(s)")
+
+conn.commit()
+conn.close()
+```
+
+`rowcount` is the number of rows affected by the last `execute`. For `UPDATE` it's the matched-and-changed count. For `DELETE` it's the removed count. For `SELECT`, the value depends on the driver: SQLite reports `-1` until all rows are fetched, while PostgreSQL gives the actual count immediately. Don't rely on `rowcount` for `SELECT`; use `len(rows)` after `fetchall()` instead.
+
+A common bug with `UPDATE` and `DELETE` is forgetting the `WHERE` clause. `DELETE FROM products` (no `WHERE`) deletes every row in the table. `UPDATE products SET price = 0` (no `WHERE`) zeros every product's price. The database will not prevent this; the statement is valid SQL. Wrap dangerous statements in a transaction so they can be rolled back, and prefer parameterized queries with explicit conditions.
+
+```python
+# safer: visible WHERE clause that fails loudly if you pass no id
+def discontinue_product(conn, product_id):
+    if not product_id:
+        raise ValueError("product_id is required")
+    cur = conn.execute("DELETE FROM products WHERE id = ?", (product_id,))
+    if cur.rowcount == 0:
+        raise LookupError(f"no product with id {product_id}")
+    return cur.rowcount
+```
+
+The check in the helper function catches "missing id" and "the product doesn't exist" before they turn into untraceable failures. For bulk operations, log the row count to keep an audit trail.
+
+<h1 id="transactions-commit-rollback-and-why-it-matters">
+  Transactions: Commit, Rollback, and Why It Matters
+</h1>
+
+Every write goes through a transaction. A transaction is the unit that either succeeds entirely or rolls back entirely. If three `INSERT`s are in one transaction and the third one fails, the first two are undone too, and the table looks like none of them ever ran.
+
+The DB-API model defaults to "implicit transactions": the first write opens a transaction, and it stays open until `conn.commit()` or `conn.rollback()` is called. That's why every write example in this lesson commits at the end.
+
+```python
+import sqlite3
+
+conn = sqlite3.connect(":memory:")
+conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance REAL)")
+conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, total REAL)")
+conn.execute("INSERT INTO accounts VALUES (1, 100.00)")
+conn.commit()
+
+# Transfer $50 from account 1 to an order
+try:
+    conn.execute("UPDATE accounts SET balance = balance - ? WHERE id = ?", (50.00, 1))
+    conn.execute("INSERT INTO orders VALUES (5001, 1, ?)", (50.00,))
+    # if we got here, both succeeded
+    conn.commit()
+except Exception:
+    conn.rollback()
+    raise
+
+print(conn.execute("SELECT balance FROM accounts WHERE id = 1").fetchone()[0])
+print(conn.execute("SELECT total FROM orders WHERE id = 5001").fetchone()[0])
+conn.close()
+```
+
+If either statement had raised (say, a constraint violation), the `except` block would roll back, and the account balance would still be 100 with no order. Without the `try`/`except`/`rollback`, a partial failure would leave the database in an inconsistent state.
+
+The cleaner form is the connection context manager. `sqlite3`, `psycopg`, and most modern drivers support `with conn:` to commit on success and roll back on exception.
+
+```python
+with conn:
+    conn.execute("UPDATE accounts SET balance = balance - ? WHERE id = ?", (50.00, 1))
+    conn.execute("INSERT INTO orders VALUES (5002, 1, ?)", (50.00,))
+# if the block raises, the transaction rolls back; if it exits normally, it commits
+```
+
+The semantics differ slightly per driver (`psycopg2` and `sqlite3` keep the connection open after the block; `psycopg` v3 closes it). Check the driver's docs, then use the idiom that fits.
+
+A different model is **auto-commit**. In auto-commit mode, every statement is its own transaction: write it, and it's immediately durable. Some drivers expose this as `autocommit=True`. It fits read-only work and one-off scripts where atomicity doesn't matter. It's the wrong fit when multi-statement units of work need to be atomic.
+
+```python
+# sqlite3 on Python 3.12+ supports an explicit autocommit parameter
+import sqlite3
+conn = sqlite3.connect(":memory:", autocommit=True)
+```
+
+When in doubt, leave auto-commit off and write explicit transactions. The performance overhead is minimal, and the correctness benefit is large.
+
+<h1 id="pagination-fetching-one-page-at-a-time">
+  Pagination: Fetching One Page at a Time
+</h1>
+
+When a result set is too big to send to the user (or to load into memory) all at once, paginate it. The basic SQL pattern uses `LIMIT` and `OFFSET`.
+
+```python
+import sqlite3
+
+conn = sqlite3.connect(":memory:")
+conn.row_factory = sqlite3.Row
+conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT)")
+conn.executemany("INSERT INTO products VALUES (?, ?)", [
+    (i, f"Product {i}") for i in range(1, 26)
+])
+conn.commit()
+
+def page(conn, page_num, page_size=5):
+    offset = (page_num - 1) * page_size
+    rows = conn.execute(
+        "SELECT id, name FROM products ORDER BY id LIMIT ? OFFSET ?",
+        (page_size, offset),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+print(page(conn, 1))
+print(page(conn, 3))
+conn.close()
+```
+
+`LIMIT 5 OFFSET 10` means "skip the first 10 rows, then take 5." Combined with `ORDER BY` (always include one, or pagination is non-deterministic), it produces stable pages.
+
+`OFFSET` has a hidden cost. To return page 1000 of 10-per-page results, the database has to scan and discard the first 9990 rows, which gets slower as the offset grows. For deep pagination on large tables, **keyset pagination** (also called cursor pagination) is much faster: instead of "skip 9990 rows," ask "give me the next 10 rows after the last id seen."
+
+```python
+def page_by_keyset(conn, last_seen_id=0, page_size=5):
+    rows = conn.execute(
+        "SELECT id, name FROM products WHERE id > ? ORDER BY id LIMIT ?",
+        (last_seen_id, page_size),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+first = page_by_keyset(conn, last_seen_id=0)
+print(first)
+next_page = page_by_keyset(conn, last_seen_id=first[-1]["id"])
+print(next_page)
+```
+
+The query uses the index on `id` to jump straight to the right starting point, regardless of how far into the result set the caller is. Page 1000 costs the same as page 1.
+
+`LIMIT 10 OFFSET 100000` is roughly O(offset). The database scans through the first 100,000 rows before returning the 10 requested. Keyset pagination is O(log n) per page when the order-by column is indexed. Use OFFSET for small offsets and keyset for deep pagination.
+
+<h1 id="building-dynamic-queries-safely">Building Dynamic Queries Safely</h1>
+
+Sometimes the query depends on user input: filter by name, by minimum price, by category. The temptation is to build the SQL with f-strings. Don't. Use parameter placeholders for values, and build the SQL structure separately for the parts that vary.
+
+```python
+def search_products(conn, name=None, min_price=None, max_price=None):
+    conditions = []
+    params = []
+    if name is not None:
+        conditions.append("name LIKE ?")
+        params.append(f"%{name}%")
+    if min_price is not None:
+        conditions.append("price >= ?")
+        params.append(min_price)
+    if max_price is not None:
+        conditions.append("price <= ?")
+        params.append(max_price)
+
+    sql = "SELECT id, name, price FROM products"
+    if conditions:
+        sql += " WHERE " + " AND ".join(conditions)
+    sql += " ORDER BY name"
+
+    return conn.execute(sql, params).fetchall()
+```
+
+The structure (which columns the `WHERE` clause references) is built from a fixed set of strings the function owns. The values go in as parameters. A user can pass any name or price; none of it touches the SQL string.
+
+If the column to sort by is user-controlled (a "sort by price, name, or stock" dropdown, for example), validate it against an allow-list. Column names can't be parameterized.
+
+```python
+ALLOWED_SORT_COLUMNS = {"id", "name", "price", "in_stock"}
+
+def search_products(conn, sort_by="name", direction="ASC"):
+    if sort_by not in ALLOWED_SORT_COLUMNS:
+        raise ValueError(f"invalid sort column: {sort_by}")
+    if direction.upper() not in {"ASC", "DESC"}:
+        raise ValueError(f"invalid direction: {direction}")
+    sql = f"SELECT id, name, price FROM products ORDER BY {sort_by} {direction}"
+    return conn.execute(sql).fetchall()
+```
+
+The f-string interpolates only values that have been checked against an allow-list, so it can't carry untrusted SQL. The list of allowed columns is small and lives in code. This pattern applies any time the user controls a column name, table name, or direction; parameter binding can't help, but a strict allow-list can.
+
+For multi-value filters (`WHERE id IN (...)` with a variable-length list), generate the placeholders dynamically.
+
+```python
+def get_products_by_ids(conn, ids):
+    placeholders = ",".join("?" for _ in ids)
+    sql = f"SELECT id, name FROM products WHERE id IN ({placeholders})"
+    return conn.execute(sql, ids).fetchall()
+
+print(get_products_by_ids(conn, [101, 103, 105]))
+```
+
+The `placeholders` string is `"?,?,?"` for three ids. The values still go in as parameters, so the function is safe even when the ids came from user input. PostgreSQL has a cleaner `WHERE id = ANY(%s)` form that takes a list directly, but the `IN (?, ?, ?)` shape is portable across drivers.
+
+The end-to-end flow for a typical query, from Python to database and back:
+
+The driver handles parameter binding. The database parses the SQL once and can reuse the compiled form for the same SQL with different parameters (a technique called **prepared statements**). Most drivers do this transparently.
+
+<h1 id="a-worked-example-an-order-service">
+  A Worked Example: An Order Service
+</h1>
+
+Pulling the lesson together: a small order service that creates an order, attaches items to it, computes the total, and returns the order id. The function uses parameter binding for every value, `executemany` for the items, `lastrowid` to get the new order id, and a transaction so a half-finished order is never committed.
+
+```python
+import sqlite3
+
+def setup(conn):
+    conn.executescript("""
+        CREATE TABLE products (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            price REAL NOT NULL,
+            in_stock INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY,
+            customer_id INTEGER NOT NULL,
+            total REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'placed'
+        );
+        CREATE TABLE order_items (
+            order_id INTEGER NOT NULL,
+            product_id INTEGER NOT NULL,
+            qty INTEGER NOT NULL,
+            price_at_purchase REAL NOT NULL,
+            PRIMARY KEY (order_id, product_id),
+            FOREIGN KEY (order_id) REFERENCES orders(id),
+            FOREIGN KEY (product_id) REFERENCES products(id)
+        );
+    """)
+    conn.executemany("INSERT INTO products VALUES (?, ?, ?, ?)", [
+        (101, "Wireless Mouse", 29.99, 42),
+        (102, "HDMI Cable", 9.99, 250),
+        (103, "Mechanical Keyboard", 89.00, 10),
+    ])
+
+def place_order(conn, customer_id, items):
+    """
+    items: list of (product_id, qty) tuples
+    returns: new order id
+    """
+    with conn:
+        # Look up current prices and stock for every product in the order
+        ids = [pid for pid, _ in items]
+        placeholders = ",".join("?" for _ in ids)
+        rows = conn.execute(
+            f"SELECT id, price, in_stock FROM products WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        prices = {r[0]: (r[1], r[2]) for r in rows}
+
+        # Check stock and compute the total in one pass
+        total = 0.0
+        for pid, qty in items:
+            if pid not in prices:
+                raise LookupError(f"unknown product id {pid}")
+            price, in_stock = prices[pid]
+            if in_stock < qty:
+                raise ValueError(f"product {pid}: requested {qty}, only {in_stock} in stock")
+            total += price * qty
+
+        # Create the order row
+        cur = conn.execute(
+            "INSERT INTO orders (customer_id, total) VALUES (?, ?)",
+            (customer_id, total),
+        )
+        order_id = cur.lastrowid
+
+        # Insert all the line items in one batch
+        line_items = [
+            (order_id, pid, qty, prices[pid][0])
+            for pid, qty in items
+        ]
+        conn.executemany(
+            "INSERT INTO order_items VALUES (?, ?, ?, ?)",
+            line_items,
+        )
+
+        # Decrement stock
+        conn.executemany(
+            "UPDATE products SET in_stock = in_stock - ? WHERE id = ?",
+            [(qty, pid) for pid, qty in items],
+        )
+
+        return order_id
+
+conn = sqlite3.connect(":memory:")
+conn.row_factory = sqlite3.Row
+setup(conn)
+
+order_id = place_order(conn, customer_id=1, items=[(101, 2), (103, 1)])
+print(f"created order {order_id}")
+
+order = conn.execute("SELECT id, total, status FROM orders WHERE id = ?", (order_id,)).fetchone()
+print(f"order: id={order['id']}, total={order['total']:.2f}, status={order['status']}")
+
+stock = conn.execute("SELECT id, in_stock FROM products ORDER BY id").fetchall()
+for r in stock:
+    print(f"product {r['id']}: {r['in_stock']} in stock")
+conn.close()
+```
+
+Every read is parameter-bound. The whole sequence (look up prices, create the order, insert items, decrement stock) is wrapped in `with conn:`, so a failure anywhere in the middle leaves the database untouched. If the stock check raises `ValueError`, the order row is rolled back and the stock isn't decremented. That's the atomicity guarantee transactions provide, applied to a real workflow.
+
+<h1 id="quiz">Quiz</h1>
+
+<h1 id="quiz-questions">Quiz Questions</h1>
+
+**Question 1: Which is the safest way to insert a product name that came from user input with sqlite3?**
+
+- [x] Pass the value as a parameter, for example using a ? placeholder and a one-item tuple.
+- [ ] Build the SQL with an f-string, then call execute after replacing single quotes by hand.
+- [ ] Use str.format to put the value into the SQL, but wrap the value in quotes first.
+- [ ] Concatenate the value only after checking that it does not contain a semicolon.
+
+**Question 2: A SELECT query finds no matching rows. What do fetchone() and fetchall() return?**
+
+- [x] fetchone() returns None, and fetchall() returns an empty list.
+- [ ] fetchone() returns an empty tuple, and fetchall() returns None.
+- [ ] Both methods return None because the result set has no rows.
+- [ ] Both methods raise StopIteration because cursors are iterators.
+
+**Question 3: When loading many product rows with the same INSERT statement, which DB-API method best expresses the operation?**
+
+- [ ] execute, called once with a list containing every row tuple.
+- [x] executemany, called with the SQL and an iterable of parameter sets.
+- [ ] fetchmany, called after the INSERT to send rows in batches.
+- [ ] commit, called with the SQL string and the list of rows.
+
+**Question 4: What does sqlite3's connection context manager do in code like with conn:?**
+
+- [ ] It opens a new connection on entry and always closes it on exit.
+- [x] It commits on normal exit and rolls back if an exception leaves the block.
+- [ ] It creates a cursor automatically and stores it in conn.cursor.
+- [ ] It turns every SELECT into fetchall() before the block exits.
+
+**Question 5: You need a dynamic ORDER BY column chosen by a web request. Which approach is safe?**
+
+- [ ] Put the column name in a ? placeholder, just like a normal value.
+- [x] Accept only names from a whitelist, then interpolate the approved identifier.
+- [ ] Escape the column name with repr(), then append it to the SQL string.
+- [ ] Use an f-string after checking that the input is truthy and not empty.
+
+**Question 6: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 7: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 8: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+<QuizCard />
+
+<CommentsSection />
+
+</LessonCard>

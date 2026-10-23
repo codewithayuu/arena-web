@@ -1,0 +1,757 @@
+---
+title: "Locks and Conditions"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Locks & Conditions explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="why-synchronized-isnt-always-enough">
+  Why synchronized Isn't Always Enough
+</h1>
+
+A thread enters a `synchronized` block, holds the monitor of the target object, and releases it on exit. While it holds the monitor, no other thread can enter any block synchronized on the same object. It's simple, it's built into the language, and for most everyday code it's appropriate.
+
+The trouble starts when the requirement goes beyond "block until I get in." Consider an e-commerce checkout service that holds a lock while reserving stock for an incoming order. If the checkout database is slow, every request thread piles up behind that lock. There's no way for a request to say "I'll wait 200 milliseconds, then give up and return an error". There's no way for a shutdown signal to interrupt a thread that's stuck waiting. And if the lock holds a queue that should drain to one consumer while a different queue drains to another, `synchronized` can only ever offer a single `wait()` queue per monitor, so all consumers end up in the same waiting room.
+
+The `Lock` interface in `java.util.concurrent.locks` was designed to fix all three of those gaps:
+
+- **Timed acquisition.** A thread can try to get the lock for at most N milliseconds, then fall back gracefully.
+- **Interruptible acquisition.** A thread can be told to stop waiting if some other thread (or a shutdown hook) interrupts it.
+- **Multiple condition queues per lock.** A single lock can have separate wait queues for separate reasons, like "buffer not full" and "buffer not empty".
+
+`Lock` is an interface, not a keyword. Create an implementation (the most common being `ReentrantLock`), call `lock()` to acquire and `unlock()` to release, and write the protected work between them.
+
+The diagram lines up what each side provides. `synchronized` is one block with one wait queue and one acquisition mode. A `Lock` is an interface that explicitly exposes timed, interruptible, and multi-condition behavior as separate calls. None of that is magic; it's an API that splits apart what `synchronized` rolled together.
+
+<h1 id="the-lock-interface-in-one-page">The Lock Interface in One Page</h1>
+
+These are the methods that appear in real code:
+
+| Method                            | What it does                                                                                | Throws                                     |
+| --------------------------------- | ------------------------------------------------------------------------------------------- | ------------------------------------------ |
+| `void lock()`                     | Acquires the lock, waiting forever if needed. Ignores interrupts.                           | nothing                                    |
+| `void lockInterruptibly()`        | Acquires the lock, but throws if the thread is interrupted while waiting.                   | `InterruptedException`                     |
+| `boolean tryLock()`               | Tries to acquire without waiting. Returns immediately.                                      | nothing                                    |
+| `boolean tryLock(long, TimeUnit)` | Tries to acquire for up to the given time. Returns when acquired or when the time runs out. | `InterruptedException`                     |
+| `void unlock()`                   | Releases the lock. Must be called by the same thread that acquired it.                      | `IllegalMonitorStateException` if not held |
+| `Condition newCondition()`        | Returns a new condition queue tied to this lock.                                            | nothing                                    |
+
+That's the interface. Six methods. The rest of this lesson is about using them correctly.
+
+A bare `Lock` doesn't do anything by itself. Assign a concrete implementation to a `Lock`-typed variable so the rest of the code only depends on the interface:
+
+```java
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class FirstLock {
+
+    private final Lock lock = new ReentrantLock();
+    private int stockCount = 0;
+
+    public void addStock(int amount) {
+        lock.lock();
+        try {
+            stockCount += amount;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public int readStock() {
+        lock.lock();
+        try {
+            return stockCount;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public static void main(String[] args) {
+        FirstLock store = new FirstLock();
+        store.addStock(10);
+        store.addStock(7);
+        System.out.println("Stock: " + store.readStock());
+    }
+}
+```
+
+The field is typed `Lock`, not `ReentrantLock`. That's intentional: it keeps the rest of the class flexible against swapping in a different implementation. The two methods that touch shared state both use the same `try / finally` shape.
+
+<h1 id="the-try-finally-pattern-and-why-it-exists">
+  The try / finally Pattern (And Why It Exists)
+</h1>
+
+There's one safe way to use an explicit lock:
+
+```text
+lock.lock();
+try {
+    // protected work
+} finally {
+    lock.unlock();
+}
+```
+
+The `lock.lock()` call goes **outside** the `try`, not inside. The `unlock()` goes inside `finally`. Both placements matter.
+
+Why outside the `try`? If `lock()` itself throws (rare for an in-memory lock, but possible for some implementations), there's no lock to release. Putting `lock()` inside the `try` would mean a failed acquisition still triggers `finally`, which calls `unlock()` on a lock not held, and the JVM throws `IllegalMonitorStateException`. Putting `lock()` before the `try` keeps the cleanup matched: the `try` block only runs after a successful acquisition.
+
+Why is `finally` required? Because the protected block can throw, and if it does, the lock still has to be released. With `synchronized`, the JVM releases the monitor on exception. With an explicit lock, the language doesn't know to do that; only the `finally` block does.
+
+A look at what happens without it:
+
+**What's wrong with this code?**
+
+```java
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class ForgottenUnlock {
+
+    private final Lock lock = new ReentrantLock();
+    private int orderCount = 0;
+
+    public void placeOrder(int amount) {
+        lock.lock();
+        if (amount < 0) {
+            throw new IllegalArgumentException("amount must be non-negative");
+        }
+        orderCount += amount;
+        lock.unlock();
+    }
+
+    public static void main(String[] args) {
+        ForgottenUnlock store = new ForgottenUnlock();
+        try {
+            store.placeOrder(-1);
+        } catch (IllegalArgumentException e) {
+            System.out.println("Caught: " + e.getMessage());
+        }
+        // The lock is now held forever by a thread that has moved on.
+        // Any other thread calling placeOrder will wait forever.
+    }
+}
+```
+
+The program prints the caught exception and exits, but in a real service the damage is hidden. The `throw` skipped over `lock.unlock()`. The lock is permanently held by a thread that has long since stopped caring. Any subsequent thread that calls `placeOrder` waits on `lock.lock()` and never returns. The bug shows up minutes later as "the service stopped responding", with the cause far from the actual problem.
+
+**Fix:**
+
+```java
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class GuardedUnlock {
+
+    private final Lock lock = new ReentrantLock();
+    private int orderCount = 0;
+
+    public void placeOrder(int amount) {
+        lock.lock();
+        try {
+            if (amount < 0) {
+                throw new IllegalArgumentException("amount must be non-negative");
+            }
+            orderCount += amount;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public int getOrderCount() {
+        lock.lock();
+        try {
+            return orderCount;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public static void main(String[] args) {
+        GuardedUnlock store = new GuardedUnlock();
+        try {
+            store.placeOrder(-1);
+        } catch (IllegalArgumentException e) {
+            System.out.println("Caught: " + e.getMessage());
+        }
+        store.placeOrder(5);
+        System.out.println("Order count: " + store.getOrderCount());
+    }
+}
+```
+
+Now the throw still triggers `finally`, which releases the lock, and the next `placeOrder(5)` succeeds. The shape is the same every time a `Lock` is used: acquire, `try`, protected work, `finally`, `unlock`.
+
+Forgetting `unlock()` in `finally` is a common explicit-lock bug. The symptom is usually "the application hangs after some uncommon code path runs", which is hard to debug because the stack trace points at the second thread (the one stuck waiting), not the first thread (the one that exited without releasing).
+
+<h1 id="timed-acquisition-with-trylock">Timed Acquisition with tryLock</h1>
+
+`tryLock(long, TimeUnit)` is the first power that `synchronized` simply doesn't have. It takes a duration. If the lock is free or becomes free within that window, the call returns `true` and the lock is held. If the timeout passes first, the call returns `false` and the lock is not held. Either way, the thread is no longer stuck.
+
+A common use case is a shutdown-aware path. Consider a service with a checkout method that updates a shared inventory record. Most of the time the lock is free and the work is quick. But during a sale, the lock can be contended, and a clean fallback is "if the lock can't be acquired within 500 milliseconds, return a friendly 'try again' error rather than hold up the request thread."
+
+```java
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class TimedInventory {
+
+    private final Lock lock = new ReentrantLock();
+    private int stock = 100;
+
+    public String reserve(int quantity) throws InterruptedException {
+        boolean acquired = lock.tryLock(500, TimeUnit.MILLISECONDS);
+        if (!acquired) {
+            return "Try again later (lock busy)";
+        }
+        try {
+            if (stock < quantity) {
+                return "Out of stock";
+            }
+            stock -= quantity;
+            return "Reserved " + quantity + ", remaining " + stock;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        TimedInventory inv = new TimedInventory();
+        System.out.println(inv.reserve(3));
+        System.out.println(inv.reserve(50));
+        System.out.println(inv.reserve(60));
+    }
+}
+```
+
+In this single-threaded demo, the lock is never contended, so each `tryLock` call returns `true` immediately. The interesting path is hard to simulate in a few lines: with a second thread holding the lock, the call would block for up to 500ms and then either succeed or return `false`. The caller's logic is the same either way, but a `false` return gives the service a chance to respond gracefully instead of stacking up indefinitely.
+
+A pattern makes the structure even more obvious. Acquire with `tryLock`, then write a single `if` that branches on the result:
+
+```java
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class ShutdownAwareCheckout {
+
+    private final Lock lock = new ReentrantLock();
+    private int cartTotal = 0;
+
+    public boolean tryAddItem(int price) throws InterruptedException {
+        if (lock.tryLock(200, TimeUnit.MILLISECONDS)) {
+            try {
+                cartTotal += price;
+                return true;
+            } finally {
+                lock.unlock();
+            }
+        }
+        return false;
+    }
+
+    public int getCartTotal() {
+        lock.lock();
+        try {
+            return cartTotal;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        ShutdownAwareCheckout checkout = new ShutdownAwareCheckout();
+        System.out.println("Added Notebook? " + checkout.tryAddItem(499));
+        System.out.println("Added Pen? " + checkout.tryAddItem(149));
+        System.out.println("Cart total (cents): " + checkout.getCartTotal());
+    }
+}
+```
+
+The `if (lock.tryLock(...))` form is the standard pattern: the `try` block is only entered when the lock is held, and the `else` (or the early `return false`) handles the timeout case without ever touching `unlock`. This is the right shape because calling `unlock` without holding the lock throws.
+
+`tryLock()` with no timeout returns immediately, so a tight loop calling it from many threads can spin and waste CPU. Use the timed `tryLock(long, TimeUnit)` form, or back off between attempts, when polling for a lock.
+
+The non-blocking, no-timeout variant `tryLock()` is occasionally useful too. It returns `true` if the lock is free right now, and `false` otherwise. A typical use is "best-effort logging": if some other thread already holds the lock, skip the log line rather than block. For most business logic, the timed form is the safer default.
+
+<h1 id="interruptible-acquisition-with-lockinterruptibly">
+  Interruptible Acquisition with lockInterruptibly
+</h1>
+
+The second power: a thread waiting for an explicit lock can be told to stop waiting.
+
+A thread waiting on `synchronized` is unresponsive to `Thread.interrupt()`. The interrupt flag gets set, but the thread keeps waiting on the monitor until it can enter the block. There's no way out. For long-running services, that's a real problem. A "shut down" signal sent while a thread is blocked on `synchronized` is not noticed until the lock becomes free, which might be never.
+
+`lockInterruptibly()` is the explicit-lock alternative. It waits for the lock like `lock()`, but if the thread is interrupted while waiting, it throws `InterruptedException` and abandons the wait. The caller catches the exception and exits cleanly.
+
+```java
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class InterruptibleDemo {
+
+    private final Lock lock = new ReentrantLock();
+
+    public void doWork(String name) {
+        try {
+            System.out.println(name + " waiting for lock");
+            lock.lockInterruptibly();
+        } catch (InterruptedException e) {
+            System.out.println(name + " was interrupted while waiting");
+            return;
+        }
+        try {
+            System.out.println(name + " got the lock, working");
+            Thread.sleep(2000);
+            System.out.println(name + " done");
+        } catch (InterruptedException e) {
+            System.out.println(name + " interrupted while working");
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        InterruptibleDemo demo = new InterruptibleDemo();
+
+        Thread first = new Thread(() -> demo.doWork("first"));
+        Thread second = new Thread(() -> demo.doWork("second"));
+
+        first.start();
+        Thread.sleep(100); // make sure first gets the lock
+        second.start();
+        Thread.sleep(100); // make sure second is waiting on the lock
+        second.interrupt();
+
+        first.join();
+        second.join();
+    }
+}
+```
+
+The `first` thread grabs the lock and starts its two-second work. `second` calls `lockInterruptibly` and waits. While it's waiting, the main thread calls `second.interrupt()`. `lockInterruptibly` notices the interrupt, throws `InterruptedException`, and the catch block prints the interruption message and returns. `first` finishes its work eventually and releases the lock. If we'd used `lock()` instead of `lockInterruptibly()`, `second` would have ignored the interrupt and waited the full two seconds.
+
+This matters in services that need to shut down promptly. A web server processing thousands of requests can't wait for every blocked thread to acquire a lock that may take seconds. With `lockInterruptibly`, the shutdown signal propagates as an `InterruptedException`, threads unwind their stacks cleanly, and the service exits in a controlled way.
+
+| Acquisition method         | Waits how long?               | Responds to interrupts? | Use when                                              |
+| -------------------------- | ----------------------------- | ----------------------- | ----------------------------------------------------- |
+| `lock.lock()`              | Forever                       | No                      | Lock is rarely contended; you want simple code        |
+| `lock.lockInterruptibly()` | Until acquired or interrupted | Yes                     | Long waits are possible and you need shutdown to work |
+| `lock.tryLock()`           | 0 (returns immediately)       | No                      | You don't want to wait at all                         |
+| `lock.tryLock(t, unit)`    | Up to `t` time units          | Yes                     | You want a bounded wait with graceful fallback        |
+
+The four acquisition methods are the explicit-lock toolkit. Pick the one whose behavior matches the situation, and the rest of the code (the `try / finally`, the protected work, the `unlock`) stays the same.
+
+<h1 id="the-condition-interface">The Condition Interface</h1>
+
+The third power: a `Lock` can host multiple wait queues, each represented by a `Condition` object. This is where explicit locks pull clearly ahead of `synchronized`.
+
+With `synchronized`, every object has exactly one monitor and one wait set. `obj.wait()` parks the current thread on that one wait set. `obj.notifyAll()` wakes every thread on that one wait set. If you have two reasons to wait (the buffer is empty, the buffer is full), every waiter sleeps on the same queue, and every wakeup brings them all back to recheck conditions. That's wasteful and easy to get wrong.
+
+A `Condition` is created from a `Lock` via `lock.newCondition()`. You can create as many conditions as you want from the same lock. Each one is its own queue. A thread waiting on `condition.await()` parks on that condition's queue. A call to `condition.signal()` wakes one waiter on that queue, and `condition.signalAll()` wakes all of them. Other conditions on the same lock are not affected.
+
+The `Condition` interface mirrors the `Object` wait/notify family with cleaner naming:
+
+| `Object` method   | `Condition` method                | What it does                                        |
+| ----------------- | --------------------------------- | --------------------------------------------------- |
+| `obj.wait()`      | `condition.await()`               | Release the lock and wait on this condition's queue |
+| `obj.wait(long)`  | `condition.await(long, TimeUnit)` | Wait with a timeout                                 |
+| `obj.notify()`    | `condition.signal()`              | Wake one waiter on this condition's queue           |
+| `obj.notifyAll()` | `condition.signalAll()`           | Wake all waiters on this condition's queue          |
+
+An important rule for both `Object` and `Condition` versions: you must hold the lock to call `await`, `signal`, or `signalAll`. `await` atomically releases the lock and parks the thread, then re-acquires the lock before returning. `signal` and `signalAll` mark waiters as runnable, but they don't release the lock; the signaler keeps holding it until its own `try` block ends.
+
+The diagram shows the shape that makes Conditions valuable. One lock, two conditions, two separate queues. Consumers waiting because the buffer is empty park on `notEmpty`. Producers waiting because the buffer is full park on `notFull`. When a producer adds an item, it signals `notEmpty` to wake one consumer. When a consumer removes an item, it signals `notFull` to wake one producer. Producers never wake up just to recheck "is the buffer empty?" because they were never on that queue to begin with.
+
+A small example before the full bounded queue. Consider a notification that an order has shipped, with consumers waiting for it:
+
+```java
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class ShipmentNotifier {
+
+    private final Lock lock = new ReentrantLock();
+    private final Condition shipped = lock.newCondition();
+    private boolean isShipped = false;
+
+    public void awaitShipment() throws InterruptedException {
+        lock.lock();
+        try {
+            while (!isShipped) {
+                shipped.await();
+            }
+            System.out.println(Thread.currentThread().getName() + " sees shipment");
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public void markShipped() {
+        lock.lock();
+        try {
+            isShipped = true;
+            shipped.signalAll();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        ShipmentNotifier notifier = new ShipmentNotifier();
+
+        Runnable consumer = () -> {
+            try {
+                notifier.awaitShipment();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        };
+
+        Thread t1 = new Thread(consumer, "consumer-1");
+        Thread t2 = new Thread(consumer, "consumer-2");
+        t1.start();
+        t2.start();
+
+        Thread.sleep(200);
+        notifier.markShipped();
+
+        t1.join();
+        t2.join();
+    }
+}
+```
+
+The two consumer threads each call `awaitShipment`, acquire the lock, see `isShipped` is `false`, and call `shipped.await()`. `await` releases the lock and parks the thread on the `shipped` queue. The main thread sleeps briefly to make sure both consumers are parked, then calls `markShipped`, which sets the flag and calls `signalAll`. Both consumers wake up, reacquire the lock one at a time, re-check the loop condition, see `isShipped` is now `true`, and continue.
+
+Two details. First, `await` is called inside a `while` loop, not an `if`. That's because a thread can be woken without the condition being true (a phenomenon called a spurious wakeup, plus some intentional API behaviors). Always re-check the predicate after waking. Second, `signalAll` was called while the lock was held, but the consumers don't actually run until the signaling thread finishes its `try` block and releases the lock. The signal marks the waiter as ready; the lock release lets it run.
+
+<h1 id="multiple-conditions-on-a-single-lock">
+  Multiple Conditions on a Single Lock
+</h1>
+
+The reason `Condition` is more flexible than `Object.wait`/`notify` is that one lock can have many conditions. Each condition is its own wait queue, and signaling one condition does not wake threads on the others.
+
+Consider the bounded queue problem. A buffer with a fixed capacity has two reasons a thread might wait on it: producers wait when the buffer is full, consumers wait when the buffer is empty. With `synchronized`, both groups share the monitor's single wait set. A producer that just added an item has to call `notifyAll` and rely on every consumer waking up, rechecking, and (in most cases) going back to sleep. That wastes scheduler time and creates contention on the monitor right when you don't want it.
+
+With two conditions, the structure is exact:
+
+- Producers that find the buffer full call `notFull.await()`. They park on the `notFull` queue.
+- Consumers that find the buffer empty call `notEmpty.await()`. They park on the `notEmpty` queue.
+- When a producer adds an item, it calls `notEmpty.signal()`. Exactly one consumer wakes.
+- When a consumer removes an item, it calls `notFull.signal()`. Exactly one producer wakes.
+
+A producer is never woken to discover the buffer is still full; only a consumer can release space, and only a consumer signals `notFull`. The wakeups are targeted.
+
+The arrows are the signals that flow between producers and consumers through the shared buffer. Each side signals the other's condition. Neither side bothers waking threads on its own condition, because its own condition is about the buffer's other constraint.
+
+<h1 id="building-a-bounded-order-queue">Building a Bounded Order Queue</h1>
+
+The classic use case for `Lock` and multiple `Condition` objects is the bounded buffer, and in an e-commerce service it shows up as a fixed-capacity queue of incoming orders waiting to be processed. Webserver threads add orders to the queue; worker threads pull them off and process them. The queue has a capacity (you don't want it growing without bound under load), so producers must wait when it's full and consumers must wait when it's empty.
+
+The implementation, written one piece at a time so the structure is visible:
+
+```java
+import java.util.LinkedList;
+import java.util.Queue;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class OrderQueue {
+
+    private final Queue<String> orders = new LinkedList<>();
+    private final int capacity;
+
+    private final Lock lock = new ReentrantLock();
+    private final Condition notFull = lock.newCondition();
+    private final Condition notEmpty = lock.newCondition();
+
+    public OrderQueue(int capacity) {
+        this.capacity = capacity;
+    }
+
+    public void put(String orderId) throws InterruptedException {
+        lock.lock();
+        try {
+            while (orders.size() == capacity) {
+                notFull.await();
+            }
+            orders.add(orderId);
+            notEmpty.signal();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public String take() throws InterruptedException {
+        lock.lock();
+        try {
+            while (orders.isEmpty()) {
+                notEmpty.await();
+            }
+            String orderId = orders.poll();
+            notFull.signal();
+            return orderId;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public int size() {
+        lock.lock();
+        try {
+            return orders.size();
+        } finally {
+            lock.unlock();
+        }
+    }
+}
+```
+
+Three fields hold the state: a `LinkedList` to back the queue, the capacity, and the `Lock` plus its two `Condition` objects. The two operations follow the same shape: acquire the lock, wait in a `while` loop on the relevant condition, do the work, signal the opposite condition, release the lock in `finally`.
+
+Why `while` and not `if`? Several reasons. A spurious wakeup can return from `await` without the condition being true. Even when wakeups aren't spurious, `signal` releases one thread to compete for the lock, and by the time it acquires the lock, the state may have changed again (another consumer might have already taken the new item). The `while` loop re-checks the predicate every time the thread reacquires the lock, which is the only safe approach.
+
+Why `signal` and not `signalAll`? In a simple symmetric producer-consumer like this, each operation creates or destroys exactly one unit of capacity, so waking exactly one waiter is sufficient. `signalAll` is necessary when more complex predicates mean a single state change might satisfy multiple waiters. For this design, `signal` is appropriate and avoids waking threads that would have to go back to sleep.
+
+Now a small demo to see the queue in action with three producers and two consumers:
+
+```java
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+public class OrderQueueDemo {
+
+    public static void main(String[] args) throws InterruptedException {
+        OrderQueue queue = new OrderQueue(3);
+        ExecutorService pool = Executors.newFixedThreadPool(5);
+
+        Runnable producer = () -> {
+            String name = Thread.currentThread().getName();
+            for (int i = 1; i <= 4; i++) {
+                String orderId = name + "-ORD-" + i;
+                try {
+                    queue.put(orderId);
+                    System.out.println("put " + orderId);
+                    Thread.sleep(50);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        };
+
+        Runnable consumer = () -> {
+            try {
+                while (true) {
+                    String orderId = queue.take();
+                    System.out.println(Thread.currentThread().getName() + " took " + orderId);
+                    Thread.sleep(150);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        };
+
+        pool.submit(producer);
+        pool.submit(producer);
+        pool.submit(producer);
+        pool.submit(consumer);
+        pool.submit(consumer);
+
+        pool.shutdown();
+        pool.awaitTermination(5, TimeUnit.SECONDS);
+        pool.shutdownNow();
+    }
+}
+```
+
+**Output (order will vary, but the pattern is the same):**
+
+```text
+put pool-1-thread-1-ORD-1
+put pool-1-thread-2-ORD-1
+put pool-1-thread-3-ORD-1
+pool-1-thread-4 took pool-1-thread-1-ORD-1
+put pool-1-thread-1-ORD-2
+pool-1-thread-5 took pool-1-thread-2-ORD-1
+put pool-1-thread-2-ORD-2
+pool-1-thread-4 took pool-1-thread-3-ORD-1
+put pool-1-thread-3-ORD-2
+... (continues until all 12 orders processed)
+```
+
+The buffer holds up to three orders. The three producers fill it quickly; on each producer's fourth attempt, they hit the cap and park on `notFull`. The two consumers take orders one by one, signaling `notFull` after each one to wake a producer. The interleaving depends on the scheduler, but the invariants hold: the queue never exceeds three orders, no producer waits when there's room, and no consumer waits when there's an order to process.
+
+Three details in this example deserve their own callouts:
+
+**The lock and conditions live together.** Both `notFull` and `notEmpty` come from the same `lock.newCondition()` calls on the same `Lock`. Calling `await` on either condition releases that one shared lock and parks the thread. Calling `signal` on either condition wakes a thread waiting on that specific condition. Producers and consumers never step on each other's waiters.
+
+**Predicates are re-checked in `while` loops.** When a producer is woken from `notFull.await()`, the producer reacquires the lock and re-checks `orders.size() == capacity`. If a different producer grabbed the lock first and refilled the buffer, the current producer goes back to sleep. The `while` keeps the logic correct under any wakeup ordering.
+
+**Signals are directional.** A producer signals `notEmpty` because it's a consumer that needs to know about the change. A consumer signals `notFull` because it's a producer that needs to know. Neither side wakes its own kind. That asymmetry is the reason multiple conditions matter, and it's what `synchronized` can't express directly.
+
+A bounded queue that's chronically full or chronically empty signals on every operation, which means a wakeup, a lock re-acquisition, and a predicate re-check on every cycle. For pre-built queues with these semantics, prefer `java.util.concurrent.ArrayBlockingQueue` or `LinkedBlockingQueue`, which are tuned implementations of exactly this pattern.
+
+<h1 id="synchronized-vs-lock-when-to-use-which">
+  synchronized vs Lock: When to Use Which
+</h1>
+
+The features add up to a clean comparison.
+
+| Property                      | `synchronized`                | `Lock`                                                    |
+| ----------------------------- | ----------------------------- | --------------------------------------------------------- |
+| Acquire forever               | yes (block until in)          | `lock()`                                                  |
+| Try without waiting           | no                            | `tryLock()`                                               |
+| Try with timeout              | no                            | `tryLock(time, unit)`                                     |
+| Interruptible while waiting   | no                            | `lockInterruptibly()`                                     |
+| Multiple wait queues per lock | no (one wait set per monitor) | `newCondition()` (as many as you want)                    |
+| Release on exception          | automatic (JVM)               | manual (`finally { unlock(); }`)                          |
+| Release on a different thread | no                            | yes (but rare; same thread is the norm)                   |
+| Reentrant                     | yes                           | yes (for `ReentrantLock`)                                 |
+| Syntax                        | language keyword              | regular method calls                                      |
+| Risk of forgetting to release | none                          | high, hence `finally`                                     |
+| Performance                   | similar in modern JVMs        | similar; explicit locks sometimes faster under contention |
+
+The defaults that fall out of this:
+
+- **Use `synchronized`** when the protected block is short, contention is light, you don't need timeouts or interruption, and you'd rather have the JVM manage release for you. The shorter syntax is one less thing to get wrong.
+- **Use `Lock`** when you need at least one of the three powers: timed acquisition, interruptible acquisition, or multiple conditions. Once you've reached for one of them, the `try / finally` ceremony is the price of admission.
+
+Both show up in real codebases, sometimes in the same file. A `synchronized` block guarding a single counter and a `ReentrantLock` guarding a complex multi-condition queue can sit next to each other. The two tools aren't enemies; they have different sweet spots.
+
+<h1 id="putting-it-all-together-a-shutdown-aware-order-pipeline">
+  Putting It All Together: A Shutdown-Aware Order Pipeline
+</h1>
+
+To bring the lesson together, a slightly larger example that uses `tryLock` for a timed critical section and Conditions for a bounded queue, in the same program:
+
+```java
+import java.util.LinkedList;
+import java.util.Queue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class OrderPipeline {
+
+    private final Queue<String> queue = new LinkedList<>();
+    private final int capacity = 4;
+    private final Lock lock = new ReentrantLock();
+    private final Condition notFull = lock.newCondition();
+    private final Condition notEmpty = lock.newCondition();
+
+    private final AtomicBoolean shutdown = new AtomicBoolean(false);
+
+    public boolean tryPut(String orderId, long timeoutMs) throws InterruptedException {
+        if (!lock.tryLock(timeoutMs, TimeUnit.MILLISECONDS)) {
+            return false;
+        }
+        try {
+            while (queue.size() == capacity && !shutdown.get()) {
+                notFull.await();
+            }
+            if (shutdown.get()) {
+                return false;
+            }
+            queue.add(orderId);
+            notEmpty.signal();
+            return true;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public String takeOrNull() throws InterruptedException {
+        lock.lock();
+        try {
+            while (queue.isEmpty() && !shutdown.get()) {
+                notEmpty.await();
+            }
+            if (queue.isEmpty()) {
+                return null;
+            }
+            String orderId = queue.poll();
+            notFull.signal();
+            return orderId;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public void shutdown() {
+        lock.lock();
+        try {
+            shutdown.set(true);
+            notFull.signalAll();
+            notEmpty.signalAll();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        OrderPipeline pipeline = new OrderPipeline();
+
+        Thread consumer = new Thread(() -> {
+            try {
+                String orderId;
+                while ((orderId = pipeline.takeOrNull()) != null) {
+                    System.out.println("processed " + orderId);
+                    Thread.sleep(40);
+                }
+                System.out.println("consumer exiting cleanly");
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        consumer.start();
+
+        for (int i = 1; i <= 6; i++) {
+            boolean accepted = pipeline.tryPut("ORD-" + i, 200);
+            System.out.println("ORD-" + i + " accepted? " + accepted);
+        }
+
+        Thread.sleep(300);
+        pipeline.shutdown();
+        consumer.join();
+    }
+}
+```
+
+**Output (timing-dependent, but representative):**
+
+```text
+ORD-1 accepted? true
+ORD-2 accepted? true
+ORD-3 accepted? true
+ORD-4 accepted? true
+processed ORD-1
+ORD-5 accepted? true
+processed ORD-2
+ORD-6 accepted? true
+processed ORD-3
+processed ORD-4
+processed ORD-5
+processed ORD-6
+consumer exiting cleanly
+```
+
+The producer side uses `tryLock` with a 200ms timeout. When the buffer is full and the consumer is slow, the producer waits up to 200ms for room; if the consumer drains an order in time, the put succeeds. The consumer side uses plain `lock()` and `notEmpty.await()`, returning `null` only when the queue is empty and shutdown has been signaled. The `shutdown()` method flips the flag and calls `signalAll` on both conditions, which is necessary because any waiter, producer or consumer, needs to wake up and notice that shutdown happened.
+
+This example pulls together every idea in the lesson: the `Lock` interface, the `try / finally` discipline, timed acquisition, and two conditions sharing a single lock. It also demonstrates a slightly more realistic shutdown pattern, where waiters can exit gracefully instead of blocking forever.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

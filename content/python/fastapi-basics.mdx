@@ -1,0 +1,420 @@
+---
+title: "FastAPI Basics"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "FastAPI Basics explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+FastAPI is a modern, async-first Python web framework built on top of Starlette (the ASGI toolkit) and Pydantic (the validation library). It uses Python type hints to drive request validation, response serialization, and automatic OpenAPI documentation. This lesson covers what FastAPI is, how to write a hello-world endpoint, how path operations work, how Pydantic models shape requests and responses, dependency injection, async endpoints, and how FastAPI compares with Flask and Django.
+
+<h1 id="what-fastapi-is">What FastAPI Is</h1>
+
+FastAPI was released in 2018 by SebastiÃ¡n RamÃ­rez. Two things made it stand out from the existing crop of Python web frameworks. The first was async-first design: every endpoint can be a coroutine, and the framework runs on an ASGI server (uvicorn or hypercorn) by default. The second was deep integration with Python's type hints: a function that declares `name: str` as a parameter gets string validation, OpenAPI schema generation, and editor autocomplete from that single annotation.
+
+The result is a framework that takes less code per endpoint than Flask, gives more correctness checks than either Flask or Django, and pays no performance penalty for it. FastAPI is consistently among the fastest Python web frameworks in independent benchmarks, largely because Starlette is fast and Pydantic v2 is implemented in Rust.
+
+The diagram traces a typical FastAPI request. Pydantic does the heavy lifting on both sides: it parses and validates the incoming body, and serializes the return value back to JSON. The endpoint function in the middle is plain Python, free to be sync or async, and only sees fully validated data.
+
+<h1 id="hello-world">Hello World</h1>
+
+The smallest useful FastAPI app fits in five lines:
+
+```python
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/")
+def read_root():
+    return {"message": "Welcome to the store"}
+```
+
+Save that as `main.py` and run it with:
+
+```text
+uvicorn main:app --reload
+```
+
+Open `http://127.0.0.1:8000/` in a browser and the response is `{"message": "Welcome to the store"}`. The function returned a dict, FastAPI serialized it to JSON, set the `Content-Type` header, and sent the response. No HTML, no templates, no router configuration beyond the decorator.
+
+Two URLs are available without any extra code:
+
+- `http://127.0.0.1:8000/docs` shows interactive Swagger UI documentation
+- `http://127.0.0.1:8000/redoc` shows the same API documented with ReDoc
+
+Both are generated from the type hints and decorators in the application code. There's no separate spec file to maintain. As endpoints, parameters, and models are added, the docs update automatically. This is the feature that has made FastAPI the default choice for many teams shipping JSON APIs.
+
+`--reload` is convenient during development because uvicorn restarts on every file change. It's strictly a development tool and should never be used in production: the reloader uses extra memory, checks the filesystem on every interval, and isn't designed for the load a real deployment sees.
+
+<h1 id="path-operations">Path Operations</h1>
+
+A "path operation" in FastAPI vocabulary is the combination of an HTTP method and a URL path. The decorators on `app` mirror the HTTP verbs: `@app.get`, `@app.post`, `@app.put`, `@app.patch`, `@app.delete`, plus `@app.head` and `@app.options` for completeness.
+
+```python
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/products")
+def list_products():
+    return [{"id": 1, "name": "Ceramic Mug"}, {"id": 2, "name": "USB Cable"}]
+
+@app.get("/products/{product_id}")
+def get_product(product_id: int):
+    return {"id": product_id, "name": "Ceramic Mug"}
+
+@app.post("/products")
+def create_product():
+    return {"id": 42, "name": "New Product"}
+```
+
+Three endpoints: list products, get one by ID, create a new one. The path `/products/{product_id}` declares a path parameter, and the `product_id: int` annotation tells FastAPI to validate that the captured value is a valid integer. A request to `/products/abc` returns a 422 with a structured error explaining what went wrong, without the endpoint ever running.
+
+```text
+GET /products/abc
+HTTP/1.1 422 Unprocessable Entity
+
+{
+  "detail": [
+    {
+      "loc": ["path", "product_id"],
+      "msg": "Input should be a valid integer, unable to parse string as an integer",
+      "type": "int_parsing"
+    }
+  ]
+}
+```
+
+The type hint isn't a suggestion. FastAPI uses it as the validation rule, the OpenAPI schema, and the editor autocomplete source, all at once. Three pieces of information from one annotation.
+
+<h1 id="pydantic-models-for-requests-and-responses">
+  Pydantic Models for Requests and Responses
+</h1>
+
+For anything more complex than a single value, FastAPI uses Pydantic models. A Pydantic model is a class that inherits from `BaseModel`, declares fields with type hints, and gets validation, serialization, JSON schema generation, and editor support from those declarations.
+
+```python
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+app = FastAPI()
+
+class ProductCreate(BaseModel):
+    name: str
+    price: float
+    stock: int = 0
+
+class ProductOut(BaseModel):
+    id: int
+    name: str
+    price: float
+    stock: int
+
+@app.post("/products", response_model=ProductOut)
+def create_product(product: ProductCreate):
+    saved = {"id": 42, **product.model_dump()}
+    return saved
+```
+
+`ProductCreate` is the input shape: a name (string, required), a price (float, required), and a stock count (integer, defaulting to 0). When a client POSTs JSON to `/products`, FastAPI parses the body, validates it against `ProductCreate`, and passes the resulting Python object to the endpoint as `product`. If validation fails, the endpoint never runs and the client gets a structured 422 error.
+
+`ProductOut` is the output shape. The `response_model=ProductOut` argument on the decorator tells FastAPI to serialize the return value through that model, which trims extra fields and converts types as needed. The same model also feeds the OpenAPI schema, so the docs show exactly what the endpoint returns.
+
+A POST with this body:
+
+```text
+POST /products
+Content-Type: application/json
+
+{
+  "name": "Ceramic Mug",
+  "price": 14.99,
+  "stock": 80
+}
+```
+
+returns:
+
+```text
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "id": 42,
+  "name": "Ceramic Mug",
+  "price": 14.99,
+  "stock": 80
+}
+```
+
+Pydantic models compose. A model can have fields of other model types, list-of-model types, dict-valued fields, optional fields with `Optional[X]` or `X | None`, and discriminated unions for polymorphism. Validators (`@field_validator`, `@model_validator`) add custom checks beyond the type hint.
+
+```python
+from pydantic import BaseModel, Field, field_validator
+
+class ProductCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    price: float = Field(gt=0)
+    stock: int = Field(ge=0, default=0)
+
+    @field_validator("name")
+    @classmethod
+    def name_must_not_be_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Name cannot be blank or whitespace")
+        return v.strip()
+```
+
+`Field` adds metadata that becomes part of validation and the JSON schema. `min_length`, `max_length`, `gt` (greater than), `ge` (greater or equal), `lt`, `le`, `pattern`, `default`, and many more are first-class. The `@field_validator` decorator adds custom logic that runs after type coercion. Together, this gives a precise description of valid input, in one class, that the framework reads to validate requests, generate docs, and inform editor autocomplete. Pydantic validation runs on every request that hits a model-typed endpoint. For most apps this is fast (Pydantic v2 is implemented in Rust and is roughly 5-50x faster than v1). For extreme hot paths with deeply nested models, profile and use `model_construct` to skip validation when the input source is trusted.
+
+<h1 id="query-path-and-body-parameters">Query, Path, and Body Parameters</h1>
+
+FastAPI infers where each parameter comes from based on its type and position. The rules are simple:
+
+- A parameter that matches a name in the URL pattern (like `product_id` in `/products/{product_id}`) is a **path parameter**.
+- A parameter with a primitive type (`int`, `str`, `float`, `bool`) that isn't in the URL is a **query parameter**.
+- A parameter with a Pydantic model type is a **request body**.
+
+```python
+@app.get("/products")
+def list_products(category: str | None = None, limit: int = 20):
+    return {"category": category, "limit": limit}
+```
+
+`category` and `limit` are query parameters because neither is in the URL and both are primitives. A request to `/products?category=mugs&limit=50` arrives with `category="mugs"` and `limit=50`. The default values make both optional. `category: str | None = None` makes `category` truly optional (it will be `None` if not supplied); `limit: int = 20` defaults to 20 if not supplied.
+
+For explicit control, FastAPI exposes `Query`, `Path`, and `Body` markers from the `fastapi` package:
+
+```python
+from fastapi import FastAPI, Query, Path
+
+app = FastAPI()
+
+@app.get("/products/{product_id}")
+def get_product(
+    product_id: int = Path(gt=0),
+    include_reviews: bool = Query(default=False),
+):
+    return {"id": product_id, "include_reviews": include_reviews}
+```
+
+`Path(gt=0)` says the path parameter must be greater than zero. `Query(default=False)` is the default for the query parameter. The same `gt`, `lt`, `min_length`, `max_length`, `pattern` keywords from Pydantic work here. The endpoint stays a normal function; the markers attach metadata.
+
+For complex query strings with many parameters, group them into a Pydantic model with a `Query()` annotation (FastAPI 0.110+), but the simple shape (one parameter per query value) covers most cases.
+
+<h1 id="dependency-injection">Dependency Injection</h1>
+
+FastAPI has a small dependency injection system based on the `Depends` marker. A dependency is a callable (usually a function) that FastAPI runs before the endpoint, passing its return value as a parameter. Dependencies can themselves declare dependencies, forming a DAG that FastAPI resolves automatically.
+
+A common use is database sessions. Open a session per request, hand it to the endpoint, close it after the response is sent:
+
+```python
+from fastapi import Depends, FastAPI
+
+app = FastAPI()
+
+def get_db():
+    db = open_database_session()
+    try:
+        yield db
+    finally:
+        db.close()
+
+@app.get("/products/{product_id}")
+def get_product(product_id: int, db = Depends(get_db)):
+    return db.query(Product).get(product_id)
+```
+
+`get_db` is a generator function: the part before `yield` runs before the endpoint, the part after `yield` runs after the response is sent. This is the standard pattern for resources that need setup and teardown.
+
+Another common use is authentication. A dependency that reads the `Authorization` header, validates the token, and returns the user:
+
+```python
+from fastapi import Depends, HTTPException, Header
+
+def current_user(authorization: str = Header()):
+    token = authorization.removeprefix("Bearer ")
+    user = validate_token(token)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return user
+
+@app.get("/me")
+def read_me(user = Depends(current_user)):
+    return user
+```
+
+If the token is invalid, the dependency raises `HTTPException(status_code=401)` and the endpoint never runs. If it's valid, the user object arrives at the endpoint as a parameter.
+
+Dependencies can depend on other dependencies. A `current_admin` dependency that builds on `current_user`:
+
+```python
+def current_admin(user = Depends(current_user)):
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin required")
+    return user
+
+@app.delete("/products/{product_id}")
+def delete_product(product_id: int, admin = Depends(current_admin)):
+    ...
+```
+
+FastAPI resolves the DAG, runs each dependency once per request, and caches the result so multiple endpoints sharing the same dependency don't pay for it twice.
+
+<h1 id="async-endpoints">Async Endpoints</h1>
+
+Endpoints can be sync (`def`) or async (`async def`). FastAPI runs both correctly: sync endpoints run in a threadpool so they don't block the event loop, async endpoints run directly on the loop.
+
+```python
+from fastapi import FastAPI
+import asyncio
+import httpx
+
+app = FastAPI()
+
+@app.get("/products/{product_id}/price")
+async def get_price(product_id: int):
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"https://prices.example.com/{product_id}")
+        return response.json()
+```
+
+`async def` allows the endpoint to use `await` on any awaitable. While the HTTP request to the upstream service is in flight, the event loop is free to handle other requests. For an API that mostly waits on other services, this is a meaningful throughput win: hundreds of concurrent requests on a single process without the overhead of one thread per request.
+
+The choice between sync and async comes down to what the endpoint does:
+
+| Endpoint does mostly...                                                     | Use                                     |
+| --------------------------------------------------------------------------- | --------------------------------------- |
+| In-memory work, simple calculations                                         | `def` (sync is fine)                    |
+| Sync database calls (SQLAlchemy sync, the standard `requests` library)      | `def` (FastAPI runs it in a threadpool) |
+| Async database calls (`asyncpg`, `databases`, SQLAlchemy async, `aiomysql`) | `async def`                             |
+| Async HTTP calls (`httpx.AsyncClient`, `aiohttp`)                           | `async def`                             |
+| External services that block for a long time                                | `async def` with an async client        |
+
+The pitfall is calling synchronous blocking code inside `async def` without going through a threadpool. `requests.get(...)` inside `async def` blocks the event loop for the duration of the HTTP call, which freezes every other concurrent request. The fix is either to switch to `httpx.AsyncClient` (and await it) or to run the blocking call in a threadpool with `await asyncio.to_thread(...)`. The same rule applies to file I/O, sync ORM calls, and any third-party library that wasn't built for async.
+
+```python
+@app.get("/bad")
+async def bad_endpoint():
+    import requests
+    return requests.get("https://example.com").text  # Blocks the loop!
+
+@app.get("/good")
+async def good_endpoint():
+    async with httpx.AsyncClient() as client:
+        response = await client.get("https://example.com")
+        return response.text
+```
+
+If the endpoint must call sync code (a legacy library that doesn't have an async version), make the function sync. FastAPI will run it in a threadpool automatically, which is fine for moderate load.
+
+A common FastAPI performance bug is "made the endpoint async, but called a sync blocking library inside it." The endpoint looks async and runs on the event loop, but blocks the whole loop on every call. Symptoms include high tail latency under load and one slow endpoint making the whole server slow. Use async-native libraries inside async endpoints, or stay sync.
+
+<h1 id="response-models-and-status-codes">Response Models and Status Codes</h1>
+
+The `response_model` parameter on the decorator controls how the return value is serialized. It can trim fields the endpoint shouldn't expose (passwords, internal IDs), convert types, and feed the OpenAPI schema.
+
+```python
+from pydantic import BaseModel
+
+class UserCreate(BaseModel):
+    username: str
+    email: str
+    password: str
+
+class UserPublic(BaseModel):
+    id: int
+    username: str
+    email: str
+
+@app.post("/users", response_model=UserPublic, status_code=201)
+def create_user(user: UserCreate):
+    new_user = {"id": 1, "username": user.username, "email": user.email, "password_hash": "..."}
+    return new_user
+```
+
+The function returns a dict that has a `password_hash` field. The `response_model=UserPublic` argument filters the output through that model, so the response includes only `id`, `username`, and `email`. The `password_hash` never leaves the server. The `status_code=201` argument sets the response status to "Created" instead of the default 200.
+
+For different status codes per response type, the `responses` argument on the decorator documents them in OpenAPI:
+
+```python
+@app.get(
+    "/products/{product_id}",
+    response_model=ProductOut,
+    responses={404: {"description": "Product not found"}},
+)
+def get_product(product_id: int):
+    ...
+```
+
+Raising `HTTPException(status_code=404, detail="Product not found")` from inside the endpoint produces a structured 404 response with the detail in the body. Custom error formats can be set up through exception handlers, but the default is usually sufficient.
+
+<h1 id="websockets-in-brief">WebSockets in Brief</h1>
+
+FastAPI supports WebSockets through Starlette's WebSocket protocol. The shape is similar to HTTP endpoints but uses `@app.websocket` and an async function that takes a `WebSocket` parameter:
+
+```python
+from fastapi import FastAPI, WebSocket
+
+app = FastAPI()
+
+@app.websocket("/ws/notifications")
+async def notifications(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            data = await websocket.receive_text()
+            await websocket.send_text(f"You said: {data}")
+    except Exception:
+        await websocket.close()
+```
+
+The endpoint accepts the connection, loops on incoming messages, and echoes them back. Production WebSocket endpoints typically broadcast to multiple connected clients, integrate with a message broker for cross-process state, and handle disconnect cleanly. The basic shape is what matters here: an async function decorated with `@app.websocket`, taking a `WebSocket` object that exposes `accept`, `receive_text`, `receive_bytes`, `receive_json`, `send_*`, and `close` methods.
+
+WebSockets are a small but important part of FastAPI's value proposition. Django's WebSocket story requires Channels (an extra package); FastAPI's is built in because Starlette has supported them from day one.
+
+<h1 id="running-fastapi">Running FastAPI</h1>
+
+Development uses uvicorn with auto-reload, as shown above. Production uses uvicorn (or hypercorn) behind a process manager that runs multiple workers.
+
+```text
+uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+```
+
+That command runs four uvicorn worker processes, each with its own event loop, sharing the port through SO_REUSEPORT. Behind that, a reverse proxy like nginx handles TLS, static files, and HTTP/2.
+
+For richer process management, gunicorn with uvicorn workers is a common pattern:
+
+```text
+gunicorn main:app --workers 4 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000
+```
+
+Gunicorn handles the worker lifecycle (graceful reload, max-requests recycling, worker timeout), uvicorn runs the async event loop inside each worker. This is the recommended production pattern for FastAPI.
+
+The number of workers is usually `2 * cores + 1` for CPU-bound work or higher for I/O-bound work. Async endpoints inside a single worker handle large concurrency on their own, so even one worker can sustain thousands of concurrent connections, but multiple workers provide fault isolation (a worker crash takes out one in N requests, not all of them).
+
+<h1 id="fastapi-vs-flask">FastAPI vs Flask</h1>
+
+Flask and FastAPI are both Python web frameworks for building HTTP APIs. The differences are substantial enough that the choice usually leans one way or the other.
+
+| Concern               | Flask                                             | FastAPI                                               |
+| --------------------- | ------------------------------------------------- | ----------------------------------------------------- |
+| Async support         | Optional, added later, not idiomatic              | Native, built on ASGI                                 |
+| Request validation    | Manual (Marshmallow, Pydantic, hand-rolled)       | Built-in via Pydantic                                 |
+| OpenAPI docs          | Extension (Flask-RESTX, flask-smorest)            | Built-in, auto-generated                              |
+| Type hint integration | None by default                                   | Drives the whole framework                            |
+| Routing               | Decorator-based                                   | Decorator-based (same shape)                          |
+| ORM                   | Bring your own (Flask-SQLAlchemy is common)       | Bring your own (SQLAlchemy, Tortoise, SQLModel)       |
+| Templating            | Built-in (Jinja2)                                 | Optional (Jinja2 via Starlette)                       |
+| WebSockets            | Extension (Flask-SocketIO)                        | Built-in                                              |
+| Performance           | Solid but sync                                    | Among the fastest Python frameworks                   |
+| Maturity              | 2010, huge ecosystem                              | 2018, fast-growing ecosystem                          |
+| Best match            | Small apps, server-rendered HTML, legacy projects | JSON APIs, async services, type-hint-driven codebases |
+
+A Flask endpoint for the same product-create operation looks like this:
+
+<CommentsSection />
+
+</LessonCard>

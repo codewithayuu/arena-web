@@ -1,0 +1,371 @@
+---
+title: "File Basics"
+readTime: "10 min read"
+lastUpdated: "June 6, 2026"
+description: "File Basics explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="what-file-io-is-for">What File I/O Is For</h1>
+
+Reading and writing files is a small set of operations: open a file, get back an object, call methods on that object to move bytes between memory and disk, then close it. That sequence shows up in every program that touches data outside its own memory.
+
+```python
+catalog = open("products.txt", "w", encoding="utf-8")
+catalog.write("mug,12.99\n")
+catalog.write("notebook,7.49\n")
+catalog.close()
+
+catalog = open("products.txt", "r", encoding="utf-8")
+print(catalog.read())
+catalog.close()
+```
+
+Four steps each direction: open, act, close, done. The rest of this section unpacks what each step does.
+
+Not every storage problem is a file problem. A 50-million-row product database belongs in PostgreSQL or SQLite, not in a CSV. A live stream of user clicks belongs in a message queue or a streaming service, not in repeated appends to a log file. File I/O fits when the data is small enough to sit on disk, simple enough to fit in a text or binary format, and rarely accessed by more than one process at a time. Configuration files, product exports, log files, downloaded images, generated reports, and scratch data between pipeline steps fit this shape.
+
+For anything multi-writer (two processes appending to the same file at the same time), anything that needs queries beyond "read everything", or anything that needs durability guarantees stronger than "the OS got around to flushing", use a database or a service designed for the job. The rest of this section assumes you already know you want a file.
+
+<h1 id="the-open-built-in">The open() Built-In</h1>
+
+`open()` is the single entry point for all file I/O in Python. It takes a path and a mode, returns a file object, and the rest is method calls on that object.
+
+```python
+f = open("orders.txt", "w", encoding="utf-8")
+print(type(f))
+print(f.name)
+print(f.mode)
+print(f.closed)
+f.close()
+print(f.closed)
+```
+
+The return type is `_io.TextIOWrapper`, which is the text-mode file object. The object knows its own name, its own mode, and whether it's currently open. The `closed` attribute flips from `False` to `True` once `close()` runs.
+
+`open()` has a long signature, but most code only ever touches the first three positional arguments and one or two keyword arguments:
+
+```python
+open(file, mode="r", buffering=-1, encoding=None, errors=None, newline=None, ...)
+```
+
+The two arguments to focus on are `file` (the path) and `mode` (what you want to do with it). This lesson uses three modes:
+
+| Mode | What it does                                                    |
+| ---- | --------------------------------------------------------------- |
+| `r`  | Read an existing text file. Raises if the file is missing.      |
+| `w`  | Write a text file. Creates if missing, wipes if present.        |
+| `a`  | Append to a text file. Creates if missing, keeps existing data. |
+
+`open()` does a system call to ask the OS for a file descriptor. It's fast, but it has a fixed cost. Don't call `open` in a tight loop over millions of items; open once, write many times, close once.
+
+<h1 id="file-objects-text-vs-binary-streams">
+  File Objects: Text vs Binary Streams
+</h1>
+
+The object `open()` returns is called a file object or a stream. There are two kinds, and mixing them up causes immediate errors.
+
+A **text stream** reads and writes `str`. Python decodes bytes into characters on the way in and encodes characters into bytes on the way out, using whatever encoding you asked for. Newline translation happens too. This is the default.
+
+A **binary stream** reads and writes `bytes`. No decoding, no encoding, no translation. What's on disk is what you see in memory.
+
+```python
+with open("greeting.txt", "w", encoding="utf-8") as f:
+    f.write("Welcome to the store")
+
+with open("greeting.txt", "r", encoding="utf-8") as f:
+    text = f.read()
+    print(type(text), text)
+
+with open("greeting.txt", "rb") as f:
+    raw = f.read()
+    print(type(raw), raw)
+```
+
+The `b` prefix on `b'Welcome to the store'` tells you the value is `bytes`, not `str`. The visible characters are the same here only because the text is plain ASCII. Save a string with an accent like `"cafÃ©"` and the binary read shows the actual UTF-8 bytes (`b'caf\xc3\xa9'`), which is a different value from the `str` `"cafÃ©"`.
+
+Choose text mode for anything you'd open in a normal editor: product catalogs, CSV exports, JSON files, log lines, source code. Choose binary mode for anything whose bytes have specific meanings: images, PDFs, compiled assets, network payloads.
+
+Trying to mix the two raises `TypeError`:
+
+```python
+with open("greeting.txt", "wb") as f:
+    f.write("hello")
+```
+
+The fix is either to switch to text mode or to encode the string first with `"hello".encode("utf-8")`. The file modes lesson covers the full text/binary split; the choice exists and you make it at `open` time.
+
+<h1 id="closing-files-and-resource-leaks">Closing Files and Resource Leaks</h1>
+
+Every open file holds a **file descriptor**, which is a number the operating system uses to track the file. Each process gets a finite number of these. On macOS and Linux the default soft limit is often 256 or 1024; on Windows the per-process limit is in the thousands. The exact number doesn't matter as much as the rule: leak them and your program eventually fails to open new files.
+
+```python
+files = []
+for i in range(1000):
+    f = open(f"products-{i}.txt", "w", encoding="utf-8")
+    f.write("mug,12.99\n")
+    files.append(f)
+```
+
+That loop opens a thousand files and never closes any of them. On a typical macOS setup it fails partway through with `OSError: [Errno 24] Too many open files`. The fix is to call `close()` on each file as soon as you're done with it:
+
+```python
+for i in range(1000):
+    f = open(f"products-{i}.txt", "w", encoding="utf-8")
+    f.write("mug,12.99\n")
+    f.close()
+```
+
+Closing a file does three things: it flushes any buffered writes to disk, it releases the file descriptor back to the OS, and it marks the object as closed so further reads or writes raise an error. The flush part matters most. Python keeps writes in an in-memory buffer for performance, and if your program exits without closing the file (or crashes before the garbage collector gets to it), those buffered bytes never reach disk.
+
+The diagram traces the lifetime of one file object. The OS gives Python a descriptor when `open` runs. Writes accumulate in a buffer in Python's memory. The only event that flushes the buffer and frees the descriptor is `close` (or program exit, but you can't rely on that for partial state). Skipping `close` means descriptors pile up and writes can sit in memory long enough to be lost.
+
+Relying on Python's garbage collector to close files for you is a bad habit. It does happen, but the timing is unpredictable, especially on alternative implementations like PyPy. Code that works on CPython because the reference count drops to zero immediately can leak descriptors on other interpreters or in long-running programs where the file object stays alive in a list or cache.
+
+The recommended pattern is to close every file you open, and to do it deterministically. That's what the `with` statement is for.
+
+<h1 id="the-with-statement-automatic-closing">
+  The with Statement: Automatic Closing
+</h1>
+
+Closing a file by hand sounds simple. In practice it's easy to get wrong, because anything that raises an exception between the `open` and the `close` skips the close entirely.
+
+```python
+def save_order(filename, order):
+    f = open(filename, "w", encoding="utf-8")
+    f.write(order["total"])  # bug: total is a float, not a string
+    f.close()                # never runs
+
+save_order("order.txt", {"total": 19.99})
+```
+
+The exception happens mid-function. The `close()` call never runs. The file is left open until the garbage collector decides to deal with it. In a long-running program this leaks descriptors over time.
+
+The `try/finally` pattern fixes this:
+
+```python
+def save_order(filename, order):
+    f = open(filename, "w", encoding="utf-8")
+    try:
+        f.write(str(order["total"]))
+    finally:
+        f.close()
+```
+
+That works, but every file handle needs the same three-line scaffolding. Python's `with` statement gives you the same guarantee in one line:
+
+```python
+def save_order(filename, order):
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(str(order["total"]))
+```
+
+The `with` block opens the file, assigns it to `f`, runs the body, and closes the file when the block exits. Closing happens whether the body returns normally, raises an exception, or breaks out of an outer loop. There's no way to skip it short of crashing the interpreter.
+
+```python
+with open("products.txt", "w", encoding="utf-8") as f:
+    f.write("mug,12.99\n")
+    f.write("notebook,7.49\n")
+
+print("file is closed:", f.closed)
+```
+
+The variable `f` still exists after the block, but the file behind it is closed. Attempting another read or write would raise `ValueError: I/O operation on closed file`.
+
+This lesson uses `with` for every example from here on. There's a separate lesson on context managers (the protocol that makes `with` work) and the `with` statement itself in the exceptions and context managers section; this lesson sticks to the practical rule.
+
+**The rule: always use `with` when opening a file.**
+
+The only exception is when the file object outlives the function that opened it, like when you return the file to a caller. That's rare in application code and almost always means you should refactor. If you're tempted to call `open` without `with`, ask first whether the file needs to stay open across function boundaries.
+
+<h1 id="path-representation-relative-vs-absolute">
+  Path Representation: Relative vs Absolute
+</h1>
+
+The first argument to `open()` is a path. Paths come in two shapes: relative and absolute.
+
+A **relative path** is interpreted from the current working directory of the running process. `"products.txt"` means "a file named products.txt in whatever folder I'm in right now." Relative paths are short and convenient, but they depend on context that isn't visible in the code.
+
+An **absolute path** starts from the filesystem root. On macOS and Linux that's `/`, as in `/Users/maya/store/products.txt`. On Windows it's a drive letter, as in `C:\Users\maya\store\products.txt`. Absolute paths are unambiguous, but they're long and they hardcode information about a particular machine.
+
+```python
+import os
+
+print(os.getcwd())
+```
+
+`os.getcwd()` shows you the current working directory. Every relative path you pass to `open` is resolved against that directory. Run the same script from a different folder and the relative path now points somewhere else.
+
+This is the main source of "it works on my machine" file bugs. A script runs fine when launched from the project root, then fails when launched from a parent directory, because the relative path `"products.txt"` resolved to two different absolute paths in the two runs.
+
+A safer approach is to derive paths from the location of the script itself, not from wherever the user happened to run it.
+
+```python
+from pathlib import Path
+
+script_dir = Path(__file__).parent
+data_file = script_dir / "products.txt"
+
+print(data_file)
+```
+
+`__file__` is a special variable that holds the path of the current source file. `Path(__file__).parent` gives you the directory the script lives in. From there you can build absolute paths that don't depend on the working directory. The `pathlib` lesson covers this in depth; for this lesson, `pathlib.Path` exists and is the modern way to handle paths.
+
+For quick exercises and REPL work, plain string paths are fine. For anything that ships, prefer `pathlib`.
+
+<h1 id="cross-platform-path-concerns">Cross-Platform Path Concerns</h1>
+
+The path separator differs across operating systems. macOS and Linux use forward slash (`/`). Windows uses backslash (`\`). Python accepts forward slashes on Windows too in most cases, but mixing styles or hardcoding the wrong separator causes subtle bugs that only show up on the other platform.
+
+```python
+# Works on macOS and Linux. Fragile on Windows.
+path = "exports" + "/" + "orders.csv"
+
+# Works everywhere via os.path.
+import os
+path = os.path.join("exports", "orders.csv")
+
+# Works everywhere via pathlib.
+from pathlib import Path
+path = Path("exports") / "orders.csv"
+```
+
+The string-concatenation form picks one separator and hopes for the best. The `os.path.join` form picks the right separator for the platform. The `pathlib` form does the same, with a nicer syntax. Either of the last two is fine; the string-concatenation form is not.
+
+A second cross-platform concern is case sensitivity. On macOS and Linux, `Products.txt` and `products.txt` are two different files. On Windows (and on the default macOS filesystem, which is case-insensitive but case-preserving), they refer to the same file. Code that opens `"Products.txt"` after writing `"products.txt"` works on one platform and fails on another. Pick a casing convention and stick to it; lowercase is the safe default.
+
+A third concern is path length. On Windows the historic limit was 260 characters per path, and while modern Windows can be configured to allow longer paths, plenty of older tools still fail on long paths. If you're generating filenames from user input or deeply nested categories, keep the total length reasonable.
+
+None of this is about performance. It's about portability. A path that works on your laptop and breaks on a teammate's machine costs more time than any micro-optimization saves.
+
+<h1 id="encoding-the-argument-you-should-always-pass">
+  Encoding: The Argument You Should Always Pass
+</h1>
+
+In text mode, Python has to translate between the `str` objects in your code and the bytes that live on disk. That translation is controlled by the `encoding` argument to `open`.
+
+```python
+with open("customer.txt", "w", encoding="utf-8") as f:
+    f.write("Customer: RenÃ©e MÃ¼ller\n")
+    f.write("City: SÃ£o Paulo\n")
+
+with open("customer.txt", "r", encoding="utf-8") as f:
+    print(f.read())
+```
+
+The `Ã©`, `Ã¼`, and `Ã£` characters are not single bytes in UTF-8. Each one takes two bytes. Open the same file in binary mode and you can see the actual bytes on disk:
+
+```python
+with open("customer.txt", "rb") as f:
+    print(f.read())
+```
+
+`\xc3\xa9` is the UTF-8 encoding of `Ã©`. Read the same file with a different encoding and Python either misreads those bytes or refuses outright:
+
+```python
+with open("customer.txt", "r", encoding="ascii") as f:
+    f.read()
+```
+
+ASCII only knows 128 code points. The `0xc3` byte that starts `Ã©` is outside that range, so the decoder gives up.
+
+<h3 id="why-the-default-is-dangerous">Why the Default Is Dangerous</h3>
+
+When you don't pass `encoding`, Python uses the platform's preferred locale encoding, available as `locale.getpreferredencoding()`. On macOS and most Linux systems that's UTF-8. On Windows it's traditionally been `cp1252` (Western European) for many setups. So a file written on a Mac with `Ã©` in it might read incorrectly on a Windows machine that picked a different default.
+
+This is a common file-handling bug across operating systems. Code runs fine on the author's Mac and crashes with `UnicodeDecodeError` on a teammate's Windows machine, or vice versa. The fix is one keyword argument away:
+
+```python
+with open(path, "r", encoding="utf-8") as f:
+    ...
+```
+
+Pass `encoding="utf-8"` to every `open` call that opens a text file. It costs nothing, it makes the behavior identical on every platform, and it documents what bytes you expect on disk.
+
+Python 3.10 added a `-X warn_default_encoding` flag and Python 3.15 will make the default encoding warning more visible. The trajectory is clear: explicit encoding is the norm now, and "let Python guess" is a legacy behavior that newer Python releases discourage.
+
+For binary mode, `encoding` is not allowed (there's nothing to translate, you're working with raw bytes). Pass it anyway and you get an immediate error:
+
+```python
+with open("logo.png", "rb", encoding="utf-8") as f:
+    pass
+```
+
+The split is clean: text mode needs an encoding, binary mode forbids one. This lesson uses UTF-8 everywhere. So should your code.
+
+<h1 id="putting-it-together">Putting It Together</h1>
+
+A complete example that uses every concept from this lesson: write a list of products to a file, then read them back and print each one.
+
+```python
+from pathlib import Path
+
+products = [
+    ("mug", 12.99),
+    ("notebook", 7.49),
+    ("pen", 1.99),
+    ("water bottle", 14.99),
+]
+
+data_file = Path("products.txt")
+
+with open(data_file, "w", encoding="utf-8") as f:
+    for name, price in products:
+        f.write(f"{name},{price}\n")
+
+with open(data_file, "r", encoding="utf-8") as f:
+    for line in f:
+        print(line.rstrip())
+```
+
+What's in there:
+
+- `pathlib.Path` for cross-platform path handling.
+- `with` blocks so neither file leaks a descriptor.
+- `encoding="utf-8"` on both opens, so the file behaves identically on every OS.
+- Text mode (the default), because we're writing readable lines.
+- Append-only writing in this case wouldn't make sense (we want a fresh file each run), so we use `"w"`.
+
+That's the entire pattern for everyday file work. The next two lessons drill into reading and writing separately, and the file modes lesson after that covers every variation of the mode string.
+
+<h1 id="common-mistakes">Common Mistakes</h1>
+
+A few patterns to watch for as you start writing file code.
+
+<h3 id="forgetting-with">Forgetting with</h3>
+
+Every file you open needs to be closed, and the surest way to close it is the `with` statement. Manual `close` calls get skipped when exceptions happen.
+
+<h3 id="forgetting-encodingutf-8">Forgetting encoding="utf-8"</h3>
+
+The default encoding depends on the OS. Code that works on macOS can corrupt characters or crash on Windows. Pass `encoding="utf-8"` to every text-mode `open`.
+
+<h3 id="using-relative-paths-without-thinking">
+  Using Relative Paths Without Thinking
+</h3>
+
+A relative path resolves against the current working directory, not the script's directory. Launch the same script from a different folder and the path now points somewhere unexpected. Use `Path(__file__).parent / "data.txt"` when the file lives next to the script.
+
+<h3 id="trying-to-read-after-the-with-block-ends">
+  Trying to Read After the with Block Ends
+</h3>
+
+The variable still exists, but the file is closed. Move the read inside the same `with` block, or open the file again for the read.
+
+```python
+with open("orders.txt", "w", encoding="utf-8") as f:
+    f.write("order-1\n")
+
+f.read()  # ValueError: I/O operation on closed file
+```
+
+<h3 id="mixing-str-and-bytes">Mixing str and bytes</h3>
+
+Text mode needs `str`, binary mode needs `bytes`. The error messages are clear (`TypeError: write() argument must be str, not bytes`), but the fix isn't always obvious. Pick a mode for the data you have, or call `.encode("utf-8")` / `.decode("utf-8")` to convert.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

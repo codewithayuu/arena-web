@@ -1,0 +1,340 @@
+---
+title: "WebSockets"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "WebSockets explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+Traditional HTTP follows a request-response model. The client sends a request, and the server returns a response.
+
+This works well when the client knows when it needs data. A user opens a profile page, the browser asks for the profile, and the server sends it back.
+
+Real-time applications are different. New data can arrive on the server at any moment, and the client has no way of knowing when to ask for it. With plain HTTP, the client has to keep checking for updates:
+
+- **Short polling** asks every few seconds. Most responses come back empty, and an update that lands just after a poll waits for the next one.
+- **Long polling** holds each request open until there is data, which cuts the delay. But every response still ends the request, so the client has to connect again after each update.
+
+Both approaches spend requests on asking rather than on data. WebSockets remove the asking. The connection stays open, and the server sends an update the moment it has one. The client can use the same connection to send data back.
+
+<h1 id="2-what-is-a-websocket">2. What Is a WebSocket?</h1>
+
+A WebSocket is a persistent, two-way connection between a client and a server. Instead of creating a new HTTP request for every update, the client opens one connection and keeps it alive.
+
+Once connected, both sides can send messages at any time, independently of each other. This is called **full-duplex** communication: the server can send while the client is sending.
+
+A few properties follow from this design:
+
+- **Persistent:** one connection carries many messages, for minutes or hours.
+- **Low overhead:** messages do not repeat full HTTP headers.
+- **Ordered and reliable:** WebSockets run over TCP, so messages arrive in order and lost packets are retransmitted.
+- **Message-based:** applications send text or binary messages, not raw byte streams.
+
+That makes WebSockets a strong fit for frequent, low-latency, bidirectional communication, such as chat apps, multiplayer games, and collaborative editors.
+
+It does not make them the answer to every real-time problem. For mostly one-way server updates, Server-Sent Events may be simpler. Section 13 covers this choice.
+
+<h1 id="3-the-websocket-handshake">3. The WebSocket Handshake</h1>
+
+A WebSocket connection usually does not start as a WebSocket. It begins as a normal HTTP request, and the client asks the server to upgrade it.
+
+The browser opens a WebSocket with a URL such as:
+
+```javascript
+const socket = new WebSocket("wss://api.example.com/chat");
+```
+
+`ws://` is unencrypted. `wss://` is WebSocket over TLS, similar to HTTPS. Production applications should use `wss://`.
+
+The client connects to the server and sends an HTTP request asking to switch protocols:
+
+```text
+GET /chat HTTP/1.1
+Host: api.example.com
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Version: 13
+Origin: https://app.example.com
+```
+
+The `Upgrade: websocket` and `Connection: Upgrade` headers are the request to switch. `Sec-WebSocket-Key` is a random value. The server hashes it into `Sec-WebSocket-Accept`, which proves the server actually understood the WebSocket handshake.
+
+If the server supports WebSockets and accepts the request, it responds with `101 Switching Protocols`:
+
+```text
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+```
+
+At that point, the HTTP handshake is complete. The same underlying TCP connection stays open and is now used for WebSocket communication. No new connection is created. From here on, the client and server exchange WebSocket messages directly.
+
+The connection remains open until one of three things happens:
+
+- The client closes it.
+- The server closes it.
+- The underlying network connection fails.
+
+The first two are graceful closes that use a Close frame (section 4). The third one is not, which is why production systems need heartbeats and reconnection logic (sections 11 and 12).
+
+<h1 id="4-websocket-frames">4. WebSocket Frames</h1>
+
+Once the connection is established, messages no longer carry full HTTP headers. Instead, WebSockets exchange data in small units called **frames**.
+
+Each frame has a small header followed by the payload. The header is typically 2 to 14 bytes, compared with the hundreds of bytes of headers an HTTP request usually carries. It holds a few pieces of metadata: whether this is the final frame of a message, the frame type, and the payload length.
+
+There are several types of frames:
+
+- **Text frames** carry UTF-8 text, commonly JSON.
+- **Binary frames** carry images, audio, Protocol Buffers, or other binary data.
+- **Ping and Pong frames** check whether the connection is still alive. One side sends a ping, and the other answers with a pong.
+- **Close frames** let either side end the connection gracefully.
+
+One application message may fit in one frame or be split across several frames:
+
+Browsers handle frames for you. Your application usually receives complete messages through an `onmessage` handler.
+
+Because the overhead of each message is small, WebSockets work well when an application needs to exchange many small messages frequently.
+
+<h1 id="5-a-basic-implementation">5. A Basic Implementation</h1>
+
+Here is a small Node.js server using the `ws` library.
+
+```javascript
+const http = require("http");
+const WebSocket = require("ws");
+
+const server = http.createServer();
+const wss = new WebSocket.Server({ server });
+
+wss.on("connection", (socket, request) => {
+  console.log("Client connected from", request.socket.remoteAddress);
+
+  socket.on("message", (rawMessage) => {
+    const message = rawMessage.toString();
+    socket.send(`echo: ${message}`);
+  });
+
+  socket.on("close", () => {
+    console.log("Client disconnected");
+  });
+});
+
+server.listen(8080, () => {
+  console.log("WebSocket server listening on port 8080");
+});
+```
+
+And a browser client:
+
+```javascript
+const socket = new WebSocket("ws://localhost:8080");
+
+socket.addEventListener("open", () => {
+  socket.send("hello");
+});
+
+socket.addEventListener("message", (event) => {
+  console.log("received:", event.data);
+});
+
+socket.addEventListener("close", () => {
+  console.log("connection closed");
+});
+
+socket.addEventListener("error", () => {
+  console.log("connection error");
+});
+```
+
+This is enough to demonstrate the protocol, but not enough for production. The rest of this chapter builds up what a real system needs, starting with a single server.
+
+<h1 id="6-single-server-websocket-architecture">
+  6. Single-Server WebSocket Architecture
+</h1>
+
+Start with the simplest setup: one WebSocket server. Each client opens a connection to that server and keeps it alive. The server keeps all active connections in memory, usually in a map from user ID to connection.
+
+Now suppose Alice wants to send a message to Bob:
+
+1. Alice sends the message over her existing WebSocket connection.
+2. The server receives it and processes it, for example by validating it and checking permissions.
+3. The server optionally stores it in a database, so it survives restarts and shows up in history.
+4. The server looks up Bob's active connection in its map.
+5. The server pushes the message directly to Bob over that connection.
+
+Extending the echo server, the connection map looks like this:
+
+```javascript
+// one connection per user, for simplicity
+const connections = new Map(); // userId -> socket
+
+wss.on("connection", (socket, request) => {
+  const userId = authenticate(request); // e.g. a token or session cookie
+  connections.set(userId, socket);
+
+  socket.on("message", (raw) => {
+    const { to, text } = JSON.parse(raw.toString());
+    const target = connections.get(to);
+    if (target) target.send(JSON.stringify({ from: userId, text }));
+  });
+
+  socket.on("close", () => connections.delete(userId));
+});
+```
+
+With a single server, this is fairly straightforward. All active connections are managed in one place, so the server already knows which connection belongs to which user.
+
+But this architecture has an obvious limit. A single machine can only hold so many open connections and process so much traffic. Each connection uses memory, a file descriptor, and some CPU for messages and heartbeats. The server is also a single point of failure. Eventually, you need to scale horizontally.
+
+<h1 id="7-scaling-websockets-horizontally">
+  7. Scaling WebSockets Horizontally
+</h1>
+
+Instead of running one WebSocket server, run several behind a load balancer. When a client opens a connection, the load balancer chooses one of the servers.
+
+Each server is now responsible for only a subset of all active connections. As traffic grows, you add more servers and distribute new connections across them.
+
+But WebSocket connections behave differently from normal HTTP traffic because they are long-lived. With normal HTTP, each request can go to any healthy server and finishes in milliseconds. A WebSocket connection may stay open for minutes or hours.
+
+The connection stays attached to the server that accepted it for as long as it remains open. If Alice connects to server 1, her connection lives on server 1 until it closes.
+
+That creates an important problem. Suppose Bob connected to server 3. Server 1's in-memory map has no entry for Bob, so when Alice sends Bob a message, server 1 cannot deliver it on its own.
+
+<h1 id="8-routing-messages-across-servers">
+  8. Routing Messages Across Servers
+</h1>
+
+Alice is connected to server 1 and Bob to server 3. Alice sends Bob a message. Server 1 receives it, but Bob's connection lives on another server. There are two common ways to get the message there.
+
+**A shared connection registry.** Keep a mapping, for example in Redis, of which server each user is connected to. Server 1 looks up Bob, finds server 3, and routes the message there.
+
+This works, but the mapping changes constantly. Users connect and disconnect, open multiple tabs, switch networks, and reconnect to different servers. Every change is a write, a stale entry sends messages to the wrong place, and servers need a way to reach each other directly.
+
+**Shared messaging infrastructure.** This is the more common approach. Instead of server 1 communicating directly with server 3, it publishes an event. The messaging layer then delivers that event to whichever server currently holds Bob's connection. Server 1 never needs to know where Bob is.
+
+This is where pub/sub systems become useful.
+
+<h1 id="9-connecting-websocket-servers-with-pubsub">
+  9. Connecting WebSocket Servers with Pub/Sub
+</h1>
+
+Imagine all of the WebSocket servers are connected through a shared pub/sub layer. A common pattern is one channel per user or per room: when Bob connects to server 3, server 3 subscribes to Bob's channel.
+
+1. Alice sends a message to server 1.
+2. Server 1 processes it and publishes an event to Bob's channel.
+3. The pub/sub layer delivers the event to every server subscribed to that channel. Here, that is server 3.
+4. Server 3 finds Bob's connection in its local memory and pushes the message to him.
+
+The WebSocket servers never communicate directly with one another. The messaging layer acts as the bridge. Adding a server means subscribing it to the layer, not wiring it to every other server.
+
+The choice of messaging layer depends on what the events need:
+
+- **Redis Pub/Sub** works well for simple, low-latency, transient events. Messages are not stored, so a server that is not subscribed at the moment of publishing misses the event.
+- **Kafka** is more useful when you also need durability, replay, or large-scale event processing. Events are kept in a log, so a consumer can read again from an earlier position.
+
+The key idea is that the messaging layer decouples the WebSocket servers from each other.
+
+<h1 id="10-load-balancing-and-connection-draining">
+  10. Load Balancing and Connection Draining
+</h1>
+
+Load balancing WebSockets is slightly different from load balancing ordinary HTTP traffic. Once the load balancer routes a connection to a WebSocket server, that connection stays attached to the same server until it closes.
+
+So the load balancer mainly decides where each connection starts. After that, all messages keep flowing through the same connection. Because connections pile up over time, a least-connections strategy often balances servers better than plain round robin.
+
+Sticky sessions are not necessarily required, because the connection is already tied to one backend for its lifetime. They matter when a library falls back to HTTP long polling, as Socket.IO can, because those separate requests must reach the same server.
+
+A bigger concern is what happens when a backend needs to shut down. If a server with tens of thousands of active connections is terminated immediately, all of those clients disconnect at once, and they all try to reconnect to the remaining servers at once.
+
+Instead, the server can use **connection draining**:
+
+1. The load balancer stops sending new connections to the server.
+2. Existing clients are given time to disconnect or reconnect elsewhere. The server can speed this up by sending Close frames to its clients a few at a time.
+3. Once the active connections are gone, or a deadline passes, the server shuts down safely.
+
+<h1 id="11-handling-failures-and-reconnection">
+  11. Handling Failures and Reconnection
+</h1>
+
+Now suppose Bob is connected to a WebSocket server, and that server crashes. His connection is lost, so the client must establish a new one. That new connection may be routed to a completely different server.
+
+This is why WebSocket servers should avoid keeping critical state only in local memory. Message history, durable user state, and important subscription data should live in shared systems such as databases, caches, or message brokers. Then when a client reconnects to another server, it can recover the state it needs. Local memory should only hold what can be rebuilt, such as the connection itself and its current subscriptions.
+
+Disconnects are normal, not rare. Laptops sleep, phones switch networks, proxies close idle connections, and deploys restart servers. Good clients handle them the same way every time:
+
+- Reconnect and authenticate again.
+- Subscribe again to their rooms or streams.
+- Resume from the last event ID when the product needs replay.
+- Avoid queueing unlimited messages while offline, and show a disconnected state when it matters to the user.
+
+Retry behavior also matters. If a large cluster fails and one million clients reconnect at the same moment, they create a massive traffic spike that can overload the servers still running and slow recovery.
+
+A common solution is **exponential backoff with jitter**. Each client doubles the delay between retries, up to a cap, and adds randomness so clients do not all reconnect at the same moment:
+
+```javascript
+function reconnectDelay(attempt) {
+  const cap = Math.min(30000, 1000 * 2 ** attempt); // 1s, 2s, 4s, 8s ... up to 30s
+  return Math.random() * cap; // jitter spreads clients across the window
+}
+```
+
+<h1 id="12-websocket-infrastructure-requirements">
+  12. WebSocket Infrastructure Requirements
+</h1>
+
+In production, clients rarely connect to WebSocket servers directly. They usually go through several layers, such as a CDN, a reverse proxy, or a load balancer.
+
+Every layer must support the WebSocket upgrade and long-lived connections. If one component does not forward the upgrade correctly, the connection fails before it ever reaches your application. For example, Nginx only forwards the upgrade when it is configured to:
+
+```text
+# Example Nginx settings for a WebSocket endpoint
+location /chat {
+    proxy_pass http://websocket_servers;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 120s;
+}
+```
+
+**Idle timeouts** are another concern. Proxies and load balancers may close connections that stay quiet for too long; defaults of around 60 seconds are common. WebSocket systems send periodic Ping and Pong messages, called heartbeats, to keep connections alive and to detect dead ones. The heartbeat interval should be shorter than the shortest idle timeout on the path.
+
+Browser JavaScript does not expose protocol-level ping directly, so browser apps often send their own heartbeat messages when they need to check whether the connection is still alive.
+
+**Deployments** also require connection draining, as described in section 10. A server being removed should stop accepting new connections while existing clients are given time to disconnect or reconnect gracefully.
+
+So when designing WebSocket infrastructure, think about the entire path between client and server: upgrades, timeouts, heartbeats, and connection draining.
+
+<h1 id="13-when-to-use-websockets">13. When to Use WebSockets</h1>
+
+WebSockets are powerful, but not every real-time feature needs them.
+
+- For normal request-response operations, HTTP is simpler.
+- If updates are infrequent, polling may be enough.
+- For mostly one-way server-to-client updates, Server-Sent Events can be a better fit.
+
+WebSockets also add operational complexity. You need to manage persistent connections, failures, reconnections, state recovery, timeouts, and message routing across servers.
+
+Use WebSockets when you truly need frequent, low-latency, bidirectional communication.
+
+<h1 id="summary">Summary</h1>
+
+HTTP's request-response model forces clients to keep asking for updates they cannot predict. A WebSocket replaces that with one persistent, full-duplex connection that either side can send on at any time.
+
+The connection starts as an HTTP request with upgrade headers. After the server replies `101 Switching Protocols`, the same TCP connection carries WebSocket frames: small headers around text, binary, ping/pong, and close payloads.
+
+One server can keep every connection in memory and deliver messages directly. Scaling out puts servers behind a load balancer, and because each connection stays on one server, messages between users on different servers go through a shared pub/sub layer such as Redis Pub/Sub or Kafka.
+
+Production systems drain connections before shutting a server down, keep critical state in shared stores so clients can recover after reconnecting, and use exponential backoff with jitter to avoid reconnect storms. Every layer on the path has to support the upgrade, long-lived connections, and heartbeats that beat idle timeouts.
+
+Use WebSockets when two-way real-time messaging is the core requirement. Use HTTP, polling, or SSE when a long-lived two-way connection is not needed.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

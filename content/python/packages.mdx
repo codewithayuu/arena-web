@@ -1,0 +1,562 @@
+---
+title: "Packages"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Packages explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="module-vs-package">Module vs Package</h1>
+
+A module is one file. A package is a directory of modules with an `__init__.py` file that marks the directory as importable. That's the entire distinction.
+
+If you have a single file `cart.py`, that's a module. You import it with `import cart`. If you have a directory `ecommerce/` containing `cart.py`, `products.py`, and an `__init__.py`, that's a package. You import its pieces with `import ecommerce.cart` or `from ecommerce import products`.
+
+The reason packages exist is scale. A 200-line `shop.py` is fine. A 2,000-line file with cart logic, product logic, customer logic, and order logic is painful to navigate. Splitting it into a package lets each concern live in its own file while still being addressable as one thing: `ecommerce`.
+
+The diagram shows the structural difference. A module is one file at the top level. A package is a directory whose contents are addressable through the directory name, with `__init__.py` acting as the marker that says "this directory is a package, not just a folder of loose scripts."
+
+The import syntax mirrors the structure. Once `ecommerce/` is a package, `ecommerce.cart` refers to the `cart` module inside it. The dot is literally the path separator. A deeper structure like `ecommerce/customers/profile.py` is reached with `ecommerce.customers.profile`.
+
+<h1 id="what-__init__py-actually-does">What __init__.py Actually Does</h1>
+
+`__init__.py` is the file that runs the first time the package is imported. It has two jobs. First, its presence tells Python "this directory is a regular package." Second, any code inside it executes once, sets up the package's namespace, and stays in memory.
+
+Start with the simplest case: an empty `__init__.py`. Empty file, zero bytes. That's enough.
+
+Directory layout:
+
+```text
+ecommerce/
+    __init__.py        (empty)
+    cart.py
+    products.py
+```
+
+Contents of `ecommerce/cart.py`:
+
+```python
+def add_item(cart, product, quantity=1):
+    cart[product] = cart.get(product, 0) + quantity
+    return cart
+
+def cart_total(cart, prices):
+    return sum(prices[product] * qty for product, qty in cart.items())
+```
+
+Contents of `ecommerce/products.py`:
+
+```python
+PRICES = {"Wireless Mouse": 29.99, "USB Cable": 9.99, "HDMI Cable": 14.99}
+
+def is_available(product):
+    return product in PRICES
+```
+
+Now from a script next to the `ecommerce/` directory:
+
+```python
+from ecommerce.cart import add_item, cart_total
+from ecommerce.products import PRICES
+
+cart = {}
+add_item(cart, "Wireless Mouse", 2)
+add_item(cart, "USB Cable")
+
+print(cart)
+print(f"Total: ${cart_total(cart, PRICES):.2f}")
+```
+
+The empty `__init__.py` did one thing: it let Python recognize `ecommerce` as a package so the dotted imports work. No setup code ran because there was none to run.
+
+A populated `__init__.py` is where the package gets interesting. It runs the first time `import ecommerce` (or any submodule import) happens, and never again in the same Python process.
+
+Change `ecommerce/__init__.py` to:
+
+```python
+print("ecommerce package initializing")
+
+PACKAGE_VERSION = "1.0.0"
+```
+
+Now run:
+
+```python
+from ecommerce.cart import add_item
+from ecommerce.products import PRICES
+import ecommerce.cart
+import ecommerce
+print(ecommerce.PACKAGE_VERSION)
+```
+
+The print statement fires once even though the script imports from the package four times. That's because Python caches imported modules in `sys.modules`. The second import returns the cached object instead of running `__init__.py` again. The `PACKAGE_VERSION` attribute lives on the package itself, accessible as `ecommerce.PACKAGE_VERSION`.
+
+> **Cost:** Heavy work inside `__init__.py` slows down the first import of the package, even if the caller only needs one tiny function. If your `__init__.py` opens a database connection or loads a 50MB model, every script that touches anything in the package pays for it. Keep `__init__.py` light, and let submodules do their own heavy lifting only when they're imported directly.
+
+<h1 id="re-exports-and-the-flat-public-api">
+  Re-exports and the Flat Public API
+</h1>
+
+One of the most useful patterns for `__init__.py` is re-exporting. Submodules live in a tree, but you can present a flat surface to callers. Internally, `ecommerce/cart.py` defines `add_item`. Externally, callers can write `from ecommerce import add_item` if the package's `__init__.py` re-exports it.
+
+Update `ecommerce/__init__.py`:
+
+```python
+from ecommerce.cart import add_item, cart_total
+from ecommerce.products import PRICES, is_available
+
+PACKAGE_VERSION = "1.0.0"
+```
+
+Now both of these work:
+
+```python
+# Deep path (still works)
+from ecommerce.cart import add_item
+
+# Flat path (works because __init__.py re-exports it)
+from ecommerce import add_item, cart_total, PRICES
+```
+
+The flat path is friendlier for users of the package. They don't have to know that `add_item` lives in `cart.py` versus `cart_utils.py` versus somewhere else. The package is the API; the file layout is an implementation detail.
+
+This pattern shows up everywhere in the standard library. When you write `from collections import Counter`, you're not actually pulling `Counter` from a file called `collections.py`. The `collections` package re-exports `Counter` from one of its internal modules. Same idea: users see a flat API; internally, the code is organized however the maintainers prefer.
+
+The trade-off is import cost. Every name re-exported in `__init__.py` causes its submodule to be loaded on the first package import. If `ecommerce/__init__.py` does `from ecommerce.cart import add_item`, then `import ecommerce` (even with no explicit cart use) loads `cart.py`. For small packages this is fine. For big packages with expensive submodules, you might choose to re-export only the most common names and leave heavier ones reachable only through their submodule path.
+
+The diagram traces what happens when a caller writes `from ecommerce import add_item`. Python loads `__init__.py`, which loads the submodules it re-exports, and the name `add_item` ends up bound on the package's namespace. The caller never has to know that `cart.py` exists.
+
+<h1 id="__all__-and-from-package-import">__all__ and from package import *</h1>
+
+When a caller writes `from ecommerce import *`, Python has to decide which names to pull in. By default, it imports every name in the package's namespace that doesn't start with an underscore. That's usually too much and not what you want as a package author.
+
+`__all__` is a list of strings that overrides this default. If `__all__` is defined in `__init__.py`, `from package import *` imports exactly those names and nothing else.
+
+```python
+# ecommerce/__init__.py
+from ecommerce.cart import add_item, cart_total, _internal_helper
+from ecommerce.products import PRICES, is_available
+
+__all__ = ["add_item", "cart_total", "PRICES", "is_available"]
+```
+
+Now in a caller:
+
+```python
+from ecommerce import *
+
+print(add_item({}, "Wireless Mouse"))
+print(is_available("Wireless Mouse"))
+
+# _internal_helper was imported into __init__.py but is NOT in __all__,
+# so the star import skips it.
+print(_internal_helper)
+```
+
+`__all__` lets you separate "names that exist inside the package" from "names that are part of the public API." Without it, star imports leak whatever happens to be lying around in `__init__.py`'s namespace, which often includes imports that were only meant for internal wiring.
+
+A few people will tell you that `from package import *` is bad practice and you should never write it. That's mostly true for application code, but the convention exists, and tools like linters use `__all__` to figure out what counts as the public API even when no one ever writes a star import. Defining `__all__` is good hygiene either way.
+
+> **Cost:** `__all__` doesn't change how much code gets executed; it only filters which names are bound after a star import. The submodules still load. If you want to keep submodules unloaded until needed, you have to skip re-exporting them in `__init__.py` entirely, not just leave them out of `__all__`.
+
+<h1 id="subpackages">Subpackages</h1>
+
+A package can contain other packages. Each subpackage is a directory with its own `__init__.py`, and the same rules apply at every level. The dotted import path mirrors the directory tree exactly.
+
+For a real-sized e-commerce project, you'd group related modules into subpackages:
+
+```text
+ecommerce/
+    __init__.py
+    cart/
+        __init__.py
+        operations.py
+        discounts.py
+    products/
+        __init__.py
+        catalog.py
+        search.py
+    customers/
+        __init__.py
+        profiles.py
+        addresses.py
+```
+
+Each subpackage is independent. `ecommerce/cart/__init__.py` is unrelated to `ecommerce/products/__init__.py`. They each get their own initialization, their own namespace, and their own `__all__` if you choose to define one.
+
+Contents of `ecommerce/cart/operations.py`:
+
+```python
+def add_item(cart, product, quantity=1):
+    cart[product] = cart.get(product, 0) + quantity
+    return cart
+
+def remove_item(cart, product):
+    cart.pop(product, None)
+    return cart
+```
+
+Contents of `ecommerce/cart/discounts.py`:
+
+```python
+def apply_percentage(total, percent):
+    return total * (1 - percent / 100)
+
+def apply_flat(total, amount):
+    return max(0, total - amount)
+```
+
+Contents of `ecommerce/cart/__init__.py`:
+
+```python
+from ecommerce.cart.operations import add_item, remove_item
+from ecommerce.cart.discounts import apply_percentage, apply_flat
+
+__all__ = ["add_item", "remove_item", "apply_percentage", "apply_flat"]
+```
+
+A caller can now use any of these import shapes:
+
+```python
+# Through the subpackage namespace
+from ecommerce.cart import add_item, apply_percentage
+
+# Or directly from a specific module inside the subpackage
+from ecommerce.cart.discounts import apply_flat
+
+cart = {}
+add_item(cart, "Wireless Mouse", 2)
+total = 60.00
+print(f"After 10% off: ${apply_percentage(total, 10):.2f}")
+print(f"After $5 off: ${apply_flat(total, 5):.2f}")
+```
+
+The top-level `ecommerce/__init__.py` can re-export from subpackages too. If you want users to call `from ecommerce import add_item` without thinking about the cart subpackage at all, write:
+
+```python
+# ecommerce/__init__.py
+from ecommerce.cart import add_item, remove_item, apply_percentage, apply_flat
+from ecommerce.products.catalog import is_available
+from ecommerce.customers.profiles import Customer
+
+__all__ = [
+    "add_item",
+    "remove_item",
+    "apply_percentage",
+    "apply_flat",
+    "is_available",
+    "Customer",
+]
+```
+
+How aggressive to be with top-level re-exports is a style choice. A flat API is easier for users; a layered API is easier to evolve internally without breaking callers. Many libraries do both: a flat top-level for the 10 names most callers want, plus the full deep paths for everything else.
+
+Each directory in the tree is a package with its own `__init__.py`. Each `.py` file inside is a module. The dotted import path follows the tree: `ecommerce.cart.discounts.apply_flat` is the file path with dots instead of slashes and no `.py` extension.
+
+<h1 id="common-package-layouts">Common Package Layouts</h1>
+
+For a typical small-to-medium project, the layout looks like this:
+
+```text
+my_shop/
+    pyproject.toml
+    README.md
+    src/
+        ecommerce/
+            __init__.py
+            cart/
+                __init__.py
+                operations.py
+                discounts.py
+            products/
+                __init__.py
+                catalog.py
+                search.py
+            customers/
+                __init__.py
+                profiles.py
+                addresses.py
+            orders/
+                __init__.py
+                placement.py
+                tracking.py
+    tests/
+        test_cart.py
+        test_products.py
+```
+
+A few things worth noting:
+
+- The `src/` layout puts the package one level below the project root. It's a common convention (called the "src layout") that prevents accidental imports of the in-development version when running tests. The alternative "flat layout" puts `ecommerce/` directly at the project root.
+- Tests live in a separate top-level `tests/` directory, not inside the package. Mixing them inside makes shipping the package harder later.
+- Each subpackage corresponds to a domain concern: cart, products, customers, orders. Files inside each subpackage split that domain further: `cart/operations.py` for adding and removing items, `cart/discounts.py` for discount logic.
+
+There's no rule that every subpackage needs more than one file. If `customers/` only has `profiles.py` today, that's fine. The subpackage exists so that when `customers/` grows to need `addresses.py` and `preferences.py` and `auth.py`, they have a natural home and you don't have to rename anything.
+
+For very small projects (one or two files), don't bother with a package at all. A single `shop.py` is more readable than `shop/__init__.py` + `shop/main.py`. Packages start paying off when you have more than three or four related modules.
+
+<h1 id="relative-imports-inside-a-package">
+  Relative Imports Inside a Package
+</h1>
+
+Inside a package, modules can refer to each other with relative imports. A dot means "current package," two dots mean "parent package." This is mostly a convenience: relative imports keep working when the package gets renamed.
+
+For example, inside `ecommerce/cart/operations.py`, you might want to use a helper from `ecommerce/cart/discounts.py`. Two ways to write it:
+
+```python
+# Absolute import (always works)
+from ecommerce.cart.discounts import apply_percentage
+
+# Relative import (equivalent here, but breaks if used from a script)
+from .discounts import apply_percentage
+```
+
+The single dot means "look in the current package," which from `operations.py`'s perspective is `ecommerce.cart`. Two dots would walk up one level to `ecommerce` itself, so `from ..products.catalog import is_available` inside `cart/operations.py` would reach `ecommerce/products/catalog.py`.
+
+Relative imports only work inside actual packages, not in top-level scripts. If you try to run a file with relative imports directly (`python operations.py`), you'll get `ImportError: attempted relative import with no known parent package`. They only resolve when the module is loaded as part of a package, which is the normal case once everything is wired up correctly.
+
+Most teams pick one style and stick with it. Absolute imports are more explicit; relative imports survive renames better. Both are fine.
+
+<h1 id="namespace-packages-no-__init__py">
+  Namespace Packages (No __init__.py)
+</h1>
+
+Python supports a second kind of package called a namespace package, introduced by PEP 420 in Python 3.3. A namespace package is a directory **without** an `__init__.py` that Python still treats as importable.
+
+The motivation: large projects sometimes want to split a single logical package across multiple directories or even multiple installed distributions. With a regular package, you can't do that, because only one `__init__.py` can "own" the package name. Namespace packages let multiple directories contribute to the same dotted name, as long as none of them has an `__init__.py`.
+
+Example layout:
+
+```text
+plugins-core/
+    ecommerce/
+        cart.py
+plugins-extras/
+    ecommerce/
+        wishlist.py
+```
+
+If both `plugins-core/` and `plugins-extras/` are on the Python path, then `import ecommerce.cart` and `import ecommerce.wishlist` both work, even though the two `ecommerce/` directories are physically separate. Python merges them into a single namespace because neither has an `__init__.py`.
+
+For most projects, you don't want this. The pitfalls are real:
+
+- No initialization code, ever. You lose `__init__.py`'s ability to set up package state or re-export names.
+- Silent merging. If two directories on the path happen to share a top-level name, Python merges them. This can mask typos and cause weird "where did this module come from?" debugging sessions.
+- Tools like `setup.py` and `pyproject.toml` need extra configuration to handle namespace packages correctly when packaging for distribution.
+- Some editors and type checkers handle namespace packages less smoothly than regular packages.
+
+Rule of thumb: use a regular package with an `__init__.py` for everything you build, even when it's empty. Reach for namespace packages only when you have a specific reason, like distributing plugins where third parties extend your package from their own installed wheels.
+
+The diagram shows the trade-off side by side. Regular packages are simpler and more controllable. Namespace packages buy you a specific extensibility feature in exchange for losing initialization and re-export control.
+
+<h1 id="putting-it-all-together">Putting It All Together</h1>
+
+A complete walkthrough using everything covered so far. Here's the final layout:
+
+```text
+ecommerce/
+    __init__.py
+    cart/
+        __init__.py
+        operations.py
+        discounts.py
+    products/
+        __init__.py
+        catalog.py
+    customers/
+        __init__.py
+        profiles.py
+```
+
+Contents of `ecommerce/cart/operations.py`:
+
+```python
+def add_item(cart, product, quantity=1):
+    cart[product] = cart.get(product, 0) + quantity
+    return cart
+
+def remove_item(cart, product):
+    cart.pop(product, None)
+    return cart
+```
+
+Contents of `ecommerce/cart/discounts.py`:
+
+```python
+def apply_percentage(total, percent):
+    return total * (1 - percent / 100)
+```
+
+Contents of `ecommerce/cart/__init__.py`:
+
+```python
+from ecommerce.cart.operations import add_item, remove_item
+from ecommerce.cart.discounts import apply_percentage
+
+__all__ = ["add_item", "remove_item", "apply_percentage"]
+```
+
+Contents of `ecommerce/products/catalog.py`:
+
+```python
+PRICES = {
+    "Wireless Mouse": 29.99,
+    "USB Cable": 9.99,
+    "HDMI Cable": 14.99,
+    "Coffee Mug": 12.50,
+}
+
+def is_available(product):
+    return product in PRICES
+
+def price_of(product):
+    return PRICES.get(product, 0.0)
+```
+
+Contents of `ecommerce/products/__init__.py`:
+
+```python
+from ecommerce.products.catalog import PRICES, is_available, price_of
+
+__all__ = ["PRICES", "is_available", "price_of"]
+```
+
+Contents of `ecommerce/customers/profiles.py`:
+
+```python
+def make_customer(name, email):
+    return {"name": name, "email": email, "wishlist": []}
+
+def add_to_wishlist(customer, product):
+    customer["wishlist"].append(product)
+    return customer
+```
+
+Contents of `ecommerce/customers/__init__.py`:
+
+```python
+from ecommerce.customers.profiles import make_customer, add_to_wishlist
+
+__all__ = ["make_customer", "add_to_wishlist"]
+```
+
+Contents of `ecommerce/__init__.py`:
+
+```python
+from ecommerce.cart import add_item, remove_item, apply_percentage
+from ecommerce.products import is_available, price_of
+from ecommerce.customers import make_customer, add_to_wishlist
+
+PACKAGE_VERSION = "1.0.0"
+
+__all__ = [
+    "add_item",
+    "remove_item",
+    "apply_percentage",
+    "is_available",
+    "price_of",
+    "make_customer",
+    "add_to_wishlist",
+]
+```
+
+Now a caller script next to the `ecommerce/` directory:
+
+```python
+from ecommerce import (
+    add_item,
+    apply_percentage,
+    is_available,
+    price_of,
+    make_customer,
+)
+
+# Build a customer and a cart.
+alice = make_customer("Alice", "alice@example.com")
+cart = {}
+
+# Add items, skipping any that aren't available.
+for product, qty in [("Wireless Mouse", 2), ("Coffee Mug", 1), ("Unknown Item", 5)]:
+    if is_available(product):
+        add_item(cart, product, qty)
+
+# Compute the total.
+subtotal = sum(price_of(product) * qty for product, qty in cart.items())
+total = apply_percentage(subtotal, 10)
+
+print(f"Customer: {alice['name']}")
+print(f"Cart: {cart}")
+print(f"Subtotal: ${subtotal:.2f}")
+print(f"After 10% discount: ${total:.2f}")
+```
+
+Every name the caller uses came from the flat `from ecommerce import ...` line. The actual code lives in five different files across three subpackages, but the caller doesn't have to know that. The package's `__init__.py` files do the work of presenting a clean surface.
+
+If a maintainer later moves `apply_percentage` from `cart/discounts.py` to a new `cart/promotions.py`, they only have to update `ecommerce/cart/__init__.py` to re-export it from the new location. Every caller that did `from ecommerce import apply_percentage` keeps working with zero changes. That's the practical payoff of structuring a package well.
+
+<h1 id="quiz">Quiz</h1>
+
+<h1 id="quiz-questions">Quiz Questions</h1>
+
+**Question 1: Which statement best describes the difference between a module and a regular package in Python?**
+
+- [x] A module is one .py file; a regular package is a directory with **init**.py.
+- [ ] A module can contain functions, but a package can contain only classes.
+- [ ] A package is any directory listed in pyproject.toml or setup.cfg.
+- [ ] A module is imported once, while a package is imported on every access.
+
+**Question 2: What happens to ecommerce/**init**.py when code first runs from ecommerce.cart import add_item?**
+
+- [ ] It runs after cart.py finishes, then add_item is copied into **init**.py.
+- [x] It runs before cart.py, and the package object is cached in sys.modules.
+- [ ] It is skipped because the import names a submodule, not the package.
+- [ ] It runs once for add_item and again for every later ecommerce import.
+
+**Question 3: Why might a package re-export names from its **init**.py file?**
+
+- [ ] To make imported functions run faster by skipping normal name lookup.
+- [x] To let callers use a flat public API while files stay organized internally.
+- [ ] To force every submodule to load only when its function is called.
+- [ ] To make module globals private unless they appear in **init**.py.
+
+**Question 4: Given an empty ecommerce/**init**.py and a file ecommerce/cart.py, what does import ecommerce do by itself?**
+
+- [ ] It imports ecommerce and automatically imports every .py file inside it.
+- [x] It imports ecommerce, but cart is not loaded unless requested or re-exported.
+- [ ] It fails because packages must define at least one public attribute.
+- [ ] It imports cart.py but leaves ecommerce/**init**.py unexecuted.
+
+**Question 5: When is a namespace package most appropriate?**
+
+- [ ] When a single file needs to behave like both a script and a module.
+- [ ] When **init**.py must run heavy setup before any submodule import.
+- [x] When package portions may live in multiple directories without **init**.py.
+- [ ] When a package should prevent users from importing its submodules.
+
+**Question 6: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 7: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 8: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+<QuizCard />
+
+<CommentsSection />
+
+</LessonCard>

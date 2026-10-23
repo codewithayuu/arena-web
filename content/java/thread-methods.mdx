@@ -1,0 +1,636 @@
+---
+title: "Thread Methods"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Thread Methods explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+A running e-commerce example: a background worker that polls an order queue, sleeps between checks, and shuts down cleanly when the main thread signals it.
+
+<h1 id="start-vs-run-the-most-common-beginner-trap">
+  start vs run: The Most Common Beginner Trap
+</h1>
+
+`Thread.start()` is the method that actually creates a new operating-system thread and runs your code on it. `Thread.run()` is just a regular method that contains the code to execute. Calling `run` directly doesn't start a new thread. It executes the body on the thread that made the call, which is almost never what you want.
+
+```java
+public class StartVsRun {
+    public static void main(String[] args) {
+        Thread worker = new Thread(() -> {
+            String name = Thread.currentThread().getName();
+            System.out.println("Polling orders on thread: " + name);
+        }, "order-worker");
+
+        System.out.println("Main thread: " + Thread.currentThread().getName());
+
+        worker.start();
+
+        try {
+            worker.join();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+}
+```
+
+The worker prints `order-worker` because `start` spun up a fresh thread and ran the lambda on it. Compare what happens if we call `run` instead.
+
+```java
+public class RunDirectly {
+    public static void main(String[] args) {
+        Thread worker = new Thread(() -> {
+            String name = Thread.currentThread().getName();
+            System.out.println("Polling orders on thread: " + name);
+        }, "order-worker");
+
+        System.out.println("Main thread: " + Thread.currentThread().getName());
+
+        worker.run();
+    }
+}
+```
+
+The lambda ran on `main`. No new thread was created. `worker.run()` is a regular method call. The worker `Thread` object exists, but it never moved out of the `NEW` lifecycle state because `start` was never called.
+
+The diagram shows the split. `start` is the path that creates a new thread of execution. `run` is a synchronous method call. If `main` shows up in places where you expected a worker name, the first thing to check is whether someone called `run` instead of `start`.
+
+A second rule goes with this one: you can only call `start` once on a `Thread` object. Calling it twice throws `IllegalThreadStateException`.
+
+```java
+public class StartTwice {
+    public static void main(String[] args) {
+        Thread worker = new Thread(() -> System.out.println("ran"), "order-worker");
+        worker.start();
+
+        try {
+            worker.start();
+        } catch (IllegalThreadStateException e) {
+            System.out.println("Second start failed: " + e.getClass().getSimpleName());
+        }
+    }
+}
+```
+
+Once a thread has finished, it's done. The `Thread` object can't be reused. To run the same work again, build a new `Thread` (or use an executor). This restriction is why people lean on thread pools for repeated work instead of recreating `Thread` instances by hand.
+
+<h1 id="threadcurrentthread-knowing-which-thread-you-are-in">
+  Thread.currentThread(): Knowing Which Thread You Are In
+</h1>
+
+`Thread.currentThread()` is a static method that returns the `Thread` object representing whichever thread is executing the call. It's the answer to "where am I?" inside any method, and the first tool to use when something prints from an unexpected thread.
+
+```java
+public class WhoAmI {
+    public static void main(String[] args) {
+        System.out.println("Main: " + describe());
+
+        Thread worker = new Thread(() -> {
+            System.out.println("Worker: " + describe());
+        }, "order-worker");
+
+        worker.start();
+        try {
+            worker.join();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    static String describe() {
+        Thread t = Thread.currentThread();
+        return t.getName() + " (id=" + t.threadId() + ", daemon=" + t.isDaemon() + ")";
+    }
+}
+```
+
+The exact `id` will vary between runs and JVM versions, but the shape is the same. From the same `describe()` method, two different threads see two different identities, because `currentThread` resolves to the calling thread each time.
+
+This method is also the gateway to the interruption methods. To signal yourself, write `Thread.currentThread().interrupt()`. To check whether you've been signaled, write `Thread.currentThread().isInterrupted()`. The static `Thread.interrupted()` is even shorter, since it implicitly works on the current thread.
+
+`Thread.currentThread()` is cheap (a JNI call backed by a thread-local), so calling it inside a tight loop is fine. The cost only matters when you call it millions of times per second; cache it in a local if you do.
+
+<h1 id="threadsleep-pausing-the-current-thread">
+  Thread.sleep: Pausing the Current Thread
+</h1>
+
+`Thread.sleep` is a static method that pauses the calling thread for at least the requested number of milliseconds. An overload takes a nanosecond component too, but the millisecond version is what you'll use 99% of the time. While a thread is sleeping, the JVM moves it from `RUNNABLE` to `TIMED_WAITING` and doesn't schedule it again until the time elapses or someone interrupts it.
+
+```java
+public class SleepBasics {
+    public static void main(String[] args) throws InterruptedException {
+        System.out.println("Polling order queue...");
+        long start = System.currentTimeMillis();
+
+        Thread.sleep(500);
+
+        long elapsed = System.currentTimeMillis() - start;
+        System.out.println("Woke up after ~" + elapsed + " ms");
+    }
+}
+```
+
+The elapsed time will be 500 ms or slightly more, depending on the OS scheduler. `sleep` makes a minimum-time guarantee, not a maximum. If the system is busy, you might wake up a few milliseconds late. You won't wake up early unless someone interrupts you.
+
+Three things to know about `sleep`:
+
+| Behavior                                 | Detail                                                                                                          |
+| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| It's static                              | `Thread.sleep(...)`, not `someThread.sleep(...)`. You can only sleep the current thread.                        |
+| It throws checked `InterruptedException` | If another thread calls `interrupt()` on this one during the sleep, sleep throws and clears the interrupt flag. |
+| It releases the CPU but not locks        | If the thread is holding a synchronized lock, that lock stays held while it sleeps.                             |
+
+The third row is the surprising one. `sleep` isn't a polite "step aside so others can take my locks" mechanism. It stops scheduling this thread for a while. Any synchronized resource the thread holds is still held when it wakes up.
+
+The first overload is `Thread.sleep(long millis)`. `Thread.sleep(long millis, int nanos)` also exists for sub-millisecond precision, but most platforms only honor a few hundred nanoseconds of resolution and the millisecond version is good enough for nearly every case in application code.
+
+In our e-commerce setting, `sleep` is what an order-polling worker uses between queue checks. A 500 ms gap between polls reduces load on the queue without blocking new orders for long:
+
+```java
+public class PollingLoop {
+    public static void main(String[] args) throws InterruptedException {
+        for (int i = 1; i <= 3; i++) {
+            System.out.println("Check #" + i + ": looking for new orders");
+            Thread.sleep(500);
+        }
+        System.out.println("Done polling");
+    }
+}
+```
+
+Each `sleep(500)` pauses the loop for at least half a second. The whole program runs in about 1.5 seconds, give or take scheduler jitter.
+
+<h1 id="join-waiting-for-another-thread-to-finish">
+  join: Waiting for Another Thread to Finish
+</h1>
+
+`join` is how one thread waits for another to terminate. You call `someThread.join()` from the thread that needs to wait, and the call blocks until `someThread` enters the `TERMINATED` state. It's the standard way to make sure background work has finished before the main thread moves on.
+
+```java
+public class JoinBasics {
+    public static void main(String[] args) throws InterruptedException {
+        Thread inventory = new Thread(() -> {
+            try {
+                Thread.sleep(300);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            System.out.println("Inventory check complete");
+        }, "inventory-check");
+
+        inventory.start();
+        System.out.println("Main: waiting for inventory check");
+        inventory.join();
+        System.out.println("Main: inventory check finished, continuing");
+    }
+}
+```
+
+Without the `join`, the last line could print before "Inventory check complete", because `main` would race ahead. `join` synchronizes them: `main` parks itself until `inventory` is done, then resumes.
+
+`join` has three overloads:
+
+| Signature                      | Behavior                                                                       |
+| ------------------------------ | ------------------------------------------------------------------------------ |
+| `join()`                       | Waits indefinitely until the target thread terminates.                         |
+| `join(long millis)`            | Waits up to `millis` milliseconds. Returns whether or not the target finished. |
+| `join(long millis, int nanos)` | Same as above, with nanosecond precision.                                      |
+
+The bounded form is important. A pure `join()` will block forever if the target thread hangs, which is the kind of bug you don't want in a service shutdown path. A `join(5000)` blocks for at most 5 seconds and then returns whether the target finished or not. Check `isAlive()` afterward to find out.
+
+```java
+public class JoinWithTimeout {
+    public static void main(String[] args) throws InterruptedException {
+        Thread slowImport = new Thread(() -> {
+            try {
+                Thread.sleep(2000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "product-import");
+
+        slowImport.start();
+        slowImport.join(500);
+
+        if (slowImport.isAlive()) {
+            System.out.println("Import still running after 500 ms, moving on");
+        } else {
+            System.out.println("Import finished in time");
+        }
+    }
+}
+```
+
+`main` waits half a second, sees the import is still going, and continues. The import thread will eventually finish, but `main` doesn't block on it. In a real e-commerce service, this pattern is how you implement "wait up to N seconds for the cache to warm, then start serving requests regardless".
+
+The diagram shows the join handshake. `main` parks at the `join` call and doesn't resume until the worker reaches `TERMINATED`. The two threads run concurrently between `start` and `join`; the `join` is the synchronization point at the end.
+
+Like `sleep`, `join` throws `InterruptedException` if another thread interrupts the waiting one.
+
+<h1 id="threadyield-a-suggestion-not-a-command">
+  Thread.yield: A Suggestion, Not a Command
+</h1>
+
+`Thread.yield()` is a static method that tells the scheduler "I am willing to give up my time slice if another thread of the same priority wants to run." The keyword is "willing". The scheduler is free to ignore the hint and keep running the same thread. On modern JVMs and modern operating systems, `yield` is closer to a polite cough than a real handoff.
+
+```java
+public class YieldDemo {
+    public static void main(String[] args) throws InterruptedException {
+        Thread a = new Thread(() -> {
+            for (int i = 0; i < 3; i++) {
+                System.out.println("A " + i);
+                Thread.yield();
+            }
+        }, "thread-a");
+
+        Thread b = new Thread(() -> {
+            for (int i = 0; i < 3; i++) {
+                System.out.println("B " + i);
+                Thread.yield();
+            }
+        }, "thread-b");
+
+        a.start();
+        b.start();
+        a.join();
+        b.join();
+    }
+}
+```
+
+**Sample output (will vary across runs):**
+
+```text
+A 0
+B 0
+A 1
+B 1
+A 2
+B 2
+```
+
+That's one possible interleaving. You might also see `A 0 A 1 B 0 A 2 B 1 B 2` or `A 0 A 1 A 2 B 0 B 1 B 2` or any other ordering. `yield` doesn't enforce alternation. It's a hint that the scheduler may or may not act on.
+
+The honest truth about `yield`:
+
+- It has weak guarantees. The JVM spec leaves it deliberately vague.
+- Different JVM versions and operating systems treat it differently. Some optimize it to a no-op.
+- It doesn't release locks (same as `sleep`).
+- It doesn't throw `InterruptedException`.
+
+In application code, you almost never need `yield`. To pause and let others run, use `Thread.sleep`. To wait on a condition, use one of the proper synchronization primitives (locks, condition variables, semaphores). The places `yield` shows up legitimately are in tight spin-wait loops where you would otherwise burn 100% CPU, and even there it's rarely the best answer.
+
+```java
+public class WhereYieldHelps {
+    static volatile boolean inventoryLoaded = false;
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread loader = new Thread(() -> {
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            inventoryLoaded = true;
+        }, "loader");
+
+        loader.start();
+
+        // Spin-wait, but yield each iteration to be polite.
+        while (!inventoryLoaded) {
+            Thread.yield();
+        }
+
+        System.out.println("Inventory loaded, proceeding");
+    }
+}
+```
+
+The `yield` inside the spin loop keeps the loop from monopolizing a CPU core if there's another runnable thread waiting. That said, a real implementation would use `wait/notify` or a `CountDownLatch` instead of spinning. `yield` is a code smell more often than it is appropriate.
+
+A `yield` is cheaper than a `sleep(1)` because it doesn't park the thread. The downside is it can also be a no-op, which means a tight `while (!done) Thread.yield();` loop can still hit 100% CPU on some platforms.
+
+<h1 id="interrupt-isinterrupted-and-interrupted-the-signaling-trio">
+  interrupt, isInterrupted, and interrupted: The Signaling Trio
+</h1>
+
+Java doesn't have a way to forcibly stop a thread. There used to be `Thread.stop()`, but it was deprecated decades ago because it could leave shared data in a corrupt state. The modern approach is **cooperative cancellation**: one thread sets a flag, and the other thread checks the flag and decides when to exit.
+
+The flag is called the **interrupt status**, and three methods work with it:
+
+| Method                       | Static or instance? | Effect                                                                                                                                                                      |
+| ---------------------------- | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `someThread.interrupt()`     | instance            | Sets the interrupt flag on `someThread`. If `someThread` is blocked in `sleep`, `join`, or `wait`, it wakes up and throws `InterruptedException` (and the flag is cleared). |
+| `someThread.isInterrupted()` | instance            | Reads the flag without changing it. Returns `true` if the thread has been interrupted.                                                                                      |
+| `Thread.interrupted()`       | static              | Reads the flag of the current thread **and clears it**. Returns `true` if the current thread had been interrupted.                                                          |
+
+The static `Thread.interrupted()` is the subtle one. It both reads and clears the flag. That's deliberate: it's designed for places where the current thread has handled the interruption and wants to reset the flag for the next round of work. Confusing it with `isInterrupted()` is one of the most common bugs in this area.
+
+A worker thread that polls an order queue and shuts down cleanly when interrupted.
+
+```java
+public class InterruptibleWorker {
+    public static void main(String[] args) throws InterruptedException {
+        Thread worker = new Thread(() -> {
+            int checks = 0;
+            while (!Thread.currentThread().isInterrupted()) {
+                checks++;
+                System.out.println("Order check #" + checks);
+                try {
+                    Thread.sleep(200);
+                } catch (InterruptedException e) {
+                    System.out.println("Interrupted during sleep, exiting");
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            System.out.println("Worker shutting down after " + checks + " checks");
+        }, "order-poller");
+
+        worker.start();
+        Thread.sleep(700);
+
+        System.out.println("Main: signaling shutdown");
+        worker.interrupt();
+        worker.join();
+        System.out.println("Main: worker fully stopped");
+    }
+}
+```
+
+A few things are working together here. The loop condition reads `Thread.currentThread().isInterrupted()`, so the worker exits when the flag is set. When the worker is sleeping at the moment of interruption, `sleep` throws `InterruptedException` and clears the flag, so the catch block re-sets it with `Thread.currentThread().interrupt()` before breaking out. Both paths converge on a clean shutdown.
+
+The diagram shows the two paths an interrupt can take. If the worker is in the middle of work (`Running`), the flag is just set and the next loop check sees it. If the worker is sleeping (`TIMED_WAITING`), the sleep call throws `InterruptedException` and clears the flag, so the catch block restores it before exiting. Either way, the worker ends up out of its loop and into termination.
+
+<h1 id="handling-interruptedexception-correctly">
+  Handling InterruptedException Correctly
+</h1>
+
+`InterruptedException` is a checked exception thrown by `sleep`, `join`, `wait`, and many other blocking calls when the thread is interrupted while waiting. Handling it correctly is subtle, so it gets its own section.
+
+The rule of thumb: when you catch `InterruptedException`, you must do one of two things. Either propagate the exception, or restore the interrupt flag before continuing. If you do neither, you've lost the signal that someone wanted this thread to stop.
+
+**What's wrong with this code?**
+
+```java
+public class SwallowedInterrupt {
+    public static void main(String[] args) throws InterruptedException {
+        Thread worker = new Thread(() -> {
+            while (!Thread.currentThread().isInterrupted()) {
+                System.out.println("Polling...");
+                try {
+                    Thread.sleep(200);
+                } catch (InterruptedException e) {
+                    // ignored
+                }
+            }
+            System.out.println("Done");
+        }, "bad-worker");
+
+        worker.start();
+        Thread.sleep(500);
+        worker.interrupt();
+        worker.join(2000);
+
+        if (worker.isAlive()) {
+            System.out.println("Worker never stopped!");
+        }
+    }
+}
+```
+
+**Sample output:**
+
+```text
+Polling...
+Polling...
+Polling...
+Polling...
+Polling...
+Polling...
+Polling...
+Polling...
+Polling...
+Polling...
+Worker never stopped!
+```
+
+The worker keeps polling forever. When `main` calls `interrupt`, the flag is set, but the worker is in `sleep` at that moment, so `sleep` throws `InterruptedException` **and clears the flag**. The empty catch block does nothing. On the next loop iteration, `isInterrupted()` reads `false` (the flag was cleared by the throw), so the loop keeps going. The signal was swallowed.
+
+**Fix:** Restore the interrupt flag inside the catch block.
+
+```java
+public class RestoredInterrupt {
+    public static void main(String[] args) throws InterruptedException {
+        Thread worker = new Thread(() -> {
+            while (!Thread.currentThread().isInterrupted()) {
+                System.out.println("Polling...");
+                try {
+                    Thread.sleep(200);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            System.out.println("Done");
+        }, "good-worker");
+
+        worker.start();
+        Thread.sleep(500);
+        worker.interrupt();
+        worker.join();
+    }
+}
+```
+
+The catch block re-sets the flag with `Thread.currentThread().interrupt()`. The next loop check sees the flag is set, and the loop exits. The worker terminates cleanly.
+
+The two acceptable patterns for `InterruptedException`:
+
+| Pattern                                                    | When to use it                                                                                                                 |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Re-throw the exception                                     | Methods that already declare `throws InterruptedException` should let callers handle it.                                       |
+| Restore the flag with `Thread.currentThread().interrupt()` | Methods that can't throw (e.g., `Runnable.run()`, which has no `throws` clause) must restore the flag and then handle locally. |
+
+The pattern you must never use is the empty catch. An empty catch on `InterruptedException` is a real bug, not a style preference.
+
+A small subtlety: some codebases write `catch (InterruptedException e) { return; }` inside a `Runnable.run()` body to exit the worker without restoring the flag. That's defensible when the run method is about to terminate anyway, because there's no remaining work that needs to see the flag. The conservative habit is still to restore the flag and break out, so callers higher up in the stack (if any) can also react.
+
+<h1 id="isalive-checking-if-a-thread-is-still-running">
+  isAlive: Checking If a Thread Is Still Running
+</h1>
+
+`isAlive()` returns `true` if the thread has been started and hasn't yet finished. It's the public API for "is this thread between `start` and termination?". Use it after a bounded `join` to find out whether the wait completed or timed out.
+
+```java
+public class AliveCheck {
+    public static void main(String[] args) throws InterruptedException {
+        Thread worker = new Thread(() -> {
+            try {
+                Thread.sleep(300);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "checkout-worker");
+
+        System.out.println("Before start, isAlive = " + worker.isAlive());
+        worker.start();
+        System.out.println("Just after start, isAlive = " + worker.isAlive());
+
+        worker.join();
+        System.out.println("After join, isAlive = " + worker.isAlive());
+    }
+}
+```
+
+A thread is "alive" only between `start` and termination. Before `start`, it's in the `NEW` state and `isAlive` returns `false`. After termination, it's in the `TERMINATED` state and `isAlive` returns `false` again. Don't confuse "alive" with "currently running"; a thread in `BLOCKED`, `WAITING`, or `TIMED_WAITING` is still alive.
+
+`isAlive` is also useful for diagnostic prints in shutdown paths. After a bounded `join`, an `if (worker.isAlive())` check tells you whether the join timed out without having to track that separately.
+
+<h1 id="daemon-threads-setdaemon-and-background-work">
+  Daemon Threads: setDaemon and Background Work
+</h1>
+
+Java threads come in two flavors: **user threads** and **daemon threads**. The difference is what happens at JVM shutdown. The JVM exits when all user threads have finished, regardless of daemon threads. If only daemon threads are still running, the JVM exits and the daemons are killed where they stand, without their `finally` blocks necessarily running.
+
+You mark a thread as a daemon by calling `setDaemon(true)` **before** `start`. Calling it after `start` throws `IllegalThreadStateException`.
+
+```java
+public class DaemonBasics {
+    public static void main(String[] args) throws InterruptedException {
+        Thread heartbeat = new Thread(() -> {
+            while (true) {
+                System.out.println("[daemon] heartbeat");
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }, "heartbeat");
+        heartbeat.setDaemon(true);
+        heartbeat.start();
+
+        // Main does a short piece of work, then exits.
+        Thread.sleep(350);
+        System.out.println("Main: exiting");
+    }
+}
+```
+
+**Sample output:**
+
+```text
+[daemon] heartbeat
+[daemon] heartbeat
+[daemon] heartbeat
+[daemon] heartbeat
+Main: exiting
+```
+
+The heartbeat thread has an infinite loop and would print forever if it were a user thread. Because it's a daemon, when `main` finishes the JVM exits and the daemon is terminated. You might see one extra heartbeat after the "exiting" line depending on timing, but the program won't hang.
+
+Without `setDaemon(true)`, the same code would print heartbeat forever, because the JVM would wait for the user-thread heartbeat loop to finish, which it never does.
+
+| Daemon?         | When the JVM exits                                | Typical use                                                                                            |
+| --------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `false` (user)  | When all user threads finish                      | Main application work, request handlers, things you don't want killed mid-write                        |
+| `true` (daemon) | When all user threads finish (daemons get killed) | Background heartbeats, metrics emitters, cache eviction loops, things that don't need a clean shutdown |
+
+The trap with daemons is that **they don't run their `finally` blocks when killed**. If your daemon writes to a log file and you rely on a `finally` to flush, those last writes can be lost on shutdown. Don't put cleanup code that has to run inside a daemon. Use a regular thread plus explicit `interrupt` + `join` for anything that owns state you care about.
+
+The diagram lays out the shutdown decision. When the last user thread is done, the JVM checks for other user threads. If there are none, it exits, and the daemons go with it. The daemons don't get a chance to wrap up.
+
+A common e-commerce use of daemons is a metrics reporter that periodically prints how many orders have been processed. Losing the last report when the service shuts down is fine; it's a metric, not a transaction. A daemon thread is the right fit.
+
+<h1 id="tying-it-together-a-worker-that-polls-and-shuts-down-cleanly">
+  Tying It Together: A Worker That Polls and Shuts Down Cleanly
+</h1>
+
+A small program that combines most of what we've covered. A `main` thread starts a worker that polls an in-memory order queue, sleeps between polls, prints what it sees, and shuts down cleanly when `main` signals interruption.
+
+```java
+import java.util.ArrayDeque;
+import java.util.Deque;
+
+public class OrderPollingService {
+    public static void main(String[] args) throws InterruptedException {
+        Deque<String> orderQueue = new ArrayDeque<>();
+
+        Thread poller = new Thread(() -> {
+            int processed = 0;
+            try {
+                while (!Thread.currentThread().isInterrupted()) {
+                    String next;
+                    synchronized (orderQueue) {
+                        next = orderQueue.pollFirst();
+                    }
+                    if (next != null) {
+                        System.out.println("Processing " + next);
+                        processed++;
+                    } else {
+                        System.out.println("Queue empty, sleeping");
+                    }
+                    Thread.sleep(150);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            System.out.println("Poller stopping, processed " + processed + " orders");
+        }, "order-poller");
+
+        poller.setDaemon(false);
+        poller.start();
+
+        // Simulate main thread placing a few orders.
+        for (int i = 1; i <= 3; i++) {
+            synchronized (orderQueue) {
+                orderQueue.addLast("ORD-" + (1000 + i));
+            }
+            Thread.sleep(100);
+        }
+
+        // Give the poller a moment to drain, then ask it to stop.
+        Thread.sleep(500);
+        System.out.println("Main: requesting shutdown");
+        poller.interrupt();
+
+        // Wait up to 2 seconds for the poller to exit.
+        poller.join(2000);
+        if (poller.isAlive()) {
+            System.out.println("Main: poller did not exit in time");
+        } else {
+            System.out.println("Main: shutdown complete");
+        }
+    }
+}
+```
+
+**Sample output (timing-dependent):**
+
+```text
+Queue empty, sleeping
+Processing ORD-1001
+Processing ORD-1002
+Processing ORD-1003
+Queue empty, sleeping
+Queue empty, sleeping
+Queue empty, sleeping
+Main: requesting shutdown
+Poller stopping, processed 3 orders
+Main: shutdown complete
+```
+
+The poller uses `isInterrupted()` as its loop condition, `sleep` to space out polls, and catches `InterruptedException` so the sleep wakes up cleanly when `main` signals stop. `main` uses `start`, `interrupt`, and a bounded `join` to coordinate. A small `synchronized` block wraps the queue access; it's there so the example is honest about thread-safe queue access, even though synchronization isn't the focus of this lesson.
+
+The shutdown pattern in `main`, **interrupt then bounded join**, is the canonical way to stop a background worker in Java. It works because the worker is written to respect interruption. A worker that ignores interrupts would defeat this whole setup.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

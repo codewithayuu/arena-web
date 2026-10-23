@@ -1,0 +1,771 @@
+---
+title: "MongoDB Deep Dive"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "MongoDB explained with clear examples, visuals, and practice questions in Mindflare's System Design Interviews course."
+---
+
+<LessonCard>
+
+MongoDB is useful when the data model is naturally document-shaped: profiles, carts, catalogs, activity records, content metadata, and other objects that are usually read and written as a unit.
+
+It sits between simple key-value stores and relational databases: richer queries than a key-value store, more schema flexibility than SQL, and built-in sharding when one machine is no longer enough.
+
+That flexibility does not remove the need for modeling. The main design work is deciding what to embed, what to reference, which indexes to maintain, and which shard key will avoid hot spots.
+
+<h1 id="mongodb-architecture-overview">MongoDB Architecture Overview</h1>
+
+A sharded MongoDB cluster has three distinct layers: application-facing routers, a config server replica set that holds routing metadata, and the data shards, each of which runs its own replica set for availability. The diagram maps how these layers connect and how writes and reads flow from client to storage:
+
+Application servers don’t talk to shard nodes directly. They connect to **mongos query routers** (M1/M2). `mongos` is the stateless front door of a sharded MongoDB cluster: it accepts client requests, consults cluster metadata, and routes each operation to the right shard(s).
+
+That routing metadata lives on the **config servers**, which run as a **replica set** (C1/C2/C3) for high availability. Config servers store the cluster’s sharding configuration: which collections are sharded, the shard key ranges (chunks), and which shard owns which chunk. `mongos` reads this metadata to decide where a query or write should go.
+
+Each shard (Shard 1 and Shard 2) is itself a **replica set**:
+
+- a **Primary** node handles all writes (and can serve reads, depending on read preference)
+- **Secondary** nodes replicate from the primary and can serve read traffic if configured
+- if the primary fails, the replica set elects a new primary automatically
+
+For a request flow:
+
+- **Writes** go through `mongos` to the primary of the target shard (chosen by the shard key). The primary then replicates the operation to its secondaries.
+- **Reads** go through `mongos` as well. If the query includes the shard key (or is otherwise targeted), `mongos` routes it to the relevant shard. If not, it may do a **scatter-gather** across shards and merge results.
+- Replication within each shard provides **availability**, while sharding across shards provides **horizontal scale** for data size and throughput.
+
+<h1 id="1-when-to-choose-mongodb">1. When to Choose MongoDB</h1>
+
+Choose MongoDB when the application mostly works with whole documents and the schema changes often. Avoid choosing it just because it is "schemaless"; poor modeling still creates slow queries, duplicated updates, and painful shard keys.
+
+<h3 id="11-choose-mongodb-when-you-have">1.1 Choose MongoDB When You Have</h3>
+
+<h4 id="flexible-or-evolving-schemas">Flexible or evolving schemas</h4>
+
+Your data structure changes frequently, or different records have different fields. MongoDB does not require schema migrations for adding new fields.
+
+<h4 id="document-centric-data">Document-centric data</h4>
+
+Your data naturally forms self-contained documents (articles, products, user profiles) rather than highly normalized relations.
+
+<h4 id="rich-query-requirements">Rich query requirements</h4>
+
+You need complex queries, aggregations, full-text search, or geospatial queries beyond simple key-value lookups.
+
+<h4 id="rapid-development">Rapid development</h4>
+
+You are building a prototype or MVP where schema flexibility accelerates iteration.
+
+<h4 id="hierarchical-or-nested-data">Hierarchical or nested data</h4>
+
+Your data has natural nesting (comments within posts, items within orders) that would require multiple joins in SQL.
+
+<h4 id="horizontal-scaling-needs">Horizontal scaling needs</h4>
+
+You anticipate needing to scale beyond a single server with built-in sharding support.
+
+<h3 id="12-avoid-mongodb-when-you-need">1.2 Avoid MongoDB When You Need</h3>
+
+<h4 id="complex-multi-table-transactions">Complex multi-table transactions</h4>
+
+While MongoDB supports transactions, it is not optimized for workloads with frequent cross-collection transactions like banking systems.
+
+<h4 id="highly-relational-data">Highly relational data</h4>
+
+If your data requires many relationships and frequent joins across entities, a relational database with proper foreign keys is cleaner.
+
+<h4 id="strong-schema-enforcement">Strong schema enforcement</h4>
+
+When data integrity is critical and you need strict validation, PostgreSQL's constraints are stronger.
+
+<h4 id="simple-key-value-access">Simple key-value access</h4>
+
+If you only need primary key lookups at massive scale, DynamoDB or Redis is more efficient.
+
+<h4 id="heavy-analytics-workloads">Heavy analytics workloads</h4>
+
+For OLAP queries over large datasets, data warehouses like Redshift or BigQuery are better suited.
+
+<h3 id="13-common-interview-systems-using-mongodb">
+  1.3 Common Interview Systems Using MongoDB
+</h3>
+
+| System                        | Why MongoDB Works                               |
+| ----------------------------- | ----------------------------------------------- |
+| Content Management System     | Flexible schema for diverse content types       |
+| E-commerce Product Catalog    | Products with varying attributes                |
+| Social Network                | User profiles, posts, comments with nested data |
+| Real-time Analytics Dashboard | Aggregation framework, time-series support      |
+| Mobile App Backend            | Schema flexibility, offline sync with Realm     |
+| Gaming User Profiles          | Complex nested data, frequent schema changes    |
+
+<h1 id="2-data-modeling-embedding-vs-referencing">
+  2. Data Modeling: Embedding vs Referencing
+</h1>
+
+If you approach MongoDB with relational database thinking, you will end up with the worst of both worlds: the operational complexity of a document database without the query flexibility of a relational one.
+
+The fundamental modeling decision in MongoDB is whether to embed related data within a document or reference it in a separate collection. This choice affects query performance, data consistency, and application complexity. There is no universally correct answer, only trade-offs that favor different access patterns.
+
+<h3 id="21-embedding-denormalization">2.1 Embedding (Denormalization)</h3>
+
+Store related data together in a single document.
+
+```json
+{
+  "_id": "order_123",
+  "customer": {
+    "name": "John Doe",
+    "email": "john@example.com"
+  },
+  "items": [
+    { "product": "Laptop", "price": 999, "quantity": 1 },
+    { "product": "Mouse", "price": 29, "quantity": 2 }
+  ],
+  "shipping_address": {
+    "street": "123 Main St",
+    "city": "San Francisco",
+    "zip": "94102"
+  },
+  "total": 1057,
+  "status": "shipped"
+}
+```
+
+<h4 id="advantages">Advantages</h4>
+
+- Single read retrieves all data (no joins)
+- Atomic updates on the entire document
+- Better read performance for common access patterns
+- Simpler application code
+
+<h4 id="disadvantages">Disadvantages</h4>
+
+- Data duplication if embedded data is shared
+- Document size limit (16 MB)
+- Updates to shared data require updating multiple documents
+
+<h3 id="22-referencing-normalization">2.2 Referencing (Normalization)</h3>
+
+Store related data in separate collections with references.
+
+```json
+// Orders collection
+{
+  "_id": "order_123",
+  "customer_id": "customer_456",
+  "item_ids": ["item_1", "item_2"],
+  "total": 1057,
+  "status": "shipped"
+}
+
+// Customers collection
+{
+  "_id": "customer_456",
+  "name": "John Doe",
+  "email": "john@example.com"
+}
+
+// Items collection
+{
+  "_id": "item_1",
+  "order_id": "order_123",
+  "product": "Laptop",
+  "price": 999
+}
+```
+
+<h4 id="advantages">Advantages</h4>
+
+- No data duplication
+- Smaller document sizes
+- Easier to update shared data
+- Better for many-to-many relationships
+
+<h4 id="disadvantages">Disadvantages</h4>
+
+- Requires multiple queries or $lookup
+- No atomic operations across collections (without transactions)
+- More complex application code
+
+<h3 id="23-decision-framework">2.3 Decision Framework</h3>
+
+The right choice between embedding and referencing depends on access patterns, relationship cardinality, and whether the child data can grow without bound. This decision tree walks through those questions in order:
+
+<h4 id="embed-when">Embed when</h4>
+
+- Data is accessed together (1:1 or 1:few relationships)
+- Child data does not make sense outside parent context
+- Data does not change frequently
+- Array will not grow unbounded
+
+<h4 id="reference-when">Reference when</h4>
+
+- Data is accessed independently
+- Many-to-many relationships exist
+- Child collection can grow unbounded
+- Data is frequently updated across many parents
+
+<h3 id="24-hybrid-approach">2.4 Hybrid Approach</h3>
+
+Often the best solution combines both strategies:
+
+```json
+// Order document with embedded items but referenced customer
+{
+  "_id": "order_123",
+  "customer_id": "customer_456",
+  "customer_snapshot": {
+    "name": "John Doe",
+    "email": "john@example.com"
+  },
+  "items": [
+    { "product_id": "prod_1", "name": "Laptop", "price": 999, "quantity": 1 }
+  ],
+  "total": 1057
+}
+```
+
+This approach embeds the data needed for display (customer_snapshot), references the canonical data that might change (customer_id), and keeps related items together for atomic updates.
+
+> **Design note:** Choose embedding or referencing from access patterns. In an order system, line items are usually embedded because they are fetched with the order, rarely queried independently, and useful for computing totals inside one document.
+>
+> For users and addresses, references may be cleaner if users can have many addresses, addresses change independently, or the same address is shared by multiple accounts.
+
+<h1 id="3-schema-design-patterns">3. Schema Design Patterns</h1>
+
+Embedding and referencing cover the basics. The next step is recognizing recurring modeling problems: documents with widely varying attributes, high-frequency time-series data, and outlier records that would otherwise make typical documents too large.
+
+Knowing these patterns, and when each applies, demonstrates practical experience beyond textbook knowledge.
+
+<h3 id="31-attribute-pattern">3.1 Attribute Pattern</h3>
+
+**Problem:** Documents have many similar fields, or fields vary between documents.
+
+**Solution:** Move sparse attributes to an array of key-value pairs.
+
+```json
+// Before: Sparse attributes
+{
+  "name": "Laptop",
+  "screen_size": "15.6",
+  "ram": "16GB",
+  "storage": "512GB SSD",
+  "graphics_card": "RTX 3060",
+  "color": null,
+  "material": null
+}
+
+// After: Attribute pattern
+{
+  "name": "Laptop",
+  "attributes": [
+    {"key": "screen_size", "value": "15.6"},
+    {"key": "ram", "value": "16GB"},
+    {"key": "storage", "value": "512GB SSD"},
+    {"key": "graphics_card", "value": "RTX 3060"}
+  ]
+}
+```
+
+<h4 id="benefits">Benefits</h4>
+
+- Index on `attributes.key` and `attributes.value` covers all attributes
+- No null fields wasting space
+- Easy to add new attributes
+
+**Use case:** Product catalogs with varying specifications.
+
+<h3 id="32-bucket-pattern">3.2 Bucket Pattern</h3>
+
+**Problem:** High-frequency time-series data creates too many documents.
+
+**Solution:** Group multiple data points into time-based buckets.
+
+```json
+// Before: One document per reading
+{"sensor_id": "S1", "timestamp": "2024-01-15T10:00:00Z", "value": 23.5}
+{"sensor_id": "S1", "timestamp": "2024-01-15T10:00:01Z", "value": 23.6}
+// ... millions of documents
+
+// After: Bucket pattern (1 hour per document)
+{
+  "sensor_id": "S1",
+  "bucket_start": "2024-01-15T10:00:00Z",
+  "bucket_end": "2024-01-15T11:00:00Z",
+  "readings": [
+    {"offset": 0, "value": 23.5},
+    {"offset": 1, "value": 23.6},
+    {"offset": 2, "value": 23.4}
+  ],
+  "count": 3600,
+  "sum": 84600,
+  "min": 22.1,
+  "max": 25.3
+}
+```
+
+<h4 id="benefits">Benefits</h4>
+
+- Fewer documents (better index efficiency)
+- Pre-computed aggregates for common queries
+- Controlled document size
+
+**Use case:** IoT sensor data, application metrics, time-series analytics.
+
+<h3 id="33-outlier-pattern">3.3 Outlier Pattern</h3>
+
+**Problem:** Most documents are small, but a few are extremely large.
+
+**Solution:** Handle outliers separately with overflow documents.
+
+```json
+// Regular book with few reviews
+{
+  "_id": "book_normal",
+  "title": "Regular Book",
+  "reviews": [
+    {"user": "A", "rating": 4, "text": "Good"},
+    {"user": "B", "rating": 5, "text": "Great"}
+  ],
+  "has_overflow": false
+}
+
+// Popular book with too many reviews
+{
+  "_id": "book_popular",
+  "title": "Bestseller",
+  "reviews": [/* first 100 reviews */],
+  "has_overflow": true
+}
+
+// Overflow document
+{
+  "_id": "book_popular_overflow_1",
+  "book_id": "book_popular",
+  "reviews": [/* next 100 reviews */]
+}
+```
+
+<h4 id="benefits">Benefits</h4>
+
+- Most queries work on compact documents
+- Outliers handled without penalizing normal cases
+- Avoids 16 MB document limit
+
+**Use case:** Social media posts with viral engagement, products with many reviews.
+
+<h3 id="34-computed-pattern">3.4 Computed Pattern</h3>
+
+**Problem:** Expensive computations run repeatedly on the same data.
+
+**Solution:** Pre-compute and store results, update on writes.
+
+```json
+{
+  "_id": "product_123",
+  "name": "Laptop",
+  "reviews": [
+    { "rating": 5 },
+    { "rating": 4 },
+    { "rating": 5 },
+    { "rating": 3 }
+  ],
+  "computed": {
+    "review_count": 4,
+    "average_rating": 4.25,
+    "rating_distribution": { "5": 2, "4": 1, "3": 1, "2": 0, "1": 0 },
+    "last_computed": "2024-01-15T10:00:00Z"
+  }
+}
+```
+
+<h4 id="benefits">Benefits</h4>
+
+- Reads are instant (no aggregation needed)
+- Trade write complexity for read performance
+- Can be updated incrementally or periodically
+
+**Use case:** Dashboards, product ratings, leaderboards.
+
+<h3 id="35-extended-reference-pattern">3.5 Extended Reference Pattern</h3>
+
+**Problem:** Frequent joins to fetch commonly needed fields from referenced documents.
+
+**Solution:** Copy frequently accessed fields into the referencing document.
+
+```json
+// Order with extended customer reference
+{
+  "_id": "order_123",
+  "customer_id": "customer_456",
+  "customer_name": "John Doe",
+  "customer_email": "john@example.com",
+  "items": [...],
+  "total": 1057
+}
+```
+
+<h4 id="benefits">Benefits</h4>
+
+- Avoids joins for common queries
+- Canonical data still in referenced collection
+- Trade consistency for read performance
+
+**Caveat:** Must update copies when source changes (eventual consistency).
+
+**Use case:** Order history display, activity feeds, denormalized views.
+
+<h1 id="4-shard-key-selection-strategies">4. Shard Key Selection Strategies</h1>
+
+The shard key is the most consequential decision in a sharded MongoDB deployment. It determines how data distributes across shards, which queries can target specific shards, and whether your cluster remains balanced under load.
+
+Unlike many schema decisions, the shard key is expensive to change. Modern MongoDB supports resharding and, in some cases, shard key value updates, but these are operationally heavy changes. Getting this decision wrong can mean living with performance problems for a long time or undertaking a careful resharding project.
+
+<h3 id="41-shard-key-requirements">4.1 Shard Key Requirements</h3>
+
+A good shard key should have:
+
+**High cardinality:** Many distinct values to distribute data across shards.
+
+**Even distribution:** Values appear with similar frequency to avoid hot spots.
+
+**Query isolation:** Common queries include the shard key to target specific shards.
+
+**Write distribution:** Writes spread across shards rather than concentrating on one.
+
+<h3 id="42-common-shard-key-strategies">4.2 Common Shard Key Strategies</h3>
+
+<h4 id="1-hashed-shard-key">1. Hashed Shard Key</h4>
+
+MongoDB applies a hash function to the shard key value before assigning a chunk range, which spreads documents across shards regardless of the original key pattern:
+
+```javascript
+sh.shardCollection("app.users", { user_id: "hashed" });
+```
+
+**Best for:** Write-heavy workloads with point queries.
+
+<h4 id="2-ranged-shard-key">2. Ranged Shard Key</h4>
+
+A ranged key preserves sort order, so documents with adjacent key values land on the same shard and range queries stay targeted. The following example shards on `customer_id` so all orders for a given customer are co-located:
+
+```javascript
+sh.shardCollection("app.orders", { customer_id: 1 });
+```
+
+**Best for:** Read-heavy workloads with range queries.
+
+<h4 id="3-compound-shard-key">3. Compound Shard Key</h4>
+
+A compound key combines a high-cardinality field for distribution with a second field for ordering within a shard, giving targeted routing for prefix queries while maintaining time order inside each tenant's data:
+
+```javascript
+sh.shardCollection("app.events", { tenant_id: 1, timestamp: 1 });
+```
+
+**Best for:** Multi-tenant applications with time-based data.
+
+<h3 id="43-shard-key-anti-patterns">4.3 Shard Key Anti-Patterns</h3>
+
+| Anti-Pattern             | Problem                                                      | Solution                              |
+| ------------------------ | ------------------------------------------------------------ | ------------------------------------- |
+| Low cardinality          | Few values limit max shards                                  | Use compound key or hash              |
+| Monotonically increasing | All writes hit one shard                                     | Use hashed key or add random prefix   |
+| Highly mutable           | Shard key updates are restricted and operationally expensive | Choose a stable field                 |
+| Query mismatch           | Common queries do not include shard key                      | Redesign key to match access patterns |
+
+<h3 id="44-shard-key-example-e-commerce-orders">
+  4.4 Shard Key Example: E-commerce Orders
+</h3>
+
+<h4 id="requirements">Requirements</h4>
+
+- Query orders by customer
+- Query orders by date range
+- High write volume during sales
+
+<h4 id="option-1-customer_id-ranged">Option 1: customer_id (ranged)</h4>
+
+Sharding on `customer_id` with a ranged strategy places all of a customer's orders on one shard, making per-customer reads efficient but causing scatter-gather for time-range queries:
+
+```javascript
+sh.shardCollection("orders", { customer_id: 1 });
+```
+
+- Good for: "Get all orders for customer X"
+- Bad for: "Get all orders from last hour" (scatter-gather)
+
+<h4 id="option-2-order_date-ranged">Option 2: order_date (ranged)</h4>
+
+Sharding by `order_date` supports efficient date-range queries, but a monotonically increasing timestamp concentrates every new insert onto the most recent shard, creating a write hot spot:
+
+```javascript
+sh.shardCollection("orders", { order_date: 1 });
+```
+
+- Good for: "Get orders from date range"
+- Bad for: Hot shard during active hours
+
+<h4 id="option-3-compound-key-recommended">
+  Option 3: Compound key (recommended)
+</h4>
+
+Hashing `customer_id` breaks the monotonic growth problem while the second field `order_date` preserves per-customer ordering within a shard, balancing write distribution against query efficiency:
+
+```javascript
+sh.shardCollection("orders", { customer_id: "hashed", order_date: 1 });
+```
+
+- Distributes writes across shards (hashed customer_id)
+- Supports customer queries (targeted)
+- Date queries are scatter-gather (acceptable trade-off)
+
+<h1 id="5-indexing-for-performance">5. Indexing for Performance</h1>
+
+Schema design determines what data you store together. Indexing determines how fast you can find it. Without indexes, MongoDB performs collection scans, reading every document to find matches. This works fine for hundreds of documents but becomes catastrophic at scale.
+
+A query that takes 5 milliseconds with a proper index might take 5 seconds without one. Understanding index types, compound index ordering, and the trade-off between read performance and write overhead is essential for building performant MongoDB applications.
+
+<h3 id="51-index-types-and-when-to-use-them">
+  5.1 Index Types and When to Use Them
+</h3>
+
+<h4 id="single-field-index">Single Field Index</h4>
+
+A single-field index on a frequently queried field eliminates collection scans for simple equality and range filters. This example indexes the `email` field in ascending order:
+
+```javascript
+db.users.createIndex({ email: 1 });
+```
+
+Use for: Simple queries on one field.
+
+<h4 id="compound-index">Compound Index</h4>
+
+A compound index covers queries that filter and sort on multiple fields. Field order matters, because MongoDB can only use the index from left to right:
+
+```javascript
+db.orders.createIndex({ customer_id: 1, order_date: -1 });
+```
+
+Use for: Queries filtering/sorting on multiple fields. Order matters.
+
+<h4 id="multikey-index-arrays">Multikey Index (Arrays)</h4>
+
+When a field holds an array, MongoDB creates a multikey index by indexing each element individually, making membership queries efficient without scanning every document:
+
+```javascript
+db.products.createIndex({ tags: 1 });
+```
+
+Use for: Searching within array fields.
+
+<h4 id="text-index">Text Index</h4>
+
+A text index tokenizes string fields and supports `$$text` search queries, including stemming and stop-word filtering. Multiple fields can share a single text index, as shown here for articles:
+
+```javascript
+db.articles.createIndex({ title: "text", content: "text" });
+```
+
+Use for: Full-text search.
+
+<h4 id="geospatial-index">Geospatial Index</h4>
+
+A `2dsphere` index stores GeoJSON coordinates in a way that supports proximity searches, bounding box queries, and intersection operators on spherical geometry:
+
+```javascript
+db.places.createIndex({ location: "2dsphere" });
+```
+
+Use for: Location-based queries.
+
+<h4 id="ttl-index">TTL Index</h4>
+
+A TTL index tells MongoDB to automatically delete documents once a date field passes a specified age, removing the need for a separate cleanup job. This example expires session documents one hour after creation:
+
+```javascript
+db.sessions.createIndex({ createdAt: 1 }, { expireAfterSeconds: 3600 });
+```
+
+Use for: Automatic document expiration.
+
+<h3 id="52-compound-index-order-esr-rule">
+  5.2 Compound Index Order (ESR Rule)
+</h3>
+
+For compound indexes, follow the **Equality, Sort, Range** order:
+
+```javascript
+// Query
+db.orders
+  .find({
+    status: "shipped", // Equality
+    total: { $gt: 100 }, // Range
+  })
+  .sort({ order_date: -1 }); // Sort
+
+// Optimal index
+db.orders.createIndex({
+  status: 1, // E: Equality first
+  order_date: -1, // S: Sort second
+  total: 1, // R: Range last
+});
+```
+
+**Why this order?**
+
+1. **Equality** narrows down candidates immediately
+2. **Sort** uses index order (no in-memory sort)
+3. **Range** filters remaining documents
+
+<h3 id="53-covered-queries">5.3 Covered Queries</h3>
+
+A **covered query** returns results directly from the index without accessing documents.
+
+```javascript
+// Index on name and email
+db.users.createIndex({ name: 1, email: 1 });
+
+// Covered query (only returns indexed fields)
+db.users.find(
+  { name: "John" },
+  { name: 1, email: 1, _id: 0 }, // Projection must exclude _id
+);
+
+// Result comes entirely from index - very fast!
+```
+
+<h3 id="54-index-intersection">5.4 Index Intersection</h3>
+
+MongoDB can combine multiple indexes for a single query:
+
+```javascript
+// Indexes
+db.products.createIndex({ category: 1 });
+db.products.createIndex({ price: 1 });
+
+// Query uses both indexes
+db.products.find({ category: "electronics", price: { $lt: 500 } });
+```
+
+However, a compound index is usually more efficient than intersection.
+
+<h3 id="55-index-strategy-guidelines">5.5 Index Strategy Guidelines</h3>
+
+| Scenario              | Strategy                      |
+| --------------------- | ----------------------------- |
+| High-frequency query  | Dedicated compound index      |
+| Ad-hoc queries        | Multiple single-field indexes |
+| Text search           | Text index with weights       |
+| Geospatial            | 2dsphere index                |
+| Time-based expiration | TTL index                     |
+| Unique constraint     | Unique index                  |
+
+> **Design note:** Indexes trade write cost for read speed. A product catalog with frequent searches and infrequent updates can afford compound indexes for major query patterns. An IoT ingestion workload should keep indexes minimal, perhaps only `sensor_id` and `timestamp`, to avoid write bottlenecks.
+>
+> Each index speeds up some reads but slows down writes and consumes memory/storage. Treat indexes as part of the write path, not just a read optimization.
+
+<h1 id="6-read-and-write-concerns">6. Read and Write Concerns</h1>
+
+MongoDB lets you choose the consistency-latency trade-off per operation. Focus on three knobs:
+
+- **Write concern:** how many replica-set members must acknowledge a write.
+- **Read concern:** what consistency guarantee a read requires.
+- **Read preference:** whether reads go to the primary or can go to secondaries.
+
+<h3 id="61-write-concern">6.1 Write Concern</h3>
+
+| Level           | Meaning               | Design takeaway                                                 |
+| --------------- | --------------------- | --------------------------------------------------------------- |
+| `w: 1`          | Primary acknowledges  | Fast, but a just-acknowledged write can be lost during failover |
+| `w: "majority"` | Majority acknowledges | Better durability across failover, with higher latency          |
+| `w: 0`          | No acknowledgment     | Rarely appropriate for user-visible writes                      |
+
+For most correctness-sensitive operations, use `w: "majority"` so acknowledged writes are less likely to disappear after primary failover.
+
+<h3 id="62-read-concern-and-read-preference">
+  6.2 Read Concern and Read Preference
+</h3>
+
+| Requirement                            | Reasonable choice                       | Trade-off                               |
+| -------------------------------------- | --------------------------------------- | --------------------------------------- |
+| Read-your-writes                       | Read from `primary`                     | Higher primary load                     |
+| Survive failover with consistent reads | `majority` read concern + primary reads | More latency than local reads           |
+| Scale stale-tolerant reads             | `secondaryPreferred`                    | May return older data                   |
+| Strongest single-document freshness    | `linearizable` read concern             | Highest latency; use only when required |
+
+The practical rule is simple: keep critical user flows on primary reads with majority writes; use secondary reads for dashboards, analytics, feeds, or other paths that can tolerate staleness.
+
+<h1 id="7-transactions-and-consistency">7. Transactions and Consistency</h1>
+
+MongoDB supports multi-document ACID transactions, but they should not be the default modeling strategy. The first design question is whether related data can live in one document, because single-document updates are atomic.
+
+<h3 id="71-model-for-single-document-atomicity">
+  7.1 Model for Single-Document Atomicity
+</h3>
+
+If an invariant naturally belongs inside one aggregate, keep it in one document. For example, updating an order status and appending an order event can often be one atomic document update. This avoids distributed coordination and usually scales better than transactions.
+
+<h3 id="72-when-transactions-are-worth-mentioning">
+  7.2 When Transactions Are Worth Mentioning
+</h3>
+
+Use multi-document transactions when a business invariant crosses document boundaries and eventual consistency is not acceptable.
+
+| Use transactions for                                 | Prefer another approach when                            |
+| ---------------------------------------------------- | ------------------------------------------------------- |
+| Money movement between accounts                      | A single document can own the invariant                 |
+| Inventory reservation with strict correctness        | Idempotent async processing is acceptable               |
+| Updating multiple entities that must commit together | Throughput is more important than immediate consistency |
+| Enforcing application-level referential integrity    | The relationship is read-heavy and can be denormalized  |
+
+The trade-off to say out loud: transactions add latency, increase contention, and become more expensive when they cross shards. A strong answer explains why the data model avoids them for the common path and reserves them for true invariants.
+
+<h1 id="8-change-streams-for-event-driven-features">
+  8. Change Streams for Event-Driven Features
+</h1>
+
+Change streams let applications react to MongoDB changes without polling. They are useful when MongoDB is the source of truth and downstream systems need updates, such as search indexing, cache invalidation, notifications, or dashboard refreshes.
+
+<h3 id="81-reliability-notes">8.1 Reliability Notes</h3>
+
+The core flow is:
+
+```javascript
+MongoDB write -> oplog entry -> change stream consumer -> downstream update
+```
+
+Two reliability details matter: consumers should resume from tokens after restarts, and handlers should be idempotent because retries can happen. Change streams are not always a complete replacement for a durable event bus or outbox pattern; if events are a core contract between services, a queue/log such as Kafka may still be the better boundary.
+
+<h3 id="82-change-streams-vs-polling">8.2 Change Streams vs Polling</h3>
+
+| Aspect     | Change Streams                       | Polling                               |
+| ---------- | ------------------------------------ | ------------------------------------- |
+| Latency    | Near real-time                       | Depends on polling interval           |
+| Efficiency | Push-based                           | Repeated queries                      |
+| Resume     | Built-in resume tokens               | Application-managed cursor/checkpoint |
+| Best fit   | Reactive features and sync pipelines | Simple low-volume jobs                |
+
+<h1 id="9-mongodb-vs-other-databases">9. MongoDB vs Other Databases</h1>
+
+Use this comparison to keep the choice tied to data shape and access patterns:
+
+| Alternative   | Prefer MongoDB when...                                             | Prefer the alternative when...                                          |
+| ------------- | ------------------------------------------------------------------ | ----------------------------------------------------------------------- |
+| PostgreSQL    | Data is document-shaped and schema flexibility matters             | Joins, relational integrity, or heavy transactions dominate             |
+| DynamoDB      | You need richer queries, aggregations, or flexible access patterns | Access patterns are fixed and managed scale matters most                |
+| Cassandra     | You need general document storage with richer query support        | Writes are extreme and availability matters more than query flexibility |
+| Elasticsearch | MongoDB is the source data store and search is secondary           | Search relevance, faceting, or log exploration is the core requirement  |
+
+<h1 id="summary">Summary</h1>
+
+Use MongoDB when the data is document-shaped, access patterns are clear, and schema flexibility is valuable. The main risks are over-normalizing, unbounded documents, poor shard keys, and too many secondary indexes on write-heavy collections.
+
+Anchor the answer on data modeling first: embed what is read together, reference shared or unbounded data, choose shard keys that spread load, and tune read/write concern based on the consistency requirement.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,563 @@
+---
+title: "Creating Threads"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Creating Threads explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+A thread is a unit of work the JVM can run alongside other units. The previous lesson established what a thread is and why a checkout flow benefits from running things in parallel: send the confirmation email, refresh the recommendation cache, and write the order to the database without blocking the user. This lesson covers the mechanics of creating one. There are three classic ways to spawn a thread, plus a modern builder added in Java 21. This lesson walks through each, compares them, names the threads, and shows small e-commerce patterns that kick off a background task without freezing the main flow.
+
+This lesson does not cover what the thread does once it starts running. The scope ends right after the thread begins executing.
+
+<h1 id="three-ways-to-create-a-thread">Three Ways to Create a Thread</h1>
+
+Java has three ways to describe the work a thread should run, and one way to start it. The work is described by a class or a lambda; the start always goes through `Thread.start()`. The options:
+
+1. **Extend `Thread`** and override `run()`. Build the subclass instance and call `start()` on it.
+2. **Implement `Runnable`** in a separate class, hand that `Runnable` to a `Thread`, and call `start()`.
+3. **Pass a lambda** (the modern form of #2, because `Runnable` is a functional interface).
+
+All three end up at the same place: a new thread executes the `run` method. The difference is who owns the code, how much boilerplate is involved, and how flexible the result is when reusing the work elsewhere.
+
+The three orange paths in the diagram are interchangeable from the JVM's point of view. Whichever one is chosen, a `Thread` object eventually receives a `start()` call, and a new OS-level thread comes to life and runs the `run` method.
+
+<h1 id="way-1-extend-the-thread-class">Way 1: Extend the Thread Class</h1>
+
+The oldest form is to subclass `java.lang.Thread` and override `run()`. The `Thread` class already knows how to be a thread; the subclass supplies the work.
+
+```java
+public class EmailThread extends Thread {
+
+    private final String customerEmail;
+
+    public EmailThread(String customerEmail) {
+        this.customerEmail = customerEmail;
+    }
+
+    @Override
+    public void run() {
+        System.out.println("Sending confirmation to " + customerEmail
+                + " on " + Thread.currentThread().getName());
+    }
+
+    public static void main(String[] args) {
+        EmailThread task = new EmailThread("ana@example.com");
+        task.start();
+        System.out.println("main is free to keep working on " + Thread.currentThread().getName());
+    }
+}
+```
+
+The output order is one of the two valid orderings. The JVM does not promise which line prints first; once `start()` returns, the main thread keeps running, and the new thread runs whenever the scheduler gives it CPU time. The two lines may print in the opposite order on a different run.
+
+A few notes on this example:
+
+- `EmailThread` extends `Thread`. Every instance is a thread object that knows how to run itself.
+- `run()` is the method the new thread executes. It is not called directly. The line `task.start()` spawns a fresh OS thread and asks it to run `run()`.
+- `Thread.currentThread().getName()` reports which thread the line is running on. The main program runs on a thread the JVM names `main`. The new thread is unnamed and the JVM gives it a default like `Thread-0`.
+
+Each platform thread allocates a stack (typically around 1 MB on a 64-bit HotSpot JVM) and a small OS-level thread record. A few dozen threads are cheap. A few thousand is not. Pools and virtual threads (chapters 11 and 23) exist because of this cost.
+
+This style works and appears in older codebases. It has one structural drawback that surfaces when the work needs to inherit something else.
+
+**What's wrong with this code?**
+
+```java
+public class OrderRepository {
+    public void save(String orderId) {
+        System.out.println("Saved " + orderId);
+    }
+}
+
+public class SaveOrderThread extends Thread extends OrderRepository {
+    // does not compile: Java has single inheritance
+}
+```
+
+**Fix:**
+
+```java
+public class OrderRepository {
+    public void save(String orderId) {
+        System.out.println("Saved " + orderId);
+    }
+}
+
+public class SaveOrderTask extends OrderRepository implements Runnable {
+    private final String orderId;
+
+    public SaveOrderTask(String orderId) {
+        this.orderId = orderId;
+    }
+
+    @Override
+    public void run() {
+        save(orderId);
+    }
+}
+```
+
+Java allows extending exactly one class. If a class already extends `OrderRepository` (or any other base class), it cannot also extend `Thread`. `Runnable` is an interface, so it sidesteps the single-inheritance rule. This is the main reason teams prefer `Runnable` over extending `Thread`.
+
+<h1 id="way-2-implement-runnable">Way 2: Implement Runnable</h1>
+
+The cleaner form is to separate the work from the thread that runs it. `Runnable` is an interface in `java.lang` with a single abstract method, `void run()`. Implement it, hand the implementation to a `Thread`, and call `start()`.
+
+```java
+public class SendEmailTask implements Runnable {
+
+    private final String customerEmail;
+
+    public SendEmailTask(String customerEmail) {
+        this.customerEmail = customerEmail;
+    }
+
+    @Override
+    public void run() {
+        System.out.println("Sending confirmation to " + customerEmail
+                + " on " + Thread.currentThread().getName());
+    }
+
+    public static void main(String[] args) {
+        SendEmailTask task = new SendEmailTask("ana@example.com");
+        Thread worker = new Thread(task);
+        worker.start();
+
+        System.out.println("main keeps going on " + Thread.currentThread().getName());
+    }
+}
+```
+
+Again, the two lines can appear in either order. The interesting line is `Thread worker = new Thread(task);`. The `Thread` constructor takes a `Runnable`. When `start()` runs, the new OS thread calls `task.run()` on the runnable that was passed in.
+
+The shape of the code is different from the subclass version in two ways.
+
+First, the work (`SendEmailTask`) and the thread (`worker`) are separate objects. The task only knows how to do the email sending. The thread only knows how to schedule something. The same `SendEmailTask` can run on a different thread, a thread pool, or synchronously by calling `task.run()` directly. Reuse is built in.
+
+Second, `SendEmailTask` is free to extend any other class. The interface does not consume the inheritance slot. If the task later needs to extend a base class like `AuditedTask` to share logging behavior, nothing about the threading changes.
+
+The same `Runnable` instance can be handed to two different `Thread` instances, and both can run it. The work is separable from the runner. This is hard to express cleanly when the work is the runner.
+
+<h1 id="way-3-pass-a-lambda">Way 3: Pass a Lambda</h1>
+
+`Runnable` is a functional interface: one abstract method, `run()`, no arguments, no return value. That makes it a perfect lambda target. Most modern Java code spawns a thread by passing a lambda directly to the `Thread` constructor.
+
+```java
+public class LambdaThread {
+    public static void main(String[] args) {
+        String customerEmail = "ana@example.com";
+
+        Thread worker = new Thread(() -> {
+            System.out.println("Sending confirmation to " + customerEmail
+                    + " on " + Thread.currentThread().getName());
+        });
+
+        worker.start();
+        System.out.println("main keeps going on " + Thread.currentThread().getName());
+    }
+}
+```
+
+The lambda is the body of `Runnable.run()`. No separate class, no constructor, no field assignment. The variable `customerEmail` is captured from the enclosing scope, and because it is effectively final (never reassigned), the capture compiles cleanly.
+
+The single-line case is even shorter:
+
+```java
+public class OneLiner {
+    public static void main(String[] args) {
+        new Thread(() -> System.out.println("refreshing recommendations"))
+            .start();
+        System.out.println("main keeps going");
+    }
+}
+```
+
+Two lines for the entire side task. The variable name can be dropped entirely by chaining `.start()` directly on the new `Thread`, when there is no need to keep a reference around for things like joining.
+
+The lambda form is the same form as Way 2 underneath. The lambda is a `Runnable`. The `Thread` constructor takes it as a `Runnable`. The new thread runs `run()`. Everything is identical to the `implements Runnable` example; the syntax is compressed.
+
+<h1 id="comparing-the-three-approaches">Comparing the Three Approaches</h1>
+
+The three approaches produce the same runtime behavior. The differences are in code structure and reuse.
+
+| Aspect                                      | Extend `Thread`                          | Implement `Runnable` | Lambda                        |
+| ------------------------------------------- | ---------------------------------------- | -------------------- | ----------------------------- |
+| Lines of code for a small task              | Medium                                   | Most                 | Fewest                        |
+| Can extend another class                    | No                                       | Yes                  | Yes                           |
+| Separates work from runner                  | No                                       | Yes                  | Yes (via the captured lambda) |
+| Reuse same task on multiple threads         | Awkward (one task per `Thread` instance) | Yes                  | Yes                           |
+| Reuse same task in a thread pool            | Hard                                     | Yes                  | Yes                           |
+| Boilerplate (constructor, fields, override) | High                                     | Medium               | Low                           |
+| Idiomatic in modern Java                    | No                                       | Yes                  | Yes                           |
+
+The recommendation: prefer `Runnable`, and when the body is short or does not need its own class, prefer a lambda. Use `extends Thread` only with a specific reason to override more than `run()`, which is rare in normal application code.
+
+The reuse rows in the table matter most when moving to thread pools. A `Runnable` slots into an `ExecutorService` with no changes. A `Thread` subclass does not fit at all; the pool wants tasks, not pre-built threads.
+
+The decision tree summarizes the choice. Most calls land on lambda or `Runnable`. The subclass option exists, but the "Yes" branch is uncommon in normal application code.
+
+<h1 id="naming-threads">Naming Threads</h1>
+
+A thread always has a name. By default the JVM assigns one: `Thread-0`, `Thread-1`, `Thread-2`, and so on. Those names are fine until something goes wrong in production and the stack trace needs to be read. A name like `email-worker` is easier to spot than `Thread-47`.
+
+There are three places to set the name.
+
+The first is the `Thread` constructor. Several `Thread` constructors take a name as the second argument after the `Runnable`.
+
+```java
+public class NamedFromConstructor {
+    public static void main(String[] args) {
+        Runnable task = () -> System.out.println("running on " + Thread.currentThread().getName());
+
+        Thread emailWorker = new Thread(task, "email-worker");
+        Thread cacheWorker = new Thread(task, "cache-refresher");
+
+        emailWorker.start();
+        cacheWorker.start();
+    }
+}
+```
+
+(Order can vary.) The two threads each carry a custom name that travels with them through stack traces and thread dumps.
+
+The second is `setName()` before calling `start()`. This is useful when the `Thread` is created somewhere central and the calling code labels it.
+
+```java
+public class NamedAfterCreation {
+    public static void main(String[] args) {
+        Thread worker = new Thread(() ->
+            System.out.println("running on " + Thread.currentThread().getName())
+        );
+        worker.setName("recommendation-refresh");
+        worker.start();
+    }
+}
+```
+
+`setName` works after `start()` too, but the name shown in tooling (debuggers, thread dumps) is most useful when set before the thread runs.
+
+The third is from inside the running thread itself with `Thread.currentThread().setName("...")`, which a long-running task can use to label phases ("downloading", "processing", "uploading"). This is an advanced technique, not the common path.
+
+Naming a thread is free at runtime. The string sits next to the thread object. The only real cost is forgetting to do it: an unnamed thread in a stack trace called `Thread-23` provides no information about what code it was running.
+
+<h1 id="the-modern-way-threadofplatform-builder">
+  The Modern Way: Thread.ofPlatform() Builder
+</h1>
+
+Java 21 added a builder API on `Thread` itself. Instead of stringing together constructor arguments and setter calls, request an `ofPlatform()` builder, chain the options, and call `start(Runnable)` at the end. The result is the same kind of platform thread (an OS-backed thread) that the constructor produces, configured through a fluent API.
+
+```java
+public class PlatformBuilder {
+    public static void main(String[] args) {
+        Thread worker = Thread.ofPlatform()
+            .name("email-worker")
+            .daemon(false)
+            .start(() -> System.out.println(
+                "Sending confirmation on " + Thread.currentThread().getName()
+            ));
+
+        System.out.println("main keeps going on " + Thread.currentThread().getName());
+    }
+}
+```
+
+(Order can vary.) The chain reads top-to-bottom like a small configuration block: a platform thread, named `email-worker`, not a daemon, started with the lambda's body as its work. `.start(...)` does two things in one call: it builds the `Thread` and starts it. There is no separate `start()` step afterward.
+
+The builder exposes more than `name` and `daemon`. The commonly useful options are summarized below.
+
+| Builder method                 | What it sets                                                   | When you'd use it                      |
+| ------------------------------ | -------------------------------------------------------------- | -------------------------------------- |
+| `.name("...")`                 | Single fixed name                                              | Most worker threads                    |
+| `.name("prefix-", 0)`          | Auto-numbered name (`prefix-0`, `prefix-1`, ...)               | Multiple threads from one builder      |
+| `.daemon(true)`                | Marks the thread as a daemon (won't keep JVM alive on its own) | Background helpers like cache refresh  |
+| `.priority(n)`                 | Sets `Thread.MIN_PRIORITY..MAX_PRIORITY`                       | Rare                                   |
+| `.uncaughtExceptionHandler(h)` | Handler for exceptions that escape `run`                       | Catch-and-log for crashing tasks       |
+| `.start(Runnable)`             | Builds and starts the thread                                   | End of the chain                       |
+| `.unstarted(Runnable)`         | Builds the thread without starting                             | When a handle is needed to start later |
+
+The auto-numbered form is handy for spawning a batch of similar workers.
+
+```java
+public class AutoNumbered {
+    public static void main(String[] args) {
+        Thread.Builder.OfPlatform builder = Thread.ofPlatform().name("cache-refresher-", 0);
+
+        for (int region = 1; region <= 3; region++) {
+            int currentRegion = region;
+            builder.start(() -> System.out.println(
+                "refreshing region " + currentRegion
+                    + " on " + Thread.currentThread().getName()
+            ));
+        }
+    }
+}
+```
+
+(Lines can interleave or arrive in a different order.) Each call to `.start(...)` on the same builder produces a fresh `Thread` whose name continues the sequence. The starting number is the second argument to `.name(prefix, start)`.
+
+The fork on the right is the only real choice once the configuration is in place: kick the thread off now (`start`) or hand it back as a not-yet-started `Thread` (`unstarted`) for the caller to start later.
+
+The classic constructor still works, and a lot of existing code uses it. New code in Java 21 and later usually picks the builder because the chain is easier to read once more than one option is set. Compare:
+
+```java
+// Classic
+Thread classic = new Thread(task, "email-worker");
+classic.setDaemon(true);
+classic.start();
+
+// Builder
+Thread builder = Thread.ofPlatform()
+    .name("email-worker")
+    .daemon(true)
+    .start(task);
+```
+
+Both produce the same kind of thread. The builder reads like a single statement; the classic form is three statements with shared state.
+
+There is also a `Thread.ofVirtual()` builder added in the same release. Virtual threads behave very differently under load, but the builder shape is identical to `ofPlatform`. The end of the lesson mentions it briefly.
+
+<h1 id="thread-factories-a-brief-mention">Thread Factories: A Brief Mention</h1>
+
+To control how every thread in a part of the system gets created (same name prefix, same daemon flag, same exception handler), use `java.util.concurrent.ThreadFactory`. It is an interface with one method, `Thread newThread(Runnable r)`, which thread pools and other framework code call when they need a fresh thread.
+
+A minimal `ThreadFactory` looks like this.
+
+```java
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class EmailThreadFactory implements ThreadFactory {
+
+    private final AtomicInteger counter = new AtomicInteger(0);
+
+    @Override
+    public Thread newThread(Runnable r) {
+        Thread t = new Thread(r);
+        t.setName("email-worker-" + counter.getAndIncrement());
+        t.setDaemon(true);
+        return t;
+    }
+
+    public static void main(String[] args) {
+        EmailThreadFactory factory = new EmailThreadFactory();
+
+        Thread t1 = factory.newThread(() ->
+            System.out.println("on " + Thread.currentThread().getName())
+        );
+        Thread t2 = factory.newThread(() ->
+            System.out.println("on " + Thread.currentThread().getName())
+        );
+
+        t1.start();
+        t2.start();
+    }
+}
+```
+
+(Order can vary.) Every thread the factory hands out has the same naming pattern and the same daemon flag, without the caller remembering any of that. The main idea: when the same thread setup repeats, push it into a factory.
+
+The Java 21 builder also provides a factory via `.factory()`, which returns a `ThreadFactory` configured with the chosen name pattern, daemon flag, and handler. This is the fastest way to produce a factory without writing a class.
+
+```java
+import java.util.concurrent.ThreadFactory;
+
+public class BuilderFactory {
+    public static void main(String[] args) {
+        ThreadFactory factory = Thread.ofPlatform()
+            .name("cache-refresher-", 0)
+            .daemon(true)
+            .factory();
+
+        Thread t1 = factory.newThread(() -> System.out.println(Thread.currentThread().getName()));
+        Thread t2 = factory.newThread(() -> System.out.println(Thread.currentThread().getName()));
+
+        t1.start();
+        t2.start();
+    }
+}
+```
+
+The factory object is reusable and thread-safe. It can be stored in a field and used wherever the system needs a fresh thread with that configuration.
+
+<h1 id="kicking-off-background-work-in-an-e-commerce-flow">
+  Kicking Off Background Work in an E-Commerce Flow
+</h1>
+
+A small but realistic pattern in an online shop is the post-checkout fan-out. The customer has just confirmed an order. The main thread needs to return a fast response to the browser. Three side jobs should run without blocking the response: send the confirmation email, refresh the recommendation cache for that customer, and write an analytics event. The work is independent, the user does not need to wait, and the main thread should keep moving.
+
+```java
+public class CheckoutFanOut {
+
+    public static void main(String[] args) {
+        String orderId = "ORD-1001";
+        String customerEmail = "ana@example.com";
+
+        long start = System.currentTimeMillis();
+        System.out.println("[main] order " + orderId + " placed at t=0");
+
+        Thread email = Thread.ofPlatform()
+            .name("email-worker")
+            .start(() -> sendEmail(customerEmail, orderId, start));
+
+        Thread recs = Thread.ofPlatform()
+            .name("recs-refresher")
+            .start(() -> refreshRecommendations(customerEmail, start));
+
+        Thread analytics = Thread.ofPlatform()
+            .name("analytics-writer")
+            .start(() -> writeAnalytics(orderId, start));
+
+        System.out.println("[main] returned HTTP 200 at t="
+                + (System.currentTimeMillis() - start) + "ms");
+    }
+
+    static void sendEmail(String to, String orderId, long start) {
+        sleep(200);
+        System.out.println("[" + Thread.currentThread().getName() + "] sent email for "
+                + orderId + " to " + to + " at t="
+                + (System.currentTimeMillis() - start) + "ms");
+    }
+
+    static void refreshRecommendations(String customer, long start) {
+        sleep(150);
+        System.out.println("[" + Thread.currentThread().getName() + "] refreshed recs for "
+                + customer + " at t=" + (System.currentTimeMillis() - start) + "ms");
+    }
+
+    static void writeAnalytics(String orderId, long start) {
+        sleep(50);
+        System.out.println("[" + Thread.currentThread().getName() + "] wrote analytics for "
+                + orderId + " at t=" + (System.currentTimeMillis() - start) + "ms");
+    }
+
+    static void sleep(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+}
+```
+
+The exact millisecond numbers depend on the machine, and the line order between the three workers depends on how long each one sleeps. The shape of the output is the point: the main thread returns its HTTP response within a few milliseconds and the three background jobs each finish whenever their own work is done.
+
+A few details in the code:
+
+- Each background task is a small named thread. The names show up in the log lines, so it is easy to tell which job produced which line.
+- The main thread does not wait for any of them. It logs its own "returned HTTP 200" line and finishes its part of the work.
+- `Thread.sleep` is wrapped in a helper because `InterruptedException` is checked. The helper keeps the main code readable.
+
+This pattern spawns one platform thread per task. For a low-volume endpoint, that is fine. For a high-volume endpoint hit thousands of times per second, hand these tasks to an `ExecutorService` instead of creating fresh threads every time. The cost of thread creation, not the cost of the actual work, drives that change.
+
+The same fan-out written with `implements Runnable` looks like this. The behavior is identical; the code is longer because each task lives in its own class.
+
+```java
+public class CheckoutFanOutRunnable {
+
+    public static void main(String[] args) {
+        String orderId = "ORD-1001";
+        String customerEmail = "ana@example.com";
+        long start = System.currentTimeMillis();
+
+        System.out.println("[main] order " + orderId + " placed at t=0");
+
+        new Thread(new SendEmail(customerEmail, orderId, start), "email-worker").start();
+        new Thread(new RefreshRecs(customerEmail, start), "recs-refresher").start();
+        new Thread(new WriteAnalytics(orderId, start), "analytics-writer").start();
+
+        System.out.println("[main] returned HTTP 200 at t="
+                + (System.currentTimeMillis() - start) + "ms");
+    }
+}
+
+class SendEmail implements Runnable {
+    private final String to;
+    private final String orderId;
+    private final long start;
+
+    SendEmail(String to, String orderId, long start) {
+        this.to = to;
+        this.orderId = orderId;
+        this.start = start;
+    }
+
+    @Override
+    public void run() {
+        sleep(200);
+        System.out.println("[" + Thread.currentThread().getName() + "] sent email for "
+                + orderId + " to " + to + " at t="
+                + (System.currentTimeMillis() - start) + "ms");
+    }
+
+    static void sleep(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+}
+
+class RefreshRecs implements Runnable {
+    private final String customer;
+    private final long start;
+
+    RefreshRecs(String customer, long start) {
+        this.customer = customer;
+        this.start = start;
+    }
+
+    @Override
+    public void run() {
+        try { Thread.sleep(150); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        System.out.println("[" + Thread.currentThread().getName() + "] refreshed recs for "
+                + customer + " at t=" + (System.currentTimeMillis() - start) + "ms");
+    }
+}
+
+class WriteAnalytics implements Runnable {
+    private final String orderId;
+    private final long start;
+
+    WriteAnalytics(String orderId, long start) {
+        this.orderId = orderId;
+        this.start = start;
+    }
+
+    @Override
+    public void run() {
+        try { Thread.sleep(50); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        System.out.println("[" + Thread.currentThread().getName() + "] wrote analytics for "
+                + orderId + " at t=" + (System.currentTimeMillis() - start) + "ms");
+    }
+}
+```
+
+Three separate `Runnable` classes, each with constructor and fields, do the same job as three lambdas. The advantage of this style is not visible in a single demo. It shows up the moment a unit test is written for `SendEmail` (without ever building a `Thread`), or the moment the same task runs twice with different threads, or is handed to a thread pool. The lambda version is shorter; the named-class version is more reusable and more testable.
+
+<h1 id="a-forward-pointer-virtual-threads">
+  A Forward Pointer: Virtual Threads
+</h1>
+
+The same builder pattern works with `Thread.ofVirtual()`. A virtual thread is a thread the JVM manages itself, mounted onto a small pool of carrier OS threads on demand. The point of virtual threads is that hundreds of thousands of them can exist at once, because they are not backed one-to-one by OS threads. The API surface is almost identical to platform threads:
+
+```java
+public class VirtualHint {
+    public static void main(String[] args) throws InterruptedException {
+        Thread v = Thread.ofVirtual()
+            .name("v-email-worker")
+            .start(() -> System.out.println(
+                "Running on " + Thread.currentThread()
+            ));
+
+        v.join();
+    }
+}
+```
+
+The exact identifiers vary. The output proves the thread is a `VirtualThread`, not a regular `Thread`. Every other example in this lesson uses `Thread.ofPlatform()` or the classic constructors, both of which create platform threads.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

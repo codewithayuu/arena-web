@@ -1,0 +1,256 @@
+---
+title: "Bloom Filters"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Bloom Filters explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+- If it says **no**, the item is definitely absent.
+- If it says **yes**, the item is only probably present.
+
+It stores:
+
+- a bit array of length `m`
+- `k` hash functions
+
+The bit array starts full of `0`s. Hash functions turn each item into positions inside that array.
+
+To add an item:
+
+1. Hash the item `k` times.
+2. Map each hash to a bit position.
+3. Set those bits to `1`.
+
+To query an item:
+
+1. Hash it the same `k` ways.
+2. Check the same bit positions.
+3. If any bit is `0`, the item is definitely absent.
+4. If all bits are `1`, the item is probably present.
+
+> Bloom filters shine when a definite "no" lets the system skip expensive work.
+
+<h1 id="2-example-url-deduplication">2. Example: URL Deduplication</h1>
+
+Suppose a web crawler wants to avoid fetching the same URL again and again.
+
+Keeping every visited URL in an exact in-memory set can become expensive when the crawler sees millions or billions of URLs. A Bloom filter gives the crawler a small, fast first check.
+
+<h3 id="initialize-the-filter">Initialize the Filter</h3>
+
+Start with an empty bit array.
+
+For a toy example, use:
+
+- bit array size `m = 10`
+- hash functions `k = 2`
+
+Real filters are much larger and use stronger hash functions. The small numbers here are only to make the idea easy to see.
+
+<h3 id="add-a-url">Add a URL</h3>
+
+Add `example.com`.
+
+The two hash functions point to positions `3` and `7`.
+
+Set bits `3` and `7` to `1`.
+
+<h3 id="add-another-url">Add Another URL</h3>
+
+Add `mindflare.tech`.
+
+The two hash functions point to positions `1` and `4`.
+
+Set bits `1` and `4` to `1`.
+
+<h3 id="query-a-present-url">Query a Present URL</h3>
+
+Check `example.com`.
+
+Both bits are `1`, so the answer is "probably present."
+
+The filter cannot prove that `example.com` was inserted, because other URLs might have set those same bits. But in this case, we know it was inserted.
+
+<h3 id="query-an-absent-url">Query an Absent URL</h3>
+
+Check `nonexistent.com`.
+
+At least one checked bit is `0`, so the answer is "definitely absent."
+
+This is the key insight. If `nonexistent.com` had been added earlier, all of its hash positions would have been set to `1`. A single `0` proves it was never added.
+
+<h1 id="3-false-positives">3. False Positives</h1>
+
+Bloom filters can be wrong in only one direction.
+
+- They do **not** return false negatives for items that were added correctly.
+- They **can** return false positives for items that were never added.
+
+A false positive happens when a missing item hashes to positions that other items already set to `1`.
+
+Think of it like checking whether a parking spot is occupied from far away. If you see an empty spot, you know there is no car there. If the spot looks occupied, you may need to walk closer and check. The Bloom filter's "yes" means "go check the real source."
+
+False positives are safe only when they cause extra work, not wrong behavior.
+
+Good:
+
+- "This SSTable might contain the key; check it."
+- "This URL might be seen; maybe skip or verify elsewhere depending on crawler policy."
+- "This cache might contain the object; perform the cache lookup."
+
+Risky:
+
+- "This user is definitely blocked."
+- "This payment has definitely been processed."
+- "This customer has definitely accepted the legal agreement."
+
+For decisions where correctness matters, use the Bloom filter only as a first filter. Follow every "probably present" answer with an exact check.
+
+<h1 id="4-sizing-a-bloom-filter">4. Sizing a Bloom Filter</h1>
+
+Bloom filters need to be sized before you use them.
+
+If you add far more items than planned, too many bits become `1`. Once that happens, missing items are more likely to look present, and the false-positive rate rises quickly.
+
+Variables:
+
+- `n`: how many items you expect to add
+- `p`: the false-positive rate you can tolerate
+- `m`: number of bits
+- `k`: number of hash functions
+
+Common formulas:
+
+Approximate bits per item:
+
+Example:
+
+For `100 million` keys and `1%` false positives:
+
+That is much smaller than storing 100 million full keys in a hash set, but it is still real memory. Bloom filters trade exact answers for smaller storage. They are not free.
+
+<h1 id="5-hash-functions">5. Hash Functions</h1>
+
+A Bloom filter depends on good hashing.
+
+Two things matter:
+
+- **Stable:** the same item must map to the same bit positions every time.
+- **Spread out:** items should be distributed evenly across the bit array.
+
+Do not use language-default hashes when the filter is saved to disk, shared between services, or reused after a restart. For example, Python's built-in `hash()` is randomized between processes by default.
+
+Production implementations often compute two base hashes and use them to generate all `k` positions:
+
+This is called **double hashing**. It gives the filter many positions without running many separate hash functions.
+
+Hash quality matters. If the hashes cluster around the same positions, the filter fills unevenly and false positives become more common than expected.
+
+<h1 id="6-implementation">6. Implementation</h1>
+
+This implementation uses a small FNV-1a hash function and double hashing.
+
+It is meant for learning. In production, use a well-tested library with strong hashing, serialization support, and clear sizing controls.
+
+Expected output:
+
+The `False` result for `user:999` is common while the filter is still fairly empty. As the filter gets closer to its planned capacity, some missing items will return `True`.
+
+<h1 id="7-production-uses">7. Production Uses</h1>
+
+Bloom filters show up wherever a cheap "definitely not here" answer can save an expensive lookup.
+
+<h3 id="lsm-tree-databases">LSM-Tree Databases</h3>
+
+Bloom filters are heavily used in LSM-tree storage engines.
+
+In systems such as Cassandra and RocksDB, data is stored in sorted files called SSTables. Once an SSTable is written, it is not changed in place. A single key lookup may need to check several of those files. Bloom filters let the engine skip files that definitely do not contain the key.
+
+This reduces disk reads, especially for missing keys, and helps keep slow requests under control.
+
+In Cassandra, the Bloom filter false-positive chance can be tuned per table. Lower false-positive rates use more memory. Existing SSTables may need compaction or rewriting before new settings fully take effect.
+
+<h3 id="caches">Caches</h3>
+
+A Bloom filter can act as a negative pre-check for a cache:
+
+1. If the filter says "definitely not present," skip the cache lookup.
+2. If the filter says "probably present," check the cache.
+
+This helps most when many requests are misses and the cache lookup is expensive enough to justify maintaining the filter.
+
+<h3 id="web-crawlers">Web Crawlers</h3>
+
+Crawlers use Bloom filters to reduce duplicate URL processing.
+
+False positives can cause a crawler to skip a URL it has not actually visited. Whether that is okay depends on the crawler's goal.
+
+For broad discovery, skipping a tiny fraction of pages may be acceptable. For compliance, archiving, or exhaustive crawling, the crawler needs an exact visited set or a verification step.
+
+<h3 id="redisbloom">RedisBloom</h3>
+
+RedisBloom provides Bloom filters with commands such as:
+
+RedisBloom can create scalable Bloom filters by adding sub-filters as capacity is reached. That is convenient, but it usually costs more memory and CPU than sizing the filter well up front.
+
+<h1 id="8-variants">8. Variants</h1>
+
+A standard Bloom filter is simple, but it has two big limits: it cannot safely delete individual items, and it gets worse when it grows past the planned capacity.
+
+Several variants handle those limits by spending more memory, adding more structure, or optimizing for a specific workload.
+
+<h3 id="counting-bloom-filter">Counting Bloom Filter</h3>
+
+A counting Bloom filter uses small counters instead of single bits.
+
+To add an item, it increments the counters. To delete an item, it decrements them.
+
+That makes deletion possible, but it costs more memory. It is also safe only if the system deletes items that were actually added. Deleting something that was never added can damage the filter's answers for other items.
+
+<h3 id="scalable-bloom-filter">Scalable Bloom Filter</h3>
+
+A scalable Bloom filter adds new sub-filters as the set grows.
+
+This avoids a hard capacity limit, but lookups may need to check multiple filters. The system also has to manage the combined false-positive rate across all of them.
+
+<h3 id="cuckoo-filter">Cuckoo Filter</h3>
+
+Cuckoo filters answer the same "probably present or definitely absent" question, but they store short fingerprints in buckets instead of setting shared bits.
+
+They are often a better fit when deletion is common.
+
+<h3 id="ribbon-filter">Ribbon Filter</h3>
+
+Ribbon filters are newer static filters designed to use less space than Bloom filters. RocksDB has explored Ribbon filters as an alternative for some workloads.
+
+They are attractive when the set is built once and queried many times.
+
+<h1 id="9-limitations">9. Limitations</h1>
+
+Bloom filters have clear boundaries:
+
+False positives are not bugs. They are part of the design. The real mistake is using a Bloom filter where a false positive changes the answer instead of only causing extra work.
+
+<h1 id="10-bloom-filters-vs-related-structures">
+  10. Bloom Filters vs Related Structures
+</h1>
+
+Bloom filters are part of a larger family of compact data structures. The easiest way to choose the right one is to ask what question the system needs answered.
+
+Use a Bloom filter when you need a compact membership check. Use HyperLogLog for distinct counts. Use Count-Min Sketch for frequencies.
+
+<h1 id="summary">Summary</h1>
+
+Bloom filters are compact filters that answer "definitely not present" or "probably present."
+
+Used correctly, they have false positives but no false negatives for items that were added. Sizing matters: choose the expected item count and false-positive rate up front, then derive the bit-array size and number of hash functions.
+
+They work best as first checks before expensive lookups, especially in databases, caches, crawlers, and distributed systems. Avoid them when you need exact answers, legal or security decisions, listing items, or frequent deletion unless you use a variant designed for that need.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

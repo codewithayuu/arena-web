@@ -1,0 +1,373 @@
+---
+title: "Memory Profiling"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "Memory Profiling explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="why-memory-profiling-matters">Why Memory Profiling Matters</h1>
+
+Python developers tend to think about CPU first and memory only when something breaks. That is reasonable for scripts that run for a minute on a laptop. It stops being reasonable for anything long-running or memory-pressured.
+
+Three situations make memory the more important question.
+
+The first is long-running services. A web server, a Celery worker, a data pipeline daemon. If each request leaks even a small amount of memory (say, 10 KB per request), the program's memory grows linearly with traffic. After a million requests, that is 10 GB of dead memory the OS thinks is in use. The process eventually gets killed by the OOM killer or starts swapping, and both look like "the service randomly died at 3 AM." The bug is a slow leak that a 10-minute test would never catch.
+
+The second is large-data processing. A script that loads a 5 GB CSV into a DataFrame, derives a few columns, and writes the result back can easily peak at 30 GB of memory without care, because intermediate copies pile up. Knowing where those copies come from requires measurement. Guessing usually leads to "fixing" the wrong copy.
+
+The third is constrained environments. Lambda functions, containers with memory limits, embedded devices. A function that works fine on a 16 GB laptop might OOM on a 512 MB Lambda. The fix is rarely "buy more memory"; it is "find the spike and avoid it."
+
+A small example to make this concrete:
+
+```python
+import json
+
+def load_and_filter(path):
+    with open(path) as f:
+        all_orders = json.load(f)  # entire file in memory
+    return [o for o in all_orders if o["status"] == "delivered"]
+
+delivered = load_and_filter("orders.json")
+```
+
+If `orders.json` is 100 MB and 90 percent of orders are not delivered, this function peaks at roughly 200 MB (the original list plus the filtered list), then settles at 20 MB (just the filtered list). The peak is the problem. A streaming version that processes the file line by line would peak at maybe 1 MB. Without profiling, the shape of the spike is unknown. Profiling reveals it, and the fix is obvious.
+
+Memory has two interesting numbers. The current footprint (how much is allocated right now) and the peak (the highest value during the run). CPU profiling cares about averages; memory profiling cares about peaks. A program can spend 99 percent of its run at 100 MB and 1 percent at 8 GB. The OS kills the process for the 1 percent.
+
+<h1 id="tracemalloc-built-in-snapshots">tracemalloc: Built-In Snapshots</h1>
+
+`tracemalloc` is the memory tracer that ships with Python. It records every allocation along with the source line that made it, and snapshots can be taken and compared to see what changed. No external tools, no decorators, no recompilation.
+
+The simplest workflow takes one snapshot at a point of interest and prints the top allocators:
+
+```python
+import tracemalloc
+
+tracemalloc.start()
+
+orders = [{"id": i, "total": i * 1.99, "items": list(range(50))} for i in range(10_000)]
+total = sum(o["total"] for o in orders)
+
+snapshot = tracemalloc.take_snapshot()
+top = snapshot.statistics("lineno")
+
+for stat in top[:5]:
+    print(stat)
+```
+
+The `statistics("lineno")` call groups allocations by the line that made them, ranks by total size, and shows count plus average. The output shows which lines of the code are allocating the most memory. Multiple lines reporting `script.py:5` appear because that one line allocates several objects (the dict, the list, the integers).
+
+Grouping by entire file uses `"filename"`, or by traceback with `"traceback"`:
+
+```python
+top = snapshot.statistics("traceback")
+for stat in top[:3]:
+    print(stat)
+    for line in stat.traceback.format():
+        print("  ", line)
+```
+
+That shows not just where the allocation happened, but how the program got there. For a function called from multiple call sites, traceback grouping identifies which caller is responsible for most of the memory.
+
+`tracemalloc.start()` instruments every allocation. Expect a 10 to 30 percent slowdown on allocation-heavy code, and additional memory overhead to store the per-allocation tracebacks. Limit how many traceback frames are kept with `tracemalloc.start(nframe)`; the default is 1.
+
+<h1 id="diffing-snapshots-to-find-growth">Diffing Snapshots to Find Growth</h1>
+
+A single snapshot shows what is allocated right now. The more useful question is what changed between two points in time. `tracemalloc` supports diffing two snapshots, which is how leaks are found.
+
+The pattern: snapshot, run the suspected leaky code, snapshot again, diff.
+
+```python
+import tracemalloc
+
+tracemalloc.start()
+
+# Baseline snapshot before the suspected operation.
+snapshot_before = tracemalloc.take_snapshot()
+
+# Run the operation that might leak.
+cache = {}
+for i in range(1000):
+    cache[i] = {"order_id": i, "items": list(range(100))}
+
+# Snapshot after.
+snapshot_after = tracemalloc.take_snapshot()
+
+# Compare the two.
+diff = snapshot_after.compare_to(snapshot_before, "lineno")
+for stat in diff[:5]:
+    print(stat)
+```
+
+The `compare_to` output shows the difference per line: `size=+312 KiB` means 312 KiB was added since the baseline. If memory grew where expected (after adding 1000 cache entries), the report shows the expected lines. If memory grew somewhere unexpected, that is a candidate for investigation.
+
+In a real leak hunt, the pattern is:
+
+1. Snapshot before processing a batch of requests.
+2. Process N requests (where N is enough to make any per-request leak visible above the noise).
+3. Snapshot after.
+4. Diff and look for lines that grew without an obvious reason.
+
+For a server, this might be embedded in an endpoint:
+
+```python
+import tracemalloc
+from collections import defaultdict
+
+_snapshots = {}
+
+def memory_baseline():
+    tracemalloc.start()
+    _snapshots["before"] = tracemalloc.take_snapshot()
+
+def memory_diff():
+    after = tracemalloc.take_snapshot()
+    diff = after.compare_to(_snapshots["before"], "lineno")
+    return [(str(stat), stat.size_diff) for stat in diff[:10]]
+```
+
+Wire those into `/debug/memory-baseline` and `/debug/memory-diff` endpoints, hit the production server with a known load, and the result is a memory diff over exactly the period that matters.
+
+<h1 id="memory_profiler-line-by-line-memory">
+  memory_profiler: Line-by-Line Memory
+</h1>
+
+`memory_profiler` is a third-party package that provides line-by-line memory usage of a decorated function. It is the memory analog of `line_profiler` for CPU: instead of timing each line, it measures how much memory each line allocates.
+
+Install and use:
+
+```text
+pip install memory_profiler
+```
+
+```python
+# leak_demo.py
+from memory_profiler import profile
+
+@profile
+def build_report():
+    orders = [{"id": i, "items": list(range(100))} for i in range(10_000)]
+    delivered = [o for o in orders if o["id"] % 3 == 0]
+    flagged_ids = {o["id"] for o in delivered}
+    return flagged_ids
+
+build_report()
+```
+
+Run it:
+
+```text
+python -m memory_profiler leak_demo.py
+```
+
+The `Increment` column is the one that matters: it shows how much memory each line added to the program's footprint. The line that builds `orders` allocates almost 7 MiB, which is the bulk of the function. The set of flagged IDs is tiny by comparison.
+
+One detail to know: `memory_profiler` measures the program's resident set size (RSS), which is the OS-level memory in use, not just Python objects. That makes it less precise than `tracemalloc` for tracking individual Python allocations, but more accurate for "how much memory does this function add to the process?" The two tools complement each other.
+
+For time-series tracking across a longer run, `memory_profiler` provides the `mprof` command:
+
+```text
+mprof run python service.py
+mprof plot
+```
+
+`mprof run` records memory usage every 0.1 seconds while the program runs, and `mprof plot` opens a matplotlib chart of the memory curve over time. For finding leaks, the curve usually tells the story at a glance: a steady upward slope means growth, a saw-tooth pattern means allocation and release in a loop, a flat line means stable behavior.
+
+`@profile` adds substantial overhead, often 2x to 10x slowdown, because the decorator queries RSS before and after each line. Use it on suspect functions after `tracemalloc` has narrowed the search, not on whole programs.
+
+<h1 id="objgraph-what-is-holding-references">
+  objgraph: What Is Holding References?
+</h1>
+
+Knowing that memory grew does not explain why it was not released. The usual cause is that something still holds a reference to objects that should be garbage. `objgraph` is the third-party tool for that question.
+
+Two functions cover most uses:
+
+```python
+import objgraph
+
+# How many instances of each type are alive?
+objgraph.show_most_common_types(limit=10)
+
+# Show a reference graph as a PNG.
+objgraph.show_backrefs([some_object], filename="refs.png")
+```
+
+`show_most_common_types` prints a count of live objects by type:
+
+```text
+function                   8742
+dict                       4321
+list                       3214
+tuple                      2156
+type                        892
+weakref                     654
+Order                       500   <-- suspicious if this should be near zero
+```
+
+If a class named `Order` shows up with 500 live instances when zero was expected, those instances are being held somewhere. The next step is `show_backrefs`, which generates a graph showing what holds references to a sample object. It writes the graph to a PNG (using graphviz, which must be installed separately), and the picture usually reveals the holder: a module-level cache dict, a registered callback list, a closure capturing the variable.
+
+A short worked example:
+
+```python
+import objgraph
+import gc
+
+class Order:
+    def __init__(self, id):
+        self.id = id
+
+# Pretend we're processing orders and some leak.
+orders = [Order(i) for i in range(100)]
+cache = {o.id: o for o in orders}  # the leak: a cache that's never cleared
+
+# Make `orders` go out of scope. The cache still holds them.
+del orders
+gc.collect()
+
+# Count the Order objects.
+print(objgraph.count("Order"))
+
+# Show what's keeping one of them alive.
+sample = next(iter(cache.values()))
+objgraph.show_backrefs([sample], filename="refs.png")
+```
+
+`objgraph.count("Order")` returns 100, even after `del orders`. The cache dict still references them, so they are not garbage. Opening `refs.png` shows the dict pointing at the `Order`, which points back through the module's `cache` global, and the leak is found.
+
+For a long-running process, the pattern is to call `objgraph.show_growth()` periodically. It reports which types have grown since the last call, which is a fast way to see leak candidates accumulating in real time.
+
+```python
+import objgraph
+import time
+
+while True:
+    handle_one_request()
+    if request_count % 100 == 0:
+        objgraph.show_growth(limit=10)
+    time.sleep(0.01)
+```
+
+A sudden +50 of some type per 100 requests is the smoking gun. Combine with `show_backrefs` on a sample of the growing type, and the leak's source is usually obvious within a few minutes.
+
+`objgraph.show_backrefs` generates a graphviz file and renders it with `dot`. For an object with thousands of references, the rendering can take minutes and produce an unreadable image. Limit `max_depth` and `too_many` to keep the graphs small.
+
+<h1 id="a-memory-profiling-workflow">A Memory Profiling Workflow</h1>
+
+The tools work best together, not in isolation. The shape that works in practice:
+
+**Notice the problem.** Either an external monitor (Kubernetes pod metrics, htop, the hosting provider's dashboard) shows the process at high memory, or it gets OOM-killed, or it appears manually in `mprof plot`.
+
+**Look at the shape of the curve.** Time-series data (`mprof run` followed by `mprof plot`, or a monitoring dashboard) shows whether the problem is a leak (slow steady growth) or a spike (peaks during specific operations). The two have different fixes, and treating one like the other wastes time.
+
+**For leaks, snapshot before and after.** `tracemalloc.take_snapshot()` before a batch of work, the same after, then `compare_to`. The lines that grew without a corresponding release are the candidates.
+
+**For spikes, find the largest allocators.** A single `tracemalloc.take_snapshot()` at peak memory, grouped by line, ranked by size. The top of the list is where the memory goes. Often it is a single line: a huge list comprehension, an unstreamed file read, a Pandas operation that materializes a copy.
+
+**For unclear cases, use objgraph.** If `tracemalloc` shows growth on a line but the objects should have been garbage by now, something is holding references. `objgraph.show_backrefs` on a sample object draws the reference chain.
+
+**Fix and re-measure.** Same as CPU profiling: change one thing, measure again, confirm the number moved. Memory fixes are easy to get wrong (a "fix" that actually moves the leak), and only a re-measurement confirms success.
+
+<h1 id="common-memory-issues">Common Memory Issues</h1>
+
+A small catalog of issues that show up over and over.
+
+**Caches without limits.** A dict that maps `request_id -> response` grows forever if nothing evicts. The fix is `functools.lru_cache(maxsize=...)`, a custom LRU, or skipping the cache when it is not needed. The signature in a profile is steady linear growth that correlates with traffic.
+
+**Closures capturing large objects.** A function returned from inside another function can capture its enclosing scope. If the outer scope held a large dataframe, the closure keeps the dataframe alive as long as the function exists. The signature: an inner function with surprising references to large objects in `objgraph.show_backrefs`.
+
+**Module-level lists used as logs.** Something like `_audit_log = []` at the top of a module, appended to on every operation, never cleared. Fine for testing, a leak in production. The fix is to write the log to disk or to a real logging system. The signature: a module-level list that grows with traffic.
+
+**Pandas operations creating hidden copies.** `df["new_col"] = df["old_col"] * 2` looks like an in-place operation. Depending on Pandas internals, it may or may not be. `df.copy()` is explicit. Memory pressure during data pipelines often comes from unintended copies. The signature: peak memory roughly 2x the expected value during a single operation.
+
+**Reference cycles with `__del__`.** Two objects referring to each other, both with `__del__` methods, form a cycle the cyclic GC cannot break automatically (it does not know what order to call the destructors). The fix is to use `weakref` for one of the references, or to not use `__del__`. The signature: objects that should be garbage staying alive, visible in `objgraph.count` after `gc.collect()`.
+
+**Generator state holding onto objects.** A generator that yields rows from a large file holds the file handle and any local variables until it is exhausted or closed. Stopping iteration early without closing the generator leaves those references in place. The signature: file handles or large objects in `objgraph` that were assumed to be released.
+
+Most leaks are not exotic. They are a few specific patterns, and the tools make them fast to spot once the patterns are familiar.
+
+<h1 id="when-to-worry-about-memory">When to Worry About Memory</h1>
+
+Not every program needs memory profiling. A few rules of thumb for when to invest the time.
+
+For one-off scripts that run for seconds and then exit, skip it. The OS reclaims everything when the process ends. Even a leak does not matter on a 30-second run.
+
+For long-running services, treat memory as a first-class metric alongside CPU and latency. Monitor it. If it grows monotonically over hours of normal operation, that is a leak and needs investigation. If it is stable but high, that is a peak issue and may be acceptable or may not.
+
+For data pipelines, watch peaks. A pipeline that processes 5 GB of data and peaks at 50 GB will work fine on a beefy laptop and OOM on the production cluster. `tracemalloc` snapshots at key points in the pipeline show where the peaks are.
+
+For libraries, especially ones called from web servers, take care with module-level state. Anything cached at module level lives as long as the process. If it can grow, it will. Use `functools.lru_cache(maxsize=...)` rather than an unbounded dict.
+
+For deployments with hard memory limits (Lambda, Kubernetes with limits, containers in general), the OS will kill the process when the limit is crossed, with no Python-level signal. Measure before shipping. A function that uses 200 MB locally might use 600 MB after warmup, and a 512 MB Lambda budget leaves no room.
+
+Memory profiling is rarely the first tool used, but when it is needed, it is needed urgently. Knowing the tools in advance saves the 3 AM scramble.
+
+<h1 id="quiz">Quiz</h1>
+
+<h1 id="quiz-questions">Quiz Questions</h1>
+
+**Question 1: A service is fast enough, but its resident memory grows after every request. Which profiling question is most relevant?**
+
+- [ ] Which functions spend the most wall-clock time per request?
+- [x] Which lines allocate or keep objects alive across requests?
+- [ ] Which imports are slowest during the service startup path?
+- [ ] Which threads are blocked most often by the GIL?
+
+**Question 2: In tracemalloc, what is the main reason to group snapshot statistics by "traceback" instead of "lineno"?**
+
+- [x] It groups allocations by the full recorded call path, not just the allocating line.
+- [ ] It records memory from native extensions that tracemalloc otherwise skips.
+- [ ] It disables garbage collection so temporary objects remain visible longer.
+- [ ] It reports operating-system RSS instead of Python allocation totals.
+
+**Question 3: A tracemalloc diff shows a line with size=+312 KiB. What does that value mean?**
+
+- [ ] That line used 312 KiB of CPU cache while the Python code was running.
+- [x] That line has 312 KiB more traced memory than in the baseline snapshot.
+- [ ] That file contains exactly 312 KiB of live Python bytecode in memory.
+- [ ] That line allocated 312 KiB once, then released it before the diff.
+
+**Question 4: Which tool is most directly associated with line-by-line memory reports and process memory timelines?**
+
+- [ ] cProfile, because it samples allocations made by each function call.
+- [ ] dis, because bytecode length predicts runtime memory usage.
+- [x] memory_profiler, because it can show memory changes per source line.
+- [ ] pdb, because breakpoints automatically track object referrers.
+
+**Question 5: tracemalloc shows that many objects are still allocated, but you need to know what is holding references to them. Which tool best fits that next step?**
+
+- [ ] timeit, because repeated runs reveal which reference is slowest.
+- [x] objgraph, because it can inspect referrers and back-reference chains.
+- [ ] venv, because a fresh environment removes retained objects.
+- [ ] compileall, because bytecode caches include object ownership data.
+
+**Question 6: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 7: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 8: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+<QuizCard />
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,586 @@
+---
+title: "Custom Exceptions"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Custom Exceptions explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+Java ships with dozens of built-in exception types, but real applications run into failures that none of them name precisely. An order lookup returns nothing. A cart checks out with no items. A payment provider declines a card. These are domain failures, and giving each one its own exception type lets callers tell them apart, lets logs read clearly, and lets the type signature document what can go wrong. This lesson covers how to declare a custom exception, what base class to extend, the four constructors every custom exception should provide, how to attach domain data as fields, and when a standard exception already fits and a custom one is overkill.
+
+<h1 id="why-define-a-custom-exception-type">
+  Why Define a Custom Exception Type
+</h1>
+
+Throwing a generic `RuntimeException` halts the program. It loses almost everything useful at the catch site or in the logs. A single catch clause has to inspect the message string to determine what happened. The stack trace shows `RuntimeException`, which says nothing about the domain. Two different failures that share the same generic type cannot be handled differently without parsing text.
+
+A named type fixes all three problems at once. `OrderNotFoundException` reads as exactly what it is. A catch clause can target it specifically and leave other failures alone. The stack trace names the problem in the first line. Anyone reading the code understands what the method can fail with without having to read the body.
+
+Consider what the two styles look like side by side. The generic version:
+
+```java
+public class OrderService {
+    public static void main(String[] args) {
+        try {
+            findOrder(404);
+        } catch (RuntimeException e) {
+            System.out.println("Something went wrong: " + e.getMessage());
+        }
+    }
+
+    public static void findOrder(long orderId) {
+        throw new RuntimeException("Order not found: " + orderId);
+    }
+}
+```
+
+The catch clause has no way to distinguish "order not found" from "database unreachable" from "cart is empty" without inspecting the message. A reader of the method signature sees that `findOrder` throws a `RuntimeException` and learns nothing about the failure.
+
+The named version conveys the failure at a glance:
+
+```java
+public class OrderNotFoundException extends RuntimeException {
+    public OrderNotFoundException(String message) {
+        super(message);
+    }
+}
+
+public class OrderService {
+    public static void main(String[] args) {
+        try {
+            findOrder(404);
+        } catch (OrderNotFoundException e) {
+            System.out.println("Order missing: " + e.getMessage());
+        }
+    }
+
+    public static void findOrder(long orderId) {
+        throw new OrderNotFoundException("Order not found: " + orderId);
+    }
+}
+```
+
+The catch clause targets one specific failure. The stack trace will read `OrderNotFoundException` on the first line. A reader of the method signature gets a hint about the failure mode just from the type name.
+
+The same payoff scales as the number of failure modes grows. An e-commerce checkout method might fail because the cart is empty, an item ran out of stock, the payment was declined, or the shipping address is invalid. Four named exception types let four catch clauses route each case to the right recovery path. One generic type forces a single catch clause to figure out which case happened.
+
+<h1 id="choosing-the-base-class">Choosing the Base Class</h1>
+
+Every custom exception extends some existing exception type. The choice that matters most is whether to extend `RuntimeException` (unchecked) or `Exception` directly (checked).
+
+| Base class         | Style     | Best for                                                                                    |
+| ------------------ | --------- | ------------------------------------------------------------------------------------------- |
+| `RuntimeException` | Unchecked | Programming errors and domain failures the caller usually cannot recover from               |
+| `Exception`        | Checked   | Failures the caller is expected to handle and that are part of the method's normal contract |
+
+Most modern Java code, and most modern frameworks, default to unchecked. The cost of checked exceptions is that every method up the call stack has to either catch them or declare them. That cost rarely pays for itself in application code, and it gets in the way when the chain of methods is deep.
+
+For the e-commerce examples in this lesson, every custom exception extends `RuntimeException`.
+
+```java
+public class OrderNotFoundException extends RuntimeException {
+    public OrderNotFoundException(String message) {
+        super(message);
+    }
+}
+```
+
+The whole class is four lines. The base class is `RuntimeException`. The constructor takes a message and hands it to `super`. That is a complete custom exception. Everything else in this lesson is about making the type carry more information or fit more situations cleanly.
+
+<h1 id="the-four-standard-constructors">The Four Standard Constructors</h1>
+
+A polished custom exception provides four constructors, each delegating to the matching `super` constructor on `RuntimeException` or `Exception`. The four shapes are:
+
+| Constructor                                  | Use                                                                     |
+| -------------------------------------------- | ----------------------------------------------------------------------- |
+| `Exception()`                                | The rare case where no message and no cause apply                       |
+| `Exception(String message)`                  | A message describing what happened                                      |
+| `Exception(String message, Throwable cause)` | A message plus the original exception that triggered this one           |
+| `Exception(Throwable cause)`                 | Just the cause, when the message would only repeat `cause.getMessage()` |
+
+A clean implementation that follows the convention exactly:
+
+```java
+public class OrderNotFoundException extends RuntimeException {
+    public OrderNotFoundException() {
+        super();
+    }
+
+    public OrderNotFoundException(String message) {
+        super(message);
+    }
+
+    public OrderNotFoundException(String message, Throwable cause) {
+        super(message, cause);
+    }
+
+    public OrderNotFoundException(Throwable cause) {
+        super(cause);
+    }
+}
+```
+
+Each constructor does one thing: hand its arguments to the matching `super` constructor. There is no extra logic, no validation, no logging. The job of the constructor is to populate the exception's state, and the base class already knows how to do that.
+
+The pattern is conventional, not mandatory. A custom exception with only one constructor compiles and runs fine. The reason to write all four: callers will eventually want each shape, and providing them up front means callers never need to call `initCause` after the fact or build a message that duplicates `cause.getMessage()`. The `(String, Throwable)` and `(Throwable)` constructors are plumbing for wrapping a lower-level exception when one bubbles up.
+
+There is a fifth, `protected` constructor on `RuntimeException` and `Exception`: `(String message, Throwable cause, boolean enableSuppression, boolean writableStackTrace)`. It exists for advanced cases where the stack trace is suppressed for performance or the suppressed-exceptions list is disabled. Application code almost never needs it, so stick with the four standard constructors.
+
+The full constructor pattern in use:
+
+```java
+public class OrderNotFoundException extends RuntimeException {
+    public OrderNotFoundException() { super(); }
+    public OrderNotFoundException(String message) { super(message); }
+    public OrderNotFoundException(String message, Throwable cause) { super(message, cause); }
+    public OrderNotFoundException(Throwable cause) { super(cause); }
+}
+
+public class OrderLookupDemo {
+    public static void main(String[] args) {
+        try {
+            loadOrder(404);
+        } catch (OrderNotFoundException e) {
+            System.out.println("Caught: " + e.getMessage());
+            if (e.getCause() != null) {
+                System.out.println("Caused by: " + e.getCause().getMessage());
+            }
+        }
+    }
+
+    public static void loadOrder(long orderId) {
+        try {
+            readFromDatabase(orderId);
+        } catch (RuntimeException dbError) {
+            throw new OrderNotFoundException("Order not found: " + orderId, dbError);
+        }
+    }
+
+    public static void readFromDatabase(long orderId) {
+        throw new RuntimeException("row missing in orders table");
+    }
+}
+```
+
+The `loadOrder` method catches the low-level database failure and rethrows it as a domain-level `OrderNotFoundException`, attaching the original exception as the cause. The catch block in `main` reads both messages. Without the `(String, Throwable)` constructor, the cause would be lost and the stack trace at the catch site would only show `OrderNotFoundException` with no link back to the underlying database problem.
+
+<h1 id="naming-convention">Naming Convention</h1>
+
+Custom exception names follow two rules. The name ends in `Exception`, and the rest of the name matches the domain term used elsewhere in the codebase.
+
+| Good                         | Why                                                           |
+| ---------------------------- | ------------------------------------------------------------- |
+| `OrderNotFoundException`     | Ends in `Exception`, matches the singular domain term `Order` |
+| `InventoryShortageException` | Describes the specific failure, not a generic category        |
+| `PaymentDeclinedException`   | Names the actual failure, not the layer that detected it      |
+| `CartEmptyException`         | Reads naturally in a catch clause                             |
+
+| Poor                 | Why                                                                  |
+| -------------------- | -------------------------------------------------------------------- |
+| `OrderNotFoundError` | Doesn't end in `Exception`; `Error` has a specific meaning in Java   |
+| `OrdersException`    | Plural form; doesn't match the singular `Order` used everywhere else |
+| `OrderProblem`       | Vague; "problem" doesn't say what went wrong                         |
+| `OrderEx`            | Abbreviation hurts readability for no real saving                    |
+
+The pattern: read the class name aloud as if it were a sentence: "Caught order not found exception." If that sounds natural, the name is doing its job. "Caught order ex" or "caught orders exception" both sound off, and the off-ness is a sign the name is wrong.
+
+Another convention: the name should describe **what went wrong**, not **where it was detected**. `DatabaseOrderException` mixes the layer with the failure, which dates badly the moment the lookup moves to a different storage backend. `OrderNotFoundException` describes the failure itself, so it stays accurate regardless of how the lookup is implemented.
+
+<h1 id="adding-fields-for-context">Adding Fields for Context</h1>
+
+A message string is enough for many custom exceptions. When the catch site needs structured access to specific values, add fields. The pattern: declare `private final` fields, accept them in the constructor, build a message that includes them, and expose getters so the catch site can read the values back without parsing the message.
+
+`InventoryShortageException` is a useful example. The failure carries three pieces of structured data: which product fell short, how many were requested, and how many were available.
+
+```java
+public class InventoryShortageException extends RuntimeException {
+    private final long productId;
+    private final int requested;
+    private final int available;
+
+    public InventoryShortageException(long productId, int requested, int available) {
+        super("Inventory shortage for product " + productId
+                + ": requested " + requested + ", available " + available);
+        this.productId = productId;
+        this.requested = requested;
+        this.available = available;
+    }
+
+    public long getProductId() {
+        return productId;
+    }
+
+    public int getRequested() {
+        return requested;
+    }
+
+    public int getAvailable() {
+        return available;
+    }
+}
+```
+
+Three details. First, the message is constructed in the constructor and handed to `super` so that `getMessage()` works the standard way. Second, the fields are `final`, which makes the exception effectively immutable once thrown. Third, the getters return the raw values, not formatted strings, so the catch site can use them in conditions or compute new values.
+
+A catch block can now react to specific situations:
+
+```java
+public class CheckoutDemo {
+    public static void main(String[] args) {
+        try {
+            reserve(101, 5);
+        } catch (InventoryShortageException e) {
+            System.out.println("Message: " + e.getMessage());
+            System.out.println("Product:   " + e.getProductId());
+            System.out.println("Requested: " + e.getRequested());
+            System.out.println("Available: " + e.getAvailable());
+
+            if (e.getAvailable() > 0) {
+                System.out.println("Suggesting partial reservation of " + e.getAvailable());
+            } else {
+                System.out.println("Item out of stock entirely");
+            }
+        }
+    }
+
+    public static void reserve(long productId, int quantity) {
+        int onHand = 2;
+        if (quantity > onHand) {
+            throw new InventoryShortageException(productId, quantity, onHand);
+        }
+    }
+}
+```
+
+The catch block does something useful with the structured data: it suggests a partial reservation when some stock is available. That branch would be awkward to write if `available` were only embedded in the message string. Parsing the message would be both fragile and silly.
+
+Including the structured data in the message is duplication, but it is the useful kind of duplication. `getMessage()` is what `printStackTrace()` and most logging frameworks call by default, so the values need to be in the message string to appear in logs.
+
+<h3 id="decision-checked-or-unchecked">Decision: Checked or Unchecked?</h3>
+
+`InventoryShortageException` extends `RuntimeException` (unchecked). The decision rests on whether the caller is expected to handle the failure as part of the method's normal contract. For a checkout flow, a shortage is a normal outcome that the UI should react to, but it is still a domain failure rather than a recoverable condition baked into every signature up the stack. Most modern codebases treat domain failures as unchecked.
+
+<h1 id="a-custom-exception-with-a-reason-code">
+  A Custom Exception With a Reason Code
+</h1>
+
+`PaymentDeclinedException` is a different shape of problem. The failure is a single event, but the catch site usually wants to know **why** the payment was declined: insufficient funds, expired card, bank-level fraud check, network timeout. A reason code fits this case.
+
+The natural fit for the reason code is an enum. The enum names the legal reasons and lets the catch site dispatch on them with `==` or a `switch`.
+
+```java
+public enum DeclineReason {
+    INSUFFICIENT_FUNDS,
+    EXPIRED_CARD,
+    FRAUD_SUSPECTED,
+    BANK_UNREACHABLE
+}
+
+public class PaymentDeclinedException extends RuntimeException {
+    private final DeclineReason reason;
+
+    public PaymentDeclinedException(DeclineReason reason) {
+        super("Payment declined: " + reason);
+        this.reason = reason;
+    }
+
+    public PaymentDeclinedException(DeclineReason reason, Throwable cause) {
+        super("Payment declined: " + reason, cause);
+        this.reason = reason;
+    }
+
+    public DeclineReason getReason() {
+        return reason;
+    }
+}
+```
+
+Two constructors here, not four. The no-argument and message-only forms do not apply: a `PaymentDeclinedException` without a reason carries no useful information, and the message is computed from the reason. The `(reason, cause)` form covers the case where a lower-level network exception triggered the failure.
+
+A catch site can then route on the reason:
+
+```java
+public class CheckoutDemo {
+    public static void main(String[] args) {
+        try {
+            charge();
+        } catch (PaymentDeclinedException e) {
+            switch (e.getReason()) {
+                case INSUFFICIENT_FUNDS -> System.out.println("Ask the customer to use another card.");
+                case EXPIRED_CARD -> System.out.println("Ask the customer to update card details.");
+                case FRAUD_SUSPECTED -> System.out.println("Hold the order and notify support.");
+                case BANK_UNREACHABLE -> System.out.println("Retry in 30 seconds.");
+            }
+        }
+    }
+
+    public static void charge() {
+        throw new PaymentDeclinedException(DeclineReason.EXPIRED_CARD);
+    }
+}
+```
+
+The `switch` on `e.getReason()` is exhaustive because the reason is an enum, so the compiler catches new reasons that someone forgets to handle. A `String` reason code would invite typos that compile and route to the wrong branch.
+
+<h3 id="decision-checked-or-unchecked">Decision: Checked or Unchecked?</h3>
+
+`PaymentDeclinedException` extends `RuntimeException`. A decline is a real, expected outcome of a charge attempt, but it is not something every caller up the stack needs to declare. The UI layer reacts to it where the charge is initiated, and lower layers do not care. Forcing `throws PaymentDeclinedException` onto every method that calls the checkout code would add noise without value.
+
+<h1 id="a-custom-exception-with-no-extra-fields">
+  A Custom Exception With No Extra Fields
+</h1>
+
+Not every custom exception needs a field. `CartEmptyException` is a clean example: the failure is fully described by its type. There is no `productId`, no quantity, no reason code. Either the cart is empty or it is not.
+
+```java
+public class CartEmptyException extends RuntimeException {
+    public CartEmptyException() {
+        super("Cart is empty");
+    }
+
+    public CartEmptyException(String message) {
+        super(message);
+    }
+
+    public CartEmptyException(String message, Throwable cause) {
+        super(message, cause);
+    }
+
+    public CartEmptyException(Throwable cause) {
+        super(cause);
+    }
+}
+```
+
+The no-argument constructor pre-fills a default message, which is friendlier than the inherited `null` message. The other three follow the standard pattern.
+
+A demo:
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class Cart {
+    private final List<String> items = new ArrayList<>();
+
+    public void add(String item) {
+        items.add(item);
+    }
+
+    public double checkout() {
+        if (items.isEmpty()) {
+            throw new CartEmptyException();
+        }
+        return items.size() * 19.99;
+    }
+}
+
+public class CheckoutDemo {
+    public static void main(String[] args) {
+        Cart cart = new Cart();
+        try {
+            double total = cart.checkout();
+            System.out.println("Total: $" + total);
+        } catch (CartEmptyException e) {
+            System.out.println("Cannot check out: " + e.getMessage());
+        }
+    }
+}
+```
+
+The type alone tells the catch site what went wrong. No fields to read. No reason code to switch on. A clear, named failure.
+
+<h3 id="decision-checked-or-unchecked">Decision: Checked or Unchecked?</h3>
+
+Unchecked. Trying to check out an empty cart is a usage error from the UI layer's perspective: the button should not be reachable when the cart is empty, but a defensive check in the service is cheap insurance. Forcing every checkout caller to declare `throws CartEmptyException` adds friction.
+
+<h1 id="putting-the-four-custom-exceptions-together">
+  Putting the Four Custom Exceptions Together
+</h1>
+
+A short demo that throws and catches each of the four custom exceptions in sequence, so the patterns sit side by side:
+
+```java
+public class CheckoutTour {
+    public static void main(String[] args) {
+        tryStep(() -> {
+            throw new OrderNotFoundException("Order not found: 404");
+        });
+
+        tryStep(() -> {
+            throw new InventoryShortageException(101, 5, 2);
+        });
+
+        tryStep(() -> {
+            throw new PaymentDeclinedException(DeclineReason.INSUFFICIENT_FUNDS);
+        });
+
+        tryStep(() -> {
+            throw new CartEmptyException();
+        });
+    }
+
+    private static void tryStep(Runnable step) {
+        try {
+            step.run();
+        } catch (OrderNotFoundException e) {
+            System.out.println("[OrderNotFound] " + e.getMessage());
+        } catch (InventoryShortageException e) {
+            System.out.println("[InventoryShortage] product=" + e.getProductId()
+                    + ", requested=" + e.getRequested() + ", available=" + e.getAvailable());
+        } catch (PaymentDeclinedException e) {
+            System.out.println("[PaymentDeclined] reason=" + e.getReason());
+        } catch (CartEmptyException e) {
+            System.out.println("[CartEmpty] " + e.getMessage());
+        }
+    }
+}
+```
+
+Each catch clause reads naturally because the type already says what went wrong. The structured fields on `InventoryShortageException` and `PaymentDeclinedException` flow through to the log line without any parsing. The `OrderNotFoundException` and `CartEmptyException` rely on the message alone, which is enough for them.
+
+<h1 id="how-custom-exceptions-fit-in-the-hierarchy">
+  How Custom Exceptions Fit in the Hierarchy
+</h1>
+
+Every custom exception slots into the standard `Throwable` tree. The diagram below shows where the four exceptions from this lesson sit relative to the built-in types.
+
+The cyan boxes are the structural backbone of the exception hierarchy: `Throwable` at the root, `Exception` below it, and `RuntimeException` below that. The teal boxes are built-in types you might consider before writing a custom one. The orange boxes are this lesson's four custom exceptions, all sitting under `RuntimeException` because each chose unchecked.
+
+If `InventoryShortageException` had extended `Exception` directly (making it checked), it would sit between the cyan `Exception` node and a teal node like `IOException`, not under `RuntimeException`. The position in the tree is exactly what determines checked-vs-unchecked status.
+
+<h1 id="a-note-on-serialversionuid">A Note on serialVersionUID</h1>
+
+Every exception class implements `Serializable` because `Throwable` does. The Java serialization machinery uses a field called `serialVersionUID` to detect when a serialized form on disk no longer matches the current class definition. The convention for any `Serializable` class, including exceptions, is to declare an explicit `serialVersionUID`.
+
+```java
+public class OrderNotFoundException extends RuntimeException {
+    private static final long serialVersionUID = 1L;
+
+    public OrderNotFoundException(String message) {
+        super(message);
+    }
+}
+```
+
+The number itself rarely matters in practice for application exceptions; pick `1L` and only bump it when intentionally breaking binary compatibility with previously serialized exception instances. Declaring it explicitly silences a compiler warning (with `-Xlint:serial`) and locks the value down so the compiler does not generate a different one on a different machine. Whether the exceptions are actually serialized across the wire or to disk is a separate concern.
+
+<h1 id="whats-wrong-with-this-code">What's Wrong With This Code?</h1>
+
+```java
+public class OrderNotFoundException extends RuntimeException {
+    public OrderNotFoundException() {
+        super();
+    }
+}
+
+public class OrderService {
+    public static void main(String[] args) {
+        try {
+            findOrder(404);
+        } catch (OrderNotFoundException e) {
+            System.out.println("Caught: " + e.getMessage());
+            System.out.println("Cause: " + e.getCause());
+        }
+    }
+
+    public static void findOrder(long orderId) {
+        try {
+            readDatabase(orderId);
+        } catch (RuntimeException dbError) {
+            throw new OrderNotFoundException();
+        }
+    }
+
+    public static void readDatabase(long orderId) {
+        throw new RuntimeException("connection refused");
+    }
+}
+```
+
+The class declares only the no-argument constructor, so callers have no way to attach a message or a cause. The catch in `findOrder` throws away the entire `dbError` exception. The catch site prints `null` for both the message and the cause, which is exactly as informative as nothing at all.
+
+**Fix:** Add the four standard constructors and use the `(message, cause)` form at the throw site to preserve the original failure.
+
+```java
+public class OrderNotFoundException extends RuntimeException {
+    public OrderNotFoundException() { super(); }
+    public OrderNotFoundException(String message) { super(message); }
+    public OrderNotFoundException(String message, Throwable cause) { super(message, cause); }
+    public OrderNotFoundException(Throwable cause) { super(cause); }
+}
+
+public class OrderService {
+    public static void main(String[] args) {
+        try {
+            findOrder(404);
+        } catch (OrderNotFoundException e) {
+            System.out.println("Caught: " + e.getMessage());
+            System.out.println("Cause: " + e.getCause().getMessage());
+        }
+    }
+
+    public static void findOrder(long orderId) {
+        try {
+            readDatabase(orderId);
+        } catch (RuntimeException dbError) {
+            throw new OrderNotFoundException("Order not found: " + orderId, dbError);
+        }
+    }
+
+    public static void readDatabase(long orderId) {
+        throw new RuntimeException("connection refused");
+    }
+}
+```
+
+Now the catch site sees the domain message and can drill into the cause when it wants the underlying failure. The stack trace in a real program would print both exceptions, linked by `Caused by:`.
+
+<h1 id="when-not-to-create-a-custom-exception">
+  When NOT to Create a Custom Exception
+</h1>
+
+Custom exceptions are useful when the failure has a real domain meaning. When the failure is already named by a standard exception, reusing the standard one is cleaner. Using a custom type out of habit creates clutter that future readers have to navigate around.
+
+Three built-in unchecked exceptions cover most cases where a custom type would be overkill:
+
+| Standard exception         | Use when                                                                                                                        |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `IllegalArgumentException` | An argument is structurally invalid (negative price, null where forbidden, malformed format)                                    |
+| `IllegalStateException`    | The object isn't in a state where the method makes sense (closing a cart that's already closed, charging an already-paid order) |
+| `NoSuchElementException`   | A lookup didn't find what was asked for, and the lookup is a generic "find by id" rather than a domain operation                |
+
+A few concrete examples:
+
+```java
+public void setPrice(double price) {
+    if (price < 0) {
+        throw new IllegalArgumentException("Price cannot be negative: " + price);
+    }
+}
+```
+
+A negative price is a programming bug or a validation gap. The failure is fully named by `IllegalArgumentException`. A `NegativePriceException` adds a type without adding clarity.
+
+```java
+public void confirm() {
+    if (status != OrderStatus.PLACED) {
+        throw new IllegalStateException("Cannot confirm an order in status " + status);
+    }
+}
+```
+
+Confirming an order that is already shipped is a state error. `IllegalStateException` says exactly that. A custom `OrderAlreadyConfirmedException` would only repeat the message in the type name.
+
+The line between "this needs a custom exception" and "this is fine with a standard one" is fuzzy. A useful test: ask whether a catch site would ever want to handle this failure differently from other failures of the same standard type. If the answer is yes, a custom type pays for itself by giving catch sites something to target. If the answer is no, the standard type is enough.
+
+`OrderNotFoundException` passes that test. A caller looking up an order wants to handle "no such order" differently from other `NoSuchElementException` cases (a missing customer, a missing product). The custom type makes that distinction possible.
+
+`NegativePriceException` would fail the test. A caller setting a price does not usually want to handle "price was negative" differently from other `IllegalArgumentException` cases (price was null, currency was wrong). The standard type handles all of them the same way.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

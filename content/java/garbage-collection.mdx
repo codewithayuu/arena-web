@@ -1,0 +1,409 @@
+---
+title: "Garbage Collection"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Garbage Collection explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+The previous two chapters covered how Java lays out memory: the stack for frames and local variables, the heap for objects, and the metaspace for class metadata. Garbage collection lives on the heap. The stack cleans itself up when a method returns; the heap doesn't, which is why it needs a collector. Subsequent chapters drill into specific collectors (Serial, Parallel, G1, ZGC) and tuning, but the ideas here apply to all of them.
+
+<h1 id="why-gc-exists">Why GC Exists</h1>
+
+In a language with manual memory management, every `new` has a matching `free` somewhere, and tracking that pairing is a real source of bugs. Freeing memory that is still in use produces a use-after-free crash. Freeing the same block twice is a double-free. Forgetting to free leaks the process slowly. These bugs are well-known, and a lot of production outages over the years have come down to one or two of them.
+
+Java's deal is simpler. You allocate objects with `new`. You don't free anything. The garbage collector watches the heap, notices which objects nothing in your program can reach anymore, and reclaims that memory for future allocations. The price you pay is some runtime overhead and occasional pauses; the value you get is that an entire category of memory bugs becomes impossible.
+
+Consider an order-processing flow that allocates a fresh `Order` object for every incoming request:
+
+```java
+public class OrderFlow {
+
+    public static void main(String[] args) {
+        for (int i = 0; i < 5; i++) {
+            placeOrder(i);
+        }
+        System.out.println("All orders placed");
+    }
+
+    static void placeOrder(int id) {
+        Order order = new Order(id, "Customer-" + id, 49.99);
+        System.out.println("Placed " + order);
+    }
+
+    record Order(int id, String customerName, double total) {}
+}
+```
+
+Each call to `placeOrder` creates a new `Order` on the heap and a new `String` for the customer name. After `placeOrder` returns, the local variable `order` is gone (its stack frame is destroyed) and nothing else in the program holds a reference to the `Order` object. It's still sitting on the heap, but it's unreachable, and the garbage collector will reclaim it the next time it runs. No cleanup code is needed.
+
+The same loop in a language without GC would require tracking ownership of each `Order`, deciding who frees it, and ensuring no other code is still using it when it does. That's a lot of overhead for a piece of state that's used for one method call and then forgotten.
+
+Garbage collection isn't free. It costs CPU time, and some phases require pausing application threads. In server applications that allocate aggressively, GC overhead can run from a few percent of CPU up to double digits if the heap is under-sized.
+
+<h1 id="reachability-is-the-rule">Reachability Is the Rule</h1>
+
+The garbage collector doesn't ask whether an object is "still wanted". It asks whether any chain of references from a known starting point eventually reaches the object. If yes, the object is reachable and stays. If no, the object is unreachable and can be collected.
+
+A reference chain is exactly what it sounds like. Start from a root, follow a field to another object, follow one of that object's fields to a third object, and so on. Any object reachable by walking the graph of references is alive. Any object the walk can't visit is dead, from the collector's point of view, even if the code looks like it might use the object someday.
+
+A small example to make this concrete. The `Cart` holds a list of `Product` references; the `Product` holds a `Category` reference. As long as the local variable `cart` lives, the whole graph beneath it is reachable.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class ReachabilityDemo {
+
+    public static void main(String[] args) {
+        Cart cart = new Cart();
+        Product mouse = new Product("Mouse", new Category("Electronics"));
+        Product book = new Product("Book", new Category("Books"));
+
+        cart.add(mouse);
+        cart.add(book);
+
+        System.out.println("Cart has " + cart.size() + " items");
+
+        // Drop the local references. The Products are still reachable through cart.
+        mouse = null;
+        book = null;
+        System.out.println("Cart still has " + cart.size() + " items");
+
+        // Drop the cart. Now Cart, both Products, and both Categories are all unreachable.
+        cart = null;
+        System.out.println("Cart reference dropped; the graph is now unreachable");
+    }
+}
+
+class Cart {
+    private final List<Product> items = new ArrayList<>();
+    public void add(Product p) { items.add(p); }
+    public int size() { return items.size(); }
+}
+
+class Product {
+    private final String name;
+    private final Category category;
+    public Product(String name, Category category) {
+        this.name = name;
+        this.category = category;
+    }
+}
+
+class Category {
+    private final String name;
+    public Category(String name) { this.name = name; }
+}
+```
+
+Setting `mouse` and `book` to `null` doesn't make the products unreachable, because `cart.items` still holds them. The collector follows the chain `cart` to `items` to each `Product` to each `Category`, and marks all of them alive. Once `cart` itself is set to `null` and the `main` method returns (or no other root references the cart), the whole graph drops out of the reachable set in one shot.
+
+There's no reference counting going on. The collector doesn't track how many things point at each object. It walks the live set from the roots, and that walk decides everything. Cyclic references are handled correctly because of this: even if A points to B and B points to A, if nothing reachable points to either of them, both are collected together. Reference counting languages have to invent extra machinery to handle cycles; tracing collectors get it automatically.
+
+<h1 id="gc-roots-where-the-walk-starts">GC Roots: Where the Walk Starts</h1>
+
+If reachability decides what's alive, the next question is reachable from what. The set of starting points is called the GC roots. The collector treats these as the seeds of the live set and walks outward from them.
+
+The main categories of roots are:
+
+| Root Type                | What It Is                                                                |
+| ------------------------ | ------------------------------------------------------------------------- |
+| Stack references         | Local variables and parameters in every running thread's stack frames     |
+| Static fields            | Class-level fields stored in the metaspace, referenced by loaded classes  |
+| JNI handles              | Native code references passed across the Java-native boundary             |
+| Active threads           | Each `Thread` object that's still alive and runnable                      |
+| Synchronization monitors | Objects currently being used as locks                                     |
+| Class objects            | The `Class<?>` instances for loaded classes (until the class is unloaded) |
+
+Anything reachable from any of these is alive. Anything that isn't, is not. The collector doesn't care which root made the object reachable; one path is enough.
+
+Here's a quick mental model. A `Server` keeps a reference to a `ConnectionPool` in a static field, and the pool holds open connections. The static field is a GC root, so the pool stays alive as long as the class is loaded, and so do all the connections in the pool. Removing a connection from the pool while nothing else holds it makes that connection unreachable and eligible for collection. The pool itself never is, because the static field never lets go.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class GcRootsDemo {
+
+    // Static field: a GC root. Holds onto the pool for the program's lifetime.
+    static final ConnectionPool POOL = new ConnectionPool();
+
+    public static void main(String[] args) {
+        // Stack reference: also a GC root while main is running.
+        Order pending = new Order(1, "Maria", 24.99);
+
+        POOL.borrow(); // adds a connection
+        POOL.borrow();
+
+        System.out.println("Pool has " + POOL.size() + " connections");
+        System.out.println("Pending order: " + pending);
+
+        // After main returns, `pending` is gone. POOL stays alive forever.
+    }
+
+    record Order(int id, String customer, double total) {}
+}
+
+class ConnectionPool {
+    private final List<Connection> live = new ArrayList<>();
+    public void borrow() { live.add(new Connection(live.size())); }
+    public int size() { return live.size(); }
+}
+
+class Connection {
+    private final int id;
+    public Connection(int id) { this.id = id; }
+}
+```
+
+The `pending` order is reachable through the `main` thread's stack while `main` runs. The `POOL` is reachable through a static field, which is a root the JVM walks every collection. As long as the class is loaded, the pool, the list inside it, and every connection in the list are all alive. To make the connections collectible, they would have to be removed from the list, breaking the reference chain.
+
+The practical consequence: static collections are a classic source of memory leaks in long-running Java programs, because they keep things alive forever from the collector's point of view, even if the application logic has moved on.
+
+<h1 id="the-mark-sweep-idea">The Mark-Sweep Idea</h1>
+
+The simplest tracing collector works in two phases. First, **mark**: walk from the roots through every reachable reference and tag each object you visit. Second, **sweep**: scan the entire heap and reclaim any object that wasn't marked. That's the algorithm.
+
+The green nodes are reachable from the roots, so the mark phase tags them. The red nodes form their own island; nothing reachable points at them, so the mark phase never visits them, and the sweep phase frees their memory. The red island has internal references (F points to G and E), but those don't help. Reachability only counts if it starts at a root.
+
+A naive mark-sweep walk in pseudocode:
+
+```text
+for each root r:
+    mark(r)
+
+function mark(obj):
+    if obj is null or obj.alreadyMarked:
+        return
+    obj.alreadyMarked = true
+    for each field f in obj:
+        mark(f)
+
+for each object o on the heap:
+    if not o.alreadyMarked:
+        free(o)
+    else:
+        o.alreadyMarked = false  // reset for next cycle
+```
+
+Two things make this work. First, marking is idempotent: visiting an object twice is harmless, because the second visit short-circuits. That's what lets the collector handle cyclic graphs without falling into infinite recursion. Second, the sweep can be linear, because by the time it runs, every reachable object is already tagged and every untagged object is garbage.
+
+The bare mark-sweep design has a problem, though. After the sweep, the heap looks like Swiss cheese. Free regions are scattered between live objects, and a new allocation has to hunt for a hole big enough to hold the object. Over time, the heap can have plenty of free bytes total but no single contiguous region large enough for a request, which is called heap fragmentation. The next two designs are direct responses to this.
+
+<h1 id="mark-sweep-compact-fixing-fragmentation">
+  Mark-Sweep-Compact: Fixing Fragmentation
+</h1>
+
+To fight fragmentation, real collectors add a third phase: **compact**. After marking and sweeping, slide the surviving objects together so they occupy one contiguous block at one end of the heap, and the free space ends up as one contiguous block at the other end. New allocations then come out of that single free region, which means allocation is as cheap as "bump a pointer."
+
+Compaction has two costs. It takes more work per collection, because every surviving object has to be physically moved. And every reference to a moved object has to be updated to point at the new location, which means the collector has to know about every reference, including the ones held by stack frames and CPU registers. This is one reason "stop the world" exists.
+
+In return, compaction makes the heap layout predictable. There's exactly one free region, allocation is a single pointer addition, and the runtime never has to scan a free list to find a hole that fits. For most production workloads, the throughput gain from cheap allocation outweighs the cost of moving objects.
+
+A useful way to think about it: mark-sweep is like running a vacuum cleaner over your floor but leaving piles of furniture wherever they happen to be; mark-sweep-compact is like vacuuming and then pushing all the furniture against one wall.
+
+Compaction moves bytes around on the heap. For a 4 GB live set, that's gigabytes of memory traffic per full collection. Modern collectors (G1, ZGC, Shenandoah) work hard to avoid stopping the world while compacting, but the work itself doesn't go away.
+
+<h1 id="copying-collectors">Copying Collectors</h1>
+
+A different way to avoid fragmentation is the **copying** collector. Split the heap into two equal-sized regions, called "from-space" and "to-space". Allocate into from-space. When from-space fills up, walk the live set, copy each surviving object from from-space into to-space (packed tightly, one after another), update all references to point at the new locations, and then flip the roles: to-space becomes the new from-space, and the old from-space is wiped clean and becomes the new to-space.
+
+A key property of this scheme is that the collection cost is proportional to the size of the **live** set, not the size of the heap. If only 5% of objects survive a collection, only 5% of the heap is copied. The dead 95% gets discarded when the old from-space is wiped.
+
+That's a great deal when most objects die quickly. And it turns out, in practice, they do.
+
+<h1 id="the-generational-hypothesis">The Generational Hypothesis</h1>
+
+After decades of running real programs, GC researchers noticed a pattern that holds across an extraordinary range of workloads: **most objects die young**. A vast majority of allocations are short-lived (request-scoped buffers, temporary strings, lambda captures, intermediate values in computations), and the rest tend to live a long time once they've survived the first few collections. There's surprisingly little in between.
+
+That observation is called the **generational hypothesis**, and it's the design basis for almost every production JVM collector. The heap is divided into generations:
+
+- **Young generation:** Where new objects are allocated. Collected frequently with cheap, copy-based collections called **minor GC**.
+- **Old generation (or tenured):** Where long-lived objects end up. Collected less frequently with a more expensive **major GC** (or **full GC** when the whole heap is touched).
+
+The young generation is itself usually subdivided. A common layout: one **Eden** region where new allocations land, and two **survivor** spaces (called S0 and S1) used as copy-collector from-space and to-space. New objects go into Eden. When Eden fills up, a minor GC copies the survivors into a survivor space. Each object carries an **age** counter; every time it survives a minor GC, its age goes up. Once the age crosses a threshold (default 15 on HotSpot, though the collector can lower it dynamically), the object is **promoted** to the old generation.
+
+The diagram traces a single object's life. It's allocated in Eden. Eden fills, a minor GC runs, the object survives, and it gets copied into survivor space S0 with age 1. On the next minor GC, the survivor space is itself the from-space; the object is copied into S1 with age 2, and S0 is wiped. This back-and-forth continues until either the object dies (in which case it's not copied, and the survivor it lived in becomes empty when it gets wiped) or its age reaches the **tenuring threshold**, at which point it's promoted into the old generation.
+
+Important caveats. These ages and thresholds are defaults, not guarantees. The JVM can adapt them at runtime, lowering the threshold when survivor space pressure rises so that long-lived objects move out faster. The exact layout varies by collector. But the shape of the design is universal: young objects are managed cheaply, surviving objects get promoted, and the old generation is collected less often with a more expensive algorithm.
+
+The payoff of the generational approach is throughput. Minor GCs are quick because Eden is small relative to the heap and most of it is dead. Major GCs are infrequent because the old generation grows slowly. The application gets the cheap-allocation behavior of a copying collector for almost all its allocations and only pays the expensive collection cost when the old generation actually needs cleaning up.
+
+<h1 id="minor-gc-vs-major-gc-vs-full-gc">Minor GC vs Major GC vs Full GC</h1>
+
+The three terms come up constantly in GC logs and tuning discussions, so it's worth pinning them down.
+
+| Term     | Scope                                           | Frequency                                  | Cost                                                 |
+| -------- | ----------------------------------------------- | ------------------------------------------ | ---------------------------------------------------- |
+| Minor GC | Young generation only                           | Frequent (every few seconds in a busy app) | Cheap; copies only young survivors                   |
+| Major GC | Old generation only                             | Infrequent                                 | More expensive; old gen is usually larger and denser |
+| Full GC  | Entire heap (young + old + sometimes metaspace) | Rare                                       | Most expensive; touches everything                   |
+
+A minor GC is the common case. The JVM runs them all day in a busy application without anyone noticing, because they pause threads for only a few milliseconds typically. The application allocates rapidly into Eden, Eden fills up, a minor GC runs, the small survivor set is copied and the rest is reclaimed, and allocation resumes.
+
+A major GC is a collection of the old generation alone. Modern collectors like G1 and ZGC interleave young and old work in ways that blur the line, but the term still shows up in logs and in the older Parallel and Serial collectors.
+
+A full GC is the heavyweight option: the JVM stops the world, collects every generation, and often compacts. Full GCs are the ones that cause perceptible pauses in production. A well-tuned application might go hours between full GCs; a poorly tuned one might full GC every few seconds, which often indicates that the heap is too small or there's a leak.
+
+The promotion path connects them. When the old generation fills up, the next major or full GC is what reclaims it. If promotion is happening faster than the old generation can be cleaned, the old gen grows until it triggers a full GC. Frequent full GCs usually indicate too many long-lived allocations or undersized heap.
+
+A minor GC on a modern multi-core JVM typically pauses the application for single-digit milliseconds. A full GC on a multi-gigabyte heap with an old collector can pause for hundreds of milliseconds to several seconds, which is enough to time out user requests in a latency-sensitive service.
+
+<h1 id="stop-the-world-pauses">Stop-the-World Pauses</h1>
+
+A stop-the-world (STW) pause is a window during which the JVM halts every application thread so the collector can do work that requires a consistent view of memory. The application makes no progress during an STW pause. The pause is the cost; the consistency is the benefit.
+
+Why does the collector need to stop the world? Because the heap is a moving target. If the application is busy creating new objects, mutating references, and shuffling state around while the collector is trying to identify what's reachable, the collector can miss objects or double-count them. The mark phase, in particular, depends on the reference graph not changing underneath it. Compaction depends on every reference being updated atomically when an object is moved. The collector either needs a global pause or a concurrent protocol that lets it work while the application runs.
+
+Different collectors strike different bargains.
+
+| Collector Style               | What Pauses                                                                    |
+| ----------------------------- | ------------------------------------------------------------------------------ |
+| Stop-the-world                | Every phase pauses the application                                             |
+| Mostly concurrent             | Only short bookkeeping phases pause; the bulk of marking runs concurrently     |
+| Pauseless (or near-pauseless) | Sub-millisecond pauses; marking, sweeping, and compaction all run concurrently |
+
+The Serial collector is fully stop-the-world. The Parallel collector is stop-the-world but uses multiple GC threads during the pause to finish faster. G1 is mostly concurrent: most of the marking happens while the application runs, but the start and end of the cycle and the actual compaction (called "evacuation") pause briefly. ZGC and Shenandoah are designed for sub-10-millisecond pauses regardless of heap size.
+
+Stop-the-world is a design choice, not a bug. Some phases of garbage collection are easier to implement correctly with a pause, and the cost of the pause has to be weighed against the engineering complexity and runtime overhead of doing the same work concurrently.
+
+<h1 id="systemgc-is-a-hint">System.gc() Is a Hint</h1>
+
+Calling `System.gc()` does not force the garbage collector to run. The Java specification describes it as a hint to the JVM that "now would be a good time to collect", and the JVM is free to ignore the hint, run a partial collection, run a full collection, or do anything in between. Different JVMs and different collectors respond to it differently. Some flags (like `-XX:+DisableExplicitGC`) make the JVM ignore the call entirely.
+
+```java
+public class SystemGcDemo {
+
+    public static void main(String[] args) {
+        // Allocate a bunch of short-lived objects.
+        for (int i = 0; i < 100_000; i++) {
+            new Order(i, "Customer-" + i, 19.99);
+        }
+
+        long before = Runtime.getRuntime().freeMemory();
+        System.gc(); // a hint, not a command
+        long after = Runtime.getRuntime().freeMemory();
+
+        System.out.println("Free memory before: " + before);
+        System.out.println("Free memory after:  " + after);
+    }
+
+    record Order(int id, String customer, double total) {}
+}
+```
+
+**Output (varies between runs and JVMs):**
+
+```text
+Free memory before: 245678912
+Free memory after:  255483904
+```
+
+The "after" number may or may not be larger than "before". On a small example like this, with a young, half-empty heap, the JVM might ignore the hint and do nothing. The fact that the numbers can go either way is the point: `System.gc()` is not reliable for any specific behavior.
+
+There are good reasons not to call it in production. First, it doesn't fix memory leaks; if the application has a leak, the collector already wants to free that memory and can't, because something is keeping it reachable. Forcing a GC just confirms it can't be freed. Second, an explicit full GC can pause the application for far longer than the JVM would have chosen to pause on its own, hurting latency. Third, the JVM's adaptive sizing and pause-time heuristics work better when they're allowed to schedule collections themselves; explicit calls confuse them.
+
+The narrow use case where `System.gc()` is sometimes acceptable is during diagnostics: forcing a collection before taking a heap dump, for instance, so the dump is smaller and easier to analyze. Even then, the JVM's diagnostic tools are usually preferred over application code.
+
+```java
+// Don't do this in production code.
+void onUserLogout() {
+    cache.clear();
+    System.gc(); // does not guarantee anything useful
+}
+```
+
+Replace the call with a clearer intent. To release memory the application is holding, release the references and let the collector do its job. To keep memory pressure down, tune the heap and the collector rather than trying to drive GC from application code.
+
+<h1 id="finalize-is-dead">finalize() Is Dead</h1>
+
+For most of Java's history, `Object.finalize()` could be overridden to run cleanup code when an object was about to be garbage collected. It looked like a destructor, and it had real problems: finalizers ran on an unpredictable thread, at an unpredictable time, or never at all; they could resurrect objects, slow down collection drastically, and swallow exceptions without warning.
+
+`finalize()` was deprecated in Java 9 and is on the path to removal. New code should not implement it. For resource cleanup, the canonical answer is `try-with-resources` and the `AutoCloseable` interface, which we covered earlier. For the rare case requiring a cleanup hook tied to GC, Java provides `java.lang.ref.Cleaner` (added in Java 9), which runs cleanups on its own thread and is much better behaved than finalizers.
+
+The short version: don't write a `finalize()` method, don't depend on garbage collection to release non-memory resources (file handles, sockets, native pointers, database connections), and use `try-with-resources` for anything that implements `AutoCloseable`.
+
+<h1 id="parallel-vs-concurrent-briefly">Parallel vs Concurrent (Briefly)</h1>
+
+Two words that look similar and mean different things in GC writing:
+
+- **Parallel** GC uses multiple threads during a stop-the-world pause to finish the work faster. The application is still paused; the pause is just shorter because more GC threads share the work.
+- **Concurrent** GC does some of its work while the application is also running. The application is not fully paused; the collector and the mutator share CPU time.
+
+Most modern collectors do both, in different phases. G1 uses parallel threads during the brief STW phases and concurrent threads during the long marking phase. ZGC does almost everything concurrently, with parallel work happening inside the few microsecond-scale pauses.
+
+The reason to know the distinction is reading GC logs, where both terms appear with precise meanings. A "parallel collector pause" means the pause itself used multiple threads. A "concurrent marking phase" means the marking ran alongside the application. Both can apply to the same collector at different times.
+
+<h1 id="putting-it-together">Putting It Together</h1>
+
+A small program that allocates objects in a few different patterns to make the generational story concrete. It allocates many short-lived objects (which die young), a few long-lived objects (which would normally get promoted), and prints memory usage at each step. The exact numbers vary by JVM, but the shape of the output is consistent.
+
+```java
+public class GcShape {
+
+    static java.util.List<Order> longLived = new java.util.ArrayList<>();
+
+    public static void main(String[] args) {
+        printMemory("Start");
+
+        // Phase 1: lots of short-lived allocations.
+        for (int i = 0; i < 1_000_000; i++) {
+            Order temp = new Order(i, "Customer-" + i, 19.99);
+            // temp is dropped at the end of each iteration; no other references kept.
+        }
+        printMemory("After 1M short-lived orders");
+
+        // Phase 2: a few long-lived allocations.
+        for (int i = 0; i < 100; i++) {
+            longLived.add(new Order(i, "VIP-" + i, 199.99));
+        }
+        printMemory("After 100 long-lived orders");
+
+        // Phase 3: drop the long-lived references and hint a collection.
+        longLived = null;
+        System.gc();
+        printMemory("After dropping long-lived refs and hinting GC");
+    }
+
+    static void printMemory(String label) {
+        Runtime rt = Runtime.getRuntime();
+        long used = rt.totalMemory() - rt.freeMemory();
+        System.out.println(label + ": " + (used / 1024 / 1024) + " MB used");
+    }
+
+    record Order(int id, String customer, double total) {}
+}
+```
+
+**Output (illustrative; exact numbers vary):**
+
+```text
+Start: 3 MB used
+After 1M short-lived orders: 27 MB used
+After 100 long-lived orders: 27 MB used
+After dropping long-lived refs and hinting GC: 6 MB used
+```
+
+The first jump (from 3 MB to 27 MB) shows that even though most of the million orders are dead the instant the loop iteration ends, the heap holds them until a minor GC runs. Eden is sized so that allocation is fast, and the collector decides when to actually clean it. The second line shows that the 100 long-lived orders barely move the needle, because they take far less memory than a million short-lived ones. The third line shows the heap shrinking after dropping the references and hinting a collection, but the exact number depends entirely on what the JVM decided to do with the hint.
+
+The lesson isn't in the specific numbers; it's in the pattern. Allocation is cheap and decoupled from collection. The collector runs on its own schedule, batches up work, and reclaims memory in bulk. The model isn't "every `new` has a matching cleanup somewhere", it's a system that batches lifetimes by age.
+
+<h1 id="common-misconceptions">Common Misconceptions</h1>
+
+A few patterns of thinking show up repeatedly in code reviews and interviews.
+
+**Setting a field to null forces GC.** It doesn't. Setting a field to `null` removes one reference from the graph. If other references to the object still exist, the object stays alive. If no other references exist, the object becomes unreachable, but the collector still runs on its own schedule. There's no immediate freeing, just a change in the reachability set.
+
+**Local variables need to be set to null at the end of a method.** They don't. The local variables disappear with the stack frame when the method returns. Setting them to `null` is noise, except in the narrow case of a method that holds a large reference and then runs a long loop before returning, where dropping the reference early can help.
+
+**The collector runs constantly.** It doesn't. The collector runs when the JVM decides it needs to, typically when a generation is about to fill up. Between collections, the JVM doesn't spend time looking for garbage.
+
+**Garbage collection means no memory leaks.** It doesn't. Java has its own leak patterns: collections that grow without bound, listeners that never get unregistered, thread-local maps in long-lived threads, classloaders that retain class metadata. The collector can't reclaim memory that is still reachable, even if the application no longer logically needs it.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

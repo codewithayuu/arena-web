@@ -1,0 +1,538 @@
+---
+title: "Design Search Autocomplete System"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Design Search Autocomplete System explained with clear examples, visuals, and practice questions in Mindflare's System Design Interviews course."
+---
+
+<LessonCard>
+
+After gathering the details, we can summarize the key system requirements.
+
+> Assume we're building for a large-scale platform like Google Search or Amazon:
+>
+> - 500 million daily active users
+> - Each user performs 10 searches per day on average
+> - Each search query generates 5-10 autocomplete requests (one per keystroke)
+> - Total: 25-50 billion autocomplete queries per day
+> - Peak QPS (queries per second): ~1 million QPS during peak hours
+> - Storage: 100 million unique search terms, with metadata
+>
+> These numbers guide our architectural decisions around caching, sharding, and replication.
+
+<h1 id="2-understanding-the-problem">2. Understanding the Problem</h1>
+
+At its core, "autocomplete" is about efficiently finding words that start with a given prefix and then intelligently ranking them.
+
+It's a blend of efficient data retrieval and smart relevance scoring.
+
+Technically, this means:
+
+1. **Prefix Search:** The system needs a way to rapidly search for all terms that begin with the characters the user has typed so far.
+2. **Relevance Ranking:** Once potential completions are found, they need to be ordered by how likely or useful they are to the user.
+3. **Dynamic Updates:** The underlying data, especially popularity scores, must be refreshed regularly to stay relevant.
+4. **Speed through Caching:** Popular queries and their results should be stored closer to the user for even faster access.
+
+Here's a typical workflow:
+
+The user types "sp," the client immediately sends a request, the service looks up matching terms, ranks them based on relevance signals, and returns the top suggestions. This entire round trip needs to complete before the user finishes typing the next character.
+
+<h1 id="3-high-level-architecture">3. High-Level Architecture</h1>
+
+Building an autocomplete system involves several interconnected components, each playing a crucial role.
+
+Let's break down the main parts:
+
+1. **Frontend / Client:** This is what the user interacts with (web browser, mobile app). It sends prefix queries to the backend with each keystroke.
+2. **API Gateway:** Acts as the entry point for all client requests. It handles authentication, rate limiting, SSL termination, and routes requests to the appropriate backend service.
+3. **Autocomplete Service:** The brain of our system. It's responsible for orchestrating the prefix lookup, fetching results from the data store, applying ranking algorithms, and interacting with the cache. This service will likely be stateless and highly scalable.
+4. **Data Store:** This is where all the potential search terms, their frequencies, popularity scores, and other metadata are stored. This needs to be optimized for prefix searches.
+5. **Cache Layer:** A critical component for low latency. It stores popular prefixes and their corresponding suggestions, preventing repeated lookups in the main data store.
+6. **Search Logs:** Captures user interactions, click-through rates (CTR), and system performance metrics. This data is invaluable for improving ranking models and identifying performance bottlenecks.
+7. **Indexing Pipeline:** A separate, asynchronous process that continuously ingests new data (search logs, trending topics), cleans it, computes scores, and builds/updates the data store and relevant indexes.
+
+<h1 id="4-design-deep-dive">4. Design Deep Dive</h1>
+
+<h2 id="41-data-model-and-storage-design">4.1 Data Model and Storage Design</h2>
+
+Designing an efficient autocomplete or search-suggestion system begins with choosing the right **data structure** for prefix lookups.
+
+The ideal choice must allow rapid retrieval of all words that begin with a given sequence of characters. For instance, retrieving `"new york"`, `"new delhi"`, and `"new balance"` when the prefix `"new"` is typed.
+
+<h3 id="the-trie-prefix-tree">The Trie (Prefix Tree)</h3>
+
+A **Trie** (pronounced “try”), or **Prefix Tree**, is the natural fit for this problem. It’s a tree-based data structure optimized for prefix matching.
+
+<h4 id="how-it-works">How It Works</h4>
+
+Each node in a Trie represents a **character**, and the path from the **root** to a **node** represents a prefix. When a path spells out a complete word, that node is marked as an **end of word**.
+
+For example, consider inserting `"new york"`, `"new delhi"`, and `"new balance"`:
+
+<h5 id="key-characteristics">Key characteristics</h5>
+
+- **Efficient Prefix Search:** To find all words starting with "new", you traverse the Trie along the "n" path, then the "e" path, then the "w" path. From the 'w' node, you can traverse all its children to find "new york", "new delhi", and "new balance".
+- **Time Complexity:** Lookups take O(m) time, where 'm' is the length of the prefix. This is incredibly fast, as it doesn't depend on the total number of words.
+- **Space Efficiency:** Common prefixes share nodes, significantly reducing redundancy compared to storing entire words independently. The worst-case space complexity is **O(ALPHABET_SIZE × N × M)**, but with compression techniques like **radix trees** or **path compression**, this becomes manageable.
+- **Metadata Storage:** Each node can also store metadata useful for ranking and personalization:
+
+<h5 id="code-representation">Code Representation</h5>
+
+Each Trie node holds a map of child characters, a flag marking word boundaries, and metadata fields that support ranking and cache acceleration at query time:
+
+```python
+class TrieNode:
+    children: Dict[char, TrieNode]  # Next characters
+    is_end_of_word: bool             # Is this a complete term?
+    frequency: int                   # How often this term is searched
+    last_updated: timestamp          # For recency scoring
+    suggestions: List[str]           # Top N completions cached at this node
+```
+
+<h2 id="42-scaling-trie-in-a-distributed-environment">
+  4.2 Scaling Trie in a Distributed Environment
+</h2>
+
+While a single-machine Trie works for small datasets, large-scale systems like Google Search or YouTube Autocomplete must manage **billions of entries**.
+
+This requires **distributing the Trie** across multiple nodes while ensuring low latency, consistency, and fault tolerance.
+
+Here are the main strategies to scale a Trie in a distributed setup:
+
+<h3 id="1-partitioning-by-prefix-sharding">
+  1. Partitioning by Prefix (Sharding)
+</h3>
+
+This is the most intuitive approach. We slice the Trie horizontally based on the first few characters of the search terms (typically the **first one or two characters**).
+
+Think of it like a physical dictionary split into several volumes: A-F, G-M, and so on.
+
+<h4 id="how-it-works">How it Works</h4>
+
+Suppose our sharding scheme looks like this:
+
+- **Shard 1:** Handles all prefixes starting with `a` through `f`.
+- **Shard 2:** Handles all prefixes starting with `g` through `m`.
+- **Shard 3:** Handles all prefixes starting with `n` through `s`.
+- **Shard 4:** Handles all prefixes starting with `t` through `z`.
+
+Here. the data is sliced based on the first character of the prefix. Each shard holds a completely independent, smaller Trie for its designated character range.
+
+A **router** or **load balancer** sits in front of our Trie cluster. When a query like `"system design"` arrives, the router inspects the first character (`'s'`) and directs the request to the specific server (shard) responsible for that character range.
+
+<h4 id="pros">Pros</h4>
+
+- **Simplicity:** The routing logic is straightforward and easy to implement. You need a simple mapping of character ranges to server addresses.
+- **Data Locality:** All related terms (e.g., "system", "systems", "systematic") are guaranteed to be on the same shard, making searches within that prefix space very efficient.
+
+<h4 id="cons-the-hotspot-problem">Cons: The Hotspot Problem</h4>
+
+The biggest drawback is **uneven load distribution**. The English language, and user search behavior, is not uniform. Prefixes starting with 's', 'c', or 'p' are far more common than those starting with 'x', 'y', or 'z'.
+
+This creates "hotspots". Some shards will be overwhelmed with traffic while others sit idle.
+
+Furthermore, **rebalancing is difficult**. If the `[n-s]` shard becomes too large and needs to be split, it's often a manual, disruptive process that requires careful planning to migrate data and update routing rules without causing downtime.
+
+<h3 id="2-hash-based-partitioning-using-consistent-hashing">
+  2. Hash-Based Partitioning (Using Consistent Hashing)
+</h3>
+
+To overcome the hotspot problem, we can use a more sophisticated approach that distributes data randomly but consistently: **consistent hashing**.
+
+<h4 id="how-it-works">How it Works</h4>
+
+Instead of looking at the character, we compute a hash of the prefix (or its first few characters) and map that hash value to a point on a virtual ring. Our server nodes are also mapped to points on this same ring.
+
+To find which shard a prefix belongs to, we hash the prefix and walk clockwise around the ring until we find the next server.
+
+`shard_id = consistent_hash(prefix[:k])`
+
+Here, `k` is the number of characters we use for hashing (e.g., the first 2 or 3).
+
+<h4 id="pros">Pros</h4>
+
+- **Even Distribution:** A good hash function distributes prefixes uniformly across all shards, eliminating the hotspots seen in range-based sharding.
+- **Easy Scaling:** When a new server is added, it's placed on the ring and only takes over a small portion of the keys from its immediate neighbor. This makes adding or removing nodes far less disruptive than re-partitioning entire character ranges.
+
+<h4 id="cons-loss-of-prefix-locality">Cons: Loss of Prefix Locality</h4>
+
+While great for distribution, naive hashing breaks a key assumption of autocomplete. If we hash the entire prefix, `hash("new")` and `hash("news")` could easily land on different shards.
+
+This means a query for "new" on Shard A wouldn't be able to find the suggestion "news" on Shard B.
+
+> We can get the best of both worlds by **hashing only the first few characters** (e.g., the first 2 or 3).
+>
+> - `hash("ne")` routes queries for "new", "news", and "netflix" to the **same shard**.
+> - `hash("sp")` routes queries for "spotify" and "sports" to the **same shard**.
+>
+> This approach provides excellent load distribution while preserving the prefix locality needed for the Trie to function correctly.
+
+<h3 id="3-geo-distribution-and-federation">
+  3. Geo-Distribution and Federation
+</h3>
+
+For a global application, performance isn't only about server capacity, it's about the speed of light. A user in India querying a server in North America will always experience high latency.
+
+The solution is to bring the data closer to the user through **geo-distribution**.
+
+<h4 id="how-it-works">How it Works</h4>
+
+We deploy independent Trie clusters in multiple geographic regions (e.g., `us-east-1`, `eu-west-1`, `ap-south-1`). Each cluster holds suggestions most relevant to its region.
+
+An **Aggregation Layer** (or Federation Service) sits on top. It's responsible for:
+
+1. Query regional Tries in parallel.
+2. Merge and rank results based on frequency, recency, and personalization.
+3. In some cases, it might query multiple clusters (e.g., the local one and a global one) and merge the results, prioritizing local suggestions (e.g., prioritize “New Delhi” over “New York” for Indian users).
+
+<h4 id="benefits">Benefits</h4>
+
+This approach reduces latency, since users get responses from a data center physically close to them. It adds regional relevance, ranking suggestions based on local context: a search for "football" prioritizes "American Football" in the US cluster and "Soccer" in the EU cluster, while "Cricket" suggestions are far more prominent in the APAC cluster.
+
+It also improves availability and fault tolerance, because if the entire `us-east-1` region goes down, the aggregation layer can reroute traffic to another region and keep the service available.
+
+<h2 id="43-optimizing-hot-prefixes">4.3 Optimizing Hot Prefixes</h2>
+
+In real-world autocomplete systems, **a small number of prefixes dominate traffic**.
+
+For instance, in an e-commerce search system, prefixes like "iphone" and "samsung" may account for 30% of queries, while thousands of other prefixes occur rarely.
+
+The most straightforward and effective optimization is to cache the results for the most popular prefixes. We identify the "hot" prefixes, the ones users search for thousands of times a minute (like "new", "weather", "cricket"), and store their top N suggestions in a fast, in-memory key-value store like **Redis** or **Memcached**.
+
+The goal is simple: **Serve as many autocomplete requests as possible directly from memory.**
+
+<h4 id="how-it-works">How it Works</h4>
+
+The system operates on a simple key-value principle. The key is the search prefix string, for example `"game of"`. The value is a pre-computed, ranked list of the top N suggestions, such as `["game of thrones", "game of thrones cast", "game of life"]`.
+
+When a request for `"game of"` arrives, the service first checks Redis. If the key exists (a **cache hit**), it grabs the list and returns it instantly. The slower, more expensive Trie lookup is completely bypassed.
+
+<h3 id="two-level-caching">Two-Level Caching</h3>
+
+A **two-level cache hierarchy** combines fast local memory access with shared global consistency, like modern CPU cache hierarchies (L1/L2).
+
+<h4 id="level-1-in-memory-cache-per-node">
+  Level 1: In-Memory Cache (Per Node)
+</h4>
+
+Each instance of the **Autocomplete Service** maintains a **local cache** often implemented using an **LRU (Least Recently Used)** policy. It stores only the most frequently accessed prefixes for that particular node and reduces network calls to Redis for repeated queries handled by the same server. This keeps latency low, since a local memory lookup is typically **&lt;1ms**.
+
+Example (in-memory LRU cache):
+
+```json
+lru_cache = {
+  "new": ["new york", "new balance", "new delhi"],
+  "how": ["how to cook rice", "how to code", "how to invest"]
+}
+```
+
+<h4 id="level-2-distributed-central-cache-redis-cluster">
+  Level 2: Distributed Central Cache (Redis Cluster)
+</h4>
+
+A centralized **Redis cluster** acts as a global, shared cache across all Autocomplete Service nodes. If a prefix is missing in the node's L1 cache, the system queries the Redis cluster, which holds a much larger set of prefixes shared across nodes.
+
+This ensures consistency, since all nodes see the same updated results, and reduces load on the Trie or primary datastore.
+
+<h2 id="44-indexing-and-ingestion-pipeline">
+  4.4 Indexing and Ingestion Pipeline
+</h2>
+
+An **autocomplete system** is only as smart as the **data** behind it.
+
+Even the most optimized Trie or caching layer can’t help if the underlying suggestions are stale, irrelevant, or incomplete.
+
+To stay current, the system needs a continuous flow of fresh, clean, and ranked data. This is the job of the **Indexing and Ingestion Pipeline**.
+
+The Indexing and Ingestion Pipeline collects new and trending terms from multiple sources, then cleans and normalizes this data for consistency. It scores and ranks terms based on popularity and recency, indexes them into the primary lookup structure (the Trie), and distributes the updates across all autocomplete service nodes.
+
+This pipeline usually runs **asynchronously and periodically**: every few minutes for real-time trending data, and every few hours or nightly for bulk log processing.
+
+<h3 id="data-sources">Data Sources</h3>
+
+The quality of autocomplete suggestions depends heavily on the **breadth and freshness of input data**.
+
+Most systems aggregate terms from a combination of the following sources:
+
+- **Historical Search Logs:** The most important source. Captures what users have searched for.
+- **Trending Queries:** Real-time data from analytics, news, or social media trends. Detects sudden spikes in interest.
+- **Domain-Specific Dictionaries**: Specialized datasets relevant to your application domain.. For e-commerce, this might be a product catalog; for a knowledge base, it could be article titles.
+- **Human-Curated Lists**: Manually adding important terms or blocking undesirable ones. Ensures high-value terms are included and inappropriate ones are excluded.
+
+<h3 id="steps-in-the-pipeline">Steps in the Pipeline</h3>
+
+Let’s break down the pipeline into its major stages.
+
+<h4 id="1-data-ingestion">1. Data Ingestion</h4>
+
+The first step is to **collect raw data** from various input sources: historical logs, catalogs, feeds, etc.
+
+Depending on the system scale, ingestion can happen in two modes:
+
+- **Batch Ingestion** (e.g., hourly processing via Spark or Flink)
+- **Streaming Ingestion** (e.g., real-time feeds through Kafka)
+
+**Example:**
+
+Kafka topics ingest continuous query logs:
+
+- `search_events` → user queries
+- `click_events` → user clicks
+- `trend_signals` → trending keywords
+
+Batch jobs periodically consume and aggregate these streams.
+
+<h4 id="2-data-cleaning-and-tokenization">2. Data Cleaning and Tokenization</h4>
+
+Raw user queries are messy. They contain typos, mixed casing, redundant spaces, and punctuation.
+
+The cleaning stage standardizes and normalizes terms to ensure **uniform indexing**.
+
+<h5 id="common-cleaning-steps">Common Cleaning Steps</h5>
+
+- Lowercasing all text. Example: “New York” → “new york”
+- Removing punctuation and special characters. Example: “new-york!” → “new york”
+- Removing stop words. Example: “the new iphone” → “new iphone”
+- Tokenizing multi-word phrases. Example: “new york city” → `[new, york, city]`
+
+For **autocomplete**, we often **avoid stemming** since users expect literal completions (e.g., “running shoes” ≠ “run shoes”).
+
+<h4 id="3-popularity-and-ranking-score-computation">
+  3. Popularity and Ranking Score Computation
+</h4>
+
+Once terms are cleaned, the pipeline computes a **score** for each term that represents its relevance and importance.
+
+This score determines how suggestions are ordered during autocomplete.
+
+**Basic Formula (Weighted Frequency):**
+
+score(term)=α×freqrecent​+β×freqhistorical​+γ×click_through_rate
+
+- **freq_recent**: Count of searches in the last few days.
+- **freq_historical**: Long-term frequency.
+- **click_through_rate**: How often users clicked on results for that term.
+- **α, β, γ**: Tunable weights (e.g., α=0.5, β=0.3, γ=0.2).
+
+<h4 id="4-indexing">4. Indexing</h4>
+
+Once the terms are ranked, we update the **main lookup structure** typically a **Trie**, **inverted index**, or **search tree**.
+
+- Each term is inserted into the Trie along its character path.
+- Leaf or terminal nodes store metadata:
+- Prefix nodes may also cache the **top-N suggestions** to speed up lookups.
+
+<h4 id="5-distribution-and-deployment">5. Distribution and Deployment</h4>
+
+After the index is updated, the new version must be **distributed** across all Autocomplete Service instances.
+
+There are typically two approaches:
+
+<h5 id="a-push-based-deployment">A. Push-Based Deployment</h5>
+
+The Indexing Service pushes serialized index files, such as compressed Trie snapshots, to all nodes. Each node then hot-swaps the index in memory without downtime.
+
+<h5 id="b-pull-based-deployment">B. Pull-Based Deployment</h5>
+
+Each node periodically polls a central store (e.g., S3, Cassandra) for the latest index version. Upon detecting a new version, it asynchronously downloads and loads it.
+
+<h2 id="45-query-flow-autocomplete-lookup">
+  4.5 Query Flow (Autocomplete Lookup)
+</h2>
+
+Now that we have our data structured and indexed, let's trace how a user's query gets processed in real-time.
+
+1. **User Types a Prefix:** As the user types, say "spo," the frontend client debounces input (to avoid sending a request for every single keystroke) and then sends a request.
+2. **Client Sends Request:** An HTTP GET request is sent to the API Gateway: `/autocomplete?q=spo`.
+3. **API Gateway Routes:** The API Gateway forwards the request to an available instance of the Autocomplete Service.
+4. **Service Checks Cache:** The Autocomplete Service first checks its distributed cache (e.g., Redis) for suggestions associated with the prefix "spo." This is the fastest path.
+5. **Cache Hit:** If found, the cached, ranked suggestions are immediately returned to the client. This is the ideal scenario for popular prefixes.
+6. **Cache Miss:** If not found in the cache:
+7. **Frontend Displays:** The frontend receives the suggestions and displays them to the user.
+
+<h2 id="46-ranking-and-personalization">4.6 Ranking and Personalization</h2>
+
+Matching prefixes is only half the job. When a user types `"apple"`, there might be **hundreds of possible completions**: company names, recipes, products, locations, news articles, and more.
+
+A great autocomplete system doesn’t only _find_ matches, it _prioritizes_ the **most relevant** ones.
+
+This is where **ranking and scoring** come into play.
+
+Each autocomplete suggestion is scored using multiple **signals** that capture different aspects of relevance: popularity, freshness, engagement, and personalization.
+
+We can represent the final score as a **weighted sum** of these signals:
+
+```text
+score= α⋅popularity + β⋅recency + γ⋅CTR + δ⋅personalization+...
+```
+
+Where:
+
+- α,β,γ,δ are **weights** determining the relative importance of each signal.
+- These weights are **tuned via A/B testing** or **machine learning models** to optimize engagement metrics.
+
+Autocomplete systems shouldn’t feel generic, they should feel _personal_. When two users type `"apple"`, one might want **“Apple stock price”**, while another might mean **“apple pie recipe”**.
+
+To move beyond generic suggestions, we need to make the autocomplete system smarter by understanding the user and their immediate context.
+
+To deliver such experiences, we need the system to **understand who the user is** and **what context they’re in**.
+
+Let’s explore the most common signals used to personalize autocomplete results.
+
+<h4 id="1-users-search-history">1. User’s Search History</h4>
+
+User search patterns often reveal long-term interests and intent.
+
+If a user frequently searches for `"vegan recipes"`, then typing `"vegan"` again should instantly suggest:
+
+- “vegan pasta recipe”
+- “vegan desserts”
+- “vegan restaurants near me”
+
+Instead of generic results like `"vegan shoes"` or `"vegan cosmetics"`.
+
+<h4 id="2-location-awareness">2. Location Awareness</h4>
+
+Where a user is physically located can dramatically alter the meaning of a query.
+
+Typing `"restaurants"` in:
+
+- **New York** → “Best restaurants NYC”, “Pizza near Times Square”
+- **Rome** → “Best pasta places in Rome”, “Trattoria near me”
+
+<h4 id="3-time-of-day-week">3. Time of Day / Week</h4>
+
+Time-based context can make certain suggestions more relevant.
+
+<h3 id="implementing-personalization">Implementing Personalization</h3>
+
+<h4 id="1-user-profiles-and-embeddings">1. User Profiles and Embeddings</h4>
+
+Each user can be represented by a **vector embedding,** a numerical representation of their interests and behaviors.
+
+**Example:**
+
+A user frequently searching for tech products might have an embedding like:
+
+```text
+[0.9 (tech), 0.8 (apple), 0.1 (food), 0.05 (sports)]
+```
+
+These embeddings can be stored in a **feature store** (e.g., Redis, Cassandra, Feast) and fetched quickly during query time.
+
+<h4 id="2-session-level-personalization">2. Session-Level Personalization</h4>
+
+Not all personalization comes from long-term behavior. Context evolves even within a session.
+
+**Example:**
+
+User searches: `system design`
+
+User then types: `sca...`
+
+The system, remembering the session's context ("system design"), heavily boosts **"scalability," "scaling,"** and **"ScyllaDB".**
+
+**Implementation:**
+
+- Maintain a **session context state** (stored in memory or Redis).
+- Use recent queries to dynamically re-weight ranking signals
+
+<h1 id="5-follow-ups">5. Follow-ups</h1>
+
+<h2 id="51-handling-typos-and-fuzzy-matching">
+  5.1 Handling Typos and Fuzzy Matching
+</h2>
+
+No matter how advanced your system is, users will **make mistakes while typing**, extra letters, missing letters, or simple transpositions like typing `"googel"` instead of `"google"`. An intelligent autocomplete system must be **forgiving** of such typos, helping users find what they meant, not only what they typed.
+
+This is where **fuzzy matching** comes into play. It enabes the system to suggest relevant results even when the input doesn’t exactly match stored prefixes.
+
+Let’s explore the key techniques used to enable typo tolerance in autocomplete systems.
+
+<h3 id="1-levenshtein-distance">1. Levenshtein Distance</h3>
+
+**Levenshtein Distance** measures how many single-character edits (insertions, deletions, substitutions) are needed to transform one string into another.
+
+```text
+distance("googel", "google") = 1 (swap ‘e’ and ‘l’)
+distance("googel", "good") = 2   (swap ‘l’ and ‘p’)
+distance("googel", "gold") = 3   (missing ‘e’)
+```
+
+We can use this metric to find all terms in our index within a distance of **1 or 2** from the user’s input. If the user types `"googel"`, we check for words in the index where `Levenshtein ≤ 2`, and `"google"` is identified as the best candidate correction.
+
+<h3 id="2-bk-trees-burkhard-keller-trees">
+  2. BK-Trees (Burkhard-Keller Trees)
+</h3>
+
+While Levenshtein distance works conceptually, computing it for every possible word in a large dictionary is expensive.
+
+To scale, we use a **BK-Tree**, a tree-based data structure built on edit distances.
+
+<h4 id="how-it-works">How it Works</h4>
+
+Each node in the tree represents a word, and edges between nodes are labeled with the **Levenshtein distance** between them. During a query, we traverse only branches where the edit distance is within the allowed threshold (e.g., ≤ 2).
+
+<h5 id="example">Example</h5>
+
+If a user types `"bokk"`, the BK-tree allows the search to **prune** most branches quickly and return `"book"`, `"cook"`, and `"look"` efficiently.
+
+<h5 id="complexity">Complexity</h5>
+
+Query time is **O(log N)** for typical edit thresholds, much faster than brute-force checking every dictionary word.
+
+BK-Trees are especially effective when the dictionary is static or updated infrequently. Common in autocomplete systems with pre-indexed search terms.
+
+<h4 id="3-n-gram-character-based-models">3. N-gram (Character-based) Models</h4>
+
+Instead of looking at whole words, we can break terms into **character sequences** (n-grams).
+
+For example, using **bigrams (2-character chunks)**:
+
+```text
+"apple" → ["ap", "pp", "pl", "le"]
+"aple" → ["ap", "pl", "le"]
+```
+
+Now, we can calculate the **similarity** between two terms based on **shared n-grams**:
+
+```text
+| Term  | N-grams        | Commonality with “aple” |
+| ----- | -------------- | ----------------------- |
+| apple | ap, pp, pl, le | 3 / 4 = 0.75            |
+| ample | am, mp, pl, le | 2 / 4 = 0.5             |
+| apply | ap, pp, pl, ly | 2 / 4 = 0.5             |
+```
+
+“apple” is the closest match since it shares the most overlapping n-grams with “aple”.
+
+N-gram similarity is fast and works well when minor letter-level errors occur, making it ideal for **typo detection** and **fuzzy prefix search** in autocomplete.
+
+<h4 id="4-spell-correction-models">4. Spell Correction Models</h4>
+
+As we scale, rule-based methods alone struggle to handle:
+
+- Complex typos (`“gogle”` vs `“google”`)
+- Phonetic mistakes (`“nite”` vs `“night”`)
+- Multilingual inputs (`“gogle mapas”`)
+
+That’s where **machine learning-based spell correction models** come in.
+
+These models learn spelling errors from **real-world query logs** and use contextual or statistical reasoning to correct them.
+
+<h5 id="example-context-aware-correction">Example: Context-aware Correction</h5>
+
+The correction model interprets the full phrase rather than individual words in isolation, allowing it to fix multiple errors at once:
+
+```text
+User input: "how to lern jva"
+→ Model correction: "how to learn java"
+```
+
+These models can be integrated with the autocomplete pipeline to correct prefixes **on the fly**.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

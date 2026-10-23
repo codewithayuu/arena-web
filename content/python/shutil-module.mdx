@@ -1,0 +1,627 @@
+---
+title: "shutil Module (High-Level File Operations)"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "shutil Module explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+The `shutil` module is Python's high-level toolbox for moving real files and directories around on disk. Where `os` gives you small surgical operations (rename one entry, remove one file) and `pathlib` gives you a clean way to write paths, `shutil` is the layer that handles whole-file and whole-tree work: copy this directory into that one, zip up a folder for download, move a file across drives, delete a tree of generated reports. This lesson walks through the parts of `shutil` you'll actually reach for in an E-Commerce codebase: copying, moving, removing, archiving, checking disk space, and finding executables.
+
+<h1 id="where-shutil-fits-in-the-file-api-stack">
+  Where shutil Fits in the File API Stack
+</h1>
+
+Python gives you three layers for working with the filesystem, each at a different level of abstraction. `os` exposes thin wrappers over operating system calls. `pathlib` gives you `Path` objects with methods like `.exists()`, `.read_text()`, and `.glob()`. `shutil` sits on top of both and handles the "whole operation" cases: copying a tree, archiving a folder, moving across devices. They aren't competitors; they cover different jobs.
+
+The diagram shows the typical stack. `shutil` calls into `os` for the actual work, and `pathlib` is mostly about clean path handling. Reach for `shutil` when an operation describes a whole-file or whole-tree action ("copy this entire folder", "zip this directory", "delete this tree"). Reach for `os` when you need a single primitive (`os.rename`, `os.remove`, `os.stat`). Reach for `pathlib` to build, join, and inspect path values.
+
+A small mental rule that works in practice:
+
+| Task                                            | Best tool             | Why                                                            |
+| ----------------------------------------------- | --------------------- | -------------------------------------------------------------- |
+| Build a path like `data/orders/2026-05-14.csv`  | `pathlib.Path`        | Cleaner joins, no string concatenation                         |
+| Check if a file exists                          | `pathlib.Path`        | `path.exists()` reads well                                     |
+| Copy one file with metadata preserved           | `shutil.copy2`        | Single call handles bytes + permissions + timestamps           |
+| Copy a whole product-images folder              | `shutil.copytree`     | Recursive copy with optional filtering                         |
+| Move a CSV from a temp folder to the data drive | `shutil.move`         | Works even when source and destination are on different drives |
+| Delete an entire reports folder for May 2026    | `shutil.rmtree`       | Recursive delete; `os.remove` would only do one file           |
+| Zip a release folder for download               | `shutil.make_archive` | One call, no `zipfile` boilerplate                             |
+| Check free space before exporting a 5 GB dump   | `shutil.disk_usage`   | Returns total, used, free in one call                          |
+| Find the `ffmpeg` binary on PATH                | `shutil.which`        | Cross-platform `which` / `where` equivalent                    |
+
+This lesson focuses on what `shutil` adds on top of low-level `os` calls and `pathlib`.
+
+<h1 id="copying-single-files">Copying Single Files</h1>
+
+There are four functions for copying one file, and the differences matter. They all sit in `shutil`, and they vary by what metadata they preserve and whether the destination can be a directory or must be a file.
+
+| Function                         | Destination can be a directory?  | Preserves permissions? | Preserves timestamps and metadata? | Returns                 |
+| -------------------------------- | -------------------------------- | ---------------------- | ---------------------------------- | ----------------------- |
+| `shutil.copyfile(src, dst)`      | No (must be a file path)         | No                     | No                                 | Path to the destination |
+| `shutil.copy(src, dst)`          | Yes                              | Yes                    | No                                 | Path to the destination |
+| `shutil.copy2(src, dst)`         | Yes                              | Yes                    | Yes (timestamps + most xattrs)     | Path to the destination |
+| `shutil.copyfileobj(fsrc, fdst)` | N/A (works on open file objects) | N/A                    | N/A                                | `None`                  |
+
+A concrete example with an order CSV. Imagine the daily orders file has just been generated and you want a quick working copy in another directory:
+
+```python
+import shutil
+from pathlib import Path
+
+source = Path("orders/2026-05-14.csv")
+source.parent.mkdir(parents=True, exist_ok=True)
+source.write_text("order_id,total\n1001,29.99\n1002,49.50\n")
+
+backup_dir = Path("backups")
+backup_dir.mkdir(exist_ok=True)
+
+# copy() will accept a directory as the destination
+saved_to = shutil.copy(source, backup_dir)
+print(saved_to)
+```
+
+`shutil.copy` saw that `backup_dir` was a directory and placed the file inside it, keeping the original file name. The return value is the actual destination path, useful when you let `shutil` pick the final name.
+
+`copyfile` is stricter. The destination must be a file path; you can't hand it a directory:
+
+```python
+import shutil
+from pathlib import Path
+
+source = Path("orders/2026-05-14.csv")
+shutil.copyfile(source, "backups/orders-may-14.csv")
+```
+
+That works because the destination is a path that names a file. The same call with `"backups"` as the destination would fail with `IsADirectoryError`, which is the difference from `copy`.
+
+`copy2` is `copy` plus metadata preservation. If you care about the original `mtime` (modification time) and `atime` (access time), and on Linux about extended attributes too, use `copy2`. Daily-orders backups that need to keep the "when was this file produced" timestamp are a textbook case:
+
+```python
+import shutil
+from pathlib import Path
+
+source = Path("orders/2026-05-14.csv")
+backup_dir = Path("backups")
+backup_dir.mkdir(exist_ok=True)
+
+saved_to = shutil.copy2(source, backup_dir)
+print("Backed up to:", saved_to)
+print("Original mtime preserved:", source.stat().st_mtime == saved_to.stat().st_mtime)
+```
+
+Without `copy2`, the destination would have the current time as its `mtime`, and a downstream script that sorts backups by "when the order was produced" would get the wrong answer.
+
+> **Cost:** `copy2` has to query the source for stat and xattrs and then apply them to the destination, so it's slightly slower than `copy`. For thousands of small files, this overhead is noticeable. Use `copy` when you don't need metadata preserved, and `copy2` when you do.
+
+`copyfileobj` is the low-level option. Instead of two paths, it takes two open file objects and streams bytes from one to the other in a loop. Most of the time you don't need it, but it's the right call when one side isn't a real file on disk (an in-memory buffer, a network stream, a file inside a zip archive). The pattern:
+
+```python
+import shutil
+from pathlib import Path
+
+source = Path("orders/2026-05-14.csv")
+destination = Path("backups/orders-stream.csv")
+destination.parent.mkdir(exist_ok=True)
+
+with open(source, "rb") as fsrc, open(destination, "wb") as fdst:
+    shutil.copyfileobj(fsrc, fdst, length=64 * 1024)
+
+print(destination.read_text())
+```
+
+The `length` argument is the buffer size. The default is fine for most cases. The reason to set it explicitly is when you're copying very large files and want to balance memory use against syscall count.
+
+<h1 id="copying-whole-directory-trees">Copying Whole Directory Trees</h1>
+
+Single-file copies are useful, but real work usually involves whole folders. A product-images folder, a release of a catalog dump, a staging directory for the CDN. `shutil.copytree(src, dst)` walks the source tree and recreates it at the destination.
+
+```python
+import shutil
+from pathlib import Path
+
+source = Path("product_images")
+(source / "electronics").mkdir(parents=True, exist_ok=True)
+(source / "clothing").mkdir(exist_ok=True)
+(source / "electronics" / "mouse.jpg").write_bytes(b"fake-image-bytes")
+(source / "clothing" / "tshirt.jpg").write_bytes(b"fake-image-bytes")
+
+cdn_staging = Path("cdn_staging/product_images")
+shutil.copytree(source, cdn_staging)
+
+for path in sorted(cdn_staging.rglob("*")):
+    print(path)
+```
+
+The destination directory (`cdn_staging/product_images`) didn't exist before the call, and `copytree` created it. The internal file objects use `copy2` by default, so timestamps and permissions carry over.
+
+**What's wrong with this code?**
+
+```python
+import shutil
+from pathlib import Path
+
+source = Path("product_images")
+destination = Path("cdn_staging/product_images")
+destination.mkdir(parents=True, exist_ok=True)
+
+shutil.copytree(source, destination)
+```
+
+The caller created the destination directory before the copy. Historically, `copytree` would refuse if the destination already existed. The fix in Python 3.8 and later is the `dirs_exist_ok=True` flag:
+
+**Fix:**
+
+```python
+import shutil
+from pathlib import Path
+
+source = Path("product_images")
+destination = Path("cdn_staging/product_images")
+destination.mkdir(parents=True, exist_ok=True)
+
+shutil.copytree(source, destination, dirs_exist_ok=True)
+```
+
+With `dirs_exist_ok=True`, `copytree` will merge into the existing destination, overwriting files with the same name and leaving other files in place. On Python 3.7 and earlier, the workaround was to remove the destination first or to write a manual walk; the flag landed in 3.8 specifically because the "merge into existing" case is so common.
+
+<h3 id="filtering-what-gets-copied">Filtering What Gets Copied</h3>
+
+When you stage product images for the CDN, you probably don't want to copy over editing artifacts, source files, or hidden metadata. `copytree` accepts an `ignore` callable that returns the set of names to skip in each directory. The easiest way to build one is `shutil.ignore_patterns`:
+
+```python
+import shutil
+from pathlib import Path
+
+source = Path("product_images")
+(source / "electronics" / "mouse.psd").write_bytes(b"photoshop-source")
+(source / ".DS_Store").write_bytes(b"mac-metadata")
+
+cdn_staging = Path("cdn_staging/product_images")
+
+if cdn_staging.exists():
+    shutil.rmtree(cdn_staging)
+
+shutil.copytree(
+    source,
+    cdn_staging,
+    ignore=shutil.ignore_patterns("*.psd", ".DS_Store"),
+)
+
+for path in sorted(cdn_staging.rglob("*")):
+    print(path)
+```
+
+The `.psd` file and the `.DS_Store` file did not make it across. `ignore_patterns` uses shell-style globbing (the same syntax as `fnmatch`), so `*.psd` matches every file ending in `.psd`, in any subdirectory. The patterns are matched against the file name only, not the full path.
+
+You can write your own ignore function if globbing isn't enough. The signature is `ignore(directory, contents) -> list of names to skip`:
+
+```python
+def skip_large_files(directory, contents):
+    skipped = []
+    for name in contents:
+        full = Path(directory) / name
+        if full.is_file() and full.stat().st_size > 5 * 1024 * 1024:
+            skipped.append(name)
+    return skipped
+```
+
+That callable would skip anything over 5 MB. You'd pass it as `ignore=skip_large_files`.
+
+> **Cost:** `copytree` is recursive, so the total work scales with the number of files in the source. For a product-images tree with 100,000 images, the per-file metadata operations from `copy2` start to dominate. Consider `copy_function=shutil.copy` (without metadata preservation) when you don't need the timestamps and the file count is large.
+
+<h1 id="moving-files-and-directories">Moving Files and Directories</h1>
+
+`shutil.move(src, dst)` renames or relocates a file or directory. On the surface it looks like `os.rename`, but it does an important extra thing: when the destination is on a different filesystem, `os.rename` fails with `OSError`, and `shutil.move` falls back to copying the bytes over and then deleting the source. That fallback is the whole point of using `shutil.move`.
+
+```python
+import shutil
+from pathlib import Path
+
+incoming = Path("inbox/order-1001.csv")
+incoming.parent.mkdir(parents=True, exist_ok=True)
+incoming.write_text("order_id,total\n1001,29.99\n")
+
+processed_dir = Path("processed")
+processed_dir.mkdir(exist_ok=True)
+
+final_path = shutil.move(incoming, processed_dir)
+print("Moved to:", final_path)
+print("Source still exists:", incoming.exists())
+```
+
+The file disappeared from `inbox` and appeared in `processed`. `shutil.move` returns the destination path, so a caller that didn't know whether the destination was a directory or a file still gets the resolved location.
+
+**What's wrong with this code?**
+
+```python
+import os
+from pathlib import Path
+
+incoming = Path("/mnt/upload-drive/inbox/order-1001.csv")
+target = Path("/mnt/data-drive/processed/order-1001.csv")
+
+os.rename(incoming, target)
+```
+
+`os.rename` is a single syscall. When the source and destination live on different filesystems, the kernel can't move the inode across without copying the data, so it refuses with `EXDEV` (Invalid cross-device link). The fix is to use `shutil.move`, which catches that error and falls back to a copy-then-delete:
+
+**Fix:**
+
+```python
+import shutil
+from pathlib import Path
+
+incoming = Path("/mnt/upload-drive/inbox/order-1001.csv")
+target = Path("/mnt/data-drive/processed/order-1001.csv")
+
+shutil.move(incoming, target)
+```
+
+That call works whether the two paths are on the same drive or not. When they're on the same drive, `shutil.move` uses `os.rename` (effectively free). When they're on different drives, it copies the bytes and then unlinks the source. The caller doesn't have to know which case applies.
+
+> **Cost:** Same-filesystem moves are O(1) (just a metadata update). Cross-filesystem moves are O(file size) because the bytes have to be copied. If you're moving terabytes of catalog data, knowing which case you're in matters for capacity planning.
+
+You can also pass a custom `copy_function` to `shutil.move`. The default is `shutil.copy2`, but you can pass `shutil.copy` if you don't need metadata preserved:
+
+```python
+shutil.move(src, dst, copy_function=shutil.copy)
+```
+
+This is rarely needed in everyday code, but it's the lever to pull if cross-device moves are showing up as a bottleneck.
+
+<h1 id="removing-whole-trees-with-rmtree">Removing Whole Trees with rmtree</h1>
+
+`os.remove` deletes one file. `os.rmdir` deletes one empty directory. Neither will remove a directory that has anything inside it. `shutil.rmtree(path)` is the recursive delete: it walks the tree, removes every file, then removes every directory, working from the leaves up.
+
+```python
+import shutil
+from pathlib import Path
+
+old_reports = Path("reports/2025-04")
+old_reports.mkdir(parents=True, exist_ok=True)
+(old_reports / "summary.txt").write_text("Total revenue: $19,500")
+(old_reports / "by_category.csv").write_text("Electronics,12000\nClothing,7500\n")
+
+shutil.rmtree(old_reports)
+print("Still there?", old_reports.exists())
+```
+
+The folder and everything inside is gone. There's no undo. Once `rmtree` finishes, the files are unlinked at the filesystem level.
+
+> **Cost:** `rmtree` issues one syscall per file and one per directory. Removing a tree with 100,000 files is not instant; it takes proportional time and a lot of syscalls. On slow filesystems (network-mounted volumes especially), this can be much slower than the equivalent local delete.
+
+<h3 id="handling-errors-gracefully">Handling Errors Gracefully</h3>
+
+By default, `rmtree` raises on the first error: a file that's locked, a permission problem, a symlink loop. In a daily cleanup job you usually want to log the failures and keep going, not abort the whole purge. The `onexc` parameter (added in Python 3.12, replacing the older `onerror`) lets you supply a callback that runs whenever a deletion fails.
+
+```python
+import shutil
+from pathlib import Path
+
+def log_and_continue(func, path, exc):
+    print(f"Could not remove {path}: {exc}")
+
+old_reports = Path("reports/2025-04")
+shutil.rmtree(old_reports, onexc=log_and_continue)
+```
+
+The callback receives the function that was attempting the deletion (`os.unlink`, `os.rmdir`, or `os.scandir`), the path it was working on, and the exception instance. Returning from the callback lets `rmtree` continue with the remaining entries.
+
+On Python 3.11 and earlier, the equivalent parameter was called `onerror` and its signature was slightly different (it received an `exc_info` tuple instead of the exception instance). Both still work in 3.12+, but `onexc` is the modern spelling and the one to reach for in new code:
+
+```python
+import shutil
+
+def legacy_handler(func, path, exc_info):
+    exc_type, exc, _ = exc_info
+    print(f"Failed on {path}: {exc}")
+
+shutil.rmtree("reports/2025-04", onerror=legacy_handler)
+```
+
+If you're targeting both old and new interpreters, you can guard with a version check; in practice, most projects pick one Python baseline and use the matching parameter.
+
+A common pattern in cleanup scripts is "delete and recreate":
+
+```python
+import shutil
+from pathlib import Path
+
+staging = Path("cdn_staging")
+if staging.exists():
+    shutil.rmtree(staging)
+staging.mkdir(parents=True)
+```
+
+That gives you a known-empty starting point before staging the next release. The `if staging.exists()` check avoids a `FileNotFoundError` on the first run.
+
+<h1 id="creating-archives">Creating Archives</h1>
+
+`shutil.make_archive(base_name, format, root_dir)` takes a directory and produces a single archive file. It's the easy way to package a release of a product-catalog dump for download, to bundle daily order CSVs into a dated archive, or to create a release artifact for a content drop.
+
+```python
+import shutil
+from pathlib import Path
+
+catalog = Path("catalog_dump")
+catalog.mkdir(exist_ok=True)
+(catalog / "products.csv").write_text("id,name,price\n1,Mouse,29.99\n")
+(catalog / "categories.csv").write_text("id,name\n10,Electronics\n")
+
+archive_path = shutil.make_archive(
+    base_name="dist/catalog-2026-05-14",
+    format="zip",
+    root_dir=catalog,
+)
+print("Created:", archive_path)
+```
+
+A few details worth knowing:
+
+- The `base_name` is the path **without** the extension. `shutil` adds the right extension based on the format.
+- `root_dir` is the directory whose contents go into the archive. The archive's top level will be the files inside `root_dir`, not the `root_dir` folder itself.
+- The destination directory (`dist/` in the example) must already exist; `make_archive` won't create parent directories.
+- The return value is the actual path to the created archive, useful when you want to log it or upload it.
+
+The function supports several formats out of the box:
+
+| Format  | Extension  | Requires extra package? |
+| ------- | ---------- | ----------------------- |
+| `zip`   | `.zip`     | No                      |
+| `tar`   | `.tar`     | No                      |
+| `gztar` | `.tar.gz`  | No                      |
+| `bztar` | `.tar.bz2` | No                      |
+| `xztar` | `.tar.xz`  | No                      |
+
+The list is available at runtime via `shutil.get_archive_formats()`, which returns a list of `(name, description)` pairs:
+
+```python
+import shutil
+
+for name, description in shutil.get_archive_formats():
+    print(f"{name}: {description}")
+```
+
+A backup-the-orders example, using a dated filename and `gztar` so the file compresses well:
+
+```python
+import shutil
+from datetime import date
+from pathlib import Path
+
+orders_dir = Path("orders")
+orders_dir.mkdir(exist_ok=True)
+(orders_dir / "2026-05-14.csv").write_text("order_id,total\n1001,29.99\n")
+(orders_dir / "2026-05-13.csv").write_text("order_id,total\n1000,49.50\n")
+
+backups = Path("backups")
+backups.mkdir(exist_ok=True)
+
+today = date.today().isoformat()
+archive_path = shutil.make_archive(
+    base_name=backups / f"orders-{today}",
+    format="gztar",
+    root_dir=orders_dir,
+)
+print("Backup written to:", archive_path)
+```
+
+The CSVs are now compressed in one file inside `backups`, dated, ready to copy off the server or attach to a release.
+
+> **Cost:** `gztar` and `bztar` spend CPU compressing. For small CSVs the cost is negligible. For multi-gigabyte image dumps you might prefer `zip` (faster, weaker compression) or `tar` (no compression at all). On a Linux box with `zstd` installed, plain `tar` + an external `zstd` pipeline is often the fastest option, though `shutil` doesn't bundle that format.
+
+<h1 id="extracting-archives">Extracting Archives</h1>
+
+The inverse of `make_archive` is `unpack_archive(filename, extract_dir, format=None)`. When the format is omitted, `shutil` infers it from the file extension.
+
+```python
+import shutil
+from pathlib import Path
+
+archive = Path("backups/orders-2026-05-14.tar.gz")
+
+restore_dir = Path("restore/orders-2026-05-14")
+restore_dir.mkdir(parents=True, exist_ok=True)
+
+shutil.unpack_archive(archive, restore_dir)
+
+for path in sorted(restore_dir.iterdir()):
+    print(path.name)
+```
+
+The files come back out into `restore/orders-2026-05-14/`, in the same layout they had when the archive was created. If the format isn't obvious from the extension (for example, a `.dat` file that's actually a `tar`), pass `format="tar"` explicitly.
+
+The list of registered unpack formats has the same shape as the archive formats:
+
+```python
+import shutil
+
+for name, extensions, description in shutil.get_unpack_formats():
+    print(f"{name}: {extensions} - {description}")
+```
+
+There's one historical safety note worth flagging. `unpack_archive` for tar files originally allowed paths inside the archive to point outside the destination (a path like `../../etc/passwd` could escape). Starting in Python 3.12, the safer behavior is opt-in via a `filter` parameter, and starting in 3.14 it became the default. If you're on 3.12 or 3.13 and you're extracting archives from untrusted sources, pass `filter="data"`:
+
+```python
+import shutil
+
+shutil.unpack_archive("downloaded.tar.gz", "restore", filter="data")
+```
+
+For archives you produced yourself, like the catalog and orders dumps above, this isn't a concern. The flag matters when the archive came from a customer upload, an external partner, or any other place you don't control.
+
+<h1 id="checking-disk-usage">Checking Disk Usage</h1>
+
+Before staging a 5 GB catalog dump, knowing whether the destination volume has room saves a half-written archive and a confusing error message later. `shutil.disk_usage(path)` returns a named tuple of `(total, used, free)` in bytes for the filesystem that contains `path`.
+
+```python
+import shutil
+
+usage = shutil.disk_usage("/")
+print("Total:", usage.total)
+print("Used:", usage.used)
+print("Free:", usage.free)
+```
+
+The numbers are in bytes, which is awkward to read. Format them yourself:
+
+```python
+import shutil
+
+def gb(n):
+    return f"{n / 1024 ** 3:.2f} GB"
+
+usage = shutil.disk_usage("/")
+print(f"Total: {gb(usage.total)}, Used: {gb(usage.used)}, Free: {gb(usage.free)}")
+```
+
+A practical use: before writing a daily product-catalog dump, refuse to start if there isn't enough headroom on the data volume.
+
+```python
+import shutil
+from pathlib import Path
+
+data_volume = Path("/var/exports")
+data_volume.mkdir(parents=True, exist_ok=True)
+
+required_bytes = 5 * 1024 ** 3   # 5 GB
+free = shutil.disk_usage(data_volume).free
+
+if free < required_bytes:
+    raise RuntimeError(
+        f"Not enough space on {data_volume}: "
+        f"need {required_bytes / 1024 ** 3:.1f} GB, have {free / 1024 ** 3:.1f} GB"
+    )
+
+print("Plenty of room, proceeding with export.")
+```
+
+The path you pass doesn't have to be the file you're about to write; any path on the right filesystem will do. `shutil.disk_usage` queries the filesystem itself, not the individual file.
+
+> **Cost:** `disk_usage` is a fast syscall. Calling it once before a big export is essentially free. Calling it inside a hot loop is wasteful; sample it at startup or on a schedule.
+
+<h1 id="finding-executables-on-path">Finding Executables on PATH</h1>
+
+`shutil.which(cmd)` is the cross-platform equivalent of Unix `which` or Windows `where`. It walks the directories on the `PATH` environment variable and returns the first matching executable, or `None` if none is found.
+
+```python
+import shutil
+
+print(shutil.which("python"))
+print(shutil.which("ffmpeg"))
+print(shutil.which("definitely-not-installed"))
+```
+
+Why this matters in an E-Commerce script: imagine a job that resizes product images before uploading them to the CDN, and you want to call out to `ffmpeg` or `convert`. Before invoking it via `subprocess`, check that the binary is actually present:
+
+```python
+import shutil
+import subprocess
+
+image_tool = shutil.which("convert")
+if image_tool is None:
+    raise RuntimeError(
+        "ImageMagick is not installed. "
+        "Install it before running the product-image resize job."
+    )
+
+subprocess.run([image_tool, "input.jpg", "-resize", "800x800", "output.jpg"], check=True)
+```
+
+The error you get from a missing binary at `subprocess.run` time (`FileNotFoundError`) is harder to debug than the explicit "ImageMagick is not installed" you can produce yourself. `shutil.which` lets you fail loudly and early.
+
+You can also pass `path=` to search a specific list of directories instead of the system `PATH`, and `mode=os.X_OK` (the default) controls the access bits the function checks for. Most code doesn't need these arguments, but they're there if you need them.
+
+<h1 id="changing-ownership-unix-only">Changing Ownership (Unix Only)</h1>
+
+`shutil.chown(path, user=None, group=None)` changes the owning user and/or group of a file or directory. It accepts either names or numeric IDs and is a thin wrapper around `os.chown` with the convenience of looking up the names for you.
+
+```python
+import shutil
+
+shutil.chown("data/orders-2026-05-14.csv", user="appuser", group="data")
+```
+
+A few things to know:
+
+- It only exists on Unix-like systems (Linux, macOS). On Windows it's not defined and importing it conditionally is the pattern: `getattr(shutil, "chown", None)`.
+- It does not work recursively. To change ownership for a whole tree, walk the tree yourself and call `chown` on each entry, or shell out to `chown -R`.
+- Changing ownership to a different user typically requires root privileges. As an unprivileged user, you can change the group to one you belong to, but not change the user.
+
+In an E-Commerce setting, the typical use is in deployment scripts: after a release pulls in fresh files, `chown` makes sure the runtime user (`appuser`) owns them so the application can read or write as needed.
+
+<h1 id="putting-the-pieces-together">Putting the Pieces Together</h1>
+
+A daily backup script for an order-processing system is a natural place for several of these calls to land in the same file. Walk through the steps the script needs:
+
+1. Make sure the destination drive has room.
+2. Copy today's order CSVs into a dated staging folder.
+3. Archive the staging folder into a single `.tar.gz` for offsite storage.
+4. Delete the staging folder.
+5. Delete the previous month's archives to keep the backup volume from filling up.
+
+The implementation, end to end:
+
+```python
+import shutil
+from datetime import date
+from pathlib import Path
+
+REQUIRED_FREE = 1 * 1024 ** 3   # 1 GB
+
+orders_dir = Path("orders")
+backups_dir = Path("backups")
+backups_dir.mkdir(parents=True, exist_ok=True)
+
+# 1. Check disk space
+free = shutil.disk_usage(backups_dir).free
+if free < REQUIRED_FREE:
+    raise RuntimeError(f"Backups drive has only {free / 1024 ** 3:.1f} GB free")
+
+# 2. Copy today's CSVs into a dated staging folder
+today = date.today().isoformat()
+staging = backups_dir / f"staging-{today}"
+shutil.copytree(orders_dir, staging, dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns("*.tmp", "*.lock"))
+
+# 3. Archive the staging folder
+archive_path = shutil.make_archive(
+    base_name=backups_dir / f"orders-{today}",
+    format="gztar",
+    root_dir=staging,
+)
+print("Created archive:", archive_path)
+
+# 4. Remove the staging folder
+shutil.rmtree(staging)
+
+# 5. Remove old monthly archives (older than 30 archives kept)
+existing = sorted(backups_dir.glob("orders-*.tar.gz"))
+for stale in existing[:-30]:
+    print("Removing stale backup:", stale)
+    stale.unlink()
+```
+
+Nothing in that script reaches for `os` or `pathlib` for actions that `shutil` already covers, which is the whole point of the module. The script reads top-to-bottom as a sequence of meaningful operations, not a sequence of byte-level calls.
+
+<h1 id="cross-platform-notes">Cross-Platform Notes</h1>
+
+A few `shutil` corners behave differently across operating systems, worth knowing before you ship a script that runs on developer laptops and Linux servers both.
+
+| Feature                               | Linux / macOS                                                                      | Windows                                                                                                                        |
+| ------------------------------------- | ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `shutil.copy2` preserves xattrs       | Yes on Linux, partial on macOS                                                     | Not applicable (NTFS uses ACLs, which are not preserved)                                                                       |
+| `shutil.chown`                        | Available                                                                          | Not defined                                                                                                                    |
+| `shutil.move` across filesystems      | Falls back to copy + delete via `copy2`                                            | Same fallback behavior                                                                                                         |
+| `shutil.which` PATH separator         | Colon `:`                                                                          | Semicolon `;`, also checks `PATHEXT` for executable extensions                                                                 |
+| `shutil.rmtree` on a junction/symlink | Follows the link target only if you explicitly opt in via `os.walk` style behavior | Behavior on junction points has had bugs historically; check the Python release notes if you're targeting Windows specifically |
+
+Most code that uses the functions in this lesson works on all three platforms without changes. The functions to be careful with are `chown` (Unix only) and anything that relies on metadata semantics specific to one filesystem.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

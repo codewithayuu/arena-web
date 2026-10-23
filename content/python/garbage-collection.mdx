@@ -1,0 +1,461 @@
+---
+title: "Garbage Collection"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "Garbage Collection explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="why-reference-counting-isnt-enough">
+  Why Reference Counting Isn't Enough
+</h1>
+
+Reference counting is straightforward: every object carries an `ob_refcnt`, the count goes up and down with assignment, function calls, container membership, and scope exits, and when it hits zero the object is freed right away. That is fast and predictable. The limitation is that two objects pointing at each other keep each other alive forever.
+
+```python
+import gc
+
+class Customer:
+    def __init__(self, name):
+        self.name = name
+        self.orders = []
+
+    def __del__(self):
+        print(f"Customer {self.name} freed")
+
+class Order:
+    def __init__(self, order_id, customer):
+        self.order_id = order_id
+        self.customer = customer
+        customer.orders.append(self)
+
+    def __del__(self):
+        print(f"Order {self.order_id} freed")
+
+def build_cycle():
+    c = Customer("Priya")
+    Order(501, c)
+    Order(502, c)
+
+gc.disable()
+build_cycle()
+print("build_cycle returned")
+gc.enable()
+```
+
+Nothing is freed. The customer's refcount is at least 2 (the two orders point at it), and each order's refcount is 1 (the customer's `orders` list holds it). When `build_cycle` returns, no name from outside reaches any of them, but their internal pointers keep all three counts above zero.
+
+The whole subgraph is unreachable from the outside but internally consistent. Refcounting cannot see this. It only ever looks at one object at a time and asks, "is anyone pointing at me?" The answer is yes, even when the only "anyone" is another piece of the same garbage island.
+
+This is the gap the `gc` module fills.
+
+<h1 id="what-the-cycle-collector-tracks">What the Cycle Collector Tracks</h1>
+
+The collector does not scan every Python object. Many objects cannot form cycles. An `int` does not reference anything else, neither does a `float`, a `str`, or a `bytes`. The collector only looks at **container** types, things that can hold references to other Python objects:
+
+- `list`, `dict`, `set`, `tuple`, `frozenset`
+- Instances of user-defined classes
+- Generators and coroutines
+- Modules, frames, and a few internal types
+
+To check whether a given object is tracked:
+
+```python
+import gc
+
+print(gc.is_tracked([1, 2, 3]))
+print(gc.is_tracked({"id": 101}))
+print(gc.is_tracked("headphones"))
+print(gc.is_tracked(42))
+print(gc.is_tracked((1, 2, 3)))
+print(gc.is_tracked((1, 2, [3])))
+```
+
+Strings and ints are not tracked because they cannot hold references to other Python objects. Tuples are a special case: CPython checks the contents and, if they are all atomic (ints, strings, other untracked tuples), the tuple itself is not tracked either. The first three integers form a tuple that cannot be part of a cycle, so the collector skips it. The last tuple contains a list, which can be part of a cycle, so the collector tracks it.
+
+Each tracked object pays a small memory overhead (the gc linked-list pointers) and consumes time during sweeps, so the collector skips what it does not need to track.
+
+<h1 id="generations">Generations</h1>
+
+Cycle detection is not free. The collector has to walk every tracked object and trace its references. Doing that every few allocations would be expensive. To keep it cheap, the collector splits tracked objects into three **generations** and scans the younger ones more often than the older ones.
+
+| Generation | Who lives here           | How often it runs              |
+| ---------- | ------------------------ | ------------------------------ |
+| 0 (young)  | Just-created objects     | Often, on every threshold trip |
+| 1 (middle) | Survived one gen 0 sweep | Less often                     |
+| 2 (old)    | Survived a gen 1 sweep   | Rarely                         |
+
+The intuition is the weak generational hypothesis: short-lived objects outnumber long-lived ones. An `Order` built to handle one request, used, and discarded never makes it past gen 0. Objects that live a long time (a config dictionary, a long-lived `ProductRepository`) get promoted into gen 1 and then gen 2, where they are checked rarely. A gen 2 sweep is the expensive one: by the time the collector decides to scan it, there are thousands of long-lived objects to walk.
+
+A `Product` instance starts in gen 0. If it is still alive when the gen 0 sweep runs, it is promoted to gen 1. If it survives a gen 1 sweep, it lands in gen 2 and stays there until something makes it unreachable.
+
+To see the current counters and thresholds:
+
+```python
+import gc
+
+print("Counts:", gc.get_count())
+print("Thresholds:", gc.get_threshold())
+```
+
+`gc.get_count()` shows how many tracked-object allocations minus deallocations have happened since the last sweep of each generation. `gc.get_threshold()` shows the trigger values. The defaults read like this:
+
+- When the gen 0 counter crosses 700, run a gen 0 sweep.
+- Every 10 gen 0 sweeps, also run gen 1.
+- Every 10 gen 1 sweeps, also run gen 2.
+
+The numbers are not fixed. They were picked so that a typical Python program does not notice the collector, and changing them is rarely necessary.
+
+<h1 id="running-the-collector-manually">Running the Collector Manually</h1>
+
+`gc.collect()` triggers a full collection right now. It returns the number of objects reclaimed.
+
+```python
+import gc
+
+class Customer:
+    def __init__(self, name):
+        self.name = name
+        self.orders = []
+
+    def __del__(self):
+        print(f"Customer {self.name} freed")
+
+class Order:
+    def __init__(self, order_id, customer):
+        self.order_id = order_id
+        self.customer = customer
+        customer.orders.append(self)
+
+    def __del__(self):
+        print(f"Order {self.order_id} freed")
+
+def build_cycle():
+    c = Customer("Priya")
+    Order(501, c)
+    Order(502, c)
+
+build_cycle()
+print("build_cycle returned")
+
+collected = gc.collect()
+print(f"gc.collect() reclaimed {collected} cycle members")
+```
+
+The same cycle that lingered with the collector disabled is now cleaned up the moment `gc.collect()` is called. The `__del__` methods fire during the sweep, in an order chosen by the collector. The number returned is the count of objects it broke out of cycles, useful for debugging.
+
+`gc.collect()` accepts an optional generation argument. `gc.collect(0)` sweeps only gen 0, `gc.collect(1)` sweeps gen 0 and gen 1, and `gc.collect(2)` (the default) sweeps everything. Most code calls it with no argument and gets the full sweep.
+
+<h1 id="tuning-thresholds">Tuning Thresholds</h1>
+
+`gc.set_threshold(t0, t1, t2)` changes how often each generation runs. Raising a threshold makes that generation collect less often; lowering it does the opposite.
+
+```python
+import gc
+
+print("Default:", gc.get_threshold())
+
+gc.set_threshold(10000, 20, 20)
+print("Custom:", gc.get_threshold())
+
+# Restore defaults
+gc.set_threshold(700, 10, 10)
+```
+
+Raising the gen 0 threshold to 10000 means CPython will allocate ten thousand container objects before running a gen 0 sweep. For most programs this is a step backwards: it trades more peak memory for fewer sweeps, when the default already runs sweeps that finish in microseconds. The numbers worth touching are usually `t1` and `t2`, to delay an expensive full-heap walk that is interrupting a latency-sensitive operation.
+
+Leaving the defaults alone is usually best. The cases where tuning helps are narrow: a benchmark suite wanting deterministic timing, a service profiler that traced a gen 2 pause to a known hot path, or a long-running batch job where the trade-off between memory and CPU is well understood. In typical code, the defaults work well.
+
+<h1 id="disabling-the-collector">Disabling the Collector</h1>
+
+`gc.disable()` turns off automatic cycle collection. Reference counting still runs, so anything that is not part of a cycle still gets freed promptly. The collector will not run on its own until `gc.enable()` is called again or `gc.collect()` is called manually.
+
+There are two legitimate reasons to disable:
+
+```python
+import gc
+
+gc.disable()
+try:
+    # A burst of allocations you know are cycle-free.
+    products = [{"id": i, "name": f"product_{i}", "price": 9.99 + i} for i in range(500_000)]
+    # Do something with products...
+finally:
+    gc.enable()
+```
+
+The first reason is a load phase that allocates many short-lived containers, none of which form cycles. During such a burst, every gen 0 sweep is wasted work, walking thousands of brand-new objects that are not going anywhere. Disabling the collector for the duration of the load can shave noticeable time off startup. The `try`/`finally` matters: forgetting to re-enable the collector means cycles will accumulate for the rest of the program.
+
+The second reason is latency control in a request-serving loop. If a web server can tolerate occasional gaps but not occasional gen 2 pauses during a hot request, the collector can be kept off during the request and `gc.collect()` called between requests on an idle worker. This is a niche optimization. Most services run fine with the defaults.
+
+Disabling the collector and forgetting to call `gc.collect()` or `gc.enable()` means cycles pile up indefinitely. The memory only comes back at interpreter shutdown, which is fine for short scripts and bad for long-running services.
+
+<h1 id="inspecting-unreachable-objects">Inspecting Unreachable Objects</h1>
+
+When the cycle collector runs, it identifies a set of objects it considers garbage. These are usually freed without any visible output. For debugging, `gc.set_debug(gc.DEBUG_SAVEALL)` tells the collector to put unreachable objects into `gc.garbage` instead of freeing them, so the program can examine what was about to be released.
+
+```python
+import gc
+
+gc.set_debug(gc.DEBUG_SAVEALL)
+
+class Customer:
+    def __init__(self, name):
+        self.name = name
+        self.orders = []
+
+class Order:
+    def __init__(self, order_id, customer):
+        self.order_id = order_id
+        self.customer = customer
+        customer.orders.append(self)
+
+c = Customer("Priya")
+Order(501, c)
+Order(502, c)
+del c
+
+gc.collect()
+
+print(f"Garbage count: {len(gc.garbage)}")
+for obj in gc.garbage:
+    print(f"  {type(obj).__name__}: {obj.__dict__}")
+
+gc.garbage.clear()
+gc.set_debug(0)
+```
+
+With `DEBUG_SAVEALL`, the customer and both orders end up in `gc.garbage` instead of being freed. Inspecting their attributes shows who is pointing at whom, which informs the fix. Clear `gc.garbage` and turn the debug flag off when done, or the "garbage" list will accumulate forever, turning the inspection mechanism into a real memory leak.
+
+A lighter-weight flag is `gc.DEBUG_STATS`, which prints summary information about each collection cycle without retaining objects. Useful for confirming that sweeps are happening at the expected rate.
+
+<h1 id="finding-who-points-at-what">Finding Who Points at What</h1>
+
+`gc.get_referrers(obj)` returns every object that holds a reference to `obj`. `gc.get_referents(obj)` returns every object `obj` points at. Together, they walk the reference graph in either direction.
+
+```python
+import gc
+
+class Product:
+    def __init__(self, name):
+        self.name = name
+
+p = Product("headphones")
+cart = [p]
+wishlist = {"first": p}
+
+referrers = gc.get_referrers(p)
+print(f"Referrers of p: {len(referrers)}")
+for r in referrers:
+    print(f"  {type(r).__name__}")
+```
+
+The three referrers are the `cart` list, the `wishlist` dict, and the local-variables dict for the current frame (which holds `p` itself). The frame referrer is the noisy one in debugging: calling `gc.get_referrers(p)` interactively also surfaces the interpreter's own structures. In a debugger or logging context, filtering out frame-like objects focuses the result on user-level containers.
+
+`gc.get_objects()` returns every tracked object in the entire interpreter. It is slow on a large heap, but useful when the location of an object is unknown. Filter the result by `type` to find every `Order` currently alive, every dict whose key is `"product_id"`, or any other target.
+
+```python
+import gc
+
+class Order:
+    def __init__(self, order_id):
+        self.order_id = order_id
+
+orders = [Order(i) for i in range(5)]
+
+alive = [obj for obj in gc.get_objects() if isinstance(obj, Order)]
+print(f"Live Order instances: {len(alive)}")
+```
+
+If that count grows unexpectedly across runs of a "should be cleaned up" operation, that is a leak. `gc.get_referrers(some_order)` then identifies what is still holding on.
+
+`gc.get_objects()` walks the entire heap and `gc.get_referrers(obj)` walks every container looking for the reference. Both are debugging tools, not production code. Calling them in a hot path will degrade performance significantly.
+
+<h1 id="leaks-that-happen-anyway">Leaks That Happen Anyway</h1>
+
+A common claim about GC is "Python cannot leak memory." That is wrong. The collector handles cycles, but typical Python leaks are not cycle bugs. They are forgotten strong references in long-lived data structures. A few patterns recur.
+
+**Pattern 1: A global cache that never evicts.**
+
+```python
+ORDER_CACHE = {}
+
+def process_order(order):
+    ORDER_CACHE[order["id"]] = order
+    # ... do work ...
+```
+
+The dict grows for the lifetime of the process. Every order ever processed stays in memory. The cycle collector cannot help; the reference is real and intentional. The fixes are a bounded cache (`functools.lru_cache(maxsize=...)`, `collections.OrderedDict` with manual eviction, or `cachetools.LRUCache`), or `weakref.WeakValueDictionary` if entries should disappear when nothing else holds them.
+
+**Pattern 2: Module-level lists that only grow.**
+
+```python
+ERRORS = []
+
+def log_error(message):
+    ERRORS.append({"time": "...", "message": message})
+```
+
+This looks innocent. If the service runs for weeks and accumulates millions of errors, `ERRORS` is the leak. The fix is a bounded `collections.deque(maxlen=10000)`, a rotating log, or shipping errors to an external store and clearing the in-memory list.
+
+**Pattern 3: Closures capturing more than expected.**
+
+```python
+def make_discount_calculator(catalog):
+    huge_lookup = build_lookup_table(catalog)
+
+    def apply(price):
+        return price * 0.9
+
+    return apply
+```
+
+`apply` does not use `huge_lookup`, but it is defined in a frame that also defines `huge_lookup`. Depending on how the closure captures variables, the entire frame's locals may be retained. If the closure outlives the function call, the lookup table is alive too. The safe pattern is to compute `huge_lookup`, use it, then discard it before defining a closure that does not need it.
+
+**Pattern 4: Async tasks that never complete.**
+
+```python
+import asyncio
+
+class OrderProcessor:
+    def __init__(self):
+        self.tasks = []
+
+    def start(self, order):
+        task = asyncio.create_task(self._process(order))
+        self.tasks.append(task)
+
+    async def _process(self, order):
+        await asyncio.sleep(1)
+```
+
+Every started task is held in `self.tasks`. The captured `order` and the frame locals stay alive until the task ends and is dropped from the list. If the list is not pruned, tasks accumulate. `task.add_done_callback(self.tasks.remove)` solves it.
+
+The shape is the same every time. Something long-lived holds something it should not, the references compound, and the resident set grows monotonically. Cycle collection is not the problem and not the answer.
+
+<h1 id="debugging-memory-leaks">Debugging Memory Leaks</h1>
+
+When a service is leaking, the investigation usually goes through three tools in order: `tracemalloc`, `gc.get_objects`, and `objgraph`.
+
+**`tracemalloc`** is the standard-library starting point. It tracks where memory is being allocated. Take a snapshot, do some work, take another snapshot, compare.
+
+```python
+import tracemalloc
+
+tracemalloc.start()
+snap_before = tracemalloc.take_snapshot()
+
+orders = []
+for i in range(20_000):
+    orders.append({
+        "id": i,
+        "customer": f"customer_{i}@example.com",
+        "items": ["headphones", "cable"],
+    })
+
+snap_after = tracemalloc.take_snapshot()
+stats = snap_after.compare_to(snap_before, "lineno")
+
+for stat in stats[:3]:
+    print(stat)
+
+tracemalloc.stop()
+```
+
+The output ranks source lines by net bytes allocated between the two snapshots. The top line is usually the source of the growth. `tracemalloc` is heavyweight (it instruments every allocation), so use it in a debug session rather than a deployed service.
+
+**`gc.get_objects`** is the next step when `tracemalloc` does not pin the problem. Count instances by type, see which types are growing, and pull a sample object to inspect.
+
+```python
+import gc
+from collections import Counter
+
+counts = Counter(type(obj).__name__ for obj in gc.get_objects())
+for name, count in counts.most_common(10):
+    print(f"{count:>8}  {name}")
+```
+
+Running this at the start and end of a "should leave no extra state" operation shows which types accumulated. A jump of a few thousand instances of a domain class (`Order`, `Cart`, `Session`) is the trail.
+
+**`objgraph`** (third party, `pip install objgraph`) builds on `gc` to draw reference graphs. Given a leaking instance, it identifies what points at it and produces a visualization. The two functions to know are `objgraph.show_backrefs(obj)` for "what is keeping this alive" and `objgraph.growth()` for "what types have grown since the last call". For complex leaks, the visual graph saves hours.
+
+```python
+import objgraph  # pip install objgraph
+
+class Order:
+    pass
+
+leaked = []
+for _ in range(10):
+    o = Order()
+    leaked.append(o)
+
+# Print the most-grown types since program start.
+objgraph.show_growth(limit=5)
+
+# Show what's keeping the first Order alive (writes a PNG).
+objgraph.show_backrefs(leaked[0], filename="backrefs.png")
+```
+
+The first call lists each type that grew, with the delta. The second call produces a PNG showing every reference path that keeps `leaked[0]` alive. For a stubborn leak, this is the picture to use.
+
+`objgraph.show_backrefs` recursively walks references. On a heap with millions of objects, give it a shallow depth (`max_depth=3` or `4`); otherwise the graph is unreadable and the call takes a long time.
+
+<h1 id="when-to-call-gccollect-manually">When to Call gc.collect Manually</h1>
+
+Most code never needs `gc.collect()`. The automatic scheduler is fine. Three situations call for a manual call.
+
+**Latency control.** A web server can call `gc.collect()` on an idle thread between requests, so a gen 2 sweep does not happen in the middle of a hot one. The pause moves from "random millisecond stutter under load" to "scheduled work between requests".
+
+```python
+import gc
+
+def serve_request(req):
+    # ... handle the request ...
+    pass
+
+def request_loop(requests):
+    for req in requests:
+        serve_request(req)
+        if some_idle_condition():
+            gc.collect()
+```
+
+**Tests that assert on cleanup.** A test that verifies "this cache is empty after the context manager exits" may need `gc.collect()` to break any cycles before asserting the count. Without it, the cycle could still be sitting on the heap, waiting for the next automatic sweep.
+
+```python
+import gc
+import weakref
+
+def test_cache_empties():
+    cache = SomeCache()
+    obj = cache.acquire()
+    cache.release(obj)
+    del obj
+    gc.collect()  # break any cycles between cache and entry
+    assert len(cache) == 0
+```
+
+**Batch jobs that process in chunks.** After processing a chunk (every 10,000 orders, say), a `gc.collect()` reclaims peak memory before the next chunk starts. Without it, peak resident memory creeps up across chunks because cycles are not freed promptly.
+
+```python
+import gc
+
+def process_batches(batches):
+    for batch in batches:
+        for order in batch:
+            handle(order)
+        collected = gc.collect()
+        print(f"Reclaimed {collected} cycle members")
+```
+
+The general rule: do not sprinkle `gc.collect()` calls everywhere. Each call walks the heap and is not free. Use them only where measurement shows they help.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

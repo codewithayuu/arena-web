@@ -1,0 +1,410 @@
+---
+title: "File Methods"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "File Methods explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="the-file-object-as-a-stream">The File Object as a Stream</h1>
+
+Every value `open()` returns is a stream. A stream is a sequence of bytes (in binary mode) or characters (in text mode) with a current position that moves forward each time you read or write. The methods on a file object fall into three groups:
+
+- **Data methods** that move the position by reading or writing: `read`, `write`, `readline`, `readlines`, `writelines`.
+- **Position methods** that change or report the current position without transferring data: `seek`, `tell`, `truncate`.
+- **Lifecycle methods** that interact with the underlying OS resource: `flush`, `close`, `fileno`.
+
+Alongside those methods, the object carries a few read-only attributes describing how it was opened.
+
+```python
+with open("orders.txt", "w", encoding="utf-8") as f:
+    print(f.name)
+    print(f.mode)
+    print(f.encoding)
+    print(f.closed)
+```
+
+`name` is the path you passed to `open` (or an integer file descriptor if you opened one directly). `mode` echoes the mode string. `encoding` is the text encoding when the file is in text mode, or `None` in binary mode. `closed` is `False` while the file is open and flips to `True` once `close()` runs (or the `with` block exits). These attributes are the cheapest way to introspect a stream when a function receives one from somewhere else.
+
+The diagram above shows the structure used through the rest of this lesson. A file object holds a moving position inside a byte stream on disk, and its methods either move the position, transfer data, or talk to the OS about the underlying resource.
+
+<h1 id="read-methods-recap">Read Methods Recap</h1>
+
+The four read calls have one-line summaries:
+
+| Method        | Returns                                           | Use when                                      |
+| ------------- | ------------------------------------------------- | --------------------------------------------- |
+| `read()`      | The whole rest of the file as one string or bytes | The file is small and fits in memory          |
+| `read(n)`     | Up to `n` characters or bytes                     | You want fixed-size chunks                    |
+| `readline()`  | One line including its trailing `\n`              | You want lines one at a time                  |
+| `readlines()` | A list of every remaining line                    | The file is small and you want indexed access |
+
+Each call advances the position by the number of characters or bytes it returned. The natural and most common way to read line by line is to iterate over the file directly:
+
+```python
+with open("orders.txt", "r", encoding="utf-8") as f:
+    for line in f:
+        print(line.rstrip())
+```
+
+The rest of this lesson focuses on what those calls leave out: the position itself, the write side, the OS-level operations, and the patterns that come up in binary work.
+
+<h1 id="write-methods-write-and-writelines">
+  Write Methods: write and writelines
+</h1>
+
+`write` takes a string (or bytes in binary mode) and writes it to the file at the current position, returning the number of characters or bytes written.
+
+```python
+with open("orders.txt", "w", encoding="utf-8") as f:
+    written = f.write("order_id,customer,total\n")
+    print(written)
+    f.write("5001,ria,89.97\n")
+    f.write("5002,alex,14.99\n")
+```
+
+The return value (`24` here) is the count of characters written, which equals the length of the string for plain text. For binary writes, it's the count of bytes. You can usually ignore the return value, but it's available to verify everything went through.
+
+`writelines` takes an iterable of strings and writes each one without inserting anything between them. The name is misleading: it does not add newlines for you.
+
+```python
+lines = ["5003,mei,249.00", "5004,jon,9.99", "5005,bea,49.50"]
+
+with open("orders.txt", "a", encoding="utf-8") as f:
+    f.writelines(line + "\n" for line in lines)
+```
+
+The generator expression adds `\n` to each line. Without that, all three lines would be concatenated into one line on disk.
+
+`writelines` is no faster than a manual `for` loop calling `write`. Both translate to the same number of OS write calls because the file's buffer batches the data. Pick whichever reads more clearly.
+
+<h1 id="iteration-support">Iteration Support</h1>
+
+A file object is its own iterator. Calling `iter(f)` returns the file itself, and `next(f)` reads the next line. This is why `for line in f:` works: it uses the same iterator protocol as lists and other sequences.
+
+```python
+with open("orders.txt", "r", encoding="utf-8") as f:
+    print(next(f), end="")
+    print(next(f), end="")
+    print(f.readline(), end="")
+```
+
+`next(f)` and `f.readline()` are interchangeable; both read one line and advance the position. They can be mixed freely, which is convenient when reading a header with `next` and then iterating the rest of the file:
+
+```python
+with open("orders.txt", "r", encoding="utf-8") as f:
+    header = next(f).rstrip().split(",")
+    print(f"Columns: {header}")
+    for line in f:
+        fields = line.rstrip().split(",")
+        print(dict(zip(header, fields)))
+```
+
+The `next` call reads the header line and advances the position to the start of the second line. The `for` loop then picks up from there. This is the idiomatic way to peel a header off a structured text file.
+
+Iteration over a file uses an internal read-ahead buffer. The buffer makes `for line in f:` cheap, but it also means that mixing iteration with `read`, `readline`, or `seek` on the same file can give inconsistent results in Python 3: the iterator's lookahead may have already consumed data past where the position appears to be. If you need to switch from iteration to byte-level seeks mid-file, call `seek` afterward to put the position back where you want it.
+
+<h1 id="file-position-tell-and-seek">File Position: tell and seek</h1>
+
+`tell()` returns the current position as an integer. The unit depends on the mode: bytes from the start of the file in binary mode, an opaque token in text mode (more on that in a moment).
+
+`seek(offset, whence)` moves the position. The `whence` argument tells `seek` what `offset` is measured from:
+
+| `whence` | Constant      | Meaning                              |
+| -------- | ------------- | ------------------------------------ |
+| `0`      | `os.SEEK_SET` | From the start of the file (default) |
+| `1`      | `os.SEEK_CUR` | From the current position            |
+| `2`      | `os.SEEK_END` | From the end of the file             |
+
+```python
+with open("orders.bin", "wb") as f:
+    f.write(b"HEADER01" + b"DATA" * 8)
+
+with open("orders.bin", "rb") as f:
+    print(f.tell())
+    print(f.read(8))
+    print(f.tell())
+    f.seek(0)
+    print(f.tell())
+    f.seek(8, 1)
+    print(f.tell())
+    f.seek(-4, 2)
+    print(f.tell())
+    print(f.read())
+```
+
+Trace through it. After opening for reading, the position is `0`. Reading 8 bytes advances it to `8`. `seek(0)` resets to the start, where `whence=0` is implicit. `seek(8, 1)` moves forward 8 bytes from the current position (which was `8`), landing on `16`. `seek(-4, 2)` moves to 4 bytes before the end of a 40-byte file, which is position `36`. Reading from there returns the last 4 bytes.
+
+`seek` is what makes a file a random-access medium rather than a one-way tape. Binary file formats (PNG, ZIP, WAV, executable files) rely on this: they put offsets and sizes in a header, and a parser jumps directly to the bytes it needs instead of reading the file sequentially.
+
+```python
+import struct
+
+# Build a tiny "image" file with a 16-byte header followed by pixel data.
+header = struct.pack(">4sIII", b"IMG1", 8, 8, 64)  # magic, width, height, data length
+pixels = bytes(range(64))
+
+with open("image.bin", "wb") as f:
+    f.write(header)
+    f.write(pixels)
+
+# Parse the header, then jump directly to the pixel data.
+with open("image.bin", "rb") as f:
+    magic, width, height, length = struct.unpack(">4sIII", f.read(16))
+    print(f"Magic: {magic.decode()}, {width}x{height}, {length} bytes of pixels")
+    f.seek(16)  # explicitly jump past the header
+    pixel_data = f.read(length)
+    print(f"First 8 pixels: {pixel_data[:8].hex()}")
+```
+
+`struct.pack` and `unpack` translate between Python values and fixed-width binary bytes (the `">4sIII"` format means big-endian, a 4-byte string, then three unsigned 32-bit ints). The `seek(16)` matters here: once the header reports where the pixel data starts, the read jumps straight to it. For a file with a multi-megabyte header followed by gigabytes of data, that one call is the difference between reading what you need and reading everything.
+
+`seek` itself is essentially free on a local disk: it's one `lseek` system call and no I/O. The real cost shows up on remote filesystems and network mounts, where seeking can flush read-ahead buffers and force a fresh round-trip. On those, sequential reads are much faster than scattered seeks.
+
+<h3 id="seek-in-text-mode-is-restricted">Seek in Text Mode Is Restricted</h3>
+
+Text mode handles UTF-8 and other variable-width encodings, where one character can span multiple bytes. Python doesn't let you `seek` to an arbitrary byte offset in text mode because landing in the middle of a multi-byte character would corrupt the stream. The only legal seeks in text mode are:
+
+- `seek(0)` to go to the start.
+- `seek(0, 2)` to go to the end.
+- `seek(pos)` where `pos` is a value you got from a previous `tell()` on the same file.
+
+```python
+with open("orders.txt", "r", encoding="utf-8") as f:
+    f.readline()
+    pos = f.tell()
+    print(pos)
+    f.read()
+    f.seek(pos)
+    print(f.readline().rstrip())
+```
+
+The `pos` returned by `tell` in text mode is not necessarily a byte offset; it's an opaque token that `seek` knows how to interpret. It can be saved and reused, but arithmetic on it won't produce meaningful results.
+
+```python
+with open("orders.txt", "r", encoding="utf-8") as f:
+    try:
+        f.seek(5, 1)
+    except OSError as e:
+        print(f"refused: {e}")
+```
+
+For byte-level seeking, open the file in binary mode (`"rb"`, `"rb+"`, or `"wb+"`) and decode the slices yourself. That's the standard pattern for parsing or patching binary formats.
+
+<h1 id="modifying-specific-offsets">Modifying Specific Offsets</h1>
+
+Combining `seek` with `write` lets you patch a file in place. Open the file in a mode that allows both reading and writing (`"r+"`, `"rb+"`, or `"wb+"`), seek to the offset you want to change, and write the replacement bytes.
+
+```python
+# Build a small inventory file with fixed-width records.
+# Each record is: 8-byte product ID, 4-byte stock count (unsigned int, big-endian).
+import struct
+
+records = [
+    (b"P0000101", 25),
+    (b"P0000102", 8),
+    (b"P0000103", 142),
+]
+
+with open("inventory.bin", "wb") as f:
+    for product_id, stock in records:
+        f.write(product_id + struct.pack(">I", stock))
+
+# Each record is 12 bytes. The stock count for record N lives at offset N*12 + 8.
+record_size = 12
+stock_offset_in_record = 8
+
+with open("inventory.bin", "rb+") as f:
+    target_record = 1  # zero-indexed: change stock for the second product
+    f.seek(target_record * record_size + stock_offset_in_record)
+    f.write(struct.pack(">I", 50))
+
+with open("inventory.bin", "rb") as f:
+    for _ in range(len(records)):
+        chunk = f.read(record_size)
+        product_id, stock = chunk[:8], struct.unpack(">I", chunk[8:])[0]
+        print(product_id.decode(), stock)
+```
+
+The patch updates only 4 bytes in the middle of the file. The other records are untouched. This kind of operation isn't possible in text mode without rewriting the surrounding content, because text characters vary in width and overwriting one might bleed into the next.
+
+Three details apply to in-place writes:
+
+- `write` does not insert bytes. It overwrites whatever was there. If you write a string shorter than what you're replacing, the leftover bytes stay in place.
+- Writing past the end of the file extends it with new content. The file grows to fit.
+- If you `seek` past the end and then write, the bytes in between are filled with zeros on most filesystems. The "hole" doesn't take real disk space on filesystems that support sparse files.
+
+<h1 id="truncate-shrinking-or-padding-the-file">
+  truncate: Shrinking or Padding the File
+</h1>
+
+`truncate(size)` sets the file's size to `size` bytes. If `size` is smaller than the current length, the file is shortened and any data past `size` is discarded. If `size` is larger, the file is padded with zero bytes up to that length. Called with no argument, `truncate()` cuts the file at the current position.
+
+```python
+with open("notes.txt", "w", encoding="utf-8") as f:
+    f.write("first line\nsecond line\nthird line\n")
+
+with open("notes.txt", "r+", encoding="utf-8") as f:
+    f.readline()  # consume the first line
+    pos = f.tell()
+    print(f"position after first line: {pos}")
+    f.truncate()
+
+print(open("notes.txt").read())
+```
+
+After reading the first line, the cursor sits just after the newline at offset `11`. `truncate()` with no argument cuts the file at that point, so everything after the first line is gone. The next `open().read()` confirms only the first line survived.
+
+The other common use is shrinking an output file when you've written less than what was there before. Without truncation, the leftover bytes from the previous content remain at the end:
+
+```python
+with open("notes.txt", "w", encoding="utf-8") as f:
+    f.write("a very long line of text that will be there to start\n")
+
+with open("notes.txt", "r+", encoding="utf-8") as f:
+    f.write("short\n")
+    # leftover bytes from the old content are still there past the new write
+    f.seek(0)
+    print(repr(f.read()))
+
+with open("notes.txt", "r+", encoding="utf-8") as f:
+    f.write("short\n")
+    f.truncate()
+    f.seek(0)
+    print(repr(f.read()))
+```
+
+The first block overwrites the start of the file but leaves the tail intact, producing a corrupted mixed file. The second block writes the new content and then calls `truncate()` to cut off whatever was left. `r+` opens for read-write without erasing, which is when this pattern matters. Plain `w` truncates the file to zero length automatically, so you only need to call `truncate` explicitly when editing in place.
+
+<h1 id="flush-and-close">flush and close</h1>
+
+When you call `write`, the data doesn't go straight to disk. It lands in an in-memory buffer that the file object owns. The buffer is flushed to the operating system in three situations: when it fills up, when you call `flush()` explicitly, and when the file is closed (manually or by the `with` block).
+
+```python
+with open("log.txt", "w", encoding="utf-8") as f:
+    f.write("line 1\n")
+    # At this point, "log.txt" may still be empty on disk.
+    f.flush()
+    # Now the data is in the OS's hands.
+    f.write("line 2\n")
+# Closing the file flushes whatever's left and releases the descriptor.
+```
+
+`flush()` pushes the buffer to the OS but doesn't force the OS to commit it to physical disk. For that, you'd need `os.fsync(f.fileno())`, which is what databases call when they need a real durability guarantee. For ordinary file writes, the buffered behavior is faster, and the `with` block guarantees the buffer gets flushed when your code is done.
+
+`close()` is the last call on a file object. It flushes the buffer, releases the OS file descriptor, and flips `f.closed` to `True`. Any further operation on a closed file raises `ValueError: I/O operation on closed file`.
+
+```python
+f = open("log.txt", "r", encoding="utf-8")
+print(f.closed)
+f.close()
+print(f.closed)
+
+try:
+    f.read()
+except ValueError as e:
+    print(f"error: {e}")
+```
+
+The `with` block calls `close` for you on the way out, including when an exception is raised inside the block. That's the recommended way to open files in Python: it's harder to leak a file descriptor with `with` than without.
+
+Each unclosed file holds an OS file descriptor. Most systems cap a process at 1024 or so descriptors. Leaking them in a loop ("forgot to close, the GC will get it eventually") works in CPython because reference counting closes the file the moment its last reference goes away, but on PyPy or any other implementation, the GC runs later and the descriptors stack up. Use `with`.
+
+<h1 id="fileno-the-underlying-os-descriptor">
+  fileno: The Underlying OS Descriptor
+</h1>
+
+`fileno()` returns the integer file descriptor that the OS uses to refer to this file. Most code never needs it, but a handful of lower-level operations require it.
+
+```python
+import os
+
+with open("orders.txt", "r", encoding="utf-8") as f:
+    fd = f.fileno()
+    print(f"file descriptor: {fd}")
+    stat = os.fstat(fd)
+    print(f"size: {stat.st_size} bytes")
+```
+
+`fileno()` is the entry point to functions in `os` that operate on raw descriptors: `os.fstat`, `os.fsync`, `os.dup`, `os.read`, `os.write`, and a few more. These bypass the file object's buffering, which is occasionally what you want (`os.fsync(fd)` for durability) and occasionally a source of bugs (mixing buffered and unbuffered I/O on the same descriptor leads to data appearing out of order).
+
+Standard input, output, and error have fixed descriptors:
+
+```python
+import sys
+
+print(sys.stdin.fileno())
+print(sys.stdout.fileno())
+print(sys.stderr.fileno())
+```
+
+Those three are universal across POSIX systems. Outside of `os` calls and a few networking tricks (`socket.fromfd`), `fileno` rarely comes up. It exists for the case when a library asks for one.
+
+<h1 id="putting-it-together-updating-a-stock-count">
+  Putting It Together: Updating a Stock Count
+</h1>
+
+A small end-to-end example touches most of the methods covered in this lesson. The file `inventory.bin` holds fixed-width product records. A function reads the current stock for a product ID, and another function updates it in place.
+
+```python
+import struct
+
+RECORD_SIZE = 12  # 8-byte product ID + 4-byte unsigned int stock
+STOCK_OFFSET = 8
+
+def create_inventory(path, items):
+    with open(path, "wb") as f:
+        for product_id, stock in items:
+            padded = product_id.encode("ascii").ljust(8, b" ")
+            f.write(padded + struct.pack(">I", stock))
+
+def find_record(f, product_id):
+    target = product_id.encode("ascii").ljust(8, b" ")
+    f.seek(0, 2)
+    file_size = f.tell()
+    f.seek(0)
+    for index in range(file_size // RECORD_SIZE):
+        chunk = f.read(RECORD_SIZE)
+        if chunk[:8] == target:
+            return index
+    return -1
+
+def read_stock(path, product_id):
+    with open(path, "rb") as f:
+        index = find_record(f, product_id)
+        if index < 0:
+            return None
+        f.seek(index * RECORD_SIZE + STOCK_OFFSET)
+        return struct.unpack(">I", f.read(4))[0]
+
+def update_stock(path, product_id, new_stock):
+    with open(path, "rb+") as f:
+        index = find_record(f, product_id)
+        if index < 0:
+            return False
+        f.seek(index * RECORD_SIZE + STOCK_OFFSET)
+        f.write(struct.pack(">I", new_stock))
+        f.flush()
+        return True
+
+create_inventory("inventory.bin", [
+    ("P101", 25),
+    ("P102", 8),
+    ("P103", 142),
+])
+
+print(read_stock("inventory.bin", "P102"))
+update_stock("inventory.bin", "P102", 50)
+print(read_stock("inventory.bin", "P102"))
+```
+
+`find_record` uses `seek(0, 2)` to find the file's size, divides by the record size to get the record count, then reads each record sequentially looking for the target. `read_stock` jumps to the stock field of the matching record and reads 4 bytes. `update_stock` opens in `rb+`, seeks to the same offset, and writes 4 new bytes. The `flush` call is mostly for explicitness: the `with` block would flush on exit anyway, but the explicit call documents that the write is meant to be visible to anyone reading the file right after.
+
+This pattern (fixed-width records on disk, seek to offset, read or write a small slice) is what databases and indexed file formats use internally. Understanding it makes those systems less mysterious and gives you a tool for ad-hoc binary patching.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,1009 @@
+---
+title: "Collectors"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Collectors explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="the-collector-shape">The Collector Shape</h1>
+
+A `Collector<T, A, R>` is built from four pieces. `T` is the input element type. `A` is the type of an intermediate accumulator (usually a mutable container like `ArrayList` or `StringBuilder`). `R` is the final result type. The four pieces are:
+
+1. **Supplier:** creates a new, empty accumulator.
+2. **Accumulator:** folds an input element into the accumulator.
+3. **Combiner:** merges two accumulators into one (used for parallel streams).
+4. **Finisher:** turns the accumulator into the final result.
+
+The diagram shows the lifecycle of a collector during a `collect` call. The stream pulls a fresh accumulator from the supplier, calls the accumulator on every element, optionally combines partial accumulators across threads, and finally hands the accumulator (or its transformed form) back through the finisher.
+
+You almost never write these four pieces by hand. The `Collectors` class gives you a few dozen factories that build the appropriate shape for the job. You pick a factory, pass it to `collect`, and get a list, a set, a map, a count, a sum, a joined string, or whatever else you need.
+
+<h1 id="collecting-into-a-list">Collecting Into a List</h1>
+
+The simplest collector is `Collectors.toList()`. It accumulates stream elements into a `List` and returns it.
+
+```java
+import java.util.List;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class ToListDemo {
+    public static void main(String[] args) {
+        List<String> products = Stream.of("Notebook", "Pen", "Eraser")
+                .collect(Collectors.toList());
+
+        products.add("Marker");
+
+        System.out.println(products);
+    }
+}
+```
+
+The list comes back mutable: we successfully added `"Marker"` after collecting. That's the historical contract of `Collectors.toList()`. The Javadoc doesn't promise mutability, but in practice it returns an `ArrayList`, and existing code has relied on that for years.
+
+Compare this with `Stream.toList()` (Java 16). `Stream.toList()` returns an **unmodifiable** list. Trying to `add` to it throws `UnsupportedOperationException`. If you want a mutable list, use `Collectors.toList()` (or `Collectors.toCollection(ArrayList::new)`). If you want an unmodifiable list, prefer `Stream.toList()` or `Collectors.toUnmodifiableList()`.
+
+```java
+import java.util.List;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class UnmodifiableList {
+    public static void main(String[] args) {
+        List<String> products = Stream.of("Notebook", "Pen", "Eraser")
+                .collect(Collectors.toUnmodifiableList());
+
+        System.out.println(products);
+
+        try {
+            products.add("Marker");
+        } catch (UnsupportedOperationException e) {
+            System.out.println("Cannot modify: " + e.getClass().getSimpleName());
+        }
+    }
+}
+```
+
+`toUnmodifiableList()` is a clear signal in the API: "this list is read-only, don't even try". It also rejects `null` elements, which the mutable form silently allows.
+
+| Factory                           | Returns                           | Mutable? | Allows nulls? |
+| --------------------------------- | --------------------------------- | -------- | ------------- |
+| `Collectors.toList()`             | `List<T>` (typically `ArrayList`) | Yes      | Yes           |
+| `Stream.toList()`                 | `List<T>` (unmodifiable)          | No       | Yes           |
+| `Collectors.toUnmodifiableList()` | `List<T>` (unmodifiable)          | No       | No            |
+
+<h1 id="collecting-into-a-set">Collecting Into a Set</h1>
+
+`Collectors.toSet()` works the same way but accumulates into a `Set`, removing duplicates. There's no order guarantee, because it's typically a `HashSet`.
+
+```java
+import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class ToSetDemo {
+    public static void main(String[] args) {
+        Set<String> categories = Stream.of("Books", "Toys", "Books", "Stationery", "Toys")
+                .collect(Collectors.toSet());
+
+        System.out.println("Unique categories: " + categories);
+        System.out.println("Count: " + categories.size());
+    }
+}
+```
+
+The print order isn't guaranteed; what is guaranteed is that duplicates are gone. If you need both deduplication and a predictable order, use `Collectors.toCollection(LinkedHashSet::new)` (covered shortly) or sort the stream first.
+
+`Collectors.toUnmodifiableSet()` parallels `toUnmodifiableList`: it returns a read-only set and rejects nulls.
+
+<h1 id="collecting-into-a-specific-collection">
+  Collecting Into a Specific Collection
+</h1>
+
+When the built-in `toList` and `toSet` don't fit, use `Collectors.toCollection(Supplier)`. You pass a constructor reference (or any `Supplier`), and the collector accumulates into that collection type.
+
+```java
+import java.util.TreeSet;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class ToCollectionDemo {
+    public static void main(String[] args) {
+        TreeSet<String> sortedCategories = Stream.of("Books", "Toys", "Stationery", "Books")
+                .collect(Collectors.toCollection(TreeSet::new));
+
+        System.out.println("Sorted unique categories: " + sortedCategories);
+    }
+}
+```
+
+`TreeSet` deduplicates and keeps elements in natural order. `LinkedHashSet::new` would deduplicate and preserve insertion order. `ArrayDeque::new` would give you a queue. You pick the shape; the collector handles the wiring.
+
+`toCollection(TreeSet::new)` is O(n log n) overall because every insert into a `TreeSet` is O(log n). `toCollection(HashSet::new)` is O(n) on average. Use a sorted set only when you actually need the ordering.
+
+<h1 id="collecting-into-a-map">Collecting Into a Map</h1>
+
+`Collectors.toMap(keyMapper, valueMapper)` is where things get interesting. You pass two functions: one extracts the key from each element, the other extracts the value.
+
+```java
+import java.util.Map;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+class Product {
+    String id;
+    String name;
+    String category;
+    double price;
+    int stock;
+
+    Product(String id, String name, String category, double price, int stock) {
+        this.id = id;
+        this.name = name;
+        this.category = category;
+        this.price = price;
+        this.stock = stock;
+    }
+
+    @Override
+    public String toString() {
+        return name + " ($" + price + ")";
+    }
+}
+
+public class ToMapDemo {
+    public static void main(String[] args) {
+        Map<String, Product> byId = Stream.of(
+                new Product("P-101", "Notebook", "Stationery", 4.99, 50),
+                new Product("P-220", "Pen", "Stationery", 1.49, 200),
+                new Product("P-301", "Lego Set", "Toys", 49.99, 12))
+            .collect(Collectors.toMap(p -> p.id, p -> p));
+
+        System.out.println("Lookup P-220: " + byId.get("P-220"));
+        System.out.println("Map size: " + byId.size());
+    }
+}
+```
+
+The keyMapper extracts the product ID; the valueMapper returns the product itself (`p -> p`, or equivalently `Function.identity()`). You get back a `Map<String, Product>` you can use as a lookup table.
+
+<h3 id="duplicate-keys-throw-an-exception">
+  Duplicate Keys Throw an Exception
+</h3>
+
+If two elements produce the same key, `toMap` throws `IllegalStateException`. It won't overwrite, it won't keep one, it'll fail loudly.
+
+**What's wrong with this code?**
+
+```java
+import java.util.Map;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class DuplicateKeyBug {
+    public static void main(String[] args) {
+        Map<String, Product> byCategory = Stream.of(
+                new Product("P-101", "Notebook", "Stationery", 4.99, 50),
+                new Product("P-220", "Pen", "Stationery", 1.49, 200))
+            .collect(Collectors.toMap(p -> p.category, p -> p));
+
+        System.out.println(byCategory);
+    }
+}
+```
+
+Two products share the `"Stationery"` category. `toMap` doesn't know which one you want, so it refuses the call.
+
+**Fix:** use the three-argument `toMap` and provide a merge function. The merge function takes the existing value and the new value and returns whatever you want to keep.
+
+```java
+import java.util.Map;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class DuplicateKeyFix {
+    public static void main(String[] args) {
+        Map<String, Product> cheapestPerCategory = Stream.of(
+                new Product("P-101", "Notebook", "Stationery", 4.99, 50),
+                new Product("P-220", "Pen", "Stationery", 1.49, 200),
+                new Product("P-301", "Lego Set", "Toys", 49.99, 12))
+            .collect(Collectors.toMap(
+                    p -> p.category,
+                    p -> p,
+                    (existing, incoming) -> existing.price <= incoming.price ? existing : incoming));
+
+        System.out.println("Cheapest per category: " + cheapestPerCategory);
+    }
+}
+```
+
+The merge function says "keep the one with the lower price". For the two stationery products, the `Pen` wins. Other common merge choices: `(a, b) -> a` (keep first), `(a, b) -> b` (keep last), `Integer::sum` if you're collecting numeric values, `(a, b) -> a + ", " + b` if you're concatenating strings.
+
+`toMap` without a merge function is convenient but fragile. If the data ever produces a duplicate key, the entire collect fails. In code that ingests external data (uploads, third-party feeds), assume duplicates are possible and use the three-argument form.
+
+<h3 id="choosing-the-map-type">Choosing the Map Type</h3>
+
+The four-argument `toMap` adds a map supplier so you can pick the implementation. By default, `toMap` returns a `HashMap`, which has no order guarantees. If you want insertion order, ask for `LinkedHashMap`. If you want sorted keys, ask for `TreeMap`.
+
+```java
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class MapTypeDemo {
+    public static void main(String[] args) {
+        Map<String, Double> insertionOrder = Stream.of(
+                new Product("P-101", "Notebook", "Stationery", 4.99, 50),
+                new Product("P-220", "Pen", "Stationery", 1.49, 200),
+                new Product("P-301", "Lego Set", "Toys", 49.99, 12))
+            .collect(Collectors.toMap(
+                    p -> p.id,
+                    p -> p.price,
+                    (a, b) -> a,
+                    LinkedHashMap::new));
+
+        Map<String, Double> sortedByKey = Stream.of(
+                new Product("P-301", "Lego Set", "Toys", 49.99, 12),
+                new Product("P-101", "Notebook", "Stationery", 4.99, 50),
+                new Product("P-220", "Pen", "Stationery", 1.49, 200))
+            .collect(Collectors.toMap(
+                    p -> p.id,
+                    p -> p.price,
+                    (a, b) -> a,
+                    TreeMap::new));
+
+        System.out.println("Insertion order: " + insertionOrder);
+        System.out.println("Sorted by key:   " + sortedByKey);
+    }
+}
+```
+
+In this run both happen to print the same order, but the guarantee is different. `LinkedHashMap` keeps the iteration order in which keys were first inserted. `TreeMap` keeps keys in natural (or `Comparator`-defined) order. Insert `"P-301"` first and the two outputs diverge.
+
+`Collectors.toUnmodifiableMap` is the read-only cousin: it returns an unmodifiable map and rejects null keys and values. It also throws on duplicate keys unless you pass a merge function.
+
+<h1 id="grouping">Grouping</h1>
+
+`Collectors.groupingBy(classifier)` is one of the most used methods on `Collectors`. The classifier extracts a grouping key, and the collector returns a `Map<K, List<T>>` where each key maps to the list of elements that produced it.
+
+```java
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class GroupByCategory {
+    public static void main(String[] args) {
+        Map<String, List<Product>> byCategory = Stream.of(
+                new Product("P-101", "Notebook", "Stationery", 4.99, 50),
+                new Product("P-220", "Pen", "Stationery", 1.49, 200),
+                new Product("P-301", "Lego Set", "Toys", 49.99, 12),
+                new Product("P-302", "Toy Car", "Toys", 9.99, 30))
+            .collect(Collectors.groupingBy(p -> p.category));
+
+        byCategory.forEach((category, products) -> {
+            System.out.println(category + ":");
+            products.forEach(p -> System.out.println("  " + p));
+        });
+    }
+}
+```
+
+Two products land in `"Stationery"`, two in `"Toys"`. The single-argument form always groups into lists, which is the right default. When you want something other than a list (a count, a sum, the most expensive product per group), use a **downstream collector**.
+
+<h3 id="grouping-with-a-downstream-collector">
+  Grouping With a Downstream Collector
+</h3>
+
+The two-argument form `groupingBy(classifier, downstream)` runs a second collector on each group. You can count, sum, average, find the minimum, build a set, build a map, anything `Collectors` can do.
+
+```java
+import java.util.Map;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class GroupCount {
+    public static void main(String[] args) {
+        Map<String, Long> countByCategory = Stream.of(
+                new Product("P-101", "Notebook", "Stationery", 4.99, 50),
+                new Product("P-220", "Pen", "Stationery", 1.49, 200),
+                new Product("P-301", "Lego Set", "Toys", 49.99, 12),
+                new Product("P-302", "Toy Car", "Toys", 9.99, 30))
+            .collect(Collectors.groupingBy(p -> p.category, Collectors.counting()));
+
+        System.out.println(countByCategory);
+    }
+}
+```
+
+`Collectors.counting()` counts the number of elements that reached it. Combined with `groupingBy`, it produces a `Map<K, Long>` of counts per group. That's a one-line answer to "how many products in each category".
+
+The diagram shows the two-stage shape of grouped collection. The classifier routes each element to a group. The downstream collector then runs on each group independently. The final result is a map from group key to whatever the downstream produced.
+
+You can chain `groupingBy` calls to build nested maps. The downstream of one `groupingBy` can be another `groupingBy`.
+
+```java
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class NestedGrouping {
+    public static void main(String[] args) {
+        Map<String, Map<Boolean, List<Product>>> nested = Stream.of(
+                new Product("P-101", "Notebook", "Stationery", 4.99, 50),
+                new Product("P-220", "Pen", "Stationery", 1.49, 0),
+                new Product("P-301", "Lego Set", "Toys", 49.99, 12),
+                new Product("P-302", "Toy Car", "Toys", 9.99, 0))
+            .collect(Collectors.groupingBy(
+                    p -> p.category,
+                    Collectors.groupingBy(p -> p.stock > 0)));
+
+        nested.forEach((category, byInStock) -> {
+            System.out.println(category + ":");
+            byInStock.forEach((inStock, products) -> {
+                System.out.println("  inStock=" + inStock + ": " + products);
+            });
+        });
+    }
+}
+```
+
+Two levels of grouping: first by category, then by in-stock status. Each leaf is a list of products that share both keys.
+
+<h3 id="choosing-the-map-type-for-groupingby">
+  Choosing the Map Type for groupingBy
+</h3>
+
+The three-argument form `groupingBy(classifier, mapFactory, downstream)` lets you pick the outer map type. Default is `HashMap`. Pass `TreeMap::new` to sort by group key, or `LinkedHashMap::new` to preserve the first-seen order.
+
+```java
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class SortedGrouping {
+    public static void main(String[] args) {
+        Map<String, Long> countByCategorySorted = Stream.of(
+                new Product("P-101", "Notebook", "Stationery", 4.99, 50),
+                new Product("P-220", "Pen", "Stationery", 1.49, 200),
+                new Product("P-301", "Lego Set", "Toys", 49.99, 12),
+                new Product("P-001", "Apple", "Groceries", 0.79, 100))
+            .collect(Collectors.groupingBy(
+                    p -> p.category,
+                    TreeMap::new,
+                    Collectors.counting()));
+
+        System.out.println(countByCategorySorted);
+    }
+}
+```
+
+The keys come out alphabetically because the outer map is now a `TreeMap`. With the default `HashMap`, the order would be whatever the hash function happens to produce.
+
+`groupingBy(..., TreeMap::new, ...)` adds an O(log k) cost per insert (k = number of groups). For small numbers of groups this is negligible; for thousands of groups it adds up. Stick with `HashMap` unless you actually need sorted keys.
+
+<h1 id="partitioning">Partitioning</h1>
+
+`Collectors.partitioningBy(predicate)` is `groupingBy` specialized for predicates. Instead of a classifier that returns any key, it takes a `Predicate<T>` and groups elements into exactly two buckets: `true` and `false`.
+
+```java
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class PartitionInStock {
+    public static void main(String[] args) {
+        Map<Boolean, List<Product>> partitioned = Stream.of(
+                new Product("P-101", "Notebook", "Stationery", 4.99, 50),
+                new Product("P-220", "Pen", "Stationery", 1.49, 0),
+                new Product("P-301", "Lego Set", "Toys", 49.99, 12),
+                new Product("P-302", "Toy Car", "Toys", 9.99, 0))
+            .collect(Collectors.partitioningBy(p -> p.stock > 0));
+
+        System.out.println("In stock:    " + partitioned.get(true));
+        System.out.println("Out of stock: " + partitioned.get(false));
+    }
+}
+```
+
+The result is always a `Map<Boolean, List<T>>` with exactly the two keys `true` and `false`, even if one of them maps to an empty list. That's the guarantee that distinguishes `partitioningBy` from `groupingBy(p -> p.stock > 0)`.
+
+`partitioningBy` is faster than `groupingBy` on a boolean classifier because it doesn't use a `Map` internally; it uses a fixed two-slot structure. For boolean partitioning, prefer it over `groupingBy`.
+
+If `groupingBy` had been used on the same predicate and one side were empty, that key would simply be missing from the map. `partitioningBy` keeps both keys present, which is convenient when downstream code expects to find both entries.
+
+The two-argument form `partitioningBy(predicate, downstream)` accepts a downstream collector, exactly like `groupingBy`.
+
+```java
+import java.util.Map;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class PartitionWithCount {
+    public static void main(String[] args) {
+        Map<Boolean, Long> stockCounts = Stream.of(
+                new Product("P-101", "Notebook", "Stationery", 4.99, 50),
+                new Product("P-220", "Pen", "Stationery", 1.49, 0),
+                new Product("P-301", "Lego Set", "Toys", 49.99, 12),
+                new Product("P-302", "Toy Car", "Toys", 9.99, 0))
+            .collect(Collectors.partitioningBy(
+                    p -> p.stock > 0,
+                    Collectors.counting()));
+
+        System.out.println("In stock:    " + stockCounts.get(true));
+        System.out.println("Out of stock: " + stockCounts.get(false));
+    }
+}
+```
+
+A clean one-liner for "how many products are in stock versus out of stock".
+
+<h1 id="counting-summing-and-averaging">Counting, Summing, and Averaging</h1>
+
+These three are the most commonly used downstream collectors. They turn a group into a number.
+
+`Collectors.counting()` counts elements and returns a `Long`. `summingInt`, `summingLong`, `summingDouble` apply a numeric function to each element and add the results. `averagingInt`, `averagingLong`, `averagingDouble` do the same but return a `Double` average.
+
+```java
+import java.util.Map;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class GroupAggregates {
+    public static void main(String[] args) {
+        Stream<Product> products = Stream.of(
+                new Product("P-101", "Notebook", "Stationery", 4.99, 50),
+                new Product("P-220", "Pen", "Stationery", 1.49, 200),
+                new Product("P-301", "Lego Set", "Toys", 49.99, 12),
+                new Product("P-302", "Toy Car", "Toys", 9.99, 30));
+
+        Map<String, Integer> stockByCategory = products.collect(
+                Collectors.groupingBy(p -> p.category, Collectors.summingInt(p -> p.stock)));
+
+        System.out.println("Total stock per category: " + stockByCategory);
+    }
+}
+```
+
+The downstream `summingInt(p -> p.stock)` adds the `stock` field of each product in the group. Stationery has 50 + 200 = 250 units; Toys has 12 + 30 = 42 units.
+
+A single program that uses count, sum, and average together:
+
+```java
+import java.util.Map;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class CategoryStats {
+    public static void main(String[] args) {
+        Stream<Product> products = Stream.of(
+                new Product("P-101", "Notebook", "Stationery", 4.99, 50),
+                new Product("P-220", "Pen", "Stationery", 1.49, 200),
+                new Product("P-301", "Lego Set", "Toys", 49.99, 12),
+                new Product("P-302", "Toy Car", "Toys", 9.99, 30));
+
+        Map<String, Double> avgPriceByCategory = products.collect(
+                Collectors.groupingBy(p -> p.category, Collectors.averagingDouble(p -> p.price)));
+
+        System.out.println("Average price per category: " + avgPriceByCategory);
+    }
+}
+```
+
+The Toys average is `(49.99 + 9.99) / 2 = 29.99`. The Stationery average is `(4.99 + 1.49) / 2 = 3.24`.
+
+| Downstream collector        | Returns   | Use                                 |
+| --------------------------- | --------- | ----------------------------------- |
+| `counting()`                | `Long`    | How many elements per group         |
+| `summingInt(toInt)`         | `Integer` | Sum of an int-valued function       |
+| `summingLong(toLong)`       | `Long`    | Sum of a long-valued function       |
+| `summingDouble(toDouble)`   | `Double`  | Sum of a double-valued function     |
+| `averagingInt(toInt)`       | `Double`  | Average of an int-valued function   |
+| `averagingLong(toLong)`     | `Double`  | Average of a long-valued function   |
+| `averagingDouble(toDouble)` | `Double`  | Average of a double-valued function |
+
+<h1 id="finding-min-and-max-in-groups">Finding Min and Max in Groups</h1>
+
+`Collectors.minBy(Comparator)` and `Collectors.maxBy(Comparator)` find the smallest or largest element in a group. Both return an `Optional<T>` because a group might (in principle) be empty.
+
+```java
+import java.util.Comparator;
+import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class MaxByCategory {
+    public static void main(String[] args) {
+        Map<String, Optional<Product>> mostExpensivePerCategory = Stream.of(
+                new Product("P-101", "Notebook", "Stationery", 4.99, 50),
+                new Product("P-220", "Pen", "Stationery", 1.49, 200),
+                new Product("P-301", "Lego Set", "Toys", 49.99, 12),
+                new Product("P-302", "Toy Car", "Toys", 9.99, 30))
+            .collect(Collectors.groupingBy(
+                    p -> p.category,
+                    Collectors.maxBy(Comparator.comparingDouble(p -> p.price))));
+
+        mostExpensivePerCategory.forEach((category, product) ->
+            System.out.println(category + " -> " + product.orElse(null)));
+    }
+}
+```
+
+The `Optional` wrapping is annoying when you know the groups are non-empty.
+
+<h1 id="mapping-and-filtering-within-a-group">
+  Mapping and Filtering Within a Group
+</h1>
+
+Sometimes you don't want the raw elements in each group; you want some transformation of them. `Collectors.mapping(mapper, downstream)` applies a function to each element before handing it to the downstream collector.
+
+```java
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class MappingNames {
+    public static void main(String[] args) {
+        Map<String, List<String>> namesByCategory = Stream.of(
+                new Product("P-101", "Notebook", "Stationery", 4.99, 50),
+                new Product("P-220", "Pen", "Stationery", 1.49, 200),
+                new Product("P-301", "Lego Set", "Toys", 49.99, 12),
+                new Product("P-302", "Toy Car", "Toys", 9.99, 30))
+            .collect(Collectors.groupingBy(
+                    p -> p.category,
+                    Collectors.mapping(p -> p.name, Collectors.toList())));
+
+        System.out.println(namesByCategory);
+    }
+}
+```
+
+The classifier groups by category, but the downstream collector pulls the `name` out of each product before adding it to the list. Without `mapping`, you'd get a `Map<String, List<Product>>`. With `mapping`, you get a `Map<String, List<String>>`.
+
+`Collectors.filtering(predicate, downstream)` (added in Java 9) is the mirror image. It runs a predicate against each element and forwards only the ones that match.
+
+```java
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class FilteringInGroups {
+    public static void main(String[] args) {
+        Map<String, List<Product>> premiumByCategory = Stream.of(
+                new Product("P-101", "Notebook", "Stationery", 4.99, 50),
+                new Product("P-220", "Pen", "Stationery", 1.49, 200),
+                new Product("P-301", "Lego Set", "Toys", 49.99, 12),
+                new Product("P-302", "Toy Car", "Toys", 9.99, 30))
+            .collect(Collectors.groupingBy(
+                    p -> p.category,
+                    Collectors.filtering(p -> p.price >= 10, Collectors.toList())));
+
+        System.out.println(premiumByCategory);
+    }
+}
+```
+
+Note that `Stationery` is still in the result map, with an empty list. That's the important distinction from filtering the stream upfront with `.filter`. If you'd filtered before grouping, the entire `Stationery` group would have vanished because no Stationery product passes the predicate. `Collectors.filtering` keeps the group, drops only the non-matching elements.
+
+<h1 id="reducing-within-a-group">Reducing Within a Group</h1>
+
+`Collectors.reducing` is the most general downstream. It works like `Stream.reduce` but as a collector. There are three overloads:
+
+- `reducing(BinaryOperator<T>)` returns `Optional<T>`.
+- `reducing(T identity, BinaryOperator<T>)` returns `T`.
+- `reducing(U identity, Function<T, U> mapper, BinaryOperator<U>)` returns `U`.
+
+```java
+import java.util.Map;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class ReducingTotal {
+    public static void main(String[] args) {
+        Map<String, Double> revenuePerCategory = Stream.of(
+                new Product("P-101", "Notebook", "Stationery", 4.99, 50),
+                new Product("P-220", "Pen", "Stationery", 1.49, 200),
+                new Product("P-301", "Lego Set", "Toys", 49.99, 12),
+                new Product("P-302", "Toy Car", "Toys", 9.99, 30))
+            .collect(Collectors.groupingBy(
+                    p -> p.category,
+                    Collectors.reducing(0.0, p -> p.price * p.stock, Double::sum)));
+
+        System.out.println("Revenue per category: " + revenuePerCategory);
+    }
+}
+```
+
+The three-argument `reducing` takes an identity (`0.0`), a mapper (price \* stock), and a binary operator (`Double::sum`). It's essentially a generalized `summingDouble`, but it can produce non-numeric results too (concatenate strings, build a custom object, anything associative).
+
+For straight numeric sums, prefer `summingInt/Long/Double` because they're clearer at the call site. Use `reducing` when the operation isn't a sum or an average.
+
+<h1 id="collectingandthen-post-processing">
+  collectingAndThen: Post-Processing
+</h1>
+
+`Collectors.collectingAndThen(downstream, finisher)` wraps another collector and runs a function on the result. The most common use is making a collected list unmodifiable.
+
+```java
+import java.util.Collections;
+import java.util.List;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class UnmodifiableViaCollectingAndThen {
+    public static void main(String[] args) {
+        List<String> products = Stream.of("Notebook", "Pen", "Eraser")
+                .collect(Collectors.collectingAndThen(
+                        Collectors.toList(),
+                        Collections::unmodifiableList));
+
+        System.out.println(products);
+
+        try {
+            products.add("Marker");
+        } catch (UnsupportedOperationException e) {
+            System.out.println("Cannot modify: " + e.getClass().getSimpleName());
+        }
+    }
+}
+```
+
+The list is built mutably by `toList()`, then wrapped by `Collections::unmodifiableList` in the finisher step. Since Java 10, `Collectors.toUnmodifiableList()` does the same job more directly, but the pattern is still useful when you need to wrap something with no dedicated factory.
+
+The other classic use is stripping `Optional` off the result of `maxBy` / `minBy`:
+
+```java
+import java.util.Comparator;
+import java.util.Map;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class MaxByWithoutOptional {
+    public static void main(String[] args) {
+        Map<String, Product> mostExpensivePerCategory = Stream.of(
+                new Product("P-101", "Notebook", "Stationery", 4.99, 50),
+                new Product("P-220", "Pen", "Stationery", 1.49, 200),
+                new Product("P-301", "Lego Set", "Toys", 49.99, 12),
+                new Product("P-302", "Toy Car", "Toys", 9.99, 30))
+            .collect(Collectors.groupingBy(
+                    p -> p.category,
+                    Collectors.collectingAndThen(
+                            Collectors.maxBy(Comparator.comparingDouble(p -> p.price)),
+                            opt -> opt.orElse(null))));
+
+        System.out.println(mostExpensivePerCategory);
+    }
+}
+```
+
+The downstream `maxBy` returns `Optional<Product>` for each group. The finisher (`opt -> opt.orElse(null)`) unwraps the `Optional`. Since `groupingBy` never produces an empty group (a group only exists if at least one element classified into it), the `Optional` is always non-empty and the unwrap is safe.
+
+<h1 id="joining-strings">Joining Strings</h1>
+
+`Collectors.joining` concatenates string elements into one big string. It has three overloads:
+
+- `joining()`: no separator.
+- `joining(CharSequence delimiter)`: separator between elements.
+- `joining(CharSequence delimiter, CharSequence prefix, CharSequence suffix)`: separator plus prefix and suffix.
+
+```java
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class JoiningDemo {
+    public static void main(String[] args) {
+        String allNames = Stream.of("Notebook", "Pen", "Eraser")
+                .collect(Collectors.joining());
+
+        String csvNames = Stream.of("Notebook", "Pen", "Eraser")
+                .collect(Collectors.joining(", "));
+
+        String formatted = Stream.of("Notebook", "Pen", "Eraser")
+                .collect(Collectors.joining(", ", "[", "]"));
+
+        System.out.println(allNames);
+        System.out.println(csvNames);
+        System.out.println(formatted);
+    }
+}
+```
+
+`joining` only works on `Stream<? extends CharSequence>`. If you have a stream of products, you'll need a `.map(p -> p.name)` first (or use `Collectors.mapping(p -> p.name, joining(", "))` as a downstream).
+
+A common use case: build a comma-separated list of product names per category.
+
+```java
+import java.util.Map;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class JoinNamesPerCategory {
+    public static void main(String[] args) {
+        Map<String, String> namesByCategory = Stream.of(
+                new Product("P-101", "Notebook", "Stationery", 4.99, 50),
+                new Product("P-220", "Pen", "Stationery", 1.49, 200),
+                new Product("P-301", "Lego Set", "Toys", 49.99, 12),
+                new Product("P-302", "Toy Car", "Toys", 9.99, 30))
+            .collect(Collectors.groupingBy(
+                    p -> p.category,
+                    Collectors.mapping(p -> p.name, Collectors.joining(", "))));
+
+        namesByCategory.forEach((category, names) -> System.out.println(category + ": " + names));
+    }
+}
+```
+
+The `mapping` downstream pulls names out of each product, and the `joining` collector glues them together with commas. Useful for printing summary lines, building log messages, or generating quick CSV-style output.
+
+`joining` uses a `StringBuilder` internally, so it's O(n) in the total character count. Don't do `stream.reduce("", String::concat)` for the same job; that's O(n^2) because each concatenation allocates a new string.
+
+<h1 id="summary-statistics">Summary Statistics</h1>
+
+When you want count, sum, min, max, and average all at once, the dedicated factories beat running separate collectors. `Collectors.summarizingInt`, `summarizingLong`, and `summarizingDouble` produce a single object holding all five statistics computed in one pass.
+
+```java
+import java.util.DoubleSummaryStatistics;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class PriceStats {
+    public static void main(String[] args) {
+        DoubleSummaryStatistics stats = Stream.of(
+                new Product("P-101", "Notebook", "Stationery", 4.99, 50),
+                new Product("P-220", "Pen", "Stationery", 1.49, 200),
+                new Product("P-301", "Lego Set", "Toys", 49.99, 12),
+                new Product("P-302", "Toy Car", "Toys", 9.99, 30))
+            .collect(Collectors.summarizingDouble(p -> p.price));
+
+        System.out.println("Count:   " + stats.getCount());
+        System.out.println("Sum:     " + stats.getSum());
+        System.out.println("Min:     " + stats.getMin());
+        System.out.println("Max:     " + stats.getMax());
+        System.out.println("Average: " + stats.getAverage());
+    }
+}
+```
+
+One traversal through the stream produces all five numbers. If you'd used `count`, `sum`, `min`, `max`, and `average` as separate operations, you'd traverse the data five times (or you'd need to collect into a list first and reuse it).
+
+`summarizingInt` and `summarizingLong` work the same way but return `IntSummaryStatistics` and `LongSummaryStatistics`. Use them when the field is naturally an int or long (stock counts, view counts, order counts).
+
+You can also use these as downstream collectors to get one summary per group:
+
+```java
+import java.util.DoubleSummaryStatistics;
+import java.util.Map;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class StatsPerCategory {
+    public static void main(String[] args) {
+        Map<String, DoubleSummaryStatistics> statsByCategory = Stream.of(
+                new Product("P-101", "Notebook", "Stationery", 4.99, 50),
+                new Product("P-220", "Pen", "Stationery", 1.49, 200),
+                new Product("P-301", "Lego Set", "Toys", 49.99, 12),
+                new Product("P-302", "Toy Car", "Toys", 9.99, 30))
+            .collect(Collectors.groupingBy(
+                    p -> p.category,
+                    Collectors.summarizingDouble(p -> p.price)));
+
+        statsByCategory.forEach((category, stats) -> {
+            System.out.println(category + ":");
+            System.out.println("  count=" + stats.getCount() + " min=" + stats.getMin()
+                    + " max=" + stats.getMax() + " avg=" + stats.getAverage());
+        });
+    }
+}
+```
+
+For each category, the collector emits a complete `DoubleSummaryStatistics`. Reports, dashboards, and any "give me everything about this group" use case become one-liners.
+
+<h1 id="teeing-two-collectors-in-one-pass">
+  teeing: Two Collectors in One Pass
+</h1>
+
+`Collectors.teeing(downstream1, downstream2, merger)` was added in Java 12 and is the answer to "I want two different summaries from the same stream without iterating twice". It runs two downstream collectors in parallel and then combines their results with a merger function.
+
+An example: compute total revenue and average price in a single pass.
+
+```java
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+class RevenueReport {
+    double totalRevenue;
+    double averagePrice;
+
+    RevenueReport(double totalRevenue, double averagePrice) {
+        this.totalRevenue = totalRevenue;
+        this.averagePrice = averagePrice;
+    }
+
+    @Override
+    public String toString() {
+        return "RevenueReport{totalRevenue=" + totalRevenue + ", averagePrice=" + averagePrice + "}";
+    }
+}
+
+public class TeeingDemo {
+    public static void main(String[] args) {
+        RevenueReport report = Stream.of(
+                new Product("P-101", "Notebook", "Stationery", 4.99, 50),
+                new Product("P-220", "Pen", "Stationery", 1.49, 200),
+                new Product("P-301", "Lego Set", "Toys", 49.99, 12),
+                new Product("P-302", "Toy Car", "Toys", 9.99, 30))
+            .collect(Collectors.teeing(
+                    Collectors.summingDouble(p -> p.price * p.stock),
+                    Collectors.averagingDouble(p -> p.price),
+                    RevenueReport::new));
+
+        System.out.println(report);
+    }
+}
+```
+
+One traversal, two answers. The first downstream (`summingDouble`) computes total revenue (price \* stock per product, summed). The second downstream (`averagingDouble`) computes the average product price. The merger (`RevenueReport::new`) takes the two numbers and packages them.
+
+`teeing` also pairs well with `partitioningBy` to compute aggregates over both buckets in one pass:
+
+```java
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class TeeingMinMax {
+    public static void main(String[] args) {
+        record PriceRange(double cheapest, double mostExpensive) {}
+
+        PriceRange range = Stream.of(
+                new Product("P-101", "Notebook", "Stationery", 4.99, 50),
+                new Product("P-220", "Pen", "Stationery", 1.49, 200),
+                new Product("P-301", "Lego Set", "Toys", 49.99, 12),
+                new Product("P-302", "Toy Car", "Toys", 9.99, 30))
+            .collect(Collectors.teeing(
+                    Collectors.minBy((a, b) -> Double.compare(a.price, b.price)),
+                    Collectors.maxBy((a, b) -> Double.compare(a.price, b.price)),
+                    (min, max) -> new PriceRange(min.get().price, max.get().price)));
+
+        System.out.println(range);
+    }
+}
+```
+
+Two scans worth of work, one scan of cost. The merger takes the two `Optional<Product>` values and builds a clean record.
+
+<h1 id="full-reference-table">Full Reference Table</h1>
+
+A consolidated view of the `Collectors` factories:
+
+| Factory                                                       | Returns                 | Use                                        |
+| ------------------------------------------------------------- | ----------------------- | ------------------------------------------ |
+| `toList()`                                                    | mutable `List<T>`       | Default list collection                    |
+| `toUnmodifiableList()`                                        | immutable `List<T>`     | Read-only result, no nulls                 |
+| `toSet()`                                                     | mutable `Set<T>`        | Deduplicate                                |
+| `toUnmodifiableSet()`                                         | immutable `Set<T>`      | Read-only set, no nulls                    |
+| `toCollection(supplier)`                                      | any `Collection`        | Pick exact collection type                 |
+| `toMap(k, v)`                                                 | `Map<K, V>`             | Lookup table; throws on duplicate keys     |
+| `toMap(k, v, merge)`                                          | `Map<K, V>`             | Lookup table with collision handling       |
+| `toMap(k, v, merge, mapSupplier)`                             | `Map<K, V>`             | Pick map type (`LinkedHashMap`, `TreeMap`) |
+| `toUnmodifiableMap(k, v[, merge])`                            | immutable `Map<K, V>`   | Read-only map, no nulls                    |
+| `groupingBy(classifier)`                                      | `Map<K, List<T>>`       | Group by key into lists                    |
+| `groupingBy(classifier, downstream)`                          | `Map<K, D>`             | Group then reduce each group               |
+| `groupingBy(classifier, mapSupplier, downstream)`             | `Map<K, D>`             | Group with chosen map type                 |
+| `partitioningBy(predicate)`                                   | `Map<Boolean, List<T>>` | Split into two groups                      |
+| `partitioningBy(predicate, downstream)`                       | `Map<Boolean, D>`       | Split then reduce each side                |
+| `counting()`                                                  | `Long`                  | Number of elements                         |
+| `summingInt/Long/Double(toN)`                                 | `Integer/Long/Double`   | Sum of mapped values                       |
+| `averagingInt/Long/Double(toN)`                               | `Double`                | Average of mapped values                   |
+| `minBy(comparator)`                                           | `Optional<T>`           | Smallest element                           |
+| `maxBy(comparator)`                                           | `Optional<T>`           | Largest element                            |
+| `reducing(...)`                                               | varies                  | Custom associative reduction               |
+| `mapping(mapper, downstream)`                                 | depends on downstream   | Transform before collecting                |
+| `filtering(predicate, downstream)`                            | depends on downstream   | Filter without dropping empty groups       |
+| `collectingAndThen(downstream, finisher)`                     | result of finisher      | Post-process collected result              |
+| `joining()` / `joining(sep)` / `joining(sep, prefix, suffix)` | `String`                | Concatenate CharSequence elements          |
+| `summarizingInt/Long/Double(toN)`                             | `*SummaryStatistics`    | count, sum, min, max, average in one pass  |
+| `teeing(d1, d2, merger)`                                      | result of merger        | Two collectors, one pass                   |
+
+<h1 id="putting-it-together">Putting It Together</h1>
+
+A small report program that exercises most of these collectors. Group products by category, count them per group, sum their revenue, find the most expensive in each category, and produce a one-line summary string.
+
+```java
+import java.util.Comparator;
+import java.util.DoubleSummaryStatistics;
+import java.util.Map;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class CatalogReport {
+    public static void main(String[] args) {
+        Stream<Product> catalog = Stream.of(
+                new Product("P-101", "Notebook", "Stationery", 4.99, 50),
+                new Product("P-220", "Pen", "Stationery", 1.49, 200),
+                new Product("P-301", "Lego Set", "Toys", 49.99, 12),
+                new Product("P-302", "Toy Car", "Toys", 9.99, 30),
+                new Product("P-001", "Apple", "Groceries", 0.79, 100));
+
+        Map<String, String> reportPerCategory = catalog.collect(
+                Collectors.groupingBy(
+                        p -> p.category,
+                        Collectors.collectingAndThen(
+                                Collectors.toList(),
+                                products -> {
+                                    DoubleSummaryStatistics stats = products.stream()
+                                            .collect(Collectors.summarizingDouble(p -> p.price));
+                                    Product mostExpensive = products.stream()
+                                            .max(Comparator.comparingDouble(p -> p.price))
+                                            .orElseThrow();
+                                    return "count=" + stats.getCount()
+                                            + ", avgPrice=" + stats.getAverage()
+                                            + ", mostExpensive=" + mostExpensive.name;
+                                })));
+
+        reportPerCategory.forEach((category, report) ->
+                System.out.println(category + " -> " + report));
+    }
+}
+```
+
+`groupingBy` splits the products by category. `collectingAndThen` runs a custom finisher on each group's list: compute summary statistics, find the most expensive product, and assemble a string. The result is a `Map<String, String>` ready to print or log.
+
+There's another way to write this with `teeing`, which avoids the inner streams:
+
+```java
+import java.util.Comparator;
+import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class CatalogReportTeeing {
+    public static void main(String[] args) {
+        record CategorySummary(long count, double avgPrice, Optional<Product> mostExpensive) {
+            @Override
+            public String toString() {
+                return "count=" + count + ", avgPrice=" + avgPrice
+                        + ", mostExpensive=" + mostExpensive.map(p -> p.name).orElse("none");
+            }
+        }
+
+        Map<String, CategorySummary> summary = Stream.of(
+                new Product("P-101", "Notebook", "Stationery", 4.99, 50),
+                new Product("P-220", "Pen", "Stationery", 1.49, 200),
+                new Product("P-301", "Lego Set", "Toys", 49.99, 12),
+                new Product("P-302", "Toy Car", "Toys", 9.99, 30),
+                new Product("P-001", "Apple", "Groceries", 0.79, 100))
+            .collect(Collectors.groupingBy(
+                    p -> p.category,
+                    Collectors.teeing(
+                            Collectors.counting(),
+                            Collectors.teeing(
+                                    Collectors.averagingDouble(p -> p.price),
+                                    Collectors.maxBy(Comparator.comparingDouble(p -> p.price)),
+                                    (avg, max) -> new double[]{avg, 0}),
+                            (count, ignored) -> new CategorySummary(count, ignored[0], Optional.empty()))));
+
+        summary.forEach((category, s) -> System.out.println(category + " -> " + s));
+    }
+}
+```
+
+That nested `teeing` is uglier than the `collectingAndThen` version. `teeing` works best when you want exactly two summaries; once you need three or more pieces, collecting to a list and computing them with a small finisher is often clearer.
+
+`Collectors` has more than one way to express most reductions. Pick the form that reads clearly for the problem at hand.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,940 @@
+---
+title: "Networking Deep Dive"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Networking explained with clear examples, visuals, and practice questions in Mindflare's System Design Interviews course."
+---
+
+<LessonCard>
+
+<h4 id="why-7-layers">Why 7 layers?</h4>
+
+Each layer abstracts complexity from the layers above it.
+
+When you write an HTTP request, you do not think about packet routing or electrical signals. The layers below handle those concerns, while the application layer focuses on request semantics.
+
+More importantly, understanding layers helps you debug problems. If your service cannot reach a database, is it name resolution, a firewall blocking the port, a TLS handshake failure, or a routing problem?
+
+Knowing the stack helps you ask the right questions.
+
+<h3 id="12-the-tcpip-model">1.2 The TCP/IP Model</h3>
+
+The OSI model is a teaching tool. The TCP/IP model maps more directly to how the internet is implemented. It combines several OSI concepts into fewer practical layers.
+
+| TCP/IP Layer   | OSI Layers | Protocols                   |
+| -------------- | ---------- | --------------------------- |
+| Application    | 7, 6, 5    | HTTP, HTTPS, DNS, FTP, SMTP |
+| Transport      | 4          | TCP, UDP                    |
+| Internet       | 3          | IP, ICMP                    |
+| Network Access | 2, 1       | Ethernet, WiFi, PPP         |
+
+<h3 id="13-data-encapsulation">1.3 Data Encapsulation</h3>
+
+When your application sends data, it does not go directly onto the wire. Each layer adds the metadata it needs, such as ports, IP addresses, and link-layer framing. This is encapsulation.
+
+<h1 id="2-ip-addressing-and-routing">2. IP Addressing and Routing</h1>
+
+Every device that communicates at the IP layer needs an address. IP addresses identify where packets should be delivered.
+
+<h3 id="21-ipv4-vs-ipv6">2.1 IPv4 vs IPv6</h3>
+
+When the internet was designed in the 1980s, 4.3 billion addresses seemed like plenty. With smartphones, IoT devices, and cloud services, we ran out of IPv4 addresses years ago.
+
+**IPv4** uses 32-bit addresses like `192.168.1.1`. These addresses are scarce, so we resort to tricks like NAT (Network Address Translation) to share them.
+
+**IPv6** solves this with 128-bit addresses like `2001:db8::1`. The address space is enormous, which reduces the need for address sharing through NAT. Adoption is uneven: common in mobile and some cloud networks, but many internal systems still use IPv4.
+
+```python
+IPv4: 192.168.1.1        (4 octets, 32 bits)
+IPv6: 2001:db8::1        (8 groups, 128 bits, :: compresses zeros)
+```
+
+For many interview designs, IPv4 is still the default assumption. Mention IPv6 when discussing mobile networks, dual-stack public endpoints, very large address spaces, or environments where NAT avoidance matters.
+
+<h3 id="22-public-vs-private-ip-addresses">
+  2.2 Public vs Private IP Addresses
+</h3>
+
+Some addresses work only within private networks. Others are routable across the public internet.
+
+Database servers should usually have private addresses and no direct inbound route from the public internet. A public load balancer or edge proxy receives user traffic and forwards it to private application tiers. Getting this wrong creates either security exposure or connectivity problems.
+
+| Range           | Type               | Use                                  |
+| --------------- | ------------------ | ------------------------------------ |
+| 10.0.0.0/8      | Private            | Large organizations                  |
+| 172.16.0.0/12   | Private            | Medium networks                      |
+| 192.168.0.0/16  | Private            | Home/small office                    |
+| Everything else | Public or reserved | Check the relevant RFC/provider docs |
+
+**NAT (Network Address Translation)** allows multiple devices with private IPs to share a single public IP. Your home router performs NAT.
+
+<h3 id="23-subnetting-and-cidr">2.3 Subnetting and CIDR</h3>
+
+When you design a system on AWS, GCP, or any cloud provider, one of the first decisions is how to carve up your network. CIDR notation helps you specify IP ranges concisely.
+
+The notation `192.168.1.0/24` means "the first 24 bits are the network, the remaining 8 bits are for hosts." In classic IPv4 subnetting, that gives 256 addresses, with 254 usable because one is the network address and one is broadcast. Cloud providers may reserve additional addresses in each subnet.
+
+```python
+192.168.1.0/24
+└── Network: 192.168.1.0
+└── Hosts: 192.168.1.1 - 192.168.1.254
+└── Broadcast: 192.168.1.255
+└── Available: 254 hosts
+```
+
+The smaller the number after the slash, the larger the network:
+
+| CIDR | Subnet Mask | Hosts | Use Case |
+| /8 | 255.0.0.0 | 16.7M | Large cloud providers |
+| /16 | 255.255.0.0 | 65,534 | VPCs, large networks |
+| /24 | 255.255.255.0 | 254 | Typical subnets |
+| /28 | 255.255.255.240 | 14 | Small subnets |
+| /32 | 255.255.255.255 | 1 | Single host |
+
+<h4 id="why-bother-with-subnets">Why bother with subnets?</h4>
+
+Subnets let you segment your network for security and control. A typical production setup might look like this:
+
+The public subnet holds your load balancer, which has a public IP. The private subnet holds your application servers, which are not directly reachable from the internet.
+
+The data subnet holds your database, isolated from direct internet access and reachable only from approved application tiers. Subnets are not a security boundary by themselves; enforce the boundary with security groups, firewall rules, network ACLs, and identity-aware controls where available.
+
+<h3 id="24-how-routing-works">2.4 How Routing Works</h3>
+
+IP addresses tell us where to send data, but they do not tell us how to get there. That is the job of routing. Every router along the path looks at the destination IP and decides which direction to forward the packet.
+
+Every router has a routing table that maps destination networks to next hops:
+
+```python
+Destination     Gateway         Interface   Notes
+0.0.0.0/0       192.168.1.1     eth0        Default route (everything else)
+10.0.0.0/8      10.0.0.1        eth1        Internal network
+192.168.1.0/24  0.0.0.0         eth0        Directly connected
+```
+
+The router checks each destination against its table, finds the most specific match (longest prefix), and forwards the packet. If no specific route matches, it uses the default route (`0.0.0.0/0`).
+
+Packets may take different paths across the internet, even within the same connection. Routers make independent decisions, and conditions change. This is why TCP needs sequence numbers to reassemble data in order.
+
+> Network topology affects latency. Services in the same availability zone are usually much faster than cross-region calls. Cross-region traffic commonly adds tens of milliseconds. If two services talk frequently, keep them close or reduce the number of synchronous round trips.
+
+<h1 id="3-tcp-deep-dive">3. TCP Deep Dive</h1>
+
+TCP is the default transport for many systems. Most HTTP/1.1 and HTTP/2 traffic, database connections, and many service-to-service calls run over TCP. It handles packet loss, reordering, and corruption detection to present a reliable ordered byte stream to the application.
+
+<h3 id="31-tcp-connection-lifecycle">3.1 TCP Connection Lifecycle</h3>
+
+Before sending data, TCP establishes a connection. This takes a round trip, which is why connection reuse matters at scale.
+
+The handshake accomplishes two things: verify that both sides can send and receive, and agree on initial sequence numbers.
+
+1. **SYN:** Client picks a random sequence number (say, 1000) and sends it. "I want to connect, starting at sequence 1000."
+2. **SYN-ACK:** Server picks its own sequence number (say, 5000) and acknowledges the client's. "Got it, I am starting at 5000, and I acknowledge your 1000."
+3. **ACK:** Client acknowledges the server's sequence number. "Got your 5000, we are ready."
+
+**Why random sequence numbers? **
+
+If they were predictable, an attacker could more easily inject fake packets into a connection. Random initial sequence numbers make this harder.
+
+**Why not two steps? **
+
+With only two steps, the server would not know if the client received its response. Old, delayed SYN packets could trick the server into allocating resources for connections that will never complete.
+
+<h3 id="32-tcp-header-structure">3.2 TCP Header Structure</h3>
+
+The TCP header is at least 20 bytes long, laid out as a series of 32-bit words. Each row below is one word, and the fields inside it sit side by side from bit 0 to bit 31.
+
+**Key fields:**
+
+| Field | Purpose |
+| Source/Dest Port | Identify application endpoints |
+| Sequence Number | Order bytes in the stream |
+| Acknowledgment | Confirm received bytes |
+| Flags (SYN, ACK, FIN) | Control connection state |
+| Window | Flow control (how much data sender can send) |
+| Checksum | Error detection |
+
+<h3 id="33-reliability-mechanisms">3.3 Reliability Mechanisms</h3>
+
+IP is unreliable. Packets can get lost, duplicated, corrupted, or arrive out of order. TCP adds reliability on top of IP through four mechanisms that work together.
+
+<h4 id="1-acknowledgments-and-retransmission">
+  1. Acknowledgments and Retransmission
+</h4>
+
+TCP acknowledges received byte ranges. When the sender does not receive progress within a timeout, or sees duplicate ACKs that imply a gap, it retransmits data.
+
+<h4 id="2-sequence-numbers">2. Sequence Numbers</h4>
+
+Each byte in the stream has a sequence number. If packet 3 arrives before packet 2, the receiver holds packet 3 until packet 2 shows up, then delivers both in order. If the same packet arrives twice (a retransmission that was not needed), the receiver ignores the duplicate.
+
+<h4 id="3-checksums">3. Checksums</h4>
+
+Every TCP segment includes a checksum computed over a pseudo-header, TCP header, and data. If the receiver's checksum does not match, TCP discards the segment. The sender retransmits if acknowledgments do not advance.
+
+<h4 id="4-sliding-window">4. Sliding Window</h4>
+
+Waiting for an ACK after every packet is slow, especially over high-latency links. The sliding window lets the sender have multiple packets "in flight" simultaneously.
+
+<h3 id="34-flow-control">3.4 Flow Control</h3>
+
+What happens if the sender transmits faster than the receiver can process? TCP flow control prevents overwhelming the receiver by having the receiver advertise how much buffered data it can accept.
+
+This back-pressure mechanism is automatic at the transport layer. Your application writes to the socket, and TCP paces delivery based on the receiver window. But if the receiver is consistently slower than the sender, the application still needs queues, backpressure, shedding, or a different data flow.
+
+<h4 id="window-scaling-for-modern-networks">
+  Window Scaling for Modern Networks
+</h4>
+
+The original TCP header has a 16-bit window field, limiting it to 64KB. On a 1 Gbps link with 100ms RTT, the bandwidth-delay product is about 12.5MB, so a 64KB window cannot fill the pipe. Modern TCP uses a window scaling option negotiated during the handshake to support much larger windows.
+
+<h3 id="35-congestion-control">3.5 Congestion Control</h3>
+
+Flow control prevents overwhelming the receiver. Congestion control prevents overwhelming the network.
+
+Consider a router in the middle of the internet handling traffic from thousands of connections. If everyone sends as fast as possible, the router's queues overflow, packets get dropped, and everyone's performance suffers. TCP detects congestion and reduces its sending rate to avoid making the problem worse.
+
+**Slow Start:** A new connection does not know how much bandwidth is available. It starts with a small congestion window (typically 10 segments) and doubles every round trip. This exponential growth quickly finds the available capacity.
+
+**Congestion Avoidance:** Once the window hits a threshold (or after recovering from loss), growth becomes linear. Add one segment per RTT. This cautious probing avoids triggering congestion.
+
+**Fast Recovery:** If the sender receives three duplicate ACKs (same acknowledgment number three times), it means a packet was lost but subsequent packets arrived. The sender retransmits immediately and halves its window, rather than starting over.
+
+**Timeout:** If acknowledgments stop arriving long enough, the sender assumes significant loss or path trouble and reduces its sending rate sharply.
+
+| Situation      | What Happens         | Impact                  |
+| -------------- | -------------------- | ----------------------- |
+| New connection | Slow start           | First few RTTs are slow |
+| Stable network | Congestion avoidance | Gradual optimization    |
+| Minor loss     | Fast recovery        | Brief slowdown          |
+| Major loss     | Timeout reset        | Significant slowdown    |
+
+New TCP connections start slow. On a high-latency link (100ms RTT), it takes several round trips just to ramp up to full speed. If your system makes many short-lived connections, most of the time is spent in slow start, never reaching peak throughput.
+
+This is why connection reuse matters. **HTTP keep-alive** keeps a TCP connection open after a response so the next request on the same connection skips the handshake and the slow-start ramp. **Connection pooling** takes this further: a client or server holds a set of warm, already-established connections and hands them out as requests arrive, instead of opening a new one each time. Database clients almost always pool connections for this reason, and HTTP/2 multiplexing and gRPC streaming reuse a single connection for many logical requests. The shared idea is to pay the setup cost once and amortize it across many requests.
+
+<h4 id="modern-congestion-control-algorithms">
+  Modern Congestion Control Algorithms
+</h4>
+
+The classic algorithms (Reno, New Reno) use packet loss as the signal of congestion. Modern algorithms are smarter:
+
+| Algorithm | Approach                               | Best For                                 |
+| --------- | -------------------------------------- | ---------------------------------------- |
+| CUBIC     | Aggressive after loss recovery         | Linux default, high bandwidth            |
+| BBR       | Estimates bottleneck bandwidth and RTT | Variable networks, high-throughput paths |
+| Vegas     | Detects congestion before loss         | Low-latency applications                 |
+
+<h3 id="36-tcp-tuning-parameters">3.6 TCP Tuning Parameters</h3>
+
+You rarely need to tune TCP, but when you do, these are the parameters that matter:
+
+```text
+# Linux kernel parameters (sysctl)
+net.core.somaxconn = 4096          # Max pending connections
+net.ipv4.tcp_max_syn_backlog = 4096 # SYN queue before accept()
+net.ipv4.tcp_fin_timeout = 30       # How long to wait in FIN-WAIT-2
+net.ipv4.tcp_keepalive_time = 300   # Seconds before sending keepalive
+net.ipv4.tcp_tw_reuse = 1           # Reuse sockets in TIME-WAIT
+net.core.rmem_max = 16777216        # Max receive buffer (16MB)
+net.core.wmem_max = 16777216        # Max send buffer (16MB)
+```
+
+<h4 id="when-you-hit-tcp-limits">When You Hit TCP Limits</h4>
+
+| Symptom                         | Likely Cause                       | Fix                                                                                          |
+| ------------------------------- | ---------------------------------- | -------------------------------------------------------------------------------------------- |
+| "Connection refused" under load | Listen queue full                  | Increase `somaxconn`                                                                         |
+| Thousands of TIME-WAIT sockets  | Many short connections             | Prefer connection pooling/keep-alive; tune kernel settings only with care                    |
+| Slow bulk transfers             | Small buffers on high-latency link | Increase buffer sizes                                                                        |
+| High latency for first request  | TCP + TLS handshakes               | Reuse connections; consider TLS resumption, HTTP/2, HTTP/3, or TCP Fast Open where supported |
+| Connections dropping after idle | Firewall killing idle connections  | Tune keepalive or use application-level pings                                                |
+
+<h1 id="4-udp-and-when-to-use-it">4. UDP and When to Use It</h1>
+
+TCP does a lot of work: connection setup, reliability, ordering, flow control, congestion control. That work takes time and bandwidth. Sometimes you do not need it. That is where UDP comes in.
+
+UDP strips away all the complexity. It takes your data, adds source and destination ports, and sends it. No handshakes, no acknowledgments, no retransmissions. If a packet is lost, UDP does not detect or resend it. If packets arrive out of order, UDP delivers them in that order.
+
+<h3 id="41-udp-vs-tcp">4.1 UDP vs TCP</h3>
+
+The trade-off is fundamental: reliability versus latency.
+
+| Aspect | TCP | UDP |
+| Connection | Required handshake | None |
+| Reliability| Guaranteed delivery | Best effort |
+| Ordering | Maintained | Not guaranteed |
+| Header size| 20-60 bytes | 8 bytes |
+| Use cases | HTTP, databases, file transfer | DNS, video streaming, gaming |
+
+<h3 id="42-udp-header">4.2 UDP Header</h3>
+
+UDP's minimal design is visible in its wire format: the entire header is just four 2-byte fields, carrying source port, destination port, total length, and an optional checksum.
+
+```text
+0      7 8     15 16    23 24    31
++--------+--------+--------+--------+
+|     Source      |   Destination   |
+|      Port       |      Port       |
++--------+--------+--------+--------+
+|     Length      |    Checksum     |
++--------+--------+--------+--------+
+|          data octets ...          |
++-----------------------------------+
+```
+
+The header is 8 bytes. No sequence numbers, no acknowledgments, no connection state.
+
+<h3 id="43-when-to-use-udp">4.3 When to Use UDP</h3>
+
+The question is not "is reliability important?" but rather "who should handle reliability?"
+
+**DNS:** A DNS query is tiny (a few hundred bytes) and expects a quick response. If the response does not arrive in 2 seconds, the client asks again. TCP's handshake would take longer than the actual query. UDP fits perfectly.
+
+**Video Streaming:** When you are watching a video, a lost frame causes a brief glitch but is tolerable. Waiting to retransmit it is worse because now multiple frames are stale. The video player interpolates or shows a brief glitch and moves on. UDP with application-level buffering works better than TCP here.
+
+**Online Gaming:** In a multiplayer game, you send player position 60 times per second. If packet 42 is lost but packet 43 arrives, you do not want the old position. You want the latest state. TCP would deliver packet 42 first, adding latency and giving you outdated information.
+
+**Voice/Video Calls:** Similar to gaming. A brief audio glitch is better than a half-second delay while TCP retransmits, and listeners can usually follow speech through small gaps.
+
+**IoT Sensors:** A temperature sensor sending readings every second does not need guaranteed delivery. If one reading is lost, the next one arrives in a second anyway. UDP keeps the protocol stack minimal for constrained devices.
+
+<h3 id="44-building-reliability-on-udp">4.4 Building Reliability on UDP</h3>
+
+Sometimes you want UDP's speed but need reliability for certain messages. The solution is to implement reliability at the application layer, but only where you need it.
+
+<h4 id="quic-http3">QUIC (HTTP/3)</h4>
+
+QUIC is the most widely deployed example of this idea. It runs over UDP but implements reliability, congestion control, encryption, and stream multiplexing in user space. The HTTP/3 section covers how it works in detail.
+
+<h4 id="game-networking">Game Networking</h4>
+
+A game might have three types of messages:
+
+1. **Unreliable:** Player position (60 times/second, old data is useless)
+2. **Reliable unordered:** Chat messages (must arrive, order does not matter)
+3. **Reliable ordered:** Game state changes (must arrive in order)
+
+The game protocol uses UDP underneath but tracks sequence numbers and acknowledgments only for the reliable messages.
+
+<h1 id="5-dns-the-internets-directory">5. DNS: The Internet's Directory</h1>
+
+Humans remember names. Computers need numbers. DNS bridges this gap, translating `google.com` into `142.250.80.46`.
+
+DNS is easy to overlook because it usually works. Most web requests, API calls, and email delivery paths depend on DNS. Slow DNS adds latency before the application even sees traffic; broken DNS can make a healthy service unreachable.
+
+<h3 id="51-dns-hierarchy">5.1 DNS Hierarchy</h3>
+
+DNS is a hierarchical, distributed system spread across millions of servers worldwide, not one central database.
+
+When you look up [`www.google.com`](https://www.google.com), the query flows from your browser through multiple servers:
+
+This looks slow, but caching makes it fast. Most queries hit a cache at some level and return immediately. A full recursive lookup only happens when no cached answer exists.
+
+<h3 id="52-dns-record-types">5.2 DNS Record Types</h3>
+
+| Record | Purpose                 | Example                                |
+| ------ | ----------------------- | -------------------------------------- |
+| A      | Domain to IPv4          | google.com -> 142.250.80.46            |
+| AAAA   | Domain to IPv6          | google.com -> 2607:f8b0:4004:800::200e |
+| CNAME  | Alias to another domain | www.google.com -> google.com           |
+| MX     | Mail server             | google.com -> smtp.google.com          |
+| TXT    | Arbitrary text          | SPF, DKIM, verification                |
+| NS     | Nameserver for domain   | google.com -> ns1.google.com           |
+| SOA    | Start of authority      | Zone configuration                     |
+| SRV    | Service location        | \_http.\_tcp.example.com               |
+
+<h3 id="53-dns-caching">5.3 DNS Caching</h3>
+
+Without caching, DNS would add avoidable latency and huge load to recursive and authoritative servers. Caching makes lookups fast, but it also creates operational trade-offs.
+
+<h4 id="the-ttl-dilemma">The TTL Dilemma</h4>
+
+Every DNS record has a TTL (Time To Live) that controls how long it can be cached. Choosing the right TTL is a trade-off:
+
+| TTL           | Propagation Time | DNS Load | Use Case                               |
+| ------------- | ---------------- | -------- | -------------------------------------- |
+| 60 seconds    | ~1 minute        | High     | Active failover, blue-green deploys    |
+| 300 seconds   | ~5 minutes       | Medium   | Most production services               |
+| 3600 seconds  | ~1 hour          | Low      | Stable services                        |
+| 86400 seconds | ~1 day           | Minimal  | Static assets, rarely-changing configs |
+
+**The complication:** Caches do not always respect TTL. Some ISPs cache longer than they should. Corporate proxies add their own caching. When you change a DNS record, some users will see the old IP for longer than you expect. Plan for this during migrations.
+
+<h3 id="54-dns-in-system-design">5.4 DNS in System Design</h3>
+
+Beyond name resolution, DNS is also a tool for traffic management.
+
+<h4 id="round-robin-load-balancing">Round-Robin Load Balancing</h4>
+
+Return multiple A records and let clients pick one:
+
+```text
+api.example.com.  60  IN  A  10.0.0.1
+api.example.com.  60  IN  A  10.0.0.2
+api.example.com.  60  IN  A  10.0.0.3
+```
+
+This spreads traffic across servers, but with significant limitations. Health behavior is coarse: some managed DNS services support health checks, but cached answers can keep sending traffic to an unhealthy endpoint until TTLs expire. Distribution is uneven, because a resolver cache may concentrate many users on the same returned address.
+
+DNS also has no request-level session awareness, so it does not know about cookies, paths, load, or user sessions. For these reasons, DNS load balancing is usually a first layer, with a real load balancer behind it.
+
+<h4 id="geographic-routing">Geographic Routing</h4>
+
+GeoDNS usually routes based on the resolver's IP address, sometimes helped by EDNS Client Subnet. This is useful, but it is approximate: public resolvers, VPNs, mobile networks, and corporate DNS can all make a user look like they are somewhere else.
+
+<h4 id="anycast">Anycast</h4>
+
+GeoDNS hands out different IPs to different users. Anycast does the opposite: many servers in different locations share the **same** IP address, and the internet's routing protocol (BGP) naturally sends each user to the topologically nearest one. The user connects to one IP, but the network decides which physical site answers.
+
+This is how the DNS root servers and most CDNs work. It gives you proximity routing without relying on the resolver's location, and it fails over automatically: if one site withdraws its route, traffic shifts to the next nearest site. The trade-off is that routing changes can move a user mid-session, so anycast suits stateless or connectionless traffic (DNS over UDP, CDN edge requests) better than long-lived stateful connections.
+
+<h4 id="service-discovery">Service discovery</h4>
+
+SRV records give you the IP, port, and priority of a service:
+
+```text
+_mongodb._tcp.example.com.  60  IN  SRV  0 5 27017 mongo1.example.com.
+_mongodb._tcp.example.com.  60  IN  SRV  0 5 27017 mongo2.example.com.
+```
+
+Kubernetes and service meshes often use DNS for internal service discovery, though they may use specialized resolvers like CoreDNS rather than public DNS.
+
+<h1 id="6-httphttps-protocol">6. HTTP/HTTPS Protocol</h1>
+
+HTTP is how most web clients talk to services. It is a request-response protocol: HTTP/1.1 and HTTP/2 usually run over TCP, while HTTP/3 runs over QUIC on UDP. Knowing that distinction helps you design APIs and debug production issues without blaming the wrong layer.
+
+<h3 id="61-http-requestresponse">6.1 HTTP Request/Response</h3>
+
+An HTTP transaction is simple: the client sends a request, the server sends a response.
+
+```text
+GET /api/users/123 HTTP/1.1
+Host: api.example.com
+Authorization: Bearer eyJhbGc...
+Accept: application/json
+```
+
+```text
+HTTP/1.1 200 OK
+Content-Type: application/json
+Cache-Control: max-age=3600
+Content-Length: 156
+
+{"id": 123, "name": "John", "email": "john@example.com"}
+```
+
+**Request components:**
+
+| Component | Purpose             | Example                     |
+| --------- | ------------------- | --------------------------- |
+| Method    | Action to perform   | GET, POST, PUT, DELETE      |
+| Path      | Resource identifier | /api/users/123              |
+| Headers   | Metadata            | Authorization, Content-Type |
+| Body      | Data payload        | JSON, form data             |
+
+**Response components:**
+
+| Component   | Purpose          | Example                     |
+| ----------- | ---------------- | --------------------------- |
+| Status Code | Result indicator | 200, 404, 500               |
+| Headers     | Metadata         | Content-Type, Cache-Control |
+| Body        | Response data    | JSON, HTML                  |
+
+<h3 id="62-http-methods">6.2 HTTP Methods</h3>
+
+HTTP methods have semantic meaning. Using them correctly makes an API easier to cache, retry, and reason about.
+
+| Method  | Purpose                    | Idempotent | Safe | Request Body |
+| ------- | -------------------------- | ---------- | ---- | ------------ |
+| GET     | Retrieve resource          | Yes        | Yes  | Usually no   |
+| POST    | Create resource or command | Usually no | No   | Yes          |
+| PUT     | Replace resource entirely  | Yes        | No   | Yes          |
+| PATCH   | Partial update             | Depends    | No   | Yes          |
+| DELETE  | Remove resource            | Yes        | No   | Uncommon     |
+| HEAD    | Get headers only           | Yes        | Yes  | No           |
+| OPTIONS | Get allowed methods        | Yes        | Yes  | No           |
+
+**Idempotent** means repeating the same request has the same intended effect. Sending the same PUT request twice leaves the resource in the same state. This matters when the network drops and the client does not know whether the first attempt succeeded.
+
+**Safe** means the request is intended only to read state. GET can still create logs or metrics, but it should not modify business data. This lets proxies cache responses and lets clients retry reads more freely.
+
+<h4 id="common-mistakes">Common mistakes</h4>
+
+- Using GET for actions that modify data (breaks caching, causes accidental repeats)
+- Using POST for everything (hides intent and makes retries harder)
+- Treating every PATCH as idempotent (some patch formats are, many are not)
+
+<h3 id="63-http-status-codes">6.3 HTTP Status Codes</h3>
+
+Status codes are grouped into five classes by their leading digit, and knowing which class a code belongs to tells you immediately whether the problem is in the client, the server, or the connection path between them.
+
+**Common status codes:**
+
+| Code | Meaning               | When to Use                                         |
+| ---- | --------------------- | --------------------------------------------------- |
+| 200  | OK                    | Request succeeded and returns a response body       |
+| 201  | Created               | New resource created, often with a Location header  |
+| 204  | No Content            | Request succeeded and returns no body               |
+| 301  | Moved Permanently     | URL changed permanently                             |
+| 302  | Found                 | Temporary redirect                                  |
+| 304  | Not Modified          | Cached version valid                                |
+| 400  | Bad Request           | Invalid input                                       |
+| 401  | Unauthorized          | Missing/invalid auth                                |
+| 403  | Forbidden             | Valid auth, no permission                           |
+| 404  | Not Found             | Resource does not exist                             |
+| 429  | Too Many Requests     | Rate limited                                        |
+| 500  | Internal Server Error | Unexpected server failure                           |
+| 502  | Bad Gateway           | Invalid/error response from upstream                |
+| 503  | Service Unavailable   | Overloaded, maintenance, or temporarily unavailable |
+| 504  | Gateway Timeout       | Upstream timeout                                    |
+
+<h3 id="64-http11-vs-http2-vs-http3">6.4 HTTP/1.1 vs HTTP/2 vs HTTP/3</h3>
+
+Each version of HTTP addresses a different bottleneck left by its predecessor, moving from one request per connection, to multiplexed streams over TCP, to full stream independence over QUIC.
+
+<h4 id="http11-the-problem">HTTP/1.1: The Problem</h4>
+
+In common HTTP/1.1 usage, each connection has one in-flight request at a time. If you need 10 resources, you either wait or open multiple connections. Browsers typically cap parallel connections per origin, so older sites used domain sharding to spread assets across names like `cdn1.example.com` and `cdn2.example.com`.
+
+<h4 id="http2-multiplexing">HTTP/2: Multiplexing</h4>
+
+HTTP/2 allows multiple requests on a single connection. The requests interleave as streams, which usually removes the need for domain sharding and reduces connection setup overhead. The protocol uses binary framing and HPACK header compression.
+
+But HTTP/2 still runs over one TCP connection. If a TCP segment is lost, delivery of later bytes is blocked until retransmission, even if those bytes belong to another HTTP/2 stream. This is TCP-level head-of-line blocking.
+
+<h4 id="http3-moving-to-quic">HTTP/3: Moving to QUIC</h4>
+
+HTTP/3 uses QUIC instead of TCP. QUIC performs loss recovery per stream, so packet loss on one stream does not block unrelated streams. QUIC also supports faster connection setup, connection migration across network changes, and 0-RTT resumption for replay-safe repeat requests.
+
+| Feature               | HTTP/1.1          | HTTP/2                 | HTTP/3               |
+| --------------------- | ----------------- | ---------------------- | -------------------- |
+| Transport             | TCP               | TCP                    | QUIC (UDP)           |
+| Multiplexing          | No                | Yes                    | Yes                  |
+| Header compression    | No                | HPACK                  | QPACK                |
+| Server push           | No                | Deprecated in practice | Not used in practice |
+| Head-of-line blocking | Application-level | TCP-level              | Avoids TCP-level     |
+
+<h3 id="65-http-caching">6.5 HTTP Caching</h3>
+
+Caching is often the most effective performance tool. The fastest request is the one the client can satisfy without contacting your server.
+
+<h4 id="cache-control-headers">Cache-Control headers</h4>
+
+The `Cache-Control` header tells browsers and CDNs what to cache and for how long:
+
+```text
+Cache-Control: public, max-age=3600
+Cache-Control: private, no-cache
+Cache-Control: no-store
+```
+
+| Directive | What It Means                                                |
+| --------- | ------------------------------------------------------------ |
+| public    | CDNs and proxies can cache                                   |
+| private   | Only the user's browser can cache                            |
+| max-age=N | Fresh for N seconds                                          |
+| no-cache  | Must check with server before using                          |
+| no-store  | Never write to disk (PII, tokens)                            |
+| immutable | Reuse while fresh; best with versioned URLs and long max-age |
+
+<h4 id="conditional-requests-efficient-revalidation">
+  Conditional Requests: Efficient Revalidation
+</h4>
+
+When a cached response expires, the browser can ask "has this changed?" rather than re-downloading everything:
+
+```text
+# First request
+GET /api/data HTTP/1.1
+
+# Response
+HTTP/1.1 200 OK
+ETag: "abc123"
+Last-Modified: Tue, 15 Nov 2024 12:45:26 GMT
+
+# Subsequent request
+GET /api/data HTTP/1.1
+If-None-Match: "abc123"
+If-Modified-Since: Tue, 15 Nov 2024 12:45:26 GMT
+
+# Response if unchanged
+HTTP/1.1 304 Not Modified
+```
+
+<h3 id="66-real-time-communication-patterns">
+  6.6 Real-Time Communication Patterns
+</h3>
+
+Not every feature needs a bidirectional socket. Pick the simplest pattern that matches the direction and frequency of updates.
+
+| Pattern                  | Direction                        | Best For                                 | Watch Out For                                         |
+| ------------------------ | -------------------------------- | ---------------------------------------- | ----------------------------------------------------- |
+| Short polling            | Client asks repeatedly           | Rare updates, simple systems             | Wasted requests and delayed updates                   |
+| Long polling             | Client waits until data is ready | Notifications without persistent sockets | More server-held connections                          |
+| Server-Sent Events (SSE) | Server to client                 | Feeds, alerts, progress updates          | One-way only, HTTP connection limits can matter       |
+| WebSocket                | Both directions                  | Chat, multiplayer, collaborative editing | Stateful connections, load balancing, reconnect logic |
+
+In interviews, call out the operational cost. WebSockets and SSE keep connections open, so you need connection-aware load balancing, heartbeats, backpressure, and a plan for reconnects. For low-frequency updates, polling is often simpler and good enough.
+
+<h1 id="7-tlsssl-and-security">7. TLS/SSL and Security</h1>
+
+HTTPS is HTTP over TLS. Without TLS, anyone on the network path, your ISP, a coffee shop router, or a compromised router, can read or modify traffic. With TLS, they see encrypted bytes and limited connection metadata.
+
+TLS provides three things:
+
+1. **Encryption:** Data cannot be read in transit
+2. **Authentication:** The client can verify the server identity, and optionally the server can verify the client with mTLS
+3. **Integrity:** Data cannot be modified without detection
+
+<h3 id="71-tls-handshake">7.1 TLS Handshake</h3>
+
+Before encrypted communication begins, client and server must agree on encryption keys. This is the TLS handshake.
+
+<h4 id="tls-13-improvements">TLS 1.3 improvements</h4>
+
+TLS 1.2 requires two round trips. TLS 1.3 cuts this to one.
+
+TLS 1.3 also removes outdated cipher suites, encrypts more of the handshake, and supports 0-RTT resumption for repeat visitors. It does not hide everything by itself: the Server Name Indication (SNI) is still visible unless Encrypted Client Hello is used and supported.
+
+<h3 id="72-certificate-chain">7.2 Certificate Chain</h3>
+
+How do you know you are talking to google.com and not an attacker? Certificates.
+
+Your browser trusts a set of Certificate Authorities (CAs). When a server presents its certificate, the browser verifies it was signed by a trusted CA.
+
+<h4 id="what-the-browser-checks">What the browser checks</h4>
+
+1. Certificate chain leads to a trusted root CA
+2. Every signature in the chain is valid
+3. No certificate is expired, and revocation status is acceptable when checked
+4. The domain in the certificate matches the requested domain
+
+If any check fails, the browser shows a warning. Never train users to click through these warnings.
+
+<h3 id="73-tls-termination-strategies">7.3 TLS Termination Strategies</h3>
+
+Where do you decrypt HTTPS traffic? This is a key architectural decision.
+
+| Strategy         | When to Use                         | Trade-offs                                                 |
+| ---------------- | ----------------------------------- | ---------------------------------------------------------- |
+| Edge termination | Most web apps                       | Simple, but traffic after the edge needs separate controls |
+| End-to-end TLS   | Compliance requirements, zero-trust | Certificate rotation becomes complex                       |
+| Mutual TLS       | Service-to-service auth             | Both sides need certificates, adds latency                 |
+
+For many applications, edge termination at the load balancer is enough when internal traffic is isolated with VPCs, security groups, private subnets, and tight IAM. For regulated, multi-tenant, or zero-trust environments, keep TLS all the way to the service and consider mTLS for service identity.
+
+<h3 id="74-https-best-practices">7.4 HTTPS Best Practices</h3>
+
+<h4 id="use-modern-cipher-suites">Use Modern Cipher Suites</h4>
+
+TLS 1.3 simplifies cipher selection because it only includes modern AEAD cipher suites:
+
+```text
+TLS_AES_256_GCM_SHA384
+TLS_CHACHA20_POLY1305_SHA256  # Useful on clients without AES acceleration
+TLS_AES_128_GCM_SHA256
+```
+
+For TLS 1.2, prefer ECDHE key exchange paired with AES-GCM or ChaCha20-Poly1305:
+
+```text
+ECDHE-ECDSA-AES256-GCM-SHA384
+ECDHE-RSA-AES128-GCM-SHA256
+ECDHE-ECDSA-CHACHA20-POLY1305  # Useful on clients without AES acceleration
+```
+
+Disable anything with "CBC", "3DES", or "RC4".
+
+<h4 id="security-headers">Security Headers</h4>
+
+These HTTP headers strengthen your security posture:
+
+```text
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+# "Always use HTTPS, browsers remember for 1 year"
+
+X-Content-Type-Options: nosniff
+# "Don't guess content types, trust the header"
+
+X-Frame-Options: DENY
+# "Don't allow this page in iframes"
+
+Content-Security-Policy: default-src 'self'
+# "Only load resources from our own domain"
+```
+
+<h4 id="automate-certificate-management">Automate Certificate Management</h4>
+
+Manual certificate renewal is easy to forget and can cause avoidable outages. Let's Encrypt and other ACME providers issue free, automated certificates. AWS Certificate Manager handles rotation automatically for AWS services. HashiCorp Vault covers internal PKI and service certificates.
+
+<h1 id="8-network-performance-and-latency">
+  8. Network Performance and Latency
+</h1>
+
+What users experience is responsiveness, not the architecture behind it. Responsiveness is dominated by latency, the time between an action and a visible response.
+
+At scale, network latency often exceeds processing time. Your database query might take 5ms, but the network round trip to the user takes 100ms. Understanding where latency comes from helps you design faster systems.
+
+<h3 id="81-latency-components">8.1 Latency Components</h3>
+
+When you send a packet across the internet, where does the time go?
+
+| Component    | Definition                | Typical Values                       |
+| ------------ | ------------------------- | ------------------------------------ |
+| Propagation  | Time for signal to travel | Roughly a few ms per 1000km each way |
+| Transmission | Time to put data on wire  | Depends on bandwidth                 |
+| Processing   | Router/server processing  | Often small per hop, but not free    |
+| Queuing      | Wait time in buffers      | Variable, can spike                  |
+
+<h3 id="82-latency-numbers-you-should-know">
+  8.2 Latency Numbers You Should Know
+</h3>
+
+These are order-of-magnitude numbers, not constants. Hardware, cloud provider, region, network path, and load all change the exact values.
+
+```text
+Operation                              Time          Notes
+---------------------------------------------------------------
+L1 cache reference                     0.5 ns        CPU cycles
+Main memory reference                  100 ns        ~200x slower than L1
+SSD random read                        150 μs        ~1500x slower than RAM
+Round trip in same datacenter          ~0.5 ms       Within same AZ
+Read 1 MB from SSD                     1 ms          Sequential read
+Round trip across AZs                  1-5 ms        Same region, provider-dependent
+Round trip US coast to coast           60 ms         Speed of light limit
+Round trip US to Europe                100 ms        Transatlantic
+Round trip US to Asia                  200 ms        Transpacific
+```
+
+Once you leave the machine, latency jumps by orders of magnitude. If a user-facing request spends 100ms on the network, reducing a 2ms handler to 1ms helps less than reducing round trips or moving work closer to the user.
+
+<h3 id="83-bandwidth-vs-latency">8.3 Bandwidth vs Latency</h3>
+
+People often confuse these. They are different things, and optimizing one does not necessarily improve the other.
+
+**Bandwidth:** How much data can flow per second. Think of it as pipe width.
+
+**Latency:** How long it takes for the first byte to arrive. Think of it as pipe length.
+
+**For small requests (API calls, web pages):** Latency dominates. Sending 10KB on a 1 Gbps link takes about 0.08ms. If latency is 100ms, the transfer time barely matters.
+
+**For large transfers (backups, video):** Bandwidth dominates. Sending 1GB takes about 8 seconds on 1 Gbps, or about 80 seconds on 100 Mbps. The initial latency is a small part of the total.
+
+```text
+Small request (10 KB) over 100 Mbps, 50ms latency:
+  Transmission: 10 KB / 100 Mbps = 0.8 ms
+  Total: 50 + 0.8 ≈ 51 ms  ← Latency is 98% of the time
+
+Large transfer (100 MB) over 100 Mbps, 50ms latency:
+  Transmission: 100 MB / 100 Mbps = 8000 ms
+  Total: 50 + 8000 ≈ 8050 ms  ← Bandwidth is 99% of the time
+```
+
+For web applications serving small responses, focus on latency. For batch data pipelines, focus on bandwidth.
+
+<h3 id="84-reducing-latency">8.4 Reducing Latency</h3>
+
+You cannot beat the speed of light. But you can reduce the distance it travels and the number of trips it makes.
+
+<h4 id="1-move-computation-closer-to-users">
+  1. Move computation closer to users
+</h4>
+
+CDNs for static content, edge functions for dynamic content, and multi-region deployments for global applications.
+
+<h4 id="2-reduce-round-trips">2. Reduce round trips</h4>
+
+Each round trip adds latency. Batch related operations when it makes the API cleaner, use HTTP/2 or HTTP/3 multiplexing where available, and keep connections alive instead of reconnecting.
+
+<h4 id="3-cache-aggressively">3. Cache aggressively</h4>
+
+Cache at the browser, CDN, application, or database layer when the data model allows it.
+
+<h4 id="4-compress-data">4. Compress data</h4>
+
+Less data = less transmission time. Use gzip or Brotli for text. Use efficient binary formats (Protocol Buffers, MessagePack) for internal APIs.
+
+<h4 id="5-process-asynchronously">5. Process asynchronously</h4>
+
+Return a quick acknowledgment, process in the background, notify when done. The user sees a fast response even if the actual work takes time.
+
+<h3 id="85-tail-latency">8.5 Tail Latency</h3>
+
+Averages hide tail behavior. If 99% of your requests take 10ms but 1% take 5 seconds, the average looks fine while some users have a poor experience.
+
+```text
+Latency percentiles for an API:
+├── p50 (median): 10ms   ← Half of requests
+├── p95: 50ms            ← Most users see this or better
+├── p99: 200ms           ← 1 in 100 requests
+└── p99.9: 1000ms        ← 1 in 1000 requests
+```
+
+<h4 id="why-p99-matters-more-than-average">
+  Why p99 matters more than average
+</h4>
+
+A single page load might make 50+ requests. If an important one is slow, the page feels slow.
+
+```text
+Probability of hitting one p99-latency request at least once with N independent requests:
+  1 - (0.99)^N
+
+  10 requests:  10% chance of hitting p99
+  50 requests:  39% chance
+  100 requests: 63% chance
+```
+
+A page with 50 independent API calls has roughly a 39% chance of seeing at least one p99-latency call. Real systems are correlated, but the lesson holds: track tail percentiles, not just the average.
+
+<h4 id="common-causes-of-tail-latency">Common Causes of Tail Latency</h4>
+
+| Cause               | Symptom                  | Fix                                    |
+| ------------------- | ------------------------ | -------------------------------------- |
+| GC pauses           | Random spikes            | Tune GC, allocate less                 |
+| Cold cache          | Spikes after deploy      | Pre-warm caches                        |
+| Resource contention | Correlates with load     | Better isolation                       |
+| Slow dependencies   | Consistent tail          | Timeouts, circuit breakers             |
+| Database locks      | Transaction-heavy spikes | Optimize queries, shorter transactions |
+
+<h1 id="9-networking-in-distributed-systems">
+  9. Networking in Distributed Systems
+</h1>
+
+Networking gets harder in distributed systems. Instead of one server, you have dozens or thousands. Instead of one network hop, you have many. At sufficient scale, some dependency is usually slow, unreachable, or recovering.
+
+Design as if partial failure is normal. That mindset changes how you choose timeouts, retries, load balancing, and service discovery.
+
+<h3 id="91-the-network-is-unreliable">9.1 The Network is Unreliable</h3>
+
+In a distributed system, you cannot distinguish between "the network is slow" and "the server is down." Both look the same: no response.
+
+**Dealing with failures:**
+
+| Failure     | Detection                         | Response                       |
+| ----------- | --------------------------------- | ------------------------------ |
+| Packet loss | Timeout, no ACK                   | Retry                          |
+| Delay       | Timeout (false positive possible) | Retry, may cause duplicate     |
+| Partition   | Timeout from multiple nodes       | Failover, accept inconsistency |
+
+<h3 id="92-timeouts">9.2 Timeouts</h3>
+
+When a request does not get a response, how long do you wait? There is no single correct timeout.
+
+**Too short:** You give up on requests that would have succeeded. You trigger retries that create duplicate work. Under load, you make things worse.
+
+**Too long:** Users wait forever. Resources (connections, threads) stay tied up. You detect failures slowly.
+
+**Strategies:**
+
+| Strategy             | How It Works                        | Best For             |
+| -------------------- | ----------------------------------- | -------------------- |
+| Static               | Fixed value (e.g., 5s)              | Simple cases         |
+| Adaptive             | Based on recent p99 + buffer        | Variable latency     |
+| Deadline propagation | Pass remaining budget to downstream | Multi-hop requests   |
+| Circuit breaker      | Stop trying after N failures        | Failing dependencies |
+
+**In practice:** Keep connection timeouts short enough to fail fast for your environment, and set read timeouts based on expected operation time. For chained calls, propagate deadlines: if you have 5 seconds total and already spent 2 seconds, downstream only gets 3 seconds.
+
+<h3 id="93-retries-and-idempotency">9.3 Retries and Idempotency</h3>
+
+You sent a request. It timed out. What happened?
+
+You cannot tell which case you are in. The solution is idempotency: design operations so that doing them twice has the same effect as doing them once.
+
+<h4 id="which-operations-are-naturally-idempotent">
+  Which Operations Are Naturally Idempotent?
+</h4>
+
+| Operation             | Idempotent? | Why                                    |
+| --------------------- | ----------- | -------------------------------------- |
+| GET /users/123        | Yes         | Reads should not change business state |
+| PUT /users/123 {data} | Yes         | Sets to specific value                 |
+| DELETE /users/123     | Yes         | Already deleted = still deleted        |
+| POST /orders          | No          | Creates new order each time            |
+| POST /transfer $100   | No          | Transfers $100 each time               |
+
+<h4 id="making-non-idempotent-operations-safe">
+  Making Non-Idempotent Operations Safe
+</h4>
+
+Use an idempotency key:
+
+The client attaches a unique key to the request:
+
+```text
+POST /orders HTTP/1.1
+Idempotency-Key: order-abc-123
+```
+
+The server uses that key to deduplicate retries:
+
+1. Check if the key already exists in a cache or database.
+2. If it exists, return the stored response without reprocessing.
+3. If not, process the request, then store the response keyed by the idempotency key.
+4. The client can now safely retry with the same key and get the same result.
+
+Many payment APIs use idempotency keys for this reason. With a correctly implemented key store, a retry returns the original result instead of charging the customer twice.
+
+<h3 id="94-service-discovery">9.4 Service Discovery</h3>
+
+In a dynamic environment, IP addresses change. Servers come and go. How does Service A find Service B?
+
+| Approach         | Complexity | Features                             | Best For                               |
+| ---------------- | ---------- | ------------------------------------ | -------------------------------------- |
+| DNS              | Low        | Basic resolution                     | Simple setups                          |
+| Service registry | Medium     | Health checks, metadata              | Microservices                          |
+| Service mesh     | High       | mTLS, observability, traffic control | Complex systems, security requirements |
+
+Most cloud environments use a combination. Kubernetes uses DNS (CoreDNS) for service names, while service meshes such as Istio or Linkerd add mTLS, telemetry, retries, and traffic policy. The registry or control plane must stay fresh; stale endpoints are a common source of flaky calls.
+
+<h3 id="95-load-balancing-in-distributed-systems">
+  9.5 Load Balancing in Distributed Systems
+</h3>
+
+Load balancers distribute traffic across servers. The choice of algorithm affects performance and reliability. A load balancer is one example of a reverse proxy, so it helps to be clear on the two kinds of proxy.
+
+<h4 id="forward-vs-reverse-proxy">Forward vs Reverse Proxy</h4>
+
+A **forward proxy** sits in front of clients and makes requests on their behalf. The server sees the proxy, not the original client. Corporate web filters and outbound gateways are forward proxies.
+
+A **reverse proxy** sits in front of servers and receives requests on their behalf. The client sees the proxy, not the backend. Load balancers, API gateways, TLS-terminating edges, and CDNs are reverse proxies. They are where you centralize TLS termination, routing, caching, rate limiting, and health checking, which is why most production traffic enters through one.
+
+<h4 id="layer-4-vs-layer-7">Layer 4 vs Layer 7</h4>
+
+<h4 id="load-balancing-algorithms">Load balancing algorithms</h4>
+
+| Algorithm           | How It Works                                   | Best For                                  |
+| ------------------- | ---------------------------------------------- | ----------------------------------------- |
+| Round robin         | Each request or connection to next server      | Uniform requests, stateless               |
+| Least connections   | Route to server with fewest active connections | Long-lived connections, variable duration |
+| Weighted            | Higher weight = more traffic                   | Mixed server capacity                     |
+| Consistent hashing  | Same key usually maps to same server           | Caching, session affinity                 |
+| Random (power of 2) | Pick 2 random servers, choose less loaded      | Large clusters                            |
+
+<h4 id="server-side-vs-client-side">Server-Side vs Client-Side</h4>
+
+| Approach       | Pros                                | Cons                                                     |
+| -------------- | ----------------------------------- | -------------------------------------------------------- |
+| Server-side LB | Simple clients, central control     | Extra hop, shared dependency                             |
+| Client-side    | Direct connection, avoids proxy hop | Clients need discovery logic and stale-endpoint handling |
+
+<h1 id="summary">Summary</h1>
+
+Here are the key takeaways:
+
+1. **Understand the stack.** Know which layer handles what. TCP provides reliability, IP provides routing, HTTP provides application semantics. Problems at different layers require different solutions.
+2. **TCP reliability has a cost.** It provides reliability through acknowledgments, retries, and ordering. These features have costs: latency, overhead, head-of-line blocking. Know when UDP is better.
+3. **Latency is often the bottleneck.** At scale, network latency dominates processing time. Design to minimize round trips, move computation close to users, and cache aggressively.
+4. **Networks fail.** Design for packet loss, delays, partitions, and total failures. Use timeouts, retries with idempotency, and circuit breakers.
+5. **DNS is critical infrastructure.** Understand TTLs, caching, and how DNS enables geographic load balancing and failover.
+6. **HTTP evolves.** HTTP/2 and HTTP/3 address HTTP/1.1 limitations. Know the differences and when they matter.
+7. **Secure traffic deliberately.** TLS protects data in transit. Understand handshakes, certificates, and termination strategies.
+8. **Real-time needs different approaches.** WebSockets, SSE, and polling each have trade-offs. Choose based on direction, frequency, and operational complexity.
+9. **Distributed systems amplify network challenges.** Service discovery, load balancing, and handling partial failures become essential.
+10. **Monitor and measure.** Track latency percentiles, not averages. Instrument at every layer. Distributed tracing is invaluable.
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,631 @@
+---
+title: "Debugging Techniques"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Debugging Techniques explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+Debugging is the work of finding out why a program does something other than what you expected. The earlier chapters in this section dealt with writing code that's easier to reason about. This one is about what to do when reasoning isn't enough. We'll walk through the mindset, stack traces, the debugger, JVM-level tools, and a handful of common bug categories on an e-commerce service.
+
+<h1 id="the-debugging-mindset">The Debugging Mindset</h1>
+
+Bug reports rarely arrive in a debuggable shape. "The cart total is wrong sometimes" is a feeling, not a problem you can attach a breakpoint to. The fastest path from "something is broken" to "here's the fix" follows four steps in order: reproduce, isolate, hypothesize, verify.
+
+**Reproduce** means getting the bug to happen on demand. Without a trigger, observation is impossible, and confirming the fix is impossible. Write down the exact inputs that produce the failure: which product, which quantity, which customer, which discount code. An intermittent bug that hits one time in ten still counts as reproducible given the inputs and the patience.
+
+**Isolate** narrows the problem down to the smallest piece of code that still misbehaves. A 500-line checkout flow that produces a wrong total can almost always be cut down to a 20-line test that exercises just the subtotal calculation. The smaller the surface, the fewer variables in play at once.
+
+**Hypothesize** is the part often skipped. Instead of changing things at random, write down what's likely happening before changing anything. "I think `applyDiscount` is being called twice on the same cart." The next action then has a goal: confirm or refute that single statement.
+
+**Verify** closes the loop. Did the fix actually fix the bug, or did it just hide the symptom? A bug that disappears for one input but returns for another wasn't fixed; it was masked. Re-run the original reproduction and at least one neighbouring case before declaring victory.
+
+The loop in the middle, between hypothesize and test, is where most of the actual work happens. Each turn around it should yield new information, even if the guess was wrong. A debugging session where every hypothesis is confirmed is suspicious; that usually means confirming an existing belief instead of finding the real cause.
+
+<h1 id="reading-a-stack-trace">Reading a Stack Trace</h1>
+
+A stack trace is the first artifact most failures leave behind, and it contains almost everything needed if read carefully. Here's a real one from an e-commerce service:
+
+```text
+Exception in thread "main" java.lang.NullPointerException: Cannot invoke "String.length()" because "couponCode" is null
+    at com.shop.cart.CartService.applyCoupon(CartService.java:42)
+    at com.shop.checkout.CheckoutController.placeOrder(CheckoutController.java:78)
+    at com.shop.checkout.Main.main(Main.java:15)
+Caused by: java.lang.IllegalStateException: coupon repository unreachable
+    at com.shop.cart.CouponRepository.findByCode(CouponRepository.java:23)
+    at com.shop.cart.CartService.applyCoupon(CartService.java:39)
+    ... 2 more
+Suppressed: java.io.IOException: stream already closed
+    at com.shop.cart.CouponRepository.close(CouponRepository.java:55)
+```
+
+The **top frame** is where the failure landed: line 42 of `CartService.applyCoupon`. That's where the `NullPointerException` came out, and where the debugger should start. The exception message names which variable was `null` (Java added the variable name in helpful NPE messages since Java 14). The frames below show the call chain that got there: `Main` called `placeOrder`, which called `applyCoupon`.
+
+The **`Caused by:`** block describes a prior exception that this one wraps. Reading from the bottom up: the coupon repository was unreachable (real root cause), which made `applyCoupon` set `couponCode` to `null` instead of a real value, which made the next line dereference `null`. The root cause sits at the bottom of the chain, not the top. New debuggers often spend twenty minutes investigating the wrong layer by starting with the top frame instead of following `Caused by` down.
+
+The **`Suppressed:`** block lists exceptions that fired while the JVM was already unwinding from another exception. Most commonly, a `close()` method throws while a try-with-resources block is already propagating a different exception. These usually aren't the cause of the original failure, but they can hint at related problems.
+
+The rule of thumb: start at the **bottom of the `Caused by` chain** to find the original failure, then walk up the frames in the **top exception** to find where the code first encountered that failure.
+
+Constructing an exception captures the entire current stack, which costs more than expected (often tens of microseconds, sometimes more). Throwing in a tight loop is significantly slower than returning a flag. This is mostly an exception-handling concern, but it is also why "stack trace omitted" appears in long-running services that throw the same exception thousands of times.
+
+A short program that produces this kind of layered trace:
+
+```java
+public class StackTraceDemo {
+    public static void main(String[] args) {
+        try {
+            applyCoupon(null);
+        } catch (RuntimeException e) {
+            e.printStackTrace();
+        }
+    }
+
+    static void applyCoupon(String couponCode) {
+        try {
+            lookupCoupon(couponCode);
+        } catch (IllegalStateException e) {
+            throw new RuntimeException("could not apply coupon", e);
+        }
+        System.out.println("Coupon length: " + couponCode.length());
+    }
+
+    static void lookupCoupon(String code) {
+        throw new IllegalStateException("coupon repository unreachable");
+    }
+}
+```
+
+The chain reads from the outer wrapper down to the inner cause. The fix lives at line 20 (the repository), but the first symptom showed up at line 14. Both are useful pieces of information; neither is the whole story on its own.
+
+<h1 id="print-debugging">Print Debugging</h1>
+
+Print statements get a bad reputation, but they're a perfectly reasonable tool when used well. They have one big advantage over the debugger: they preserve a trace over time. A breakpoint reveals one moment; a print statement records hundreds of moments to grep through afterwards.
+
+```java
+public class PrintDebugDemo {
+    public static void main(String[] args) {
+        double[] prices = {19.99, 29.99, 9.99};
+        int[] quantities = {2, 1, 4};
+        double total = computeTotal(prices, quantities);
+        System.out.println("Final total: $" + total);
+    }
+
+    static double computeTotal(double[] prices, int[] quantities) {
+        double total = 0.0;
+        for (int i = 0; i < prices.length; i++) {
+            double lineTotal = prices[i] * quantities[i];
+            System.out.println("DEBUG i=" + i
+                + " price=" + prices[i]
+                + " qty=" + quantities[i]
+                + " lineTotal=" + lineTotal);
+            total += lineTotal;
+        }
+        return total;
+    }
+}
+```
+
+The `DEBUG` prefix is doing two things. It makes the lines easy to grep for, and it makes them easy to delete with a search-and-replace later. A typical workflow is: drop in a few prints, follow the data, then either remove them or promote them to actual log statements before committing.
+
+Print debugging is fine when:
+
+- A chronological log of a long-running flow is useful.
+- The bug only reproduces in production-shaped environments where attaching a debugger is hard.
+- Only a few specific values matter and there's no need to interact with the running program.
+
+Graduate to a debugger or to structured logging when:
+
+- Stepping through the code one statement at a time is needed.
+- The values worth inspecting aren't easy to print (deep object graphs, lazy iterators).
+- The prints have started to outnumber the real code, which signals blind hunting.
+
+The middle ground, real logging, is what gets committed. A `log.debug("Computed line total {} for product {}", lineTotal, productId)` reads almost exactly like a print, but it can be turned on and off without recompiling, and it ships to production. Lesson 06 covered the logging APIs in detail; the relevant point here is that reaching for `System.out.println` for the third time on the same flow signals it's time to use a logger.
+
+<h1 id="using-the-ide-debugger">Using the IDE Debugger</h1>
+
+The IDE debugger is the single biggest leap most Java developers make in their first year. Everything possible with print statements is faster with a debugger, plus a lot more.
+
+The vocabulary is the same across IntelliJ IDEA, Eclipse, and VS Code, though the keyboard shortcuts differ. IntelliJ shortcuts serve as the primary reference. The five core operations are:
+
+| Operation      | What it does                                                         | IntelliJ shortcut                         |
+| -------------- | -------------------------------------------------------------------- | ----------------------------------------- |
+| Set breakpoint | Pauses execution when this line is about to run                      | Click the gutter, or `Ctrl+F8` / `Cmd+F8` |
+| Step over      | Runs the current line, stops on the next line of the same method     | `F8`                                      |
+| Step into      | Descends into the method call on the current line                    | `F7`                                      |
+| Step out       | Runs the rest of the current method, stops on the caller's next line | `Shift+F8`                                |
+| Resume program | Continues running until the next breakpoint                          | `F9` / `Cmd+Option+R`                     |
+
+The flow looks repetitive, and that's the point. Each pause is an opportunity to look at the world, decide whether the relevant state has been seen, and pick the next move. Most debugging sessions are dozens of small decisions: "this looks fine, step over"; "what does this method do, step in"; "seen enough of this loop, step out."
+
+A small program to practice on. Set a breakpoint on the first line of `applyDiscount` and step through it:
+
+```java
+public class DebuggerPractice {
+    public static void main(String[] args) {
+        double subtotal = 100.0;
+        double discount = 0.15;
+        double finalTotal = applyDiscount(subtotal, discount);
+        System.out.println("Final total: $" + finalTotal);
+    }
+
+    static double applyDiscount(double subtotal, double percentage) {
+        double off = subtotal * percentage;
+        double total = subtotal - off;
+        return total;
+    }
+}
+```
+
+When the debugger pauses inside `applyDiscount`, the **Variables** panel shows `subtotal=100.0`, `percentage=0.15`, and the local variables `off` and `total` as they get assigned. Stepping over moves one statement forward. Stepping into would descend into a method call if there were one. Stepping out runs the rest of `applyDiscount` and pauses again in `main`, just after the call.
+
+The two skills worth practising deliberately: **knowing when to step over versus step into**, and **looking before stepping**. Stepping into every call buries the session in JDK source. Stepping over everything misses the buggy method when it's the one that got skipped. Checking the variables panel before each step confirms whether the current state matches the hypothesis, which is the whole reason for stepping.
+
+<h1 id="conditional-breakpoints">Conditional Breakpoints</h1>
+
+A plain breakpoint pauses every time the line runs. That's fine for a method that runs once, but useless for one that runs ten thousand times per request. A **conditional breakpoint** only pauses when a specified expression is true.
+
+In IntelliJ, right-click a breakpoint and enter a condition like `cart.size() > 100` or `product.getId().equals("prod-42")`. The debugger evaluates the condition every time the line is about to run, and only stops when it's true.
+
+Consider a loop that processes a large cart and one specific item has a wrong subtotal:
+
+```java
+public class ConditionalBreakpointDemo {
+    public static void main(String[] args) {
+        String[] productIds = {"prod-1", "prod-2", "prod-3", "prod-42", "prod-5"};
+        double[] prices = {10.0, 20.0, 30.0, -40.0, 50.0};
+        for (int i = 0; i < productIds.length; i++) {
+            double lineTotal = prices[i] * 2;
+            System.out.println(productIds[i] + ": $" + lineTotal);
+        }
+    }
+}
+```
+
+With a conditional breakpoint on the loop body and the condition `productIds[i].equals("prod-42")`, the debugger pauses exactly once, when `i == 3`. From there, inspecting `prices[i]` confirms it's negative, which points at whatever populates that array.
+
+Conditional breakpoints evaluate their expression every time the line is reached, even when the condition is false. A condition like `cart.size() > 100` is cheap. A condition that calls a slow method or allocates objects can noticeably slow the debug session.
+
+<h1 id="watches-and-evaluating-expressions">
+  Watches and Evaluating Expressions
+</h1>
+
+Breakpoints freeze the program; **watches** and **evaluate expressions** ask questions of that frozen state.
+
+A **watch** is an expression the debugger evaluates every time the program steps. Adding `cart.getTotal()` as a watch makes the **Watches** panel show the current value at every pause, even if the cart total isn't already shown in the Variables panel.
+
+**Evaluate expression** (in IntelliJ: `Alt+F8` or right-click a variable, choose Evaluate Expression) runs any one-off Java expression in the current paused frame. Useful for testing a fix without restarting:
+
+- `cart.applyDiscount(0.10)` to call a method and see the result immediately.
+- `cart.getItems().stream().mapToDouble(CartItem::getPrice).sum()` to compute something the program doesn't currently compute.
+- `new BigDecimal(price).setScale(2, RoundingMode.HALF_UP).toString()` to check a formatting fix before writing it.
+
+A useful pattern: when a method is suspected of having a bug, pause just before the call, and use Evaluate Expression to compute what the right answer should be by other means. Disagreement between the two values localises the bug to that method.
+
+<h1 id="variable-inspection-and-modification">
+  Variable Inspection and Modification
+</h1>
+
+The Variables panel shows every local variable, parameter, and `this`-field in the current frame. Expanding a complex object shows its fields recursively. For collections, IntelliJ renders `List`, `Map`, and `Set` as their logical contents rather than their internal arrays.
+
+The less obvious feature: most debuggers can **modify** a variable's value while paused. Right-click in the Variables panel and choose Set Value. Type `42` and the variable now holds 42 from that point forward.
+
+Two main reasons to do this:
+
+- **Reproduce a hard-to-trigger case.** A bug that only happens when `quantity == 0` may be hard to produce through the UI. Pause before the offending line, set `quantity = 0`, and step forward.
+- **Test a fix in place.** A suspected bug is that `discountPercent` is being read as `0.5` instead of `0.05`. Pause before the multiplication, set `discountPercent = 0.05`, step over, and see whether the rest of the flow now produces the right total. A successful result confirms the cause without recompiling.
+
+Modify with care. The change is live for the running program; if the method has side effects, they fire with the modified value. Avoid this on production debug sessions where a wrong value could trigger a real charge or a wrong shipping label.
+
+<h1 id="field-watchpoints">Field Watchpoints</h1>
+
+A **field watchpoint** is a special kind of breakpoint that fires when a particular field is read or written, regardless of where in the codebase the access happens. Use it when a field ends up with the wrong value and the cause is in an unknown method.
+
+In IntelliJ, set one by clicking the gutter next to the field declaration (not a line in the method body). It can be configured to fire on reads, on writes, or both.
+
+```java
+public class FieldWatchpointDemo {
+    static class Cart {
+        double total = 0.0; // set a field watchpoint here
+
+        void addItem(double price) {
+            total += price;
+        }
+
+        void applyDiscount(double pct) {
+            total = total * (1.0 - pct);
+        }
+
+        void reset() {
+            total = 0.0;
+        }
+    }
+
+    public static void main(String[] args) {
+        Cart cart = new Cart();
+        cart.addItem(19.99);
+        cart.addItem(29.99);
+        cart.applyDiscount(0.10);
+        cart.reset();
+    }
+}
+```
+
+Running this under a debugger with a write watchpoint on `total` pauses four times: once for each `addItem`, once for `applyDiscount`, and once for `reset`. Each pause shows the call stack that performed the write. That's gold when a bug looks like "this field has the wrong value but nothing in this file touches it." The stack trace identifies the file that does.
+
+Watchpoints are slow when the field is touched many times per second. The JVM has to intercept every read or write. Use them on cold paths or with a condition attached.
+
+<h1 id="exception-breakpoints">Exception Breakpoints</h1>
+
+An **exception breakpoint** pauses the program whenever an exception of a particular type is thrown, anywhere in the code, before the `catch` block runs. It's the answer to "something throws `NullPointerException` somewhere, but the catch swallows it."
+
+In IntelliJ, open Run > View Breakpoints, click the `+`, choose Java Exception Breakpoints, and pick the exception type. It can be scoped to thrown by user code, by library code, or both.
+
+```java
+import java.util.HashMap;
+import java.util.Map;
+
+public class ExceptionBreakpointDemo {
+    public static void main(String[] args) {
+        Map<String, Integer> stock = new HashMap<>();
+        stock.put("prod-1", 10);
+        stock.put("prod-2", 5);
+
+        try {
+            checkStock(stock, "prod-3");
+        } catch (NullPointerException e) {
+            System.out.println("Caught: " + e.getMessage());
+        }
+    }
+
+    static void checkStock(Map<String, Integer> stock, String productId) {
+        int available = stock.get(productId); // unboxes null
+        System.out.println(productId + ": " + available);
+    }
+}
+```
+
+The console shows that an NPE was caught, but if the catch block hadn't been there or had been further up the stack, the origin might never have been visible. With a `NullPointerException` exception breakpoint set, the debugger pauses on line 18 the moment the autounboxing fails, right at the source.
+
+Use exception breakpoints sparingly. A breakpoint on `Exception` pauses on every exception the JVM throws internally, including ones in JDK code that aren't relevant. Narrow to the specific exception type, and disable the breakpoint when done.
+
+<h1 id="method-breakpoints">Method Breakpoints</h1>
+
+A **method breakpoint** fires whenever a particular method is entered or exited. It's useful for finding callers of a method and the arguments they pass, without scattering breakpoints in every caller.
+
+```java
+public class MethodBreakpointDemo {
+    public static void main(String[] args) {
+        chargeCustomer("alice", 49.99);
+        chargeCustomer("bob", 19.99);
+        chargeCustomer("carol", 99.99);
+    }
+
+    static void chargeCustomer(String email, double amount) { // method breakpoint
+        System.out.println("Charging " + email + " $" + amount);
+    }
+}
+```
+
+A method breakpoint on `chargeCustomer` pauses three times, once at each entry, and the call stack identifies which `main` line invoked it. The Variables panel shows the arguments.
+
+Method breakpoints can be slower than line breakpoints. The JVM has to track every method entry and exit, which disables certain JIT optimisations. IntelliJ explicitly warns about this. Use a line breakpoint on the first line of the method body when possible; use a real method breakpoint only when firing on every overload or every implementation of an interface method is needed.
+
+<h1 id="remote-debugging-with-jdwp">Remote Debugging With JDWP</h1>
+
+Sometimes the bug only happens on a remote server: in staging, in a container, on a colleague's laptop. The Java Debug Wire Protocol (JDWP) attaches the local IDE's debugger to a JVM running somewhere else.
+
+Start the remote JVM with the JDWP agent enabled:
+
+```text
+java -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005 -jar shop-server.jar
+```
+
+The pieces of that argument:
+
+| Part                  | Meaning                                                                                      |
+| --------------------- | -------------------------------------------------------------------------------------------- |
+| `transport=dt_socket` | Use a TCP socket for the debugger to attach over.                                            |
+| `server=y`            | The JVM acts as the debug server; the IDE connects to it.                                    |
+| `suspend=n`           | Don't pause the JVM at startup waiting for a debugger. Use `y` if you need to debug startup. |
+| `address=*:5005`      | Listen on port 5005 on all interfaces. Use `127.0.0.1:5005` to restrict to localhost.        |
+
+Then in IntelliJ, create a Remote JVM Debug configuration pointing at the host and port, and click Debug. Breakpoints fire when the remote code hits them, exactly as if it were running locally.
+
+Two warnings worth taking seriously. First, JDWP gives the connected client effectively full control of the JVM, including the ability to invoke arbitrary methods. Never expose port 5005 on a public network, and never leave debug enabled on a production server. Second, the local source code must match the bytecode running remotely. If they're out of sync, breakpoints fire on wrong lines and Variables panels show wrong values. Build the remote artifact from the same commit checked out locally.
+
+The IDE and the JVM agree on a wire protocol; the IDE sends commands like "set a breakpoint at this line" or "evaluate this expression," and the JVM sends back events like "thread paused here." Everything available locally works remotely; it's just slower because each command goes over the network.
+
+<h1 id="hot-code-replace">Hot Code Replace</h1>
+
+When a method changes while the JVM is paused at a breakpoint and recompiles, modern IDEs try to push the new bytecode into the running JVM without restarting it. This is **Hot Code Replace** (also called HotSwap).
+
+The feature shines during a debug loop where the bug took two minutes of clicking to reproduce. Restarting the whole app for every one-line tweak is wasteful. With HotSwap, change the method body, save, and the next call uses the new code.
+
+The limits are real, though. The standard JVM only allows changes to method bodies. Adding a field, changing a method signature, or modifying a class hierarchy forces a full restart. Some teams use enhanced agents like JRebel for more aggressive hot swapping, but vanilla HotSwap is fine for the common case of fixing a wrong calculation in a method.
+
+When HotSwap fails, the IDE reports why. The usual fixes are either accepting a restart, or working around the limit (move new field initialisation into an existing setter, for example) until the fix is confirmed and a clean restart is possible.
+
+<h1 id="thread-debugging">Thread Debugging</h1>
+
+A multi-threaded program can fail in ways a single-threaded one cannot. Two threads update the same variable and one of the updates is lost. Three threads each hold a lock the others want, and nobody can make progress. A worker thread dies without notification and the main thread keeps queuing work for it.
+
+The IDE debugger has a **Threads** panel that lists every thread, its state (running, waiting, blocked), and its current stack. Switching threads in the panel updates which frame the Variables panel describes.
+
+A small program with two threads that increment a shared counter without proper synchronisation:
+
+```java
+public class RaceConditionDemo {
+    static int totalItemsSold = 0;
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread worker1 = new Thread(() -> {
+            for (int i = 0; i < 100_000; i++) {
+                totalItemsSold++;
+            }
+        });
+        Thread worker2 = new Thread(() -> {
+            for (int i = 0; i < 100_000; i++) {
+                totalItemsSold++;
+            }
+        });
+        worker1.start();
+        worker2.start();
+        worker1.join();
+        worker2.join();
+        System.out.println("Total items sold: " + totalItemsSold);
+    }
+}
+```
+
+(The exact number varies between runs; it's almost always less than 200,000.)
+
+The expected total is 200,000. The actual total is lower because `totalItemsSold++` is not atomic: read the value, add one, write the result. Two threads can read the same value, both add one to the same starting number, and both write back the same result, losing one increment.
+
+A debugger helps confirm the cause by pausing both threads and inspecting their state. The fix is to use an `AtomicInteger`, a `synchronized` block, or one of the structured concurrency tools. The point here is that the debugger surfaces the symptom (two threads, each reading the same `totalItemsSold`, both about to write) in a way that print statements rarely catch.
+
+**Deadlocks** are the other classic threading bug. Two threads each hold a lock the other wants, and neither will release. The JVM detects most simple deadlocks and reports them in a thread dump.
+
+The state diagram is the lens to read a thread dump through. A `BLOCKED` thread is waiting for a lock; that's almost always interesting. A `WAITING` thread is waiting on a condition or I/O; sometimes interesting, sometimes just a healthy idle worker. A `RUNNABLE` thread is doing actual work or eligible to. Ten `BLOCKED` threads all waiting on the same lock signal a contention point.
+
+<h1 id="when-to-skip-the-debugger">When to Skip the Debugger</h1>
+
+Debuggers are powerful but not always the best fit. Sometimes structured logging beats a debug session.
+
+- **Production debugging.** Pausing production traffic for ten minutes during a request isn't an option. Add log statements, ship them, and read the log.
+- **Intermittent bugs.** A bug that fires one time in a thousand isn't going to wait. Logs capture every occurrence; a breakpoint only catches the ones being watched.
+- **Distributed flows.** A request that hops between three services with their own threads is hard to debug as one session. Correlation IDs and per-request log lines are usually clearer.
+- **Performance bugs.** A debugger pauses execution, which destroys the timing being measured. Use a profiler instead; this lesson stays on correctness.
+
+A reasonable heuristic: if the bug reproduces reliably on a laptop, use the debugger first. Otherwise, use logs first and use the debugger when the trigger finally appears.
+
+<h1 id="jvm-debugging-tools">JVM Debugging Tools</h1>
+
+The JDK ships with command-line tools that do not need a debugger attached. Use them when a process is misbehaving in production and inspection should be minimally disruptive.
+
+| Tool           | What it does                                                                                |
+| -------------- | ------------------------------------------------------------------------------------------- |
+| `jps`          | Lists running JVM processes on the local machine, with their PIDs.                          |
+| `jstack <pid>` | Prints a thread dump: every thread's state and stack trace.                                 |
+| `jmap <pid>`   | Heap-related operations: histograms, full heap dumps, finalizer queue.                      |
+| `jstat <pid>`  | Garbage collection and class loader statistics over time.                                   |
+| `jcmd <pid>`   | Umbrella tool for sending diagnostic commands; usually preferred over the individual tools. |
+
+A typical session starts with `jps -l` to find the PID of the process to inspect:
+
+```text
+$$ jps -l
+38712 com.shop.checkout.Main
+38901 jdk.compiler/com.sun.tools.javac.Main
+40012 sun.tools.jps.Jps
+```
+
+Once the PID is known, the rest of the tools attach to it. `jcmd 38712 help` lists every diagnostic command the JVM accepts for that process.
+
+`jcmd` has gradually absorbed the functionality of the other tools. `jcmd <pid> Thread.print` is equivalent to `jstack <pid>`. `jcmd <pid> GC.heap_dump /tmp/heap.hprof` is equivalent to `jmap -dump`. New JDK features tend to land in `jcmd` first, so it's a good default.
+
+<h1 id="thread-dumps">Thread Dumps</h1>
+
+A **thread dump** is a snapshot of every thread's state and stack at a single moment. It's the first thing to capture when an application is unresponsive or slow.
+
+```text
+$$ jcmd 38712 Thread.print
+```
+
+A trimmed excerpt from what you might see:
+
+```text
+"checkout-worker-1" #14 prio=5 os_prio=0 cpu=12.34ms elapsed=42.5s
+   java.lang.Thread.State: BLOCKED (on object monitor)
+    at com.shop.cart.CartService.applyDiscount(CartService.java:42)
+    - waiting to lock <0x000000076b2f1a30> (a java.lang.Object)
+    at com.shop.checkout.CheckoutController.placeOrder(CheckoutController.java:78)
+
+"checkout-worker-2" #15 prio=5 os_prio=0 cpu=8.12ms elapsed=42.5s
+   java.lang.Thread.State: BLOCKED (on object monitor)
+    at com.shop.cart.CartService.releaseStock(CartService.java:67)
+    - waiting to lock <0x000000076b2f1a30> (a java.lang.Object)
+    at com.shop.checkout.CheckoutController.cancelOrder(CheckoutController.java:104)
+```
+
+Two checkout workers are both `BLOCKED` waiting for the same lock (`0x000000076b2f1a30`). Whichever thread holds that lock is the next target; scrolling up in the dump to find a thread whose stack shows it currently holds that monitor (the JVM prints `- locked <0x000000076b2f1a30>` for the holder) reveals the cause of the contention.
+
+The JVM also explicitly flags deadlocks at the end of a thread dump:
+
+```text
+Found one Java-level deadlock:
+=============================
+"thread-A":
+  waiting to lock monitor 0x00007f1b88003008 (object 0x000000076b2f1a30),
+  which is held by "thread-B"
+"thread-B":
+  waiting to lock monitor 0x00007f1b88003078 (object 0x000000076b2f1b20),
+  which is held by "thread-A"
+```
+
+That's an automatic deadlock report. No interpretation required: thread-A holds lock 1, wants lock 2; thread-B holds lock 2, wants lock 1; neither will progress. The fix is to make both threads acquire locks in the same order, or to use a single lock for the section that needs them both.
+
+<h1 id="heap-dumps-and-outofmemoryerror">Heap Dumps and OutOfMemoryError</h1>
+
+A **heap dump** is a binary snapshot of every object in the JVM heap. It's the tool for debugging memory leaks and `OutOfMemoryError`.
+
+The most useful flag is one set proactively, before there's a problem:
+
+```text
+java -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/var/log/shop/heap.hprof -jar shop-server.jar
+```
+
+When the JVM hits `OutOfMemoryError` and is about to crash, it writes a complete heap dump to the specified path. Without that flag, the dying JVM produces a stack trace and nothing else, which is rarely enough to find a leak.
+
+To capture a heap dump on demand from a live process:
+
+```text
+$$ jcmd 38712 GC.heap_dump /tmp/shop-heap.hprof
+```
+
+Open the resulting `.hprof` file in Eclipse Memory Analyzer (MAT), VisualVM, or the IntelliJ Profiler. The first view to learn is the **dominator tree**, which sorts objects by how much of the heap they're keeping alive. A leak almost always shows up as one object near the top holding millions of others.
+
+A common e-commerce shape: a static `Map<String, Cart>` cache that's never bounded. Every visit creates a new cart, the map keeps the reference forever, and after a week the heap is mostly old carts. The dominator tree shows the map at the top with 99% of the heap underneath it, and the fix is to add eviction.
+
+Generating a heap dump pauses the JVM for the duration of the dump (often seconds for a multi-GB heap). Do not dump production heaps casually. When a production dump is necessary, do it on one instance at a time and behind a load balancer that can drain traffic.
+
+<h1 id="java-flight-recorder">Java Flight Recorder</h1>
+
+**Java Flight Recorder** (JFR) is the JVM's built-in continuous profiler. It records low-overhead events (GC pauses, lock contention, allocation, exceptions, custom application events) into a binary file for later analysis in JDK Mission Control or IntelliJ.
+
+Start a recording on a running JVM:
+
+```text
+$$ jcmd 38712 JFR.start name=checkout duration=60s filename=/tmp/checkout.jfr
+```
+
+Or start the JVM with a recording enabled from launch:
+
+```text
+java -XX:StartFlightRecording=duration=60s,filename=/tmp/checkout.jfr -jar shop-server.jar
+```
+
+JFR is targeted at performance analysis, but it earns a mention here because it surfaces correctness clues too. A spike in `jdk.JavaErrorThrow` events at the same moment the cart total goes wrong is a strong hint that the bug is a swallowed exception somewhere. A `jdk.JavaMonitorEnter` event with a long wait time pinpoints a contended lock.
+
+The overhead is intentionally low (the official target is under 1% of CPU for the default settings), so JFR is safe to leave running in production. That makes it a useful tool to enable preemptively on services where bugs are hard to reproduce after the fact.
+
+<h1 id="bug-categories-and-strategy">Bug Categories and Strategy</h1>
+
+Different bugs respond to different tools. A rough field guide:
+
+| Bug shape                       | Symptoms                                                          | First move                                                                                                                                                 |
+| ------------------------------- | ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| NullPointerException            | Stack trace pointing at a `.method()` call                        | Read the message (Java 14+ names the variable); set a `NullPointerException` exception breakpoint if the catch hides it; check the caller for missing data |
+| Infinite loop                   | One CPU pinned, no progress                                       | `jstack` to see which method the thread is stuck in; look for missing increment or wrong terminating condition                                             |
+| Off-by-one                      | Loop reads array index out of bounds, or skips first/last element | Set a breakpoint at the loop, step through the first and last iteration with a small input                                                                 |
+| Race condition                  | Output varies between runs, sometimes correct, sometimes not      | Look for non-atomic updates on shared state; use a thread dump to confirm threads are touching the same data                                               |
+| Deadlock                        | All threads `BLOCKED`, application unresponsive                   | `jstack`; let the JVM's automatic deadlock report point at the lock cycle                                                                                  |
+| Memory leak                     | Heap grows over time, eventual `OutOfMemoryError`                 | Heap dump with `-XX:+HeapDumpOnOutOfMemoryError`; analyse dominator tree in MAT                                                                            |
+| Wrong arithmetic                | Totals off by small amounts                                       | Often `float` / `double` rounding; switch to `BigDecimal` for money                                                                                        |
+| Intermittent crash on prod only | Works on your laptop, fails in staging                            | Difference in JVM version, environment, locale, or load; capture logs and a thread dump from the failing instance                                          |
+
+The pattern across all of them is the same: gather evidence first, then form one hypothesis, then test it. The fastest debuggers guess less often.
+
+<h1 id="rubber-duck-debugging">Rubber Duck Debugging</h1>
+
+The single most reliable technique for an invisible bug has nothing to do with tooling. **Rubber duck debugging** is the practice of explaining the code, out loud, to an inanimate object. The duck doesn't help; the explanation does.
+
+Walking through code line by line forces articulation of what each piece is supposed to do. Roughly half the time, the act of articulating it reveals a wrong assumption. "And then `applyDiscount` is called with the percentage as a fraction... wait, no, it's a whole number. That's the bug."
+
+Debugging is mostly a mismatch between a mental model and the code's actual behavior. Explaining the model surfaces the mismatch. A teammate is even better than a duck, but the duck never has a calendar conflict.
+
+<h1 id="git-as-a-debugging-tool">Git as a Debugging Tool</h1>
+
+When a bug used to not exist and now does, git history is the right place to look.
+
+**`git blame <file>`** shows the last commit that touched each line of a file. Given a buggy line, blame identifies the last author and the surrounding change. The commit message is the second most useful piece of information, after the code itself.
+
+**`git bisect`** finds the commit that introduced a bug by binary search. Given a known-good commit and a known-bad commit, it checks out commits halfway between them. Build, test, and tell bisect whether the bug is present (`git bisect bad`) or not (`git bisect good`). Within `log2(N)` steps, the exact commit that introduced the bug is isolated.
+
+```text
+$$ git bisect start
+$ git bisect bad                  # current commit has the bug
+$ git bisect good v2.3.1          # version 2.3.1 was fine
+Bisecting: 64 revisions left to test after this (roughly 6 steps)
+[abc1234] Refactor cart total calculation
+$ ./run-test.sh
+$ git bisect bad                  # bug is here too
+Bisecting: 32 revisions left to test after this (roughly 5 steps)
+[def5678] Add quantity validation to cart
+$ ./run-test.sh
+$ git bisect good                 # bug not here
+...
+abc1234 is the first bad commit
+$ git bisect reset
+```
+
+Bisect is dramatically more efficient than reading commits one at a time. A regression introduced 200 commits ago takes about 8 test runs to find, not 200.
+
+<h1 id="reproducing-intermittent-bugs">Reproducing Intermittent Bugs</h1>
+
+Intermittent bugs are the hardest because the very act of looking at them changes what they do. A few tactics:
+
+- **Capture more before changing anything.** Increase log verbosity in the suspected area. Log request IDs, timestamps, thread names, and the values of the inputs. The next failure leaves a richer artifact.
+- **Add assertions.** A defensive `if (cart.getTotal() < 0) throw new IllegalStateException("negative total: " + cart);` doesn't fix the bug, but it makes the bug fail loudly at the moment the invariant breaks, not three frames later when something else trips over the bad state.
+- **Run the trigger in a loop.** A bug that happens one time in a thousand becomes reproducible by running the operation in a loop ten thousand times and asserting every result. Many race conditions only show up under load; a tight loop is a poor man's load generator.
+- **Reduce the input.** If a 50-item cart sometimes fails, does it reproduce with 10 items? With 2? Shrinking the input shrinks the surface where the bug can be hiding.
+- **Check the environment.** Some "intermittent" bugs are perfectly deterministic, just sensitive to JVM version, OS, locale, time zone, or available memory. Pin everything possible and see if the intermittency goes away.
+
+The mindset shift is to stop trying to catch the bug as it happens and start trying to make it happen more often. A reliably-reproducing bug is an almost-fixed bug.
+
+<h1 id="putting-it-together-a-debugging-walkthrough">
+  Putting It Together: A Debugging Walkthrough
+</h1>
+
+A short, fully worked example. The bug report: "When I add a coupon, the total goes negative."
+
+The code:
+
+```java
+public class CouponBugDemo {
+    public static void main(String[] args) {
+        double subtotal = 49.99;
+        double couponDiscount = 60.00;  // a $60 off coupon
+        double total = applyCoupon(subtotal, couponDiscount);
+        System.out.println("Total: $" + total);
+    }
+
+    static double applyCoupon(double subtotal, double discount) {
+        return subtotal - discount;
+    }
+}
+```
+
+Reproduce: easy, the reporter gave the inputs (subtotal $49.99, coupon $60 off) and the wrong output ($-10.01).
+
+Isolate: the bug is in `applyCoupon`. The method has two lines.
+
+Hypothesize: the method subtracts the discount without checking whether the discount is bigger than the subtotal.
+
+Verify: set a breakpoint on the `return` line, look at `subtotal` and `discount`, confirm `discount > subtotal`, then fix:
+
+```java
+public class CouponBugFixed {
+    public static void main(String[] args) {
+        double subtotal = 49.99;
+        double couponDiscount = 60.00;
+        double total = applyCoupon(subtotal, couponDiscount);
+        System.out.println("Total: $" + total);
+    }
+
+    static double applyCoupon(double subtotal, double discount) {
+        return Math.max(0.0, subtotal - discount);
+    }
+}
+```
+
+The fix clamps the result at zero. Run the original reproduction, confirm the total is `$$0.0`, then run a neighbour (a $20 coupon on a $50 subtotal) to confirm the normal case still produces $30.
+
+That's the whole loop. Reproduce, isolate, hypothesize, verify. Every debugging session, big or small, walks the same path; the difference is the number of turns it takes.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

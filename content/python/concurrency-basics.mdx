@@ -1,0 +1,197 @@
+---
+title: "Concurrency Basics"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Concurrency Basics explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+Concurrency is how a program juggles multiple jobs so it doesn't sit idle while one of them is waiting. A checkout page that fetches product prices, stock counts, and shipping estimates one after another feels slow, even if each call is quick. Run those fetches together and the page feels instant. This lesson covers what concurrency actually means, how it differs from parallelism, when each Python tool helps, and why the wall clock matters more than CPU time for a lot of real work.
+
+<h1 id="the-problem-concurrency-solves">The Problem Concurrency Solves</h1>
+
+Most code is written as a straight line. Do step one, then step two, then step three. That's fine when every step is fast and the steps depend on each other. It falls apart the moment a step has to wait for something outside the program: a database, a payment service, a file on disk, a price feed.
+
+Think about a script that builds an order confirmation page. It needs to:
+
+1. Look up the customer profile.
+2. Fetch the cart contents.
+3. Get the latest stock count for each product.
+4. Pull a shipping estimate.
+5. Calculate the total.
+
+If each lookup takes 200 milliseconds and there are five of them, the page takes a full second. Most of that second is the program sitting around doing nothing while a network response makes its way back. The CPU is bored.
+
+```python
+import time
+
+def fetch_customer(customer_id: int) -> dict:
+    time.sleep(0.2)  # pretend this is a network call
+    return {"id": customer_id, "name": "Alice"}
+
+def fetch_cart(customer_id: int) -> list[str]:
+    time.sleep(0.2)
+    return ["Wireless Mouse", "USB Cable", "Charger"]
+
+def fetch_stock(product: str) -> int:
+    time.sleep(0.2)
+    return 12
+
+start = time.perf_counter()
+
+customer = fetch_customer(101)
+cart = fetch_cart(101)
+stock = {item: fetch_stock(item) for item in cart}
+
+elapsed = time.perf_counter() - start
+print(f"Done in {elapsed:.2f} seconds")
+print(stock)
+```
+
+Five sequential waits, one second total. Every one of those `time.sleep` calls is a stand-in for an I/O wait. During each wait, the CPU could be doing something else: starting the next request, checking inventory, anything. Sequential code wastes that time.
+
+Concurrency is the idea that a program can have multiple things in flight at once, switching between them as each one waits, so the total wall-clock time is closer to the longest single wait than the sum of all of them.
+
+<h1 id="concurrency-vs-parallelism">Concurrency vs Parallelism</h1>
+
+These two words get used interchangeably, but they describe different things.
+
+**Concurrency** is about structure. A program is concurrent if it's organized to handle multiple tasks that overlap in time. The tasks might run on a single CPU, taking turns, or they might run on multiple CPUs at the same instant. The point is the program is set up to make progress on more than one thing.
+
+**Parallelism** is about execution. A program is parallel if multiple tasks actually run at the same instant on different CPU cores. Parallelism is one way to achieve concurrency, but not the only way.
+
+A single-core machine can be concurrent without being parallel: it switches rapidly between tasks, doing a bit of each. A multi-core machine can be parallel: each core handles one task at the same moment.
+
+The diagram shows three setups. Sequential runs each task to completion before starting the next. Concurrent (single core) interleaves them so that whenever one task is waiting, another gets a turn. Parallel actually runs them at the same moment on different cores.
+
+Here's the kicker: for a program that mostly waits on the network or disk, you don't need parallelism. Concurrency is enough. A single CPU core can drive hundreds of network requests at once because for each one, the CPU's job is just "send the request" and then "wait for the response". While it waits, it works on another request.
+
+<h1 id="cpu-bound-vs-io-bound-work">CPU-Bound vs I/O-Bound Work</h1>
+
+Before picking a concurrency tool, you have to know what kind of work the program is doing. Every job a computer does falls into one of two camps.
+
+**I/O-bound** work spends most of its time waiting for something outside the CPU. Reading from disk, calling another service, querying a database, downloading a file, accepting a customer request, waiting on a payment service to confirm a charge. The CPU is idle during the wait.
+
+**CPU-bound** work spends most of its time doing actual computation. Resizing a product image, encoding a video, computing a complex pricing model, hashing passwords, parsing a large JSON file. The CPU is pegged at 100%.
+
+| Work Type | Bottleneck                       | Examples                                                                                                              |
+| --------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| I/O-bound | Network, disk, external services | Fetching product details from an API, reading order history from a database, downloading a customer's profile picture |
+| CPU-bound | Processor compute                | Resizing thousands of product thumbnails, computing a recommendation score, encoding a video review                   |
+
+Why does this distinction matter? Because the two kinds of work benefit from completely different concurrency strategies.
+
+I/O-bound work benefits massively from concurrency, even without parallelism. If you have 100 product lookups and each one waits 50 milliseconds for the database, doing them one at a time takes 5 seconds. Running them concurrently on a single core can finish in about 50 milliseconds, because all 100 waits overlap.
+
+CPU-bound work doesn't benefit from concurrency on a single core. If each calculation takes 50 milliseconds of actual CPU work, running 100 of them on one core still costs 5 seconds. The only way to speed it up is parallelism: split the work across multiple cores so they all crunch numbers at the same time.
+
+The decision tree above is the short version of the whole rest of this section. Once you know which side your code sits on, the right tool follows.
+
+A quick way to tell which one you have: open a system monitor while the program runs. If a single core is pinned at 100% and the program is slow, you're CPU-bound. If all cores are idle and the program is still slow, you're I/O-bound.
+
+<h1 id="wall-clock-time-vs-cpu-time">Wall-Clock Time vs CPU Time</h1>
+
+There are two clocks that matter when you talk about performance, and concurrency only moves one of them.
+
+**Wall-clock time** is what a real clock on the wall would measure. From "I clicked the button" to "the page loaded". This is what customers feel.
+
+**CPU time** is how long the CPU was actually doing work for your program. If the program waited for the network for half a second, the CPU was not busy during that wait, so the wait doesn't count toward CPU time.
+
+For a sequential I/O-bound program, wall-clock time is much larger than CPU time. The program ran for one second on the wall, but the CPU only did 20 milliseconds of actual work. The other 980 milliseconds were spent waiting.
+
+Concurrency shrinks wall-clock time by overlapping those waits. The total CPU work stays roughly the same (still 20 milliseconds), but the wall clock drops because the waits happen in parallel with each other, even on a single core.
+
+Here's a script that makes this concrete. It pretends to fetch stock counts for five products. Each fetch waits 200 milliseconds (simulating a network round-trip).
+
+```python
+import time
+
+def fetch_stock(product: str) -> int:
+    time.sleep(0.2)  # network wait
+    return 42
+
+products = ["Wireless Mouse", "USB Cable", "Charger", "HDMI Cable", "Webcam"]
+
+# Sequential: one fetch at a time
+wall_start = time.perf_counter()
+cpu_start = time.process_time()
+
+stock = [fetch_stock(p) for p in products]
+
+wall_elapsed = time.perf_counter() - wall_start
+cpu_elapsed = time.process_time() - cpu_start
+
+print(f"Wall-clock time: {wall_elapsed:.2f} s")
+print(f"CPU time:        {cpu_elapsed:.4f} s")
+```
+
+The wall clock says one second. The CPU did less than a millisecond of actual work. The rest of that second was the program waiting on five `time.sleep` calls in a row. If you could overlap those sleeps, the wall-clock time would drop close to 0.2 seconds (the longest single wait), and the CPU time would barely change.
+
+That's exactly what concurrency does for I/O-bound code. Same total CPU work, much smaller wall clock.
+
+> **Cost:** `time.sleep(0.2)` is a stand-in for network latency. Real network calls have variable latency (50-500 ms is typical for cross-region API calls), and concurrency benefits compound when you stack many of them. The wall-clock savings scale with how many waits you can overlap.
+
+For CPU-bound code, this trick doesn't work. There's no wait to overlap, the CPU is genuinely busy the whole time. The only path to a smaller wall clock is to use more CPU cores in parallel.
+
+<h1 id="the-three-python-concurrency-tools">
+  The Three Python Concurrency Tools
+</h1>
+
+Python gives you three main tools to introduce concurrency. Each one fits a different shape of problem, and picking the wrong one can make the program slower instead of faster.
+
+**Threading** runs multiple threads inside a single Python process. Threads share memory, so they can read and write the same variables. In Python, threads are great for I/O-bound work because the interpreter releases its internal lock while a thread waits on the network or disk. For CPU-bound work, threading does not help: only one Python thread runs Python bytecode at a time per process.
+
+**Multiprocessing** runs multiple Python processes, each with its own interpreter and memory space. Because each process has its own everything, they can genuinely run CPU-bound Python code in parallel on multiple cores. The cost is that processes can't share memory directly, so passing data between them is slower than sharing variables between threads.
+
+**Asyncio** is a different model entirely. It runs a single thread that switches between many tasks at points marked with `await`. There's no operating system thread per task and no lock to fight over. Asyncio is built for I/O-bound work where you might have thousands of concurrent waits (a chat server with 10,000 connected customers, for example). It's the most efficient option for high-concurrency I/O, but it requires writing your code with `async` and `await`.
+
+| Tool              | Runs in                             | Good for                                                  | Not good for                                           |
+| ----------------- | ----------------------------------- | --------------------------------------------------------- | ------------------------------------------------------ |
+| `threading`       | One process, multiple OS threads    | I/O-bound work, simpler to retrofit into existing code    | CPU-bound work (the GIL prevents true parallelism)     |
+| `multiprocessing` | Multiple OS processes               | CPU-bound work, true parallel execution on multiple cores | High-concurrency I/O (process startup and memory cost) |
+| `asyncio`         | One process, one thread, many tasks | Very high-concurrency I/O (thousands of connections)      | CPU-bound work, mixing with blocking libraries         |
+
+The diagram below shows where each tool lives in the operating system.
+
+The left process shows threading: one process, multiple threads, shared memory between them. The middle two boxes show multiprocessing: separate processes, no shared memory, but real parallelism across cores. The right box shows asyncio: a single thread running an event loop that juggles many tasks, none of them mapping to a separate OS thread.
+
+A rough rule of thumb:
+
+- Network calls, file I/O, database queries, a handful of waits: **threading**.
+- Heavy math, image processing, anything CPU-bound: **multiprocessing**.
+- Thousands of concurrent connections or a codebase already using `async`: **asyncio**.
+
+There's also `concurrent.futures`, a higher-level wrapper around threading and multiprocessing that gives you a single API for both.
+
+<h1 id="a-quick-note-on-the-gil">A Quick Note on the GIL</h1>
+
+You'll hear about the **Global Interpreter Lock** (the GIL) constantly when reading about Python concurrency. The short version: CPython, the reference implementation of Python that nearly everyone uses, has a lock that allows only one thread to execute Python bytecode at a time inside a single process.
+
+That's why threading doesn't speed up CPU-bound Python code: even with eight threads on an eight-core machine, only one of them is running Python at any moment. The other seven are waiting for the lock.
+
+The GIL doesn't get in the way of I/O-bound work because the interpreter releases the lock while a thread waits on the network or disk. Other threads can run Python during that wait. That's why threading is genuinely useful for I/O-bound code.
+
+Multiprocessing sidesteps the GIL entirely by using multiple processes, each with its own interpreter and its own GIL. They can't fight over a single lock because they don't share one.
+
+Asyncio works inside a single thread, so the GIL never comes up. There's only one thread holding the lock the whole time, and it does its work by yielding cooperatively at `await` points instead of preempting itself.
+
+> **Note:** Python 3.13 introduced an experimental "no-GIL" build (PEP 703) that removes the lock entirely, and 3.14 is making it official. For the next several years, though, the GIL is the default and the rules above hold.
+
+The takeaway for this lesson: the GIL is why CPU-bound and I/O-bound work need different tools. It's not a bug, it's a design choice that makes CPython simpler and faster for the common case (one thread, lots of I/O). Once you know the work is CPU-bound, you reach for multiprocessing and the GIL stops mattering.
+
+<h1 id="putting-it-together">Putting It Together</h1>
+
+Concurrency is structure. Parallelism is execution. CPU-bound work needs parallelism (multiple cores actually running at once). I/O-bound work just needs concurrency (a way to overlap waits).
+
+Most application code is I/O-bound: web requests, database queries, calls to other services, reading files, talking to a payment provider. For that kind of work, concurrency gives you a multi-second speedup with relatively little code change.
+
+A small number of jobs are CPU-bound: image processing, machine learning, large in-memory data crunching. For those, the GIL forces you to multiprocessing if you want real speedup on Python.
+
+The rest of this section walks through each tool one at a time. By the end, you'll know exactly which one to reach for and why.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,590 @@
+---
+title: "Design Instagram"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Design Instagram explained with clear examples, visuals, and practice questions in Mindflare's System Design Interviews course."
+---
+
+<LessonCard>
+
+<h1 id="2-capacity-estimation">2. Capacity Estimation</h1>
+
+<h3 id="user-base">User Base</h3>
+
+- **Total Monthly Active Users (MAUs):** 2 billion
+- **Daily Active Users (DAUs):** → **500 million users/day**
+
+<h3 id="estimating-read-write-requests">Estimating Read & Write Requests</h3>
+
+<h4 id="post-uploads-writes">Post Uploads (Writes)</h4>
+
+- 100M media uploads/day
+- Each upload generates metadata writes (DB + cache)
+- **Total write requests:** 100M uploads + 100M metadata writes = 200M writes/day
+
+<h4 id="feed-reads">Feed Reads</h4>
+
+- Assume an average user scrolls through 100 posts per session
+- 500 million DAUs × 100 posts viewed = 50B feed requests/day
+- Assuming 80% of feed reads are served from cache, backend reads = 10B DB reads/day
+
+<h3 id="estimating-storage-requirements">Estimating Storage Requirements</h3>
+
+<h4 id="assumptions">Assumptions</h4>
+
+- 20% of DAUs (100M) upload media every day
+- 80% of uploads are photos, 20% are videos
+- **Average photo size:** 1MB
+- **Average video size:** 10 MB
+
+<h4 id="daily-storage-calculation">Daily Storage Calculation</h4>
+
+- **Photos:** (100M × 80%) × 1 MB = 80 TB/day
+- **Videos:** (100M × 20%) × 10 MB = 200 TB/day
+- **Total storage per day:** 280 TB/day
+
+<h4 id="database-storage">Database Storage</h4>
+
+- **Metadata per post:** ~500 bytes (caption, timestamp, author, engagement counts)
+- **Total posts in a year:** 100M × 365 = 36B posts
+- **Metadata storage per year:** 90 TB/year
+
+<h4 id="caching-requirements">Caching Requirements</h4>
+
+- **Hot cache size:** Store recent & popular 1 billion posts
+- Assume each cached post takes 2 KB (post data + engagement counts)
+- Cache size = 2 TB for active posts (Redis/Memcached)
+
+<h1 id="3-high-level-design">3. High Level Design</h1>
+
+The diagram below maps the major components and their connections, from the clients and API Gateway through the core services, data stores, and CDN.
+
+<h3 id="components">Components</h3>
+
+<h4 id="1-clients-web-mobile">1. Clients (Web, Mobile)</h4>
+
+Users interact with the platform through web browsers or mobile apps. The client applications handle video playback, user interactions like likes and comments, and UI rendering, communicating with backend services through an **API Gateway** or **Load Balancer**.
+
+<h4 id="2-load-balancer-api-gateway">2. Load Balancer / API Gateway</h4>
+
+Acts as the single entry point for all client requests. It distributes incoming traffic across multiple service instances for **high availability** and **scalability**, and enforces **rate limiting**, **authentication**, and **authorization** before forwarding requests to downstream services.
+
+<h4 id="3-user-service">3. User Service</h4>
+
+Stores and manages **user authentication, profile data, and social connections** (follow/unfollow).
+
+<h4 id="4-post-service">4. Post Service</h4>
+
+Handles **photo/video uploads** and stores metadata such as caption, user info, and timestamps. It coordinates the upload of media files from the user's device to **Object Storage (e.g., AWS S3)** and updates metadata in a **database**. It also uses a message queue such as **Kafka** to notify the Feed Service when a new post is created.
+
+<h4 id="5-feed-service">5. Feed Service</h4>
+
+Precomputes and stores user feeds in a high-performance cache such as Redis or Memcached to enable fast retrieval, and queries the database if a feed is not cached.
+
+<h4 id="6-engagement-service">6. Engagement Service</h4>
+
+Manages **likes, comments, and shares**, and writes engagement data to a high-throughput database asynchronously via a message queue.
+
+<h4 id="7-search-service">7. Search Service</h4>
+
+Allows users to search for other users, hashtags, and posts. It uses **Elasticsearch** to index and retrieve data quickly, and supports **autocomplete and full-text search** for a better user experience.
+
+<h4 id="8-message-queue">8. Message Queue</h4>
+
+Decouples services and enables event-driven processing. It notifies the **Feed Service** of new posts and updates engagement data asynchronously.
+
+<h4 id="9-object-storage-cdn">9. Object Storage & CDN</h4>
+
+Photos and videos are stored in distributed object storage such as S3 or Google Cloud Storage, and a **CDN (Cloudflare, AWS CloudFront)** ensures fast delivery globally.
+
+<h1 id="4-database-design">4. Database Design</h1>
+
+A large-scale content platform like Instagram requires handling both **structured data** (e.g., user accounts, post metadata) and **unstructured/semistructured data** (e.g., photos, videos, search indexes).
+
+Typically, you’ll combine multiple database solutions to handle different workloads.
+
+Given the requirements, we will use a **relational database (e.g., PostgreSQL, MySQL)** for structured data and a **NoSQL database (Cassandra, DynamoDB, or Elasticsearch)** for feed storage and search indexing.
+
+<h2 id="41-relational-database-for-structured-data">
+  4.1 Relational Database for Structured Data
+</h2>
+
+Given the structured nature of user profiles and posts metadata, a relational database (like **PostgreSQL** or **MySQL**) is often well-suited.
+
+- **Users Table: **Stores user account details.
+- **Posts Table: **Stores metadata related to posts.
+- **Media Table: **Stores photo/video metadata, but not the actual files.
+- **Comments Table: **Stores post comments.
+- **Shares Table: **Stores post shares.
+- **Followers Table: **Maintains the follow/unfollow relationship. Stores engagement score from followers to help with ranking posts in the feed.
+
+<h2 id="42-nosql-databases-for-high-volume-data">
+  4.2 NoSQL Databases for High-Volume Data
+</h2>
+
+While relational databases are ideal for structured data, they struggle with high-velocity writes and large scale distributed workloads. NoSQL databases like **Cassandra, DynamoDB, or Redis** provide horizontal scalability and high availability.
+
+To reduce **feed generation latency**, a **denormalized feed table** stores precomputed timelines:
+
+```json
+{
+  "user_id": 56789,
+  "feed": [
+    {
+      "post_id": 111,
+      "user_id": 123,
+      "media_url": "s3://path1",
+      "caption": "Hello world"
+    },
+    {
+      "post_id": 112,
+      "user_id": 234,
+      "media_url": "s3://path2",
+      "caption": "Sunset view"
+    }
+  ]
+}
+```
+
+This table is updated **asynchronously** via **Kafka** when a user posts, and cached **in Redis for quick retrieval**.
+
+<h4 id="using-graph-databases-for-social-connections">
+  Using Graph Databases for Social Connections
+</h4>
+
+To support complex relationship queries, such as mutual friends, suggested followers, and influencer ranking, we can use a **graph database** like Neo4j or Amazon Neptune.
+
+They efficiently model follower-following relationships with nodes and edges.
+
+**Example Query: "People You May Know"**
+
+```text
+MATCH (me:User {id:12345})-[:FOLLOWS]->(friend)-[:FOLLOWS]->(suggested)
+WHERE NOT (me)-[:FOLLOWS]->(suggested)
+RETURN suggested LIMIT 5
+```
+
+This allows **real-time friend suggestions** without complex SQL joins.
+
+<h2 id="43-search-indexes">4.3 Search Indexes</h2>
+
+To support fast and scalable search queries, we can use **Elasticsearch**, a distributed, real-time search engine optimized for full-text searches.
+
+Each user profile and post metadata can be stored as a document in an Elasticsearch index, allowing quick lookups and advanced filtering.
+
+<h4 id="example-storing-user-data-in-elasticsearch">
+  Example: Storing User Data in Elasticsearch
+</h4>
+
+```json
+{
+  "user_id": 12345,
+  "username": "john_doe",
+  "full_name": "John Doe",
+  "bio": "Photographer | Traveler"
+}
+```
+
+To support trending hashtags and keyword searches, we can store **hashtags** in a separate Elasticsearch index.
+
+**Example:**
+
+```json
+{
+  "hashtag": "#travel",
+  "post_count": 1500000,
+  "last_used": "2025-03-20T12:00:00Z"
+}
+```
+
+<h2 id="44-media-storage">4.4 Media Storage</h2>
+
+Instagram handles **petabytes of photos/videos**, requiring a **durable and low-latency storage solution**.
+
+A **distributed object storage system**, such as **Amazon S3**, is well-suited for storing media files. It supports **pre-signed URLs**, enabling users to upload media directly without routing through application servers, reducing load and latency.
+
+To ensure **high durability**, media files are stored in multiple replicas across different data centers, protecting against data loss.
+
+To further optimize read latency, content can be cached closer to users using a **Content Delivery Network (CDN)** like **Cloudflare or Amazon CloudFront**. This reduces load times and improves the user experience, especially for frequently accessed media.
+
+<h1 id="5-api-design">5. API Design</h1>
+
+<h3 id="51-get-user-profile">5.1 Get User Profile</h3>
+
+Fetching a user's profile requires a valid JWT token; the response returns core account fields including follower and following counts.
+
+```text
+GET /api/v1/users/{user_id}
+Authorization: Bearer JWT_TOKEN
+```
+
+**Response:**
+
+```json
+{
+  "user_id": 12345,
+  "username": "john_doe",
+  "full_name": "John Doe",
+  "profile_pic": "https://cdn.example.com/profile.jpg",
+  "followers_count": 200,
+  "following_count": 150
+}
+```
+
+<h3 id="52-follow-a-user">5.2 Follow a User</h3>
+
+A POST to the follow endpoint records the relationship between the authenticated user and the target account, and no request body is required.
+
+```text
+POST /api/v1/users/{user_id}/follow
+Authorization: Bearer JWT_TOKEN
+```
+
+<h3 id="53-create-a-new-post">5.3 Create a New Post</h3>
+
+This endpoint accepts multipart form data so that both caption text and media files can be submitted in a single request.
+
+```text
+POST /api/v1/posts
+Authorization: Bearer JWT_TOKEN
+Content-Type: multipart/form-data
+```
+
+**Form Data:**
+
+```text
+caption: "Sunset at the beach"
+media: [image1.jpg, video1.mp4]
+```
+
+**Response:**
+
+```json
+{
+  "post_id": 98765,
+  "message": "Post uploaded successfully"
+}
+```
+
+<h3 id="54-get-a-post-by-id">5.4 Get a Post by ID</h3>
+
+This endpoint retrieves the full metadata for a single post, including media URLs, like count, and comment count.
+
+```text
+GET /api/v1/posts/{post_id}
+```
+
+**Response:**
+
+```json
+{
+  "post_id": 98765,
+  "user_id": 12345,
+  "caption": "Sunset at the beach",
+  "media": [
+    "https://cdn.example.com/photo1.jpg",
+    "https://cdn.example.com/video1.mp4"
+  ],
+  "likes_count": 500,
+  "comments_count": 120
+}
+```
+
+<h3 id="55-get-user-feed">5.5 Get User Feed</h3>
+
+Paginated via `page` and `limit` query parameters, this endpoint returns a personalized list of posts from accounts the authenticated user follows.
+
+```text
+GET /api/v1/feed?page=1&limit=10
+Authorization: Bearer JWT_TOKEN
+```
+
+**Response:**
+
+```json
+[
+  {
+    "post_id": 123,
+    "user": {
+      "user_id": 56789,
+      "username": "travel_lover"
+    },
+    "caption": "Exploring the mountains!",
+    "media": ["https://cdn.example.com/photo123.jpg"],
+    "likes_count": 1200,
+    "comments_count": 85
+  },
+  {
+    "post_id": 124,
+    "user": {
+      "user_id": 98765,
+      "username": "foodie_dude"
+    },
+    "caption": "Delicious sushi!",
+    "media": ["https://cdn.example.com/photo124.jpg"],
+    "likes_count": 980
+  }
+]
+```
+
+<h3 id="56-like-a-post">5.6 Like a Post</h3>
+
+Sending a POST to this endpoint records a like from the authenticated user on the specified post, with no request body needed.
+
+```text
+POST /api/v1/posts/{post_id}/like
+Authorization: Bearer JWT_TOKEN
+```
+
+<h3 id="57-comment-on-a-post">5.7 Comment on a Post</h3>
+
+Posting a comment requires a JSON body containing the comment text; the endpoint accepts `application/json` as the content type.
+
+```text
+POST /api/v1/posts/{post_id}/comment
+Authorization: Bearer JWT_TOKEN
+Content-Type: application/json
+```
+
+```json
+{
+  "content": "Amazing shot!"
+}
+```
+
+<h3 id="58-get-comments-for-a-post">5.8 Get Comments for a Post</h3>
+
+Comments are returned in paginated order; each item includes the commenter's ID, username, text content, and timestamp.
+
+```text
+GET /api/v1/posts/{post_id}/comments?page=1&limit=10
+```
+
+**Response:**
+
+```json
+[
+  {
+    "comment_id": 65432,
+    "user": {
+      "user_id": 12345,
+      "username": "john_doe"
+    },
+    "content": "Amazing shot!",
+    "created_at": "2025-03-18T12:34:56Z"
+  },
+  {
+    "comment_id": 65433,
+    "user": {
+      "user_id": 67890,
+      "username": "nature_lover"
+    },
+    "content": "Breathtaking view!"
+  }
+]
+```
+
+<h3 id="59-search-users">5.9 Search Users</h3>
+
+A GET request with the `q` query parameter returns matching user profiles ranked by relevance, powered by Elasticsearch under the hood.
+
+```text
+GET /api/v1/search/users?q=john
+```
+
+**Response:**
+
+```json
+[
+  {
+    "user_id": 12345,
+    "username": "john_doe",
+    "full_name": "John Doe",
+    "profile_pic": "https://cdn.example.com/profile.jpg"
+  }
+]
+```
+
+<h1 id="6-design-deep-dive">6. Design Deep Dive</h1>
+
+<h2 id="61-photovideo-upload">6.1 Photo/Video Upload</h2>
+
+1. **User Initiates the Upload**
+2. **API Gateway Handles the Request**
+3. **Post Service Generates a Pre-signed URL**
+4. **Client Uploads Media to Object Storage**
+5. **Post Service Saves Metadata in the Database**
+6. **Kafka Publishes a "New Post" Event**
+
+<h2 id="62-newsfeed-generation">6.2 Newsfeed Generation</h2>
+
+Since users follow both normal users and celebrities, the system must mix posts efficiently.
+
+<h3 id="fan-out-on-write-push-model-for-normal-users">
+  Fan-out-on-write (Push Model) for Normal Users
+</h3>
+
+For **normal users** with a manageable number of followers, we use **fan-out-on-write**, meaning posts are **pushed** to followers’ feeds at the time of posting.
+
+<h4 id="how-it-works">How It Works</h4>
+
+1. User A posts a new photo/video.
+2. The Post Service sends an event to Kafka, notifying the Feed Service.
+3. The Feed Service identifies the users followers (e.g., 500 followers).
+4. The post is immediately inserted into each follower’s timeline, stored in Redis (hot cache).
+5. When followers open their feeds, posts are instantly available, ensuring low-latency reads.
+
+**Example: LPUSH - Add Post to Followers’ Feeds**
+
+Suppose user `12345` (John Doe), who has 500 followers, posts a new photo. The Feed Service pushes this post to all 500 followers' feeds.
+
+```text
+LPUSH feed:56789 "{'post_id': 98765, 'author': 'john_doe', 'media_url': 'https://cdn.instagram.com/photo98765.jpg', 'caption': 'Sunset at the beach!', 'timestamp': '2025-03-20T14:30:00Z'}"
+
+LPUSH feed:67890 "{'post_id': 98765, 'author': 'john_doe', 'media_url': 'https://cdn.instagram.com/photo98765.jpg', 'caption': 'Sunset at the beach!', 'timestamp': '2025-03-20T14:30:00Z'}"
+
+LPUSH feed:78901 "{'post_id': 98765, 'author': 'john_doe', 'media_url': 'https://cdn.instagram.com/photo98765.jpg', 'caption': 'Sunset at the beach!', 'timestamp': '2025-03-20T14:30:00Z'}"
+
+...
+```
+
+Here, John's post is pushed to the feeds of followers `56789`, `67890`, and `78901`, along with 497 other followers.
+
+**Example: Fetching a User’s Feed (LRANGE - Get Recent Posts)**
+
+```text
+LRANGE feed:56789 0 9  # Fetch the latest 10 posts from user 56789's feed
+```
+
+**Benefits:** Reads are fast since followers' feeds are pre-loaded, and the approach works well for small and medium-sized accounts.
+
+**Challenges:** It becomes inefficient for users with millions of followers, such as celebrities. Writing a single post requires copying it to potentially millions of timelines, which leads to high write amplification.
+
+<h3 id="fan-out-on-read-pull-model-for-celebrities">
+  Fan-out-on-read (Pull Model) for Celebrities
+</h3>
+
+For **celebrities and influencers**, where a single post may need to reach **millions of followers**, preloading into every follower’s feed is impractical.
+
+Instead, a **fan-out-on-read (pull model)** is used.
+
+<h4 id="how-it-works">How It Works</h4>
+
+1. When a user requests their newsfeed, the Feed Service dynamically retrieves normal users’ posts from Redis (precomputed feeds) and celebrity posts from a hot cache (Redis) or a persistent store (PostgreSQL).
+2. The system merges both types of posts in real-time before serving the feed.
+
+**Benefits:** It avoids massive write operations, which keeps the system scalable, and it serves fresh data when users request their feeds.
+
+**Challenges:** Read latency is slightly higher than the push model, and it requires caching optimization to reduce database lookups.
+
+<h2 id="63-search">6.3 Search</h2>
+
+<h3 id="indexing-new-content">Indexing New Content</h3>
+
+1. **A New Post/User is Created**
+2. **Search Service Updates Elasticsearch Index**
+
+<h3 id="search-request">Search Request</h3>
+
+1. **User Initiates a Search Request**
+2. **Search Service Queries Elasticsearch**
+3. **Elasticsearch Returns Results**
+4. **Search Results are Cached in Redis**
+
+<h2 id="64-like-comments-and-shares">6.4 Like, Comments and Shares</h2>
+
+The **Engagement Service **processes like, comment and share requests.
+
+It sends a Kafka event to update the DB asynchronously.
+
+**Like event:**
+
+```json
+{
+  "event": "POST_LIKED",
+  "user_id": 12345,
+  "post_id": 67890
+}
+```
+
+**Share event:**
+
+```json
+{
+  "event": "POST_SHARED",
+  "user_id": 12345,
+  "post_id": 67890
+}
+```
+
+**Comment event:**
+
+```json
+{
+  "event": "POST_COMMENTED",
+  "user_id": 12345,
+  "post_id": 67890,
+  "comment_id": 99999,
+  "content": "Amazing shot!"
+}
+```
+
+To optimize the latency for popular posts, we can cache like / share count and top comments.
+
+<h1 id="7-follow-ups">7. Follow-ups</h1>
+
+<h2 id="71-scalability">7.1 Scalability</h2>
+
+Scalability ensures the system can handle increasing load without degrading performance.
+
+<h4 id="horizontal-scaling-scale-out">Horizontal Scaling (Scale Out)</h4>
+
+Use distributed databases like Cassandra or DynamoDB to spread data across nodes, and deploy multiple instances of each service behind a load balancer to handle user requests.
+
+<h4 id="sharding">Sharding</h4>
+
+Shard large datasets to split them across nodes:
+
+- User Data → Shard by `user_id mod N`
+- Posts → Shard by `post_id mod N`
+- Followers Table → Shard by `follower_id mod N`
+
+<h4 id="microservices-architecture">Microservices Architecture</h4>
+
+Break the system into independent services such as the Feed Service, Post Service, and User Service to improve maintainability and scalability. Use message queues like Kafka or RabbitMQ to handle high-throughput operations asynchronously, including notifications, updates, and feed generation.
+
+<h2 id="72-availability">7.2 Availability</h2>
+
+Availability ensures that Instagram remains accessible 24/7, even in the face of failures. Given its global user base, the platform must achieve atleast 99.99% uptime.
+
+<h4 id="redundancy-replication">Redundancy & Replication</h4>
+
+Maintain replicated databases across multiple regions, such as PostgreSQL replicas and Cassandra multi-region clusters, and deploy multiple application servers across different availability zones (AZs).
+
+<h4 id="failover-mechanisms">Failover Mechanisms</h4>
+
+Use automatic failover in databases, such as a leader-follower setup in PostgreSQL or multi-leader Cassandra clusters, and implement circuit breakers to gracefully degrade service if a dependency fails.
+
+<h2 id="73-durability">7.3 Durability</h2>
+
+Durability ensures that data, especially user-generated content (photos, videos, comments, likes), is never lost, even in case of system failures.
+
+<h4 id="distributed-object-storage">Distributed Object Storage</h4>
+
+Store media in Amazon S3 or Google Cloud Storage, which replicates data across multiple locations to prevent loss.
+
+<h4 id="database-replication-backups">Database Replication & Backups</h4>
+
+Use multi-region replication across Cassandra, DynamoDB, or PostgreSQL replicas for disaster recovery, and perform regular backups to prevent accidental data loss.
+
+<h4 id="write-ahead-logging-wal-event-sourcing">
+  Write-Ahead Logging (WAL) & Event Sourcing
+</h4>
+
+Implement WAL in databases so that changes are recorded before they are committed, and use event sourcing to log user actions like new posts and likes so that state can be rebuilt if necessary.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

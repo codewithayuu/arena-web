@@ -1,0 +1,663 @@
+---
+title: "Test Coverage"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "Test Coverage explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="what-coverage-actually-measures">What Coverage Actually Measures</h1>
+
+When you run your tests under a coverage tool, it instruments your code so that every time a line executes, it gets recorded. After the test run, you get a report saying "out of 200 lines in this module, 174 ran and 26 didn't". The lines that didn't run are the ones no test reached.
+
+That's the whole mechanism. There's no magic. The tool watches your code execute and writes down what it sees. The interesting question isn't "how does it work" but "what does the answer mean".
+
+A high coverage number means your tests touched a lot of code. It does not mean your tests verified that code behaves correctly. A test that calls `calculate_discount(100, "gold")` and asserts nothing still counts every line of `calculate_discount` as covered. The line ran. The tool can't tell whether anyone checked the result.
+
+So coverage is a "tests didn't reach here" detector. Use it to find blind spots, not to prove quality.
+
+The output of the loop is a list of line numbers your tests never touched. You read that list, look at the code, and decide whether each missed line is a real gap (write a test) or genuinely unreachable (mark it as excluded).
+
+<h1 id="installing-and-running">Installing and Running</h1>
+
+`coverage.py` is the underlying tool. `pytest-cov` is a thin pytest plugin that calls into it. Most projects install both via the plugin:
+
+```text
+pip install pytest-cov
+```
+
+That pulls `coverage` in as a dependency. You don't have to install it separately.
+
+The simplest run looks like this. Suppose your package is named `shop` and lives at `shop/`:
+
+```text
+pytest --cov=shop
+```
+
+That tells pytest to run the test suite and measure coverage for the `shop` package. The output adds a small table at the end:
+
+```text
+============================= test session starts ==============================
+collected 12 items
+
+tests/test_discount.py ............                                      [100%]
+
+----------- coverage: platform darwin, python 3.12.0-final-0 -----------
+Name                          Stmts   Miss  Cover
+-------------------------------------------------
+shop/__init__.py                  0      0   100%
+shop/discount.py                 24      3    88%
+shop/order.py                    31      0   100%
+-------------------------------------------------
+TOTAL                            55      3    95%
+
+============================== 12 passed in 0.18s ==============================
+```
+
+Three columns matter:
+
+- **Stmts:** how many executable statements the file has.
+- **Miss:** how many statements no test ran.
+- **Cover:** the percentage that did run.
+
+The total at the bottom is the weighted average across all files. A `0/0` file (empty `__init__.py`) reports 100% by convention.
+
+If you want to see which lines specifically weren't covered, ask for the missing report:
+
+```text
+pytest --cov=shop --cov-report=term-missing
+```
+
+That changes the table to include a `Missing` column:
+
+```text
+Name                Stmts   Miss  Cover   Missing
+-------------------------------------------------
+shop/discount.py       24      3    88%   17-19
+shop/order.py          31      0   100%
+-------------------------------------------------
+TOTAL                  55      3    95%
+```
+
+Now you can open `shop/discount.py`, jump to lines 17-19, and decide whether those lines need a test.
+
+> **Cost:** Coverage instrumentation typically slows the test suite by 5 to 20 percent because Python's trace hook fires on every line. For small suites it's invisible. For a large suite that already takes minutes, consider running coverage only in CI or behind a flag.
+
+<h1 id="line-coverage-vs-branch-coverage">Line Coverage vs Branch Coverage</h1>
+
+By default, `coverage.py` measures **line coverage**: did this line of code execute, yes or no. That's enough for straight-line code, but it misses something important about conditionals.
+
+Look at this `DiscountCalculator`:
+
+```python
+def calculate_discount(price: float, tier: str) -> float:
+    if tier == "gold":
+        discount = 0.20
+    elif tier == "silver":
+        discount = 0.10
+    else:
+        discount = 0.0
+    return price * (1 - discount)
+```
+
+Now suppose you only write one test:
+
+```python
+def test_gold_tier_gets_twenty_percent_off():
+    assert calculate_discount(100.0, "gold") == 80.0
+```
+
+Run line coverage and you'll see line 2 (the `if`) ran, line 3 ran, and line 8 (the `return`) ran. Lines 4, 5, 6, and 7 didn't. So you'll get a "missing 4-7" report, which correctly tells you the silver and default paths aren't tested. Fine.
+
+But consider a smaller example where the `else` is missing entirely:
+
+```python
+def round_price(amount: float) -> float:
+    if amount < 0:
+        amount = 0
+    return round(amount, 2)
+```
+
+If your only test is `round_price(19.999)`, line coverage says everything ran except line 3. Easy to spot.
+
+Now what if your only test is `round_price(-5)`? Line 2 ran (the `if`), line 3 ran (the assignment), line 4 ran. Line coverage reports 100% for this function. But you've never tested what happens when `amount >= 0` directly skips the `if` body. The decision point was only exercised in one direction.
+
+**Branch coverage** fixes this. It records each conditional outcome separately: did the `if` go true at least once, and did it go false at least once. To turn it on, add `--cov-branch`:
+
+```text
+pytest --cov=shop --cov-branch --cov-report=term-missing
+```
+
+With branch coverage on, the second example above reports:
+
+```text
+Name              Stmts   Miss Branch BrPart  Cover   Missing
+-----------------------------------------------------------
+shop/pricing.py       4      0      2      1    83%   2->4
+```
+
+The new columns:
+
+- **Branch:** how many branch decisions exist in the file.
+- **BrPart:** how many branches were only partially covered (took one direction but not the other).
+- **Missing:** now also shows missed branches in `from->to` form. `2->4` means "the `if` on line 2 going directly to line 4 was never taken" (the `False` direction in this case).
+
+Here's the same comparison as a diagram. Line coverage cares only about which boxes were entered. Branch coverage cares which arrows were taken.
+
+The solid arrow is the path your single test took. The dashed arrow is the path branch coverage flags as missing, even though every line on both paths technically ran. Line coverage would have reported 100% and you'd never have known.
+
+The fix is the test you didn't write yet:
+
+```python
+def test_round_price_does_not_clamp_positive():
+    assert round_price(19.999) == 20.0
+```
+
+Now both branches are taken and `BrPart` drops to zero.
+
+> **Cost:** Branch coverage is more expensive to compute than line coverage, usually 10 to 30 percent slower than already-instrumented line coverage. For most projects the extra signal is worth it. Turn it on in CI even if you skip it locally.
+
+<h1 id="reading-a-coverage-report-in-detail">
+  Reading a Coverage Report in Detail
+</h1>
+
+The terminal report is fine for "did anything regress". For actually fixing gaps, the HTML report is much better. Generate it with:
+
+```text
+pytest --cov=shop --cov-branch --cov-report=html
+```
+
+That writes a directory called `htmlcov/` to the current working directory. Open `htmlcov/index.html` in a browser. The index page lists every covered file with the same columns as the terminal output, but clickable.
+
+Click a file and you get the full source listing, color-coded. Each line gets a small marker on the left:
+
+- A **green** line ran at least once during the test suite.
+- A **red** line never ran. These are the gaps.
+- A **yellow** line is partially branched: it ran, but at least one of the branches it controls was never taken.
+
+Hover over a yellow line and the report tells you which target line numbers were missed. So if you see line 12 highlighted yellow with `partial` indicating `12 -> 18`, that means the `if` on line 12 was never taken in the direction that jumps to line 18.
+
+If you need a machine-readable report for CI tooling (Codecov, Coveralls, SonarQube), produce XML:
+
+```text
+pytest --cov=shop --cov-branch --cov-report=xml
+```
+
+That writes `coverage.xml` in Cobertura format, which every coverage dashboard understands. You can produce multiple reports in one run:
+
+```text
+pytest --cov=shop --cov-branch \
+    --cov-report=term-missing \
+    --cov-report=html \
+    --cov-report=xml
+```
+
+The terminal report tells you the headline number, the HTML report lets you investigate, and the XML report uploads to wherever your team aggregates results.
+
+The order of report flags doesn't matter. None of these regenerate coverage data; they're all different views of the same `.coverage` file written during the test run.
+
+<h1 id="a-realistic-example-discountcalculator">
+  A Realistic Example: DiscountCalculator
+</h1>
+
+Let's walk through what coverage looks like on a small but realistic module. Imagine an e-commerce store with membership tiers. Each tier gets a different discount, and there's a minimum order to qualify for the gold tier discount.
+
+```python
+# shop/discount.py
+def calculate_discount(price: float, tier: str, items_in_cart: int) -> float:
+    if price < 0:
+        raise ValueError("price cannot be negative")
+
+    if tier == "gold":
+        if items_in_cart >= 3:
+            discount = 0.25
+        else:
+            discount = 0.15
+    elif tier == "silver":
+        discount = 0.10
+    elif tier == "bronze":
+        discount = 0.05
+    else:
+        discount = 0.0
+
+    final_price = price * (1 - discount)
+    return round(final_price, 2)
+```
+
+And the first test file:
+
+```python
+# tests/test_discount.py
+from shop.discount import calculate_discount
+
+def test_gold_tier_with_three_items_gets_quarter_off():
+    assert calculate_discount(100.0, "gold", 3) == 75.0
+
+def test_silver_tier_gets_ten_percent_off():
+    assert calculate_discount(100.0, "silver", 1) == 90.0
+
+def test_unknown_tier_gets_no_discount():
+    assert calculate_discount(100.0, "guest", 1) == 100.0
+```
+
+Run coverage with branches and missing lines:
+
+```text
+pytest --cov=shop --cov-branch --cov-report=term-missing
+```
+
+The output:
+
+```text
+Name                  Stmts   Miss Branch BrPart  Cover   Missing
+---------------------------------------------------------------
+shop/__init__.py          0      0      0      0   100%
+shop/discount.py         14      2      8      2    81%   3, 14, 5->8, 12->14
+---------------------------------------------------------------
+TOTAL                    14      2      8      2    81%
+```
+
+Two missed lines and two missed branches. Reading the missing column:
+
+- **Line 3:** `raise ValueError("price cannot be negative")`. No test passes a negative price.
+- **Line 14:** `discount = 0.05`. The bronze tier is never exercised.
+- **Branch 5->8:** the `if items_in_cart >= 3` on line 5 going to line 8 (the `else` branch) was never taken. We tested gold with 3 items but never gold with fewer than 3.
+- **Branch 12->14:** the `elif tier == "bronze"` on line 12 reaching line 14 was never taken, which matches the line-14 miss.
+
+The gaps map directly to test cases we should add:
+
+```python
+import pytest
+
+def test_negative_price_raises():
+    with pytest.raises(ValueError):
+        calculate_discount(-10.0, "gold", 3)
+
+def test_gold_tier_with_fewer_items_gets_smaller_discount():
+    assert calculate_discount(100.0, "gold", 2) == 85.0
+
+def test_bronze_tier_gets_five_percent_off():
+    assert calculate_discount(100.0, "bronze", 1) == 95.0
+```
+
+Re-run coverage and the report shows 100% line and branch. That's the loop in practice: run, read the misses, write a focused test for each, run again.
+
+<h1 id="configuration-in-pyprojecttoml">Configuration in pyproject.toml</h1>
+
+Out of the box, coverage tracks everything in the package you point it at. That's usually too much: you don't want to count auto-generated migration files, scripts, or the `__main__` block of a module against your coverage number. You also don't want to repeat the same flags every time you run pytest.
+
+The cleanest place to configure all this is `pyproject.toml`. `coverage.py` reads two sections, `[tool.coverage.run]` and `[tool.coverage.report]`:
+
+```text
+[tool.coverage.run]
+branch = true
+source = ["shop"]
+omit = [
+    "shop/migrations/*",
+    "shop/scripts/*",
+    "*/tests/*",
+    "*/__main__.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+fail_under = 80
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@(abc\\.)?abstractmethod",
+]
+```
+
+What each piece does:
+
+- `branch = true` turns on branch coverage by default, so you can drop `--cov-branch` from the command line.
+- `source` is the package to measure. Equivalent to passing `--cov=shop`.
+- `omit` is a list of glob patterns. Files matching any pattern are excluded entirely from measurement.
+- `show_missing` mirrors `--cov-report=term-missing`.
+- `fail_under` makes the report fail if total coverage drops below the threshold (more on this in the CI section).
+- `exclude_lines` is a list of regex patterns. Any line in your source that matches one of these patterns is treated as if it weren't there. The line still runs at runtime, but coverage ignores it.
+
+The `exclude_lines` defaults are worth a closer look. Most projects exclude these four categories:
+
+- `pragma: no cover` is the manual escape hatch. You put `# pragma: no cover` at the end of a line (or above a block) you want coverage to ignore.
+- `raise NotImplementedError` is for abstract methods that aren't supposed to run.
+- `if __name__ == "__main__":` is the script-entrypoint block that tests never reach.
+- `if TYPE_CHECKING:` is the import block for static type checkers, which is `False` at runtime.
+
+The regex flavor is Python's `re` module. The escaped dots in `if __name__ == .__main__.:` match the literal quote characters around `__main__`.
+
+Once this is in `pyproject.toml`, your command line shrinks back to:
+
+```text
+pytest --cov
+```
+
+Everything else is config.
+
+> **Cost:** A wide `omit` pattern can hide real coverage gaps. Be specific. Don't `omit = ["*/utils/*"]` just because the utils module is hard to test; tighten the pattern to the specific files (`*/utils/legacy_helpers.py`) so you can still see the rest.
+
+<h1 id="excluding-lines-with-pragma-no-cover">
+  Excluding Lines with # pragma: no cover
+</h1>
+
+Sometimes a single line is genuinely unreachable, or reachable only in a way that doesn't make sense to test. Defensive error handling for "this shouldn't happen" cases is the classic example. You don't want those lines to drag your number down, but you also don't want to omit the whole file.
+
+Use `# pragma: no cover` on the specific line or block:
+
+```python
+def find_customer(customer_id: int) -> dict:
+    customer = database.fetch(customer_id)
+    if customer is None:
+        return {"id": customer_id, "name": "unknown"}
+    return customer
+
+def parse_order_status(status: str) -> str:
+    status = status.lower().strip()
+    if status in {"placed", "shipped", "delivered", "cancelled"}:
+        return status
+    raise ValueError(f"unknown status: {status}")  # pragma: no cover
+```
+
+Now coverage skips that one line. The rest of the function still counts.
+
+You can also apply the pragma to a block by putting it on the opening line of the block:
+
+```python
+if __name__ == "__main__":  # pragma: no cover
+    import sys
+    customer_id = int(sys.argv[1])
+    print(find_customer(customer_id))
+```
+
+The pragma applies to the entire indented block under the line it's on. You only need one pragma comment for the whole `if` body.
+
+Two rules of thumb when reaching for `# pragma: no cover`:
+
+- **Justify each one.** If you can't say in one sentence why this line shouldn't be tested, it probably should be.
+- **Audit them periodically.** Pragmas tend to accumulate. Once a quarter, grep for them and ask whether each is still earning its keep.
+
+A common abuse is to slap pragmas on lines that are hard to test rather than lines that genuinely shouldn't be tested. Resist that. If a line is hard to test, the more honest move is to refactor the code so it's testable, not to hide it from the report.
+
+<h1 id="combining-coverage-from-multiple-runs">
+  Combining Coverage from Multiple Runs
+</h1>
+
+Some test suites can't run in a single process. You might split tests across multiple machines in CI, or run unit tests and integration tests separately, or run the same suite under multiple Python versions. Each run produces its own `.coverage` file, and you want the final report to reflect the union of everything that ran.
+
+`coverage combine` merges them. The flow is:
+
+1. Each run writes its data to a uniquely named file. Set `parallel = true` in `[tool.coverage.run]` (or pass `COVERAGE_FILE` with different values), and each process writes to `.coverage.HOSTNAME.PID.RANDOM` instead of overwriting `.coverage`.
+2. After all runs finish, you collect the files (download them from CI, or copy them locally) into one directory.
+3. Run `coverage combine`. It reads every `.coverage.*` file and writes a single merged `.coverage`.
+4. Run `coverage report` or `coverage html` to view the merged result.
+
+A minimal `pyproject.toml` for this:
+
+```text
+[tool.coverage.run]
+branch = true
+parallel = true
+source = ["shop"]
+```
+
+A typical CI shell script:
+
+```text
+# job 1
+pytest tests/unit --cov
+
+# job 2
+pytest tests/integration --cov
+
+# after both jobs, on the aggregator
+coverage combine
+coverage report --show-missing
+coverage html
+```
+
+Without `parallel = true`, each run overwrites the previous `.coverage` file and you lose data. With it on, both jobs write to distinct files, and `combine` produces the union.
+
+The same flow works for `pytest-xdist`, which runs tests in parallel processes on one machine. Each worker writes its own data file; `combine` merges them before the final report.
+
+<h1 id="what-coverage-doesnt-tell-you">What Coverage Doesn't Tell You</h1>
+
+The biggest mistake teams make with coverage is treating the percentage as a quality score. It isn't. Coverage tells you exactly one thing: which lines your tests reached. It is silent on every other question that matters.
+
+<h3 id="coverage-doesnt-measure-behavior">Coverage Doesn't Measure Behavior</h3>
+
+Consider this function and test pair:
+
+```python
+def calculate_order_total(items: list[dict], discount: float) -> float:
+    subtotal = sum(item["price"] * item["quantity"] for item in items)
+    tax = subtotal * 0.08
+    total = subtotal + tax
+    total = total * (1 - discount)
+    return round(total, 2)
+
+def test_calculate_order_total():
+    items = [{"price": 10.0, "quantity": 2}]
+    calculate_order_total(items, 0.10)
+```
+
+The test calls the function. Every line of `calculate_order_total` runs. Coverage reports 100%. But the test asserts nothing. If you swap `subtotal + tax` for `subtotal - tax`, the test still passes. If you remove the `round`, the test still passes. The function could return `None` (it doesn't, but it could) and the test would still pass.
+
+This is the **"100% coverage, zero asserts"** anti-pattern, and it shows up in real codebases more often than people admit. A team gets pressured to hit a coverage target, writes tests that call code without checking results, and ships a green dashboard that proves nothing.
+
+The fix is review, not a different tool. Coverage doesn't know what your code is supposed to do, so it can't catch missing assertions. Reading the tests is the only way to catch this.
+
+<h3 id="coverage-doesnt-measure-edge-cases">
+  Coverage Doesn't Measure Edge Cases
+</h3>
+
+```python
+def parse_price(text: str) -> float:
+    return float(text.strip().replace("$", ""))
+
+def test_parse_price():
+    assert parse_price("$19.99") == 19.99
+    assert parse_price("  29.50 ") == 29.50
+```
+
+100% line and branch coverage. Both tests pass. The function works for happy-path strings.
+
+What about `"19,99"` (European decimal)? `""` (empty)? `"$"` (just the symbol)? `"-5"` (negative)? `"19.99.50"` (malformed)? `None` (not a string at all)?
+
+Every one of those is a bug the tests don't catch. Coverage shows green. The number lies about completeness.
+
+The takeaway: coverage tells you about code you wrote and didn't test. It says nothing about inputs you didn't think of. Edge-case design happens in the test, not in the coverage report.
+
+<h3 id="coverage-doesnt-measure-assertion-strength">
+  Coverage Doesn't Measure Assertion Strength
+</h3>
+
+A weak assertion still counts. `assert result is not None` covers the same lines as `assert result == 80.0`. The first proves nothing about the math; the second proves the function returned the right number. Coverage tools cannot tell them apart.
+
+Mutation testing is the tool that actually measures assertion strength: it modifies your code in small ways (`+` to `-`, `<` to `<=`, `True` to `False`) and checks whether tests fail. If they don't, the assertion was too weak. That's a separate, much harder topic. Coverage is the cheap first pass.
+
+<h3 id="realistic-coverage-targets">Realistic Coverage Targets</h3>
+
+A few rules of thumb that work in practice:
+
+- **80 to 90% line and branch coverage is a healthy soft goal** for most application code. Above that, you start hitting diminishing returns; each additional point takes disproportionate effort.
+- **100% on critical modules.** Payment calculations, security checks, anything where a bug means real money or real damage. Pay the cost.
+- **Lower is fine for glue code.** Wiring between systems, thin adapters, CLI argument parsing. 60% might be the right level if the rest is exercised end-to-end.
+- **The trend matters more than the absolute number.** A project at 70% and rising is healthier than one at 95% and falling. Watch the direction.
+
+Don't chase 100% as a vanity number. The last 10% is usually error-handling code that's genuinely hard to trigger, and the easiest way to "cover" it is to add `# pragma: no cover` everywhere, which is exactly the wrong incentive. Aim for "high enough that gaps are deliberate", not "100 percent at any cost".
+
+| Target     | When it makes sense                                                              |
+| ---------- | -------------------------------------------------------------------------------- |
+| 60%        | Glue code, prototypes, scripts where the failure mode is "I'll notice"           |
+| 80%        | Most application code; the standard "we take testing seriously" baseline         |
+| 90%        | Library code consumed by other teams or projects                                 |
+| 100%       | Money-handling, security, regulatory code; small libraries where it's achievable |
+| Above 100% | Doesn't exist; chasing it is a smell                                             |
+
+<h1 id="coverage-in-ci-failing-the-build">Coverage in CI: Failing the Build</h1>
+
+Coverage data is most useful when it gates merges. If a pull request drops the coverage number, you want to find out at PR review time, not three months later when the trend report shows a slow decline.
+
+The simplest gate is `--cov-fail-under`. Pass a threshold; if total coverage falls below it, pytest exits non-zero:
+
+```text
+pytest --cov=shop --cov-branch --cov-fail-under=80
+```
+
+A run that comes in at 79% prints something like:
+
+```text
+FAIL Required test coverage of 80% not reached. Total coverage: 79.34%
+```
+
+and exits with code 2. Any CI system reading the exit code will mark the job as failed.
+
+You can also set the threshold in `pyproject.toml` so it lives next to the rest of the config:
+
+```text
+[tool.coverage.report]
+fail_under = 80
+```
+
+A few things to think about when picking a threshold:
+
+- **Set it where you are, not where you wish you were.** If you're at 78% today, set the gate at 78% (or 75% for slack). Setting it to 90% when you're at 78% means the build is red on day one and people learn to ignore it.
+- **Ratchet the number up, never down.** Raise the threshold when coverage rises naturally. Don't lower it when it dips; investigate the dip.
+- **A failing gate should mean "investigate this PR", not "skip this gate".** If the gate fires for a legitimate reason (e.g., a hotfix that didn't have time for tests), document the exception and raise it back next sprint.
+
+For deeper analysis, most teams pipe the XML report to a service like Codecov or Coveralls:
+
+```text
+pytest --cov=shop --cov-branch --cov-report=xml
+# upload coverage.xml to the service
+```
+
+Those tools track coverage per file, per pull request, and per commit, and they comment on the PR with a diff showing which lines the PR added that aren't covered. The XML is the same Cobertura format every coverage service understands; you write it once and consume it from whichever dashboard you prefer.
+
+The shape is always the same: tests run, coverage is measured, a threshold check decides whether the build is allowed to pass. Everything else is which threshold, which reports, and which dashboard.
+
+<h1 id="putting-it-together-an-order-state-machine">
+  Putting It Together: An Order State Machine
+</h1>
+
+To pull the chapter together, let's run coverage end to end on a slightly larger example: an `Order` state machine with explicit transitions. This is the kind of code where branch coverage really earns its keep.
+
+```python
+# shop/order.py
+class InvalidTransition(Exception):
+    pass
+
+class Order:
+    VALID_TRANSITIONS = {
+        "placed": {"shipped", "cancelled"},
+        "shipped": {"delivered"},
+        "delivered": set(),
+        "cancelled": set(),
+    }
+
+    def __init__(self, order_id: int) -> None:
+        self.order_id = order_id
+        self.status = "placed"
+
+    def transition_to(self, new_status: str) -> None:
+        allowed = self.VALID_TRANSITIONS.get(self.status)
+        if allowed is None:
+            raise InvalidTransition(f"unknown current status: {self.status}")
+        if new_status not in allowed:
+            raise InvalidTransition(
+                f"cannot move from {self.status} to {new_status}"
+            )
+        self.status = new_status
+
+    def is_terminal(self) -> bool:
+        return self.status in {"delivered", "cancelled"}
+```
+
+A first round of tests:
+
+```python
+# tests/test_order.py
+import pytest
+from shop.order import Order, InvalidTransition
+
+def test_new_order_starts_as_placed():
+    order = Order(1)
+    assert order.status == "placed"
+
+def test_placed_to_shipped_is_allowed():
+    order = Order(1)
+    order.transition_to("shipped")
+    assert order.status == "shipped"
+
+def test_invalid_transition_raises():
+    order = Order(1)
+    with pytest.raises(InvalidTransition):
+        order.transition_to("delivered")
+```
+
+Run coverage:
+
+```text
+pytest --cov=shop --cov-branch --cov-report=term-missing
+```
+
+The output (illustrative):
+
+```text
+Name              Stmts   Miss Branch BrPart  Cover   Missing
+-------------------------------------------------------------
+shop/order.py        14      3      4      1    71%   18-19, 28, 17->18
+-------------------------------------------------------------
+TOTAL                14      3      4      1    71%
+```
+
+The misses tell a clear story:
+
+- **Lines 18-19:** the `raise InvalidTransition(f"unknown current status: {self.status}")` branch is never hit. No test puts the order in an unknown status.
+- **Line 28:** the `is_terminal` method is never called.
+- **Branch 17->18:** the `if allowed is None` going to the raise was never taken.
+
+Two of these are real gaps. The unknown-status branch is defensive: it can only fire if someone bypasses `transition_to` and writes garbage directly to `self.status`. That's a reasonable candidate for `# pragma: no cover`, since you can't trigger it through the public API without explicit mucking.
+
+The `is_terminal` gap is a clean gap. Add a test:
+
+```python
+def test_is_terminal_for_delivered():
+    order = Order(1)
+    order.transition_to("shipped")
+    order.transition_to("delivered")
+    assert order.is_terminal()
+
+def test_is_terminal_for_placed():
+    order = Order(1)
+    assert not order.is_terminal()
+```
+
+The defensive branch gets a pragma:
+
+```python
+def transition_to(self, new_status: str) -> None:
+    allowed = self.VALID_TRANSITIONS.get(self.status)
+    if allowed is None:  # pragma: no cover
+        raise InvalidTransition(f"unknown current status: {self.status}")
+    if new_status not in allowed:
+        raise InvalidTransition(
+            f"cannot move from {self.status} to {new_status}"
+        )
+    self.status = new_status
+```
+
+Re-run and the report comes back at 100% line and branch, with the pragma accounting for the only real exclusion. The number now reflects what's deliberately tested, not a mix of "actually tested" and "haven't gotten around to it".
+
+That's the loop one more time: run, read the misses, write tests for the real gaps, mark genuine exclusions with pragmas, run again. The point of the tool is to make those gaps visible, not to chase a number.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

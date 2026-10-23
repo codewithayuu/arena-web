@@ -1,0 +1,207 @@
+---
+title: "Message Queues"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Message Queues explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+This is exactly where a **message queue** comes in.
+
+<h1 id="1-what-is-a-message-queue">1. What Is a Message Queue?</h1>
+
+A message queue, such as Amazon SQS or RabbitMQ, is a buffer that sits between two kinds of services:
+
+- **Producers** are the services that create work.
+- **Consumers** are the services that do the work.
+
+The producer sends a message to the queue describing a task, such as "transcode video 456". The queue stores the message until a consumer is ready. A consumer then takes the message from the queue, does the work, and tells the queue it is finished.
+
+The system that stores the messages and hands them out is often called the **broker**. It accepts messages from producers, keeps them safe, delivers them to consumers, and tracks which ones have been acknowledged.
+
+<h3 id="one-message-one-consumer">One Message, One Consumer</h3>
+
+The key property of a queue is that **each message is processed by one consumer**. If you have ten workers reading from the same queue, each message goes to only one of them.
+
+This is what separates a queue from **pub/sub**, where every subscriber receives its own copy of each message. A queue is for handing out work. Pub/sub is for telling several independent services that something happened.
+
+<h3 id="back-to-the-video-example">Back to the Video Example</h3>
+
+With a queue in place, the upload service stores the file, sends a message to the queue, and immediately returns a response. The user sees that their video is processing, and the heavy work happens in the background.
+
+<h1 id="2-the-life-of-a-message">2. The Life of a Message</h1>
+
+Let's take a closer look at what happens to a message as it moves through a queue.
+
+<h3 id="step-1-the-producer-sends-a-message">
+  Step 1: The Producer Sends a Message
+</h3>
+
+The producer sends a message to the queue. The queue stores it durably, typically on disk and often replicated across multiple nodes, before confirming that it has been received.
+
+Once the producer gets this confirmation, it can move on, knowing the message has been safely stored.
+
+<h3 id="step-2-a-consumer-receives-the-message">
+  Step 2: A Consumer Receives the Message
+</h3>
+
+Next, a consumer receives the message. But the queue doesn't remove it right away. Instead, it temporarily prevents other consumers from receiving the same message.
+
+In Amazon SQS, this is handled through a **visibility timeout**. For a set period, say 30 seconds, the message stays invisible to other consumers while the first consumer processes it.
+
+<h3 id="step-3-the-consumer-acknowledges">Step 3: The Consumer Acknowledges</h3>
+
+Once processing is complete, the consumer **acknowledges** the message. In SQS, this means explicitly deleting it from the queue.
+
+<h3 id="what-if-the-consumer-crashes">What If the Consumer Crashes?</h3>
+
+Since the consumer never acknowledged the message, the queue still has it:
+
+- **In SQS**, the visibility timeout eventually expires, and the message becomes available again.
+- **In RabbitMQ**, the broker detects that the consumer's connection has closed and requeues any unacknowledged messages.
+
+In both cases, another consumer can pick up the message and try again. This is how acknowledgments prevent messages from being lost.
+
+<h3 id="the-catch-duplicates">The Catch: Duplicates</h3>
+
+This safety net has a side effect. If a consumer finishes the work but crashes before acknowledging, the message is delivered again and the work runs twice. Consumers need to be safe to run more than once. We'll cover how in the Delivery Semantics chapter.
+
+<h1 id="3-scaling-with-competing-consumers">
+  3. Scaling with Competing Consumers
+</h1>
+
+With a message queue, scaling is fairly simple. You add more consumers to the same queue, and each worker picks up available messages, spreading the workload across them. This is known as the **competing consumers** pattern.
+
+<h3 id="scaling-on-queue-depth">Scaling on Queue Depth</h3>
+
+Many systems automatically scale their workers based on **queue depth**, which is the number of messages waiting to be processed.
+
+- If the queue keeps growing, the system adds more workers.
+- If it stays nearly empty, it can scale down to save resources.
+
+Adding workers only helps up to a point. If every worker depends on the same database or third-party API, that dependency eventually becomes the limit, and more workers just add more pressure on it.
+
+<h3 id="prefetch">Prefetch</h3>
+
+There's also an important setting called **prefetch**. Instead of fetching one message at a time, a consumer can fetch several messages at once to reduce network round trips.
+
+However, if one worker grabs a hundred messages while others sit idle, the workload becomes uneven. In RabbitMQ, you control this with the prefetch count. For long-running tasks like video transcoding, keeping this value small usually spreads the work more evenly. For quick, lightweight tasks, a larger value can improve throughput.
+
+<h1 id="4-absorbing-traffic-spikes">4. Absorbing Traffic Spikes</h1>
+
+Message queues also help protect your system from sudden spikes in traffic.
+
+Imagine a flash sale where incoming orders jump from 100 per second to 5,000 per second for ten minutes. The order service can accept these requests quickly, but the downstream fulfillment system can only process 1,000 orders per second.
+
+- **Without a queue**, the fulfillment system would quickly become overwhelmed. Requests would start failing, and those failures could spread back to the order service.
+- **With a queue in between**, the extra orders wait until the fulfillment system is ready for them. Workers keep processing at a steady 1,000 orders per second, and the backlog gradually clears once traffic returns to normal.
+
+This is often called **load leveling**. It works because it's acceptable for fulfillment to happen a few minutes later. If the user needed the result right away, a queue would not remove that requirement.
+
+<h3 id="the-limits-of-buffering">The Limits of Buffering</h3>
+
+Queues have their limits. If messages consistently arrive faster than consumers can process them, the backlog will keep growing. Users will wait longer for their tasks to complete, and eventually the queue could run out of storage.
+
+That's why it's important to monitor two key metrics:
+
+The age of the oldest message is often more useful than queue depth alone. A queue with just 100 messages could still indicate a serious problem if the oldest one has been waiting for an hour.
+
+<h1 id="5-poison-messages-and-dead-letter-queues">
+  5. Poison Messages and Dead-Letter Queues
+</h1>
+
+Sometimes a message keeps failing no matter how many times it's processed. Maybe the video file is corrupted, or the message references a user account that no longer exists.
+
+Each time a worker fails to process the message, it becomes available in the queue again, and another worker picks it up. Without a retry limit, this cycle can continue forever, wasting resources and delaying other messages.
+
+A message that repeatedly fails processing is called a **poison message**.
+
+A common solution is to limit the number of delivery attempts. In Amazon SQS, this is configured with a setting called `maxReceiveCount`. Once a message has been received that many times without being deleted, SQS moves it to a separate queue called a **dead-letter queue**, or DLQ.
+
+This keeps the problem message from interfering with normal processing. Engineers can then investigate why it failed, fix the underlying issue, and reprocess the message when it's safe to do so.
+
+<h1 id="6-message-ordering">6. Message Ordering</h1>
+
+Another important question is whether messages are processed in the order they were sent. The word "queue" suggests first in, first out, but in practice ordering isn't always guaranteed.
+
+Even if messages are delivered in order, multiple consumers may process them at different speeds:
+
+1. Worker 1 picks up the first message but gets delayed by a slow network request.
+2. Meanwhile, Worker 2 picks up the second message and finishes it first.
+
+Retries can also change the processing order, since a failed message might be retried after newer messages have already been processed.
+
+For many workloads, this isn't a problem. If two different videos need to be transcoded, it usually doesn't matter which one finishes first.
+
+But some operations depend on strict ordering. Suppose one message updates an order's shipping address, and the next message tells the system to ship the order. If the shipping message is processed first, the package could be sent to the wrong address.
+
+<h3 id="ordering-within-a-group">Ordering Within a Group</h3>
+
+A common solution is to preserve ordering within related groups of messages, rather than across the entire queue.
+
+Amazon SQS FIFO queues support this with a **message group ID**. Messages with the same group ID, such as those belonging to a particular order, are delivered in order. Messages from different groups can be processed in parallel.
+
+This gives you ordering where it matters without forcing the whole queue through a single worker. Strict ordering across every message in a busy queue rarely scales well.
+
+<h1 id="7-designing-messages">7. Designing Messages</h1>
+
+The messages themselves also need some careful design.
+
+**Keep them small.** Message queues are designed to handle large numbers of small messages, and most have a limit on message size. If a task involves a large file, store it in object storage like Amazon S3 and include only a reference to it in the message.
+
+For example, our transcoding message should contain the video ID and its storage location, not the video file itself:
+
+```json
+{
+  "messageId": "b7e2c9a4-5f1d-4c1e-9a3b-2d8f6e0c71aa",
+  "type": "TranscodeVideo",
+  "version": 2,
+  "videoId": 456,
+  "location": "s3://uploads/videos/456/original.mp4"
+}
+```
+
+It's also useful to include a few extra fields:
+
+- **A unique message ID**, so consumers can detect duplicates.
+- **A message type**, so consumers know what kind of task it is.
+- **A version**, so consumers know how to interpret the data.
+
+Versioning lets you change the message format over time without breaking consumers that still expect an older version.
+
+<h1 id="8-when-to-use-message-queues">8. When to Use Message Queues</h1>
+
+Message queues are particularly useful when tasks are slow, resource-intensive, or don't need to finish before the user receives a response. Common examples include:
+
+- Processing videos and images
+- Sending emails and notifications
+- Generating reports
+- Handling background payment workflows
+- Processing webhook events
+
+They're also useful when one service produces work faster than another can process it, or when a downstream service is unreliable and you want failed tasks to be retried rather than lost.
+
+However, message queues aren't always the right choice. If the caller needs an immediate result, such as verifying a password during login, a direct request is usually simpler and more appropriate.
+
+<h1 id="summary">Summary</h1>
+
+A message queue allows producers to hand off work without waiting for it to finish, while consumers process messages independently at their own pace.
+
+- **Acknowledgments** help prevent messages from being lost.
+- **Competing consumers** make it easier to scale.
+- **Buffering** helps absorb sudden spikes in traffic.
+
+But to use message queues reliably, you also need to:
+
+- Handle duplicate messages, since delivery is usually at-least-once.
+- Configure retries and dead-letter queues for poison messages.
+- Consider message ordering, and use message groups where order matters.
+- Keep messages small and versioned.
+- Monitor queue depth and the age of the oldest message.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

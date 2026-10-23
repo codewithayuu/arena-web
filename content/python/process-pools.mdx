@@ -1,0 +1,257 @@
+---
+title: "Process Pools"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "Process Pools explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="why-a-pool-beats-raw-processes">Why a Pool Beats Raw Processes</h1>
+
+When you create a `Process` per task and call `start()` and `join()` on each one, That works for a handful of tasks. Once you have hundreds or thousands, three problems show up:
+
+1. **Spawning a process is expensive.** Each `Process` triggers a `fork` or `spawn` call, imports modules, and sets up Python state. On Linux this takes a few milliseconds; on macOS and Windows where `spawn` is the default, it can run into tens or hundreds of milliseconds. Multiply that by 10,000 tasks and the cost dominates the actual work.
+2. **You probably don't want 10,000 processes anyway.** Your CPU has, say, 8 cores. Running more processes than cores doesn't speed anything up for CPU-bound work, it just adds context-switching overhead.
+3. **You'd have to write a task queue yourself.** Distribute the input, send work, collect results, handle failures, balance load. That's a lot of plumbing for code that should be three lines.
+
+`Pool` solves all three. You create it once with `N` workers (where `N` is usually `os.cpu_count()`), hand it an iterable of inputs, and it dispatches work across the existing workers. The same `N` processes handle everything. Worker reuse means you pay the startup cost once.
+
+The dispatcher hands tasks to whichever worker is free. Workers run independently in their own processes, so they bypass the GIL entirely. When all tasks are done, results come back to the parent in the order you asked for (or in completion order, depending on the method you call).
+
+> **Cost:** Process startup is the most expensive part of multiprocessing. A `Pool` of 8 workers pays this cost 8 times, not once per task. For 10,000 short tasks, this can be the difference between "finishes in 2 seconds" and "finishes in 90 seconds."
+
+<h1 id="creating-a-pool">Creating a Pool</h1>
+
+The constructor is straightforward:
+
+The `processes` argument sets how many worker processes the pool will keep running. If you leave it out, `Pool` defaults to `os.cpu_count()`, which is the number of logical cores on your machine.
+
+For CPU-bound work like image processing or hashing, `os.cpu_count()` is usually the right answer. More workers than cores doesn't add speed, just overhead. For I/O-bound work, you might use a higher number, but for I/O `Pool` isn't the right tool anyway. `asyncio` or threads work better there.
+
+The pool starts its workers immediately when you create it. Each worker is a separate Python process that sits idle, waiting for work to arrive. You don't need to start them yourself.
+
+<h1 id="poolmap-the-simple-case">pool.map: The Simple Case</h1>
+
+The most common method is `pool.map(func, iterable)`. It looks like the built-in `map`, but it runs the function in parallel across the pool's workers and returns a list of results in the same order as the input.
+
+A few things to notice:
+
+1. **`if __name__ == "__main__":` is required on Windows and macOS** because the `spawn` start method re-imports the module in each worker. Without the guard, workers would re-run the pool creation and recurse forever.
+2. **The function must be importable from the module.** Lambdas and locally defined functions don't work because workers need to import them by name. Define your worker function at module scope.
+3. **Results come back in input order**, not completion order. Even if task 5 finishes before task 1, `results[0]` is still the square of `1`.
+
+`pool.map` blocks until all results are ready. The parent process sits there waiting. For most batch jobs, this is what you want, you just need the answers and don't care about progress reporting.
+
+> **Cost:** `pool.map` materializes the entire input as a list before dispatching. If your input is a generator producing millions of items, you'll pay the memory cost upfront. Use `pool.imap` for lazy iteration.
+
+<h1 id="poolimap-and-imap_unordered">pool.imap and imap_unordered</h1>
+
+`pool.imap(func, iterable)` does the same work as `map`, but returns an iterator instead of a list. Results come back one at a time, in input order, as workers finish them.
+
+The output order matches the input order. The difference from `map` is that you can start processing each result as it arrives, without waiting for the whole batch. That matters when:
+
+- You want a progress bar (`for i, result in enumerate(pool.imap(...)):` updates as work completes).
+- Each result is large and you want to write it to disk before the next one comes in.
+- The input is huge or infinite and you don't want to materialize it.
+
+`pool.imap_unordered(func, iterable)` is the same idea but gives up the ordering guarantee. Results come back in whatever order workers finish them. This is faster because a worker doesn't have to wait for an earlier task to finish before its result can be yielded.
+
+Use `imap_unordered` when you don't care which input produced which result, only that they all get processed. A common pattern is when each result is self-contained, for example, "resize this image and save it with a known filename." The output filename is derived from the input, so you don't need to know which task finished first.
+
+The three methods cover most batch dispatch needs. Pick `map` when you want a list back and don't need progress. Pick `imap` when you want a progress indicator or lazy input. Pick `imap_unordered` when ordering doesn't matter and you want the best throughput.
+
+<h1 id="apply_async-and-map_async">apply_async and map_async</h1>
+
+`map` and `imap` are good for "run this function over a batch." `apply_async` is the lower-level primitive: it schedules a single function call and returns an `AsyncResult` object that you can query later.
+
+`apply_async(func, args, kwds)` queues one call. It returns immediately with an `AsyncResult`. The actual call happens in a worker. To retrieve the answer:
+
+- `result.get(timeout=None)` blocks until the result is available, or raises `TimeoutError` if `timeout` expires.
+- `result.ready()` returns `True` if the result is available, `False` if the worker is still busy.
+- `result.successful()` returns `True` if the call finished without an exception. Only valid after `ready()` returns `True`.
+- `result.wait(timeout=None)` blocks until ready but doesn't return the value.
+
+`map_async(func, iterable)` is the async version of `map`. It schedules the whole batch and returns one `AsyncResult` that yields the list of results when ready.
+
+The `_async` variants let the parent process do other things while the pool works. A common pattern is to launch several `map_async` calls against different datasets and then collect their results in any order.
+
+All three calls run in parallel. The `get()` calls block in order, but the work was already happening concurrently in the background. This pattern is useful when you have a fixed set of independent jobs and want fine-grained control over when to wait for each one.
+
+A `callback` parameter lets you register a function to run when a result is ready, without polling:
+
+The callback fires in the parent process, in the thread that handles result delivery. Keep callbacks short and non-blocking.
+
+<h1 id="chunksize-why-it-matters">Chunksize: Why It Matters</h1>
+
+The `map`, `imap`, and `imap_unordered` methods all accept an optional `chunksize` argument:
+
+`chunksize` controls how many items the pool sends to a worker in one batch. Default is `1` for `imap` and `imap_unordered`. For `map`, the pool picks a default based on the input length, roughly `len(iterable) / (processes * 4)`.
+
+Why does this matter? Every item you dispatch to a worker has a per-item cost: pickling the input, sending it through a pipe to the worker, unpickling it on the other side, pickling the result, sending it back, unpickling. If each individual task is tiny (microseconds of CPU work), this dispatch overhead can dominate.
+
+With `chunksize=1`, the pool dispatches each integer one at a time. The actual work, adding one to a number, takes nanoseconds. The dispatch overhead is orders of magnitude larger. With `chunksize=10000`, each worker pulls 10,000 items at once, processes them in a tight loop locally, and sends back the batch. The per-item cost amortizes.
+
+The trade-off works in both directions:
+
+The other consideration is **load balancing**. With a very large `chunksize`, if one worker gets a chunk with all the slow tasks and another gets a chunk with all the fast ones, the slow worker holds up the whole pool. Smaller chunks let work redistribute as workers finish.
+
+For our image-resize example coming up, each task takes tens of milliseconds, so a `chunksize` of 1 or a small number is fine. For trivial per-element transforms over millions of items, crank it up.
+
+> **Cost:** Dispatch overhead per task is O(1) but with a large constant (microseconds). For tasks faster than the dispatch cost, the pool is slower than serial. The rule of thumb: if a single task takes less than a millisecond of CPU work, batch it with a higher chunksize or do it serially.
+
+<h1 id="lifecycle-close-terminate-join">Lifecycle: close, terminate, join</h1>
+
+A pool has three lifecycle methods you'll see in real code:
+
+- `pool.close()` tells the pool to stop accepting new tasks. Workers finish whatever they're doing, then exit gracefully.
+- `pool.terminate()` stops workers immediately. Anything they were working on is abandoned. Use this for emergency shutdown.
+- `pool.join()` blocks until all workers have exited. You must call `close()` or `terminate()` first.
+
+The typical pattern without a context manager looks like this:
+
+Forget either `close()` or `join()`, and you'll leak worker processes. They'll keep running after your program exits, holding file descriptors and memory.
+
+The clean way is to use `Pool` as a context manager, which is what we've been doing in most examples:
+
+The `with` block automatically calls `terminate()` when it exits (whether normally or because of an exception). This is convenient for scripts, but be aware: `terminate()` is the abrupt variant. If you want workers to finish in-flight tasks before shutdown, do it explicitly:
+
+For most batch jobs that finish all their work via `map` before the `with` block ends, this distinction doesn't matter, all the work is already done by the time `terminate()` runs.
+
+The three shutdown paths cover the cases you'll encounter. Graceful drain when you want to let work complete, hard stop when you don't, and the context manager default for short-lived scripts.
+
+<h1 id="how-exceptions-surface">How Exceptions Surface</h1>
+
+A worker that raises an exception doesn't crash the whole pool. Instead, the exception is captured, pickled, sent back to the parent, and re-raised when the parent tries to retrieve the result.
+
+The parent sees the same exception type and message that the worker raised. The traceback even shows where in the worker function it happened. This is convenient because you don't need a special "worker exception" type, normal `try/except` works.
+
+The catch is that `map` stops yielding results once any task raises. If three out of four tasks succeed and one fails, you lose the three successful results. If you want to collect successes and failures separately, use `apply_async` per task and check `successful()`:
+
+Now each task's outcome is tracked independently. Successes give results, failures give exception details, and the pool keeps running.
+
+One more thing: the exception must be picklable. Most built-in exceptions are, but custom exceptions with unpicklable arguments (open file handles, lambdas, etc.) can't be sent back. The worker will then raise a different error during the pickling step, usually a confusing one. Keep your exception types simple.
+
+> **Cost:** Exception propagation adds a small overhead per failed task (pickling the exception, sending it through a pipe). This is negligible compared to the task itself, but it does mean a pool full of failing tasks costs more than the same number of trivially-failing local calls.
+
+<h1 id="parallel-image-resize-example">Parallel Image Resize Example</h1>
+
+Time to put it all together. An e-commerce site uploads new product images. Each image needs to be resized into three sizes (thumbnail, medium, large) and saved to disk. The total job: 200 images, 3 sizes each, on an 8-core machine.
+
+We'll simulate the resize work with a CPU-bound function so we don't depend on an image library. The pattern is identical with a real library like Pillow.
+
+The speedup isn't a perfect 8x because some tasks (the large 1200-pixel ones) take longer than others, and the OS scheduler doesn't put every worker on its own core all the time. Real-world parallel speedups on CPU-bound work tend to land between 60% and 90% of theoretical, which is what we see here.
+
+A few things worth pointing out in this code:
+
+1. **The worker function takes a single argument.** `pool.map` only passes one positional argument per call, so we packed `(filename, target_size)` into a tuple. If you need multiple arguments, either bundle them or use `pool.starmap`, which unpacks tuples.
+2. **The worker is defined at module scope.** This is mandatory for the `spawn` start method.
+3. **The `if __name__ == "__main__":` guard** wraps everything that uses the pool. Workers re-import the module, so anything outside the guard would run again in each worker.
+
+For real image processing with Pillow, the worker function would look like:
+
+The pool dispatch code stays exactly the same. The pool doesn't care what your worker function does; it just hands it inputs and collects outputs.
+
+Now let's add progress tracking with `imap_unordered`. For a long-running batch, you want to know it's making progress.
+
+The `imap_unordered` loop gives us per-result granularity. The order isn't guaranteed, but each filename ends up with its own output, so we don't care which workers finished first.
+
+<h1 id="another-example-parallel-order-export">
+  Another Example: Parallel Order Export
+</h1>
+
+A second concrete case: nightly export of order data to a CSV file. Each order has line items, and computing a per-order summary (totals, tax, etc.) is CPU work. We have tens of thousands of orders.
+
+The speedup is lower than the image example because each order is light work; dispatch overhead eats more of the gain. The `chunksize=200` mitigates this. If we used the default `chunksize=1`, the timing would actually be worse than serial.
+
+Try it yourself: drop `chunksize=200` from the `map` call and rerun. On most machines, the parallel version becomes slower than the serial one. Then bump it to `1000` or `2000`. You'll see the parallel version pull ahead.
+
+This is the practical rule for tuning: if a single task is light, raise `chunksize` until throughput stops improving. The crossover point varies by task and machine, so measure rather than guess.
+
+<h1 id="a-third-example-parallel-checksums">
+  A Third Example: Parallel Checksums
+</h1>
+
+A common operation in storage systems is verifying file integrity by computing checksums. For an e-commerce site with thousands of product images stored on disk, you might run a nightly verification job that recomputes hashes and compares them against a database.
+
+Hashing is purely CPU-bound (assuming the file fits in OS cache), which makes it a near-ideal pool workload. Each task is heavy enough that dispatch overhead doesn't matter, and there's no shared state between tasks.
+
+<h1 id="a-note-on-concurrentfutures">A Note on concurrent.futures</h1>
+
+The `multiprocessing.Pool` API is the original one, and it works. There's also `concurrent.futures.ProcessPoolExecutor`, which is a newer wrapper that many people prefer because it uses the same `submit` / `map` / `Future` API as the thread pool variant. The underlying machinery is the same; the API is just nicer in places.
+
+For now, knowing `multiprocessing.Pool` directly is valuable because:
+
+- A lot of existing code uses it.
+- Its method names (`apply_async`, `imap_unordered`, `chunksize`) appear in documentation, blog posts, and Stack Overflow answers from the last decade.
+- Understanding the lower-level API makes the `concurrent.futures` abstraction obvious when you get to it.
+
+If you're starting a new project from scratch, `ProcessPoolExecutor` is often the better choice. For everything in this lesson, you can apply the same concepts there.
+
+<h1 id="quiz">Quiz</h1>
+
+<h1 id="quiz-questions">Quiz Questions</h1>
+
+**Question 1: Why is multiprocessing.Pool usually better than creating one Process for each of 10,000 CPU-bound tasks?**
+
+- [x] It reuses a fixed set of workers and avoids startup cost per task.
+- [ ] It converts CPU-bound work into nonblocking asyncio tasks.
+- [ ] It shares one Python heap so no objects need serialization.
+- [ ] It uses threads, so it never creates operating system processes.
+
+**Question 2: Which callable is the safest choice to pass to pool.map on Windows or macOS when using the spawn start method?**
+
+- [ ] A lambda defined inside the if **name** == "**main**" block.
+- [ ] A nested function that closes over a local variable.
+- [x] A function defined at module scope and importable by name.
+- [ ] A generator expression that yields function objects.
+
+**Question 3: Which statement best describes the difference between pool.map and pool.imap?**
+
+- [ ] map returns an iterator, while imap returns a completed list.
+- [x] map blocks for a list; imap yields ordered results lazily.
+- [ ] map gives completion order; imap always shuffles the results.
+- [ ] map is for threads only; imap is for separate processes.
+
+**Question 4: What happens when a worker raises an exception during pool.map?**
+
+- [x] The parent receives the exception when map collects the results.
+- [ ] The exception is printed only in the child and then ignored.
+- [ ] The worker retries the same input until it returns normally.
+- [ ] The Pool converts the exception into None in the result list.
+
+**Question 5: What does the chunksize argument control in Pool methods such as map and imap?**
+
+- [ ] The number of worker processes created by the Pool.
+- [ ] The maximum size of each returned Python object.
+- [x] How many input items are bundled into one work message.
+- [ ] How many exceptions may be raised before shutdown.
+
+**Question 6: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 7: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 8: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+<QuizCard />
+
+<CommentsSection />
+
+</LessonCard>

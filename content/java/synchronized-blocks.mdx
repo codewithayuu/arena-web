@@ -1,0 +1,579 @@
+---
+title: "Synchronized Blocks"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Synchronized Blocks explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="the-shape-of-a-synchronized-block">
+  The Shape of a Synchronized Block
+</h1>
+
+A synchronized block has two parts: a lock object inside parentheses, and a body inside braces. The thread that enters the block has to acquire the lock on the object before it can execute the body, and it releases the lock when control leaves the block, either by reaching the closing brace or by throwing.
+
+```java
+public class FirstBlock {
+    private int stockCount = 0;
+    private final Object lock = new Object();
+
+    public void addStock(int units) {
+        // Some prep work that doesn't touch shared state
+        String message = "Adding " + units + " units";
+        System.out.println(message);
+
+        // Only this section reads and writes the shared field
+        synchronized (lock) {
+            stockCount = stockCount + units;
+        }
+    }
+
+    public int getStockCount() {
+        synchronized (lock) {
+            return stockCount;
+        }
+    }
+
+    public static void main(String[] args) {
+        FirstBlock inventory = new FirstBlock();
+        inventory.addStock(5);
+        inventory.addStock(3);
+        System.out.println("Final stock: " + inventory.getStockCount());
+    }
+}
+```
+
+The `synchronized (lock)` part tells the JVM "before running the body, acquire the monitor of the object referenced by `lock`." Only one thread can hold a given object's monitor at a time. Any other thread that hits a synchronized block on the same object has to wait until the holder lets go. The `println` call sits outside the block because printing doesn't touch the shared field; only the read-modify-write on `stockCount` needs protection.
+
+The diagram shows one thread's path through the block: enter, acquire the monitor, run the body, release the monitor. A second thread that arrives at the same block (with the same lock object) is stuck on the "acquire" step until the first thread releases. That's the entire mechanism. There's no queue you've to manage by hand, no flag to flip, no extra bookkeeping. The JVM does the waiting and the wake-up.
+
+The release at the closing brace is automatic, and importantly, it also happens if the body throws. The JVM treats the synchronized block like a hidden `try-finally` around the body, with the release in the finally part. If `stockCount = stockCount + units` somehow threw (it won't here, but consider a method call that could), the monitor would still be released, and other threads waiting on it would get their turn.
+
+<h1 id="why-blocks-instead-of-methods">Why Blocks Instead of Methods</h1>
+
+A `synchronized` method modifier is a shortcut for a block that wraps the entire method body, with `this` as the lock object (or the class object, for `static` methods). When the whole method touches shared state, that shortcut is fine. When only part of the method touches shared state, the modifier holds the lock longer than necessary, and every other thread that wants the same lock is stuck waiting for work that didn't need protection in the first place.
+
+An inventory class written with the modifier first, then with a block. The two versions produce the same answers, but the block version is friendlier to other threads.
+
+```java
+public class CoarseInventory {
+    private int stockCount = 100;
+
+    public synchronized void restock(int units, String supplierName) {
+        // Lock is held for this whole method
+        String banner = "Restocking from " + supplierName + " at "
+            + System.currentTimeMillis();
+        System.out.println(banner);
+
+        // Pretend this takes a while
+        for (int i = 0; i < 1_000_000; i++) {
+            Math.sqrt(i);
+        }
+
+        stockCount = stockCount + units;
+    }
+
+    public synchronized int getStockCount() {
+        return stockCount;
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        CoarseInventory inv = new CoarseInventory();
+
+        Thread t1 = new Thread(() -> inv.restock(20, "Acme"));
+        Thread t2 = new Thread(() -> inv.restock(10, "Globex"));
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+
+        System.out.println("Final stock: " + inv.getStockCount());
+    }
+}
+```
+
+The exact timestamps and ordering depend on the run. `t1` holds the monitor on `this` for the entire method body, including the banner build, the println, and the busy loop. `t2` can't even print its own banner until `t1` is done with the whole thing. That's wasted serialization. The banner and the loop never touched `stockCount`.
+
+Now the same logic with a block around just the part that matters:
+
+```java
+public class TightInventory {
+    private int stockCount = 100;
+    private final Object stockLock = new Object();
+
+    public void restock(int units, String supplierName) {
+        // Lock-free prep
+        String banner = "Restocking from " + supplierName + " at "
+            + System.currentTimeMillis();
+        System.out.println(banner);
+
+        for (int i = 0; i < 1_000_000; i++) {
+            Math.sqrt(i);
+        }
+
+        // Only this read-modify-write is locked
+        synchronized (stockLock) {
+            stockCount = stockCount + units;
+        }
+    }
+
+    public int getStockCount() {
+        synchronized (stockLock) {
+            return stockCount;
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        TightInventory inv = new TightInventory();
+
+        Thread t1 = new Thread(() -> inv.restock(20, "Acme"));
+        Thread t2 = new Thread(() -> inv.restock(10, "Globex"));
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+
+        System.out.println("Final stock: " + inv.getStockCount());
+    }
+}
+```
+
+Both threads can now print their banners and run their busy loops in parallel. Only the moment of updating `stockCount` is serialized. The final answer is the same `130`, because the locked section is still a true read-modify-write that no other thread can interleave with. We've shortened the lock's hold time without weakening the safety.
+
+This is the central trade-off of synchronization. A lock keeps your data correct, but it also funnels every thread through a single doorway. The narrower the doorway and the shorter the time anyone stands in it, the less contention you create. The rule of thumb is to put inside the block exactly the lines that read or write the shared field, and to keep prep work, formatting, logging, and slow I/O outside.
+
+The diagram lines up the two shapes side by side. A wide critical section serializes work that didn't need serializing. A narrow one serializes only the work that depends on shared state. For most classes, the narrow version is what you want, and the block syntax is how you write it.
+
+Acquiring an uncontended monitor in modern JVMs is very cheap, often a single atomic compare-and-swap. The cost shows up when threads contend: every thread waiting on a held monitor parks, and the OS has to schedule it back in when the holder releases. Long critical sections turn cheap locks into expensive bottlenecks.
+
+<h1 id="choosing-the-lock-object">Choosing the Lock Object</h1>
+
+A synchronized block needs an object to lock on. Any non-null object works at the language level, but the choice matters a lot in practice. The wrong object can break correctness, expose your lock to outside code, or accidentally share a lock with strangers.
+
+Three patterns cover the common cases, and each one fits a different situation.
+
+<h3 id="pattern-1-a-private-final-lock-object">
+  Pattern 1: A Private Final Lock Object
+</h3>
+
+The safest and most common pattern is a dedicated `private final Object` field used only for locking. Nobody outside the class can see it, nobody can reassign it, and nobody can accidentally lock on it from elsewhere.
+
+```java
+public class OrderLog {
+    private final Object logLock = new Object();
+    private final java.util.List<String> entries = new java.util.ArrayList<>();
+
+    public void record(String event) {
+        synchronized (logLock) {
+            entries.add(event);
+        }
+    }
+
+    public int size() {
+        synchronized (logLock) {
+            return entries.size();
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        OrderLog log = new OrderLog();
+        Thread t1 = new Thread(() -> {
+            for (int i = 0; i < 100; i++) log.record("placed-" + i);
+        });
+        Thread t2 = new Thread(() -> {
+            for (int i = 0; i < 100; i++) log.record("shipped-" + i);
+        });
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+        System.out.println("Total events: " + log.size());
+    }
+}
+```
+
+`logLock` is `private` so external code can't reference it, and `final` so neither the class itself nor a subclass can swap it out for something else. Every operation that touches `entries` synchronizes on the same `logLock`, which is what guarantees the count comes out right. The lock is a piece of internal machinery, not part of the class's public surface.
+
+Why `final` matters: if `logLock` could be reassigned, two threads could end up locking on different objects (the old reference and the new one) and would think they were cooperating when they weren't. `final` removes that possibility. The variable always points at the same monitor, for the lifetime of the instance.
+
+<h3 id="pattern-2-locking-on-this">Pattern 2: Locking on this</h3>
+
+Locking on `this` is what a `synchronized` instance method does implicitly. You can do the same thing explicitly with a block:
+
+```java
+public class SimpleCart {
+    private int itemCount = 0;
+
+    public void addItem() {
+        synchronized (this) {
+            itemCount = itemCount + 1;
+        }
+    }
+
+    public int getItemCount() {
+        synchronized (this) {
+            return itemCount;
+        }
+    }
+
+    public static void main(String[] args) {
+        SimpleCart cart = new SimpleCart();
+        cart.addItem();
+        cart.addItem();
+        cart.addItem();
+        System.out.println("Items in cart: " + cart.getItemCount());
+    }
+}
+```
+
+This works, and for small classes with one piece of shared state, it's reasonable. The catch is that `this` is part of your public identity. Any code that has a reference to the cart, including outside callers, can write `synchronized (cart) { ... }` and acquire the same monitor. If they hold it for a long time, your own methods get blocked, and the only sign is that operations on the cart slow down for no obvious reason.
+
+```java
+public class HostileCaller {
+    public static void main(String[] args) throws InterruptedException {
+        SimpleCart cart = new SimpleCart();
+
+        Thread hostile = new Thread(() -> {
+            synchronized (cart) {
+                System.out.println("Hostile thread holding cart's monitor");
+                try { Thread.sleep(2000); } catch (InterruptedException e) {}
+                System.out.println("Hostile thread releasing");
+            }
+        });
+        hostile.start();
+
+        Thread.sleep(100);
+        long start = System.currentTimeMillis();
+        cart.addItem();
+        long elapsed = System.currentTimeMillis() - start;
+        System.out.println("addItem waited " + elapsed + " ms");
+    }
+}
+```
+
+`addItem` had to wait nearly two seconds because the hostile thread grabbed `cart`'s monitor and held it. The cart class did nothing wrong; it just locked on an object that's also visible to the outside world. A private final lock object would have made this impossible, because no external code could even name the lock.
+
+This isn't paranoia. A common version of the same problem is innocent: a helper method in another class wraps a block of cart operations in `synchronized (cart) { ... }` for "extra safety," not realizing it's competing with the cart's own internal locks. The cart still works, just slower than it should.
+
+<h3 id="pattern-3-class-literal-for-static-state">
+  Pattern 3: Class Literal for Static State
+</h3>
+
+For static fields, you need a lock that exists once per class, not once per instance. The standard idiom is to lock on the class object itself, written as `ClassName.class`.
+
+```java
+public class OrderIdGenerator {
+    private static long nextId = 1000;
+
+    public static long nextOrderId() {
+        synchronized (OrderIdGenerator.class) {
+            long id = nextId;
+            nextId = nextId + 1;
+            return id;
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        Runnable task = () -> {
+            for (int i = 0; i < 5; i++) {
+                System.out.println(Thread.currentThread().getName()
+                    + " got " + nextOrderId());
+            }
+        };
+
+        Thread t1 = new Thread(task, "T1");
+        Thread t2 = new Thread(task, "T2");
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+    }
+}
+```
+
+The exact interleaving varies, but every ID is unique and the sequence is monotonically increasing. `OrderIdGenerator.class` is a single object that exists once per class loader, and a static synchronized method would lock on the same thing implicitly. Using `ClassName.class` in a block lets you keep the block narrow while still locking on the class-level monitor.
+
+This is appropriate when the shared state itself is static (`nextId` doesn't belong to any particular instance), or when you want a single lock shared across every instance of the class. If you lock on `this` instead, two different instances would have two different locks, and concurrent calls on different instances would both update `nextId` without coordinating.
+
+| Lock object            | Good for                                                             | Watch out for                             |
+| ---------------------- | -------------------------------------------------------------------- | ----------------------------------------- |
+| `private final Object` | Instance state, when external code shouldn't touch the lock          | Slightly more code than `this`            |
+| `this`                 | Tiny classes with one obvious lock and no risk of outside contention | Outside callers can grab the same monitor |
+| `ClassName.class`      | Static shared state, or one global lock per class                    | Wrong choice for per-instance state       |
+
+The decision usually goes: if the state is static, lock on the class literal. Otherwise, lock on a private final object. Only fall back to `this` for very small classes where the simplicity wins and every caller is trusted.
+
+<h1 id="lock-objects-that-cause-problems">Lock Objects That Cause Problems</h1>
+
+Picking a lock object that the language accepts but the runtime sabotages is one of the easiest mistakes to make. The compiler doesn't complain. The code runs. It doesn't synchronize the way you think.
+
+<h3 id="locking-on-a-string-literal">Locking on a String Literal</h3>
+
+String literals in Java are interned. Two different pieces of code that write `"inventory-lock"` get the exact same `String` object, because the JVM keeps a pool of distinct literal values and hands the same one back every time. That sharing extends across classes, modules, and libraries.
+
+**What's wrong with this code?**
+
+```java
+public class StringLiteralLock {
+    private int stockCount = 0;
+
+    public void addStock(int units) {
+        synchronized ("inventory-lock") {
+            stockCount = stockCount + units;
+        }
+    }
+}
+```
+
+It compiles. It runs. The synchronization "works" in the sense that two threads inside this class's `addStock` will serialize on the same `String`. The problem is that any other code anywhere in the JVM that also writes `synchronized ("inventory-lock") { ... }` is locking on the exact same object. A logging library, a testing framework, a third-party JAR, a different unrelated class in your own codebase, all of them collide on one global lock that nobody owns and nobody can debug.
+
+**Fix:**
+
+```java
+public class StringLiteralLockFixed {
+    private final Object inventoryLock = new Object();
+    private int stockCount = 0;
+
+    public void addStock(int units) {
+        synchronized (inventoryLock) {
+            stockCount = stockCount + units;
+        }
+    }
+}
+```
+
+A private final `Object` field is unique to this instance. Nothing outside the class can name it, much less lock on it. The same fix applies to anything that might be interned or globally shared: `String` literals, the values returned by `String.intern()`, and boxed primitives in the cached range.
+
+<h3 id="locking-on-a-boxed-integer">Locking on a Boxed Integer</h3>
+
+Java caches small `Integer` values. By default, `Integer.valueOf(n)` for `n` between `-128` and `127` returns the same cached object every time, and autoboxing uses `valueOf` internally. That means `Integer one = 1;` in two different places gives you the same `Integer` instance, with the same monitor.
+
+**What's wrong with this code?**
+
+```java
+public class BoxedLock {
+    private Integer counter = 0;
+
+    public void increment() {
+        synchronized (counter) {
+            counter = counter + 1;
+        }
+    }
+}
+```
+
+Two bugs in one. First, `counter` is a boxed `Integer` in the cached range, so the first few calls all synchronize on the same shared `Integer.valueOf(0)` that the rest of the JVM also uses. Second, `counter = counter + 1` rebinds `counter` to a different object (the boxed result of `counter + 1`), so the lock object on the next call isn't the same as the one this call held. Threads end up locking on different objects from one call to the next, and the synchronization stops serializing anything.
+
+**Fix:**
+
+```java
+public class BoxedLockFixed {
+    private final Object counterLock = new Object();
+    private int counter = 0;
+
+    public void increment() {
+        synchronized (counterLock) {
+            counter = counter + 1;
+        }
+    }
+}
+```
+
+Two fixes layered together: a separate lock object that's never reassigned, and a primitive `int` for the counter so the state itself isn't an object whose identity can shift. The lock is one thing, the counted value is another. They never get confused.
+
+The general rule is to lock on objects whose identity you control and whose reference you don't reassign. Boxed primitives violate both of those, as do `String` literals, cached `Boolean.TRUE`/`Boolean.FALSE`, and anything else the JVM might deduplicate. A fresh `new Object()` stored in a `final` field is the boring, correct answer.
+
+The diagram sorts the dangerous lock objects on the left and the safe pattern on the right. Each red branch is a real bug pattern someone has shipped to production. The green branch is one line of code that avoids every one of them.
+
+<h1 id="multiple-locks-for-different-shared-state">
+  Multiple Locks for Different Shared State
+</h1>
+
+A class with two unrelated pieces of shared state doesn't need one lock guarding both. Putting them under one lock is correct, but it forces threads to wait on each other even when they're touching different data. Splitting the locks lets independent operations run in parallel.
+
+An inventory class that tracks stock counts and also maintains an order log. The two pieces of state never read each other.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class StoreState {
+    private final Object stockLock = new Object();
+    private final Object logLock = new Object();
+
+    private int stockCount = 100;
+    private final List<String> orderLog = new ArrayList<>();
+
+    public void recordOrder(String customer, int units) {
+        // Touches only the log
+        synchronized (logLock) {
+            orderLog.add(customer + " ordered " + units);
+        }
+
+        // Touches only the stock count
+        synchronized (stockLock) {
+            stockCount = stockCount - units;
+        }
+    }
+
+    public int getStockCount() {
+        synchronized (stockLock) {
+            return stockCount;
+        }
+    }
+
+    public int getLogSize() {
+        synchronized (logLock) {
+            return orderLog.size();
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        StoreState store = new StoreState();
+
+        Runnable task = () -> {
+            for (int i = 0; i < 10; i++) {
+                store.recordOrder("Customer-" + i, 1);
+            }
+        };
+        Thread t1 = new Thread(task);
+        Thread t2 = new Thread(task);
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+
+        System.out.println("Stock left: " + store.getStockCount());
+        System.out.println("Log entries: " + store.getLogSize());
+    }
+}
+```
+
+Two threads each call `recordOrder` ten times. The log gets twenty entries and the stock count drops by twenty, both correctly. The interesting part is that while thread A is inside the `logLock` block, thread B can be inside the `stockLock` block at the same time. The two pieces of state are independent, so the two locks are independent. Contention shows up only when two threads happen to need the same lock.
+
+Compare with a single shared lock:
+
+```java
+public class StoreStateOneLock {
+    private final Object storeLock = new Object();
+    private int stockCount = 100;
+    private final java.util.List<String> orderLog = new java.util.ArrayList<>();
+
+    public void recordOrder(String customer, int units) {
+        synchronized (storeLock) {
+            orderLog.add(customer + " ordered " + units);
+            stockCount = stockCount - units;
+        }
+    }
+}
+```
+
+Same correctness, but every order serializes through one bottleneck. A thread that wants to just append to the log has to wait if another thread is mid-way through updating the stock count, even though the two operations don't conflict. For a low-traffic class, the one-lock version is fine and arguably simpler. For a high-traffic one, splitting the locks scales better.
+
+The diagram shows the difference. One lock funnels everything; two locks let independent traffic flow side by side. The right number of locks is whatever the data structure naturally has: one per piece of state that can be touched independently of the others.
+
+Two important caveats. First, if an operation needs to touch both pieces of state atomically (say, "if stock is positive, deduct one and log the order, as one atomic action"), you can't just take both locks in sequence inside one method. Acquiring two locks in different orders from different methods leads to deadlock. For now, the rule is: split locks only when the operations truly are independent.
+
+Second, more locks isn't always better. Each lock adds bookkeeping: which one protects what, which one to acquire when. Three or four locks in one class is approaching the limit of what most readers can keep straight. If you need finer-grained locking than that, a `ReentrantLock` or a concurrent collection from `java.util.concurrent` handles the bookkeeping for you.
+
+Each synchronized block carries a tiny per-acquire overhead, but the bigger cost is the time other threads spend parked waiting. Splitting locks shortens that waiting time only when threads need different locks. If every operation needs both locks, splitting gains nothing and costs you the extra locking overhead.
+
+<h1 id="a-realistic-e-commerce-example">A Realistic E-Commerce Example</h1>
+
+A small `Store` class that puts these techniques together: separate locks for independent state, a class-literal lock for a static counter, and narrow critical sections around the read-modify-write portions.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class Store {
+    // Per-instance state, each with its own private lock
+    private final Object stockLock = new Object();
+    private final Object logLock = new Object();
+
+    private int stockCount;
+    private final List<String> orderLog = new ArrayList<>();
+
+    // Class-level state, locked on the class object
+    private static long nextOrderId = 1000;
+
+    public Store(int initialStock) {
+        this.stockCount = initialStock;
+    }
+
+    public boolean placeOrder(String customer, int units) {
+        // Lock-free prep
+        long orderId = generateOrderId();
+        String announcement = customer + " is placing order " + orderId;
+        System.out.println(announcement);
+
+        // Lock #1: only the stock check and decrement
+        synchronized (stockLock) {
+            if (stockCount < units) {
+                return false;
+            }
+            stockCount = stockCount - units;
+        }
+
+        // Lock #2: only the log append
+        synchronized (logLock) {
+            orderLog.add("order-" + orderId + " " + customer + " " + units);
+        }
+
+        return true;
+    }
+
+    public int getStockCount() {
+        synchronized (stockLock) {
+            return stockCount;
+        }
+    }
+
+    public int getLogSize() {
+        synchronized (logLock) {
+            return orderLog.size();
+        }
+    }
+
+    private static long generateOrderId() {
+        synchronized (Store.class) {
+            long id = nextOrderId;
+            nextOrderId = nextOrderId + 1;
+            return id;
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        Store store = new Store(50);
+
+        Runnable buyer = () -> {
+            for (int i = 0; i < 10; i++) {
+                store.placeOrder(Thread.currentThread().getName(), 2);
+            }
+        };
+
+        Thread t1 = new Thread(buyer, "Ana");
+        Thread t2 = new Thread(buyer, "Ben");
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+
+        System.out.println("Stock left: " + store.getStockCount());
+        System.out.println("Orders logged: " + store.getLogSize());
+    }
+}
+```
+
+The interleaving of announcements varies from run to run because the `println` calls happen outside any lock. The important numbers are the final ones: twenty orders went through, stock dropped from 50 to 10 (twenty orders of two units each), and the log has twenty entries. All of that holds even though two threads were running concurrently and racing through the same code.
+
+Each lock in this class does one job. `stockLock` guards the stock count check-and-decrement. `logLock` guards the append to the order log. `Store.class` guards the global ID counter. None of the three blocks holds a lock for longer than the few lines that need it. The `println` for the announcement happens before any lock is acquired, so threads can announce in parallel.
+
+The check-then-decrement pattern inside `stockLock` deserves a second look. The `if (stockCount < units) return false;` and the `stockCount = stockCount - units;` together form one read-modify-write. They must be inside the same synchronized block, because if they were split into two separate blocks, two threads could both pass the check on the same starting value, both decrement, and oversell. Read-modify-write is the prototypical pattern that needs locking, and the rule "everything that reads-and-decides-and-writes the same value goes inside one block" is the rule you'll apply over and over.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

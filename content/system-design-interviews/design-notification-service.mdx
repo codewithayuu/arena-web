@@ -1,0 +1,364 @@
+---
+title: "Design a Scalable Notification Service"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Design Notification Service explained with clear examples, visuals, and practice questions in Mindflare's System Design Interviews course."
+---
+
+<LessonCard>
+
+<h1 id="2-scale-estimation">2. Scale Estimation</h1>
+
+> - **Users**: Assume the system serves **50 million daily users**.
+> - **Notifications per user**: On average, each user receives **5 notifications/day**.
+> - **Peak load**: Assume the peak time sees **1 million notifications** within 1 minutes (a common scenario during flash sales, for example).
+
+This means the system should handle:
+
+- **Notifications per day: **50 million x 5 = 250 million notifications/day
+- **Peak notifications per second: **1 million / 60** = ~**17,000 notifications/second
+
+<h3 id="storage-requirements">Storage Requirements</h3>
+
+Assuming average notification and user data size of 1KB.
+
+- **Storage for user data:** 50 million \* 1 KB = 50GB
+- **Daily Storage for notifications:** 50 million _ 5 _ 1 KB = 250GB
+
+<h1 id="3-high-level-design">3. High Level Design</h1>
+
+On a high level, our system will consist of the following components:
+
+<h3 id="1-notification-service">1. Notification Service</h3>
+
+The **Notification Service** is the **entry point** for all notification requests, either from external applications or internal systems. It exposes **APIs** that various clients can call to trigger notifications.
+
+These could be requests to send **transactional notifications** (e.g., password reset emails), **promotional notifications** (e.g., discount offers), or **system alerts** (e.g., downtime warnings).
+
+Each request is **validated** to ensure it contains all the necessary information, such as the recipient’s ID, notification type, message content, and channels through which the notification should be sent (email, SMS, etc.).
+
+For notifications that need to be sent at a future date or time, the Notification Service integrates with the **Scheduler** **Service**.
+
+After processing the request, the Notification Service pushes the notifications to a **Notification Queue** (e.g., Kafka or RabbitMQ).
+
+<h3 id="2-user-preference-service">2. User Preference Service</h3>
+
+The **User Preference Service** allows users to control how they receive notifications.
+
+It stores and retrieves individual user preferences for receiving notifications across different channels.
+
+The service tracks which types of notifications users have explicitly opted into or out of.
+
+To prevent users from being overwhelmed by notifications, the User Preference Service enforces **frequency limits** for certain types of notifications, especially promotional messages.
+
+<h3 id="3-scheduler-service">3. Scheduler Service</h3>
+
+The **Scheduler Service** is responsible for storing and tracking the **scheduled notifications**, notifications that need to be sent at a specific future time.
+
+These can include reminders, promotional campaigns, or other time-sensitive notifications that are not sent immediately but must be triggered based on a predefined schedule.
+
+Once the scheduled time arrives, the Scheduler Service pulls the notification from its storage and sends it to the **Notification Queue**.
+
+<h3 id="4-notification-queue">4. Notification Queue</h3>
+
+The **Notification Queue **acts as a buffer between the **Notification Service** and the **Channel Processors**.
+
+By decoupling the notification request submission from the notification delivery, the queue enables the system to scale much more effectively, particularly during high-traffic periods.
+
+The Queue System provides guarantees around message delivery.
+
+Depending on the use case, it can be configured for:
+
+- **At-least-once delivery**: Ensures that every notification will be sent at least once, even if this results in duplicate messages in rare cases.
+- **Exactly-once delivery**: Ensures that every notification is delivered exactly once, preventing duplicates while maintaining reliability.
+
+<h3 id="5-channel-processors">5. Channel Processors</h3>
+
+The **Channel Processors **are responsible for pulling notifications from the **Notification Queue** and delivering them to users via specific channels, such as **email**, **SMS**, **push notifications**, and **in-app notifications**.
+
+By decoupling the Notification Service from the actual delivery, Channel Processors enable **independent scaling** and **asynchronous processing** of notifications.
+
+This setup allows each processor to focus on its designated channel, ensuring reliable delivery with built-in retry mechanisms and handling failures efficiently.
+
+<h3 id="6-databasestorage">6. Database/Storage</h3>
+
+The **Database/Storage** layer manages large volumes of data, including notification content, user preferences, scheduled notifications, delivery logs, and metadata.
+
+The system requires a mix of storage solutions to support various needs:
+
+- **Transactional Data**: A relational database like **PostgreSQL** or **MySQL** stores structured data, such as notification logs and delivery status.
+- **User Preferences**: **NoSQL databases** (e.g., DynamoDB, MongoDB) store large volumes of user-specific data, such as preferences and rate limits.
+- **Blob Storage**: For notifications containing large attachments (e.g., email with images or PDFs), **Amazon** **S3** or similar services can store them.
+
+<h1 id="4-detailed-design">4. Detailed Design</h1>
+
+<h3 id="step-1-notification-request-creation">
+  Step 1: Notification Request Creation
+</h3>
+
+An external system (e.g., an e-commerce platform, a system alert generator, or a marketing system) generates a notification request.
+
+<h4 id="sample-request">Sample Request</h4>
+
+```json
+{
+  "requestId": "abc123",
+  "timestamp": "2024-09-17T14:00:00Z",
+  "notificationType": "transactional",
+  "channels": ["email", "sms", "push"],
+  "recipient": {
+    "userId": "user789",
+    "email": "user@example.com"
+  },
+  "message": {
+    "subject": "Order Confirmation",
+    "body": "Thank you for your order! Your order #123456 has been confirmed.",
+    "attachments": ["https://example.com/invoice123456.pdf"],
+    "smsText": "Thank you for your order! Order #123456 confirmed.",
+    "pushNotification": {
+      "title": "Order Confirmed",
+      "body": "Your order #123456 has been confirmed. Check your email for details.",
+      "icon": "https://example.com/icon.png",
+      "action": {
+        "type": "viewOrder",
+        "url": "https://example.com/order/123456"
+      }
+    }
+  },
+  "schedule": {
+    "sendAt": "2024-09-17T15:00:00Z"
+  },
+  "metadata": {
+    "priority": "high",
+    "retries": 3
+  }
+}
+```
+
+<h3 id="step-2-notification-service-ingestion">
+  Step 2: Notification Service Ingestion
+</h3>
+
+The **Notification Service** (via an **API Gateway / Load Balancer**) receives the notification request.
+
+The request is **authenticated** and **validated** to ensure it’s coming from an authorized source and all necessary information (recipient, message, channels, etc.) is present and correct.
+
+<h3 id="step-3-fetching-user-preferences">Step 3: Fetching User Preferences</h3>
+
+The **Notification Service** queries the **User Preference Service** to retrieve:
+
+- **Preferred Notification Channels** (e.g., some users may prefer email for promotional messages but SMS for critical alerts).
+- **Opt-in/Opt-out Preferences**: Ensures compliance with user preferences, such as not sending marketing emails if the user has opted out.
+- **Rate Limits**: Ensures that the user does not exceed their configured notification limits (e.g., max 3 promotional SMS messages per day).
+
+<h4 id="sample-response-from-user-preference-service">
+  Sample Response from User Preference Service
+</h4>
+
+```json
+{
+  "userId": "user789",
+  "preferences": {
+    "channels": {
+      "transactional": ["email", "push"],
+      "promotional": ["sms"],
+      "systemAlert": ["push", "sms"]
+    },
+    "doNotDisturb": {
+      "enabled": true,
+      "startTime": "22:00",
+      "endTime": "08:00",
+      "timezone": "America/New_York"
+    },
+    "dailyLimits": {
+      "promotionalLimit": 2,
+      "promotionalSentToday": 1
+    },
+    "optOut": {
+      "email": false,
+      "sms": false,
+      "push": false
+    },
+    "preferredTimeForDelivery": {
+      "enabled": true,
+      "startTime": "09:00",
+      "endTime": "21:00",
+      "timezone": "America/New_York"
+    }
+  }
+}
+```
+
+<h3 id="step-4-scheduling-if-required">Step 4: Scheduling (If Required)</h3>
+
+If the notification is **scheduled for future delivery** (e.g., a reminder for tomorrow or a marketing email next week), the **Notification Service **sends the notification to **Scheduler Service** which stores the notification along with its scheduled delivery time in a **time-based database** or **NoSQL database **that allows for efficient querying based on time.
+
+The `scheduled_notifications `table is partitioned on `scheduled_time `so that` `the system can efficiently retrieve only the notifications that fall within the relevant time range, rather than scanning the entire table.
+
+The Scheduler Service continuously queries the storage for notifications that are **due for delivery**.
+
+When the scheduled time arrives, the Scheduler Service takes the notification and sends it to the **Notification Queue**.
+
+<h3 id="step-5-message-creation-and-formatting">
+  Step 5: Message Creation and Formatting
+</h3>
+
+Based on the user’s preferences and the request, the **Notification Service** uses **templates** (if needed) to dynamically generate and format the message for each channel:
+
+- **Email:** HTML or plain text with headers, footers, and attachments.
+- **SMS:** Plain text with a maximum character limit.
+- **Push Notification:** A concise message with metadata for app actions.
+- **In-app Notification:** JSON payload formatted for display in the app.
+
+<h4 id="sample-message-email">Sample Message (Email)</h4>
+
+```json
+{
+  "messageId": "msg12345",
+  "timestamp": "2024-09-17T14:00:00Z",
+  "notificationType": "transactional",
+  "channel": "email",
+  "recipient": {
+    "userId": "user789",
+    "email": "user@example.com"
+  },
+  "messageContent": {
+    "subject": "Order Confirmation - Order #123456",
+    "body": {
+      "html": "<html><body><h1>Thank you for your order!</h1><p>Your order #123456 has been confirmed. You can track your order <a href='https://example.com/track'>here</a>.</p></body></html>",
+      "plainText": "Thank you for your order! Your order #123456 has been confirmed. Track your order here: https://example.com/track"
+    },
+    "attachments": [
+      {
+        "url": "https://example.com/invoice123456.pdf",
+        "fileName": "invoice123456.pdf",
+        "mimeType": "application/pdf"
+      }
+    ]
+  },
+  "metadata": {
+    "priority": "high",
+    "retries": 3,
+    "sentBy": "OrderService",
+    "templateId": "orderConfirmationTemplate",
+    "requestId": "req9876"
+  }
+}
+```
+
+<h3 id="step-6-queueing-the-notification">Step 6: Queueing the Notification</h3>
+
+Once the **Notification Service** has created and formatted the messages for the required channels, it places each message into the respective **topic** in the **Notification Queue System** (e.g., **Kafka**, **RabbitMQ**, **AWS SQS**).
+
+Each channel (email, SMS, push, etc.) has its own **dedicated topic**, ensuring that the messages are processed independently by the relevant **Channel Processors**.
+
+The **Email Message** is placed into the **Email Topic**, the **SMS Message** into the **SMS Topic**, and the **Push Notification Message** into the **Push Topic**.
+
+These **topics** allow each **Channel Processor** to focus on consuming messages relevant to its channel, reducing complexity and improving processing efficiency.
+
+Each message contains the **notification payload**, **channel-specific information**, and metadata (such as priority and retry count).
+
+<h3 id="step-7-channel-specific-message-processing">
+  Step 7: Channel-Specific Message Processing
+</h3>
+
+The **Notification Queue** stores the messages until the relevant **Channel Processors** pull them for processing.
+
+Each channel processor acts as a consumer to the queue, responsible for consuming its own messages.
+
+The **Email Processor** pulls from the **Email Topic**, the **SMS Processor** from the **SMS Topic**, the **Push Processor** from the **Push Topic**, and the **In-app Processor** from the **In-app Topic**.
+
+<h3 id="step-8-sending-the-notification">Step 8: Sending the Notification</h3>
+
+Each **Channel Processor** handles the delivery of the notification through the specified channel:
+
+<h4 id="email-processor">Email Processor</h4>
+
+It connects to the email provider (e.g., **SendGrid**, **Mailgun**, **Amazon SES**), sends the email while following the user’s preferences such as HTML versus plain text, and handles errors such as bounces or invalid email addresses.
+
+<h4 id="sms-processor">SMS Processor</h4>
+
+It connects to the SMS provider (e.g., **Twilio**, **Nexmo**), sends the SMS with any formatting adjustments to meet character limits or regional requirements, and handles issues such as invalid phone numbers or network errors.
+
+<h4 id="push-notification-processor">Push Notification Processor</h4>
+
+It uses services like **Firebase Cloud Messaging (FCM)** for Android or **Apple Push Notification Service (APNs)** for iOS, sends the push notification including any metadata such as app-specific actions or icons, and handles failures such as expired device tokens or offline devices.
+
+<h4 id="in-app-notification-processor">In-App Notification Processor</h4>
+
+It sends the in-app notification via **WebSockets** or **long polling** to the user’s active session and formats the message for display in the app’s UI, adhering to any app-specific display rules.
+
+<h3 id="step-9-monitoring-and-delivery-confirmation">
+  Step 9: Monitoring and Delivery Confirmation
+</h3>
+
+Each **Channel Processor** waits for an acknowledgment from the external provider. A success means the message has been delivered, while a failure means delivery failed for reasons such as network issues or invalid addresses.
+
+The **Channel Processors** logs each notification’s status in the `notification_logs` table for future reference, auditing, and reporting.
+
+<h1 id="5-follow-ups">5. Follow-ups</h1>
+
+<h3 id="51-handling-failures-and-retries">5.1 Handling Failures and Retries</h3>
+
+If a notification delivery fails due to a temporary issue (e.g., third-party provider downtime), the **Channel Processor** will attempt to resend the notification.
+
+Typically, an **exponential backoff** strategy is used, where each retry is delayed by progressively longer intervals.
+
+If the notification remains undelivered after a set number of retries, it is moved to the **Dead Letter Queue (DLQ) **for further handling.
+
+Administrators can then manually review and reprocess messages in the DLQ as needed.
+
+<h3 id="52-scalability">5.2 Scalability</h3>
+
+<h4 id="horizontal-scalability">Horizontal Scalability</h4>
+
+The system should be designed for **horizontal scalability**, meaning components can scale by adding more instances as the load increases.
+
+- **Notification Service**: As request volumes grow, additional instances can be deployed to manage the increased load of incoming notifications.
+- **Notification Queue**: Distributed queueing systems, like **Kafka** or **RabbitMQ**, are naturally scalable and can handle larger workloads by distributing the queue across multiple nodes.
+- **Channel Processors**: Each processor (email, SMS, etc.) should be horizontally scalable to handle large volumes of notifications.
+
+<h4 id="sharding-partitioning">Sharding & Partitioning</h4>
+
+To efficiently handle large datasets, particularly for user data and notification logs, sharding and partitioning distribute the load across multiple databases or geographic regions:
+
+- **User-based Sharding**: Distribute users across different databases or regions based on geographic location or user ID to balance the load.
+- **Time-based Partitioning**: Organize notification logs into time-based partitions (e.g., daily or monthly) to improve query performance and manage large volumes of historical data.
+
+<h4 id="caching">Caching</h4>
+
+Implement caching with solutions like **Redis** or **Memcached** to store frequently accessed data, such as user preferences.
+
+Caching reduces the load on the database and improves response times for real-time notifications by avoiding repeated database lookups.
+
+<h3 id="53-reliability">5.3 Reliability</h3>
+
+For high availability, data (e.g., user preferences, logs) should be replicated across multiple data centers or regions. This ensures that even if one region fails, the data is available elsewhere.
+
+A **load balancer** should be used to distribute incoming traffic evenly among instances of the Notification Service, ensuring that no single instance becomes a bottleneck.
+
+<h3 id="54-monitoring-and-logging">5.4 Monitoring and Logging</h3>
+
+To ensure smooth operation at scale, the system should have:
+
+- **Centralized Logging**: Use tools like **ELK Stack** or **Prometheus/Grafana** to collect logs from various components and monitor the health of the system.
+- **Alerting**: Set up alerts for failures (e.g., notification delivery failure rates exceed a threshold).
+- **Metrics**: Track metrics like success rate, failure rate, delivery latency, and throughput for each channel.
+
+<h3 id="55-security">5.5 Security</h3>
+
+Implement strong authentication (e.g., OAuth 2.0) for all incoming requests to the notification service. Use **Role-Based Access Control (RBAC)** to limit access to critical services.
+
+Protect the service from abuse by implementing rate limiting on the API gateway to avoid DoS attacks.
+
+<h3 id="56-archiving-old-data">5.6 Archiving Old Data</h3>
+
+As a notification system handles large volumes of data over time, it is important to implement a strategy for **archiving old data**.
+
+Archiving involves moving outdated or less frequently accessed data (e.g., old delivery logs, notification content, and user history) from the main storage to a lower-cost, longer-term storage solution.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

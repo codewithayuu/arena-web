@@ -1,0 +1,230 @@
+---
+title: "Authentication & Authorization"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Authentication vs Authorization explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+Authentication may tell the system this is `user_42` from `tenant_a`. Authorization must still check whether `user_42` can read `invoice_123`, whether the invoice belongs to `tenant_a`, and whether any extra rule applies.
+
+Do not treat login as permission to do everything. Login only tells the system who the caller is.
+
+<h1 id="2-authentication">2. Authentication</h1>
+
+Authentication verifies that a caller controls something the system accepts as proof.
+
+For people, that proof may be a password, passkey, security key, one-time code, or biometric unlock. For machines, it may be a client certificate, signed JWT, API key, workload identity token, or cloud IAM role.
+
+Authentication does not always prove a person's real-world identity. Many products only need to know that the same account came back. Regulated systems may need stronger checks, such as verifying legal identity or requiring a stronger login method.
+
+<h3 id="common-factors">Common Factors</h3>
+
+Authentication factors are usually grouped as:
+
+Biometrics need one important clarification. In well-designed systems, the fingerprint or face scan is not sent to your server. It unlocks a local device credential, often a cryptographic key. The server verifies a signed challenge, which proves the device has the right private key, not a copy of the user's biometric data.
+
+<h3 id="authentication-methods">Authentication Methods</h3>
+
+These are common authentication methods, how they work, and where they usually fit.
+
+The right method depends on the client, risk, and environment. A browser SaaS app, mobile app, public API, and internal service mesh usually should not all use the same authentication method.
+
+<h3 id="password-login-flow">Password Login Flow</h3>
+
+A password login usually involves several checks: the password, account state, a possible second factor, and then the session that gets created.
+
+A production authentication flow checks more than the password. It confirms that the account is active, verifies the password hash, decides whether MFA is required, and looks for unusual login signals that may require a stronger check.
+
+It may also check whether the account or credential has been compromised. Only then does it create, rotate, or deny the session.
+
+Passwords should be stored with a dedicated password hashing algorithm such as Argon2id, bcrypt, or scrypt. Do not store plaintext passwords. Do not use fast general-purpose hashes such as SHA-256 by themselves for password storage. Fast hashes make password cracking easier if the password database leaks.
+
+<h3 id="sessions-and-tokens">Sessions and Tokens</h3>
+
+After authentication succeeds, the system usually creates a session or issues a token.
+
+For browser applications, a random session ID in a `Secure`, `HttpOnly`, `SameSite` cookie is often the simplest safe default. The server stores the session data and can revoke it immediately.
+
+For APIs, mobile apps, service-to-service calls, and federated login systems, tokens are common. Some tokens are random references that the server must look up. Others are self-contained signed tokens such as JWTs.
+
+Where you store the session or token is part of the security design. Browser-accessible storage such as `localStorage` is exposed to JavaScript and is risky if an XSS bug exists. Cookies need CSRF defenses. JWTs need careful expiration, audience validation, key rotation, and a revocation plan.
+
+There is no free storage location. Each option moves the risk.
+
+<h1 id="3-authorization">3. Authorization</h1>
+
+Authorization decides whether a caller is allowed to perform an action. The caller may be a signed-in user, a service account, a device, or an anonymous client.
+
+Authorization applies even to public endpoints. A public endpoint simply gives anonymous callers a small, intentional set of actions.
+
+A complete authorization decision usually needs four things:
+
+- **Subject:** Who is trying to act? This could be a user, service, device, or anonymous client.
+- **Action:** What are they trying to do? Examples: read, create, update, delete, approve, or export.
+- **Resource:** What are they acting on? Examples: invoice, document, tenant, account, or deployment.
+- **Context:** What else matters? Examples: tenant, owner, project, network, time, login strength, or data sensitivity.
+
+Authentication identifies the subject. Authorization evaluates the rest.
+
+<h3 id="common-authorization-models">Common Authorization Models</h3>
+
+Authorization models differ mainly in what they base the decision on. Real systems often combine them.
+
+For example, RBAC may grant `invoices:read`, while ABAC or ReBAC checks that the invoice belongs to the user's tenant or project.
+
+<h3 id="authorization-flow">Authorization Flow</h3>
+
+Tracing a delete request shows where authorization sits: the API identifies the caller, loads the target resource, then decides whether this caller may act on that resource.
+
+The API loads resource details before the final authorization decision. Checking only the user's role is not enough. The system must also check the target resource.
+
+```java
+public boolean canDeletePost(User user, Post post) {
+    if (!authz.hasPermission(user, "posts:delete")) {
+        return false;
+    }
+
+    if (!user.getTenantId().equals(post.getTenantId())) {
+        return false;
+    }
+
+    return post.getStatus() != PostStatus.LOCKED;
+}
+```
+
+This is the difference between "the user has a delete permission somewhere" and "the user may delete this specific post."
+
+<h1 id="4-end-to-end-example">4. End-to-End Example</h1>
+
+An editor tries to delete a blog post. The full flow looks like this:
+
+1. The user signs in.
+2. The authentication service validates credentials and MFA.
+3. The server creates a session or issues a token.
+4. The user sends `DELETE /posts/42`.
+5. The API validates the session or token.
+6. The API loads post `42`.
+7. The authorization layer checks:
+8. The API either deletes the post or returns `403 Forbidden`.
+
+A signed-in user who lacks access gets `403 Forbidden`. A request with missing or invalid authentication usually gets `401 Unauthorized`.
+
+The names are imperfect, but the distinction is useful: `401` means the caller has not presented valid credentials. `403` means the caller is known but not allowed.
+
+<h1 id="5-production-practices">5. Production Practices</h1>
+
+These practices turn the concepts into habits that hold up once a system has many endpoints, services, and users.
+
+<h3 id="authenticate-at-the-edge-authorize-at-the-operation">
+  Authenticate at the edge, authorize at the operation
+</h3>
+
+Gateways, middleware, and load balancers can validate sessions and tokens early. That is useful.
+
+Authorization still belongs close to the protected operation. Background jobs, admin endpoints, GraphQL resolvers, file downloads, and internal APIs need checks too. Attackers only need one missed path.
+
+<h3 id="deny-by-default">Deny by default</h3>
+
+If no rule explicitly allows the action, deny it.
+
+```java
+if (!authz.isAllowed(user, action, resource)) {
+    throw new ForbiddenException();
+}
+```
+
+New endpoints should start closed. New resources should start private. New roles should start with no permissions.
+
+<h3 id="validate-authorization-on-every-request">
+  Validate authorization on every request
+</h3>
+
+Do not rely on the frontend hiding buttons. Do not rely on a route being hard to guess. Do not rely on IDs being random.
+
+Every protected request should be checked on the server. This includes static files, exports, webhooks, background jobs, and service-to-service calls.
+
+<h3 id="separate-authentication-strength-from-authorization">
+  Separate authentication strength from authorization
+</h3>
+
+A user may be allowed to view an account with a normal session but require stronger authentication to change MFA settings, rotate API keys, export data, or approve payments.
+
+This is called step-up authentication. It means asking for stronger proof, such as MFA, before a sensitive action.
+
+<h3 id="design-for-revocation">Design for revocation</h3>
+
+Access changes must take effect predictably. A disabled user, a password or MFA reset, a removed role, a compromised token, a stolen session, or an employee leaving the company should all remove access in a clear and timely way.
+
+Server-side sessions are easy to revoke. Self-contained tokens need short lifetimes, refresh-token rotation, revocation lists, or permission-version checks.
+
+<h3 id="log-the-decisions-that-matter">Log the decisions that matter</h3>
+
+Log authentication and authorization events with enough detail to investigate incidents. Record login successes and failures, MFA challenges and failures, and every session creation and revocation. Capture permission denials, sensitive actions that were allowed, and any change to a role or policy.
+
+Avoid logging secrets, passwords, full tokens, or sensitive personal data. Logs should help investigation without becoming another source of compromise.
+
+<h3 id="test-the-negative-cases">Test the negative cases</h3>
+
+Most access-control bugs are not in the happy path.
+
+Test requests that arrive with no credentials, invalid credentials, or an expired session or token. Test an authenticated user who has no permission, a correct role pointed at the wrong tenant, and a correct role pointed at the wrong resource owner. Test a revoked role, a locked or restricted resource, and a service account calling a user-only endpoint.
+
+Authorization tests should be first-class tests, not a few accidental controller checks.
+
+<h1 id="6-common-mistakes">6. Common Mistakes</h1>
+
+Access-control bugs usually come from familiar mistakes, not exotic attacks.
+
+<h3 id="confusing-oauth-with-login">Confusing OAuth with login</h3>
+
+OAuth 2.0 is for delegated access to APIs. OpenID Connect adds the identity layer used for login.
+
+People often say "OAuth login" casually, but if the application needs to sign in a user, the implementation should be OpenID Connect.
+
+<h3 id="trusting-token-data-without-validation">
+  Trusting token data without validation
+</h3>
+
+A token is not trustworthy just because it looks like a JWT. The server must validate the signature, issuer, audience, expiration, algorithm, and key ID.
+
+For opaque tokens, the server must look them up or ask the issuer whether they are valid.
+
+<h3 id="putting-authorization-only-in-the-ui">
+  Putting authorization only in the UI
+</h3>
+
+The UI can improve user experience by hiding unavailable actions. It cannot protect data. All real enforcement must happen server-side.
+
+<h3 id="checking-only-roles">Checking only roles</h3>
+
+`admin` or `editor` is rarely enough information. The system also needs resource scope: tenant, owner, project, environment, region, workflow state, or data sensitivity.
+
+<h3 id="treating-internal-traffic-as-trusted">
+  Treating internal traffic as trusted
+</h3>
+
+Internal services still need authentication and authorization. A compromised service, misconfigured job, or leaked service token can cause the same damage as an external attacker.
+
+<h3 id="ignoring-lifecycle-events">Ignoring lifecycle events</h3>
+
+Authentication and authorization are tied to account lifecycle. When people join, change teams, or leave, their access must change too.
+
+If those workflows are manual, access will drift. Connect identity, HR, directory, and application authorization systems where the risk justifies it.
+
+<h1 id="summary">Summary</h1>
+
+Authentication establishes identity. Authorization controls access.
+
+Good systems keep those decisions separate, validate both on the server, deny by default, and check access against the specific resource being requested.
+
+Use strong authentication for account access, step-up authentication for sensitive actions, and explicit authorization checks for every protected operation.
+
+The hard part is not the login screen. The hard part is making sure every path that touches data asks, "Is this caller allowed to do this here?"
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

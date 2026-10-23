@@ -1,0 +1,393 @@
+---
+title: "Coroutines"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Coroutines explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="what-a-coroutine-object-is">What a Coroutine Object Is</h1>
+
+When an `async def` function is called, Python builds a coroutine object. The object holds a frozen execution: the function's local variables, the current line of bytecode, the suspended call stack, and nothing else. It is not running. It is a value, like a list or a dict.
+
+```python
+import asyncio
+
+async def fetch_price(product_id: str) -> float:
+    await asyncio.sleep(0.05)
+    return 29.99
+
+coro = fetch_price("wireless-mouse")
+print(coro)
+print(type(coro))
+print(type(coro).__name__)
+
+coro.close()  # avoids the "never awaited" warning since we won't run it
+```
+
+The repr shows the function the coroutine came from and the memory address. The type is `coroutine`, a built-in class distinct from `function`, `generator`, and `async_generator`.
+
+A coroutine object is single-use. Drive it once, it produces a result, and that's it. Calling the function again returns a fresh coroutine object pointing at the same body, which can be driven independently.
+
+```python
+import asyncio
+
+async def calculate_cart_total(prices: list[float]) -> float:
+    await asyncio.sleep(0.01)
+    return sum(prices)
+
+async def main() -> None:
+    coro = calculate_cart_total([29.99, 14.99])
+    print(await coro)
+    print(await coro)  # second await on the same coroutine fails
+
+asyncio.run(main())
+```
+
+A coroutine looks like a function when reading the source, but behaves like a one-shot generator when used. A coroutine carries state. Once that state has reached the end of the body, the object is exhausted.
+
+<h1 id="native-coroutines-vs-generator-based-coroutines">
+  Native Coroutines vs Generator-Based Coroutines
+</h1>
+
+Python has had two ways to write coroutines. The first, from Python 3.4, used generators decorated with `@asyncio.coroutine` and the `yield from` keyword. The second, from Python 3.5 (PEP 492), introduced the dedicated `async def` and `await` syntax for native coroutines. The two coexisted for several releases. As of Python 3.10 the generator-based form is deprecated, and in Python 3.11 it was removed entirely.
+
+A side-by-side comparison shows what legacy code looked like:
+
+```python
+# Old (Python 3.4, removed in 3.11):
+import asyncio
+
+@asyncio.coroutine
+def fetch_price_old(product_id):
+    yield from asyncio.sleep(0.05)
+    return 29.99
+
+# Modern (Python 3.5+):
+async def fetch_price(product_id):
+    await asyncio.sleep(0.05)
+    return 29.99
+```
+
+The old form leaned on generator machinery. `yield from` was the suspension point, and `@asyncio.coroutine` told asyncio that a generator should be treated as a coroutine. The new form has its own machinery: native coroutine objects, the `await` keyword, and a clean separation from generators.
+
+The two forms could call each other in older versions, which is why a lot of pre-3.5 asyncio tutorials mix `yield from` and `await` casually. In modern code there's no reason to use the old form, and the lint rule `PYI` series in tools like `ruff` flags it.
+
+The practical differences are:
+
+| Property                  | Generator-based (`@asyncio.coroutine`)    | Native (`async def`) |
+| ------------------------- | ----------------------------------------- | -------------------- |
+| Available in              | 3.4 to 3.10 (deprecated), removed in 3.11 | 3.5 and later        |
+| Suspension keyword        | `yield from`                              | `await`              |
+| Class                     | `generator`                               | `coroutine`          |
+| `iscoroutinefunction`?    | Yes (for the decorated function)          | Yes                  |
+| `isgeneratorfunction`?    | Yes                                       | No                   |
+| Can yield non-awaitables? | Yes (it's still a generator)              | No                   |
+
+The last row is the main reason native coroutines were added. A generator-based coroutine could accidentally `yield` a value that wasn't an awaitable, and asyncio had to handle that case. With native coroutines, the type system enforces "only awaitables go after `await`," which prevents whole categories of bugs. Generator-based coroutines were slower than native ones because asyncio had to introspect each yielded value to figure out what to do with it. Native coroutines avoid that overhead by having a dedicated path through the event loop.
+
+<h1 id="the-lifecycle-of-a-coroutine">The Lifecycle of a Coroutine</h1>
+
+A coroutine moves through a small number of states. Tracking those states makes asyncio debugging easier, because most odd behavior maps to "the coroutine is in state X but was expected to be in state Y."
+
+The diagram shows the five states. A coroutine starts in **Created** the moment `fetch_price("wireless-mouse")` returns. It stays there until something starts driving it. The first time the event loop or an `await` advances the coroutine, it enters **Running**. From there it can hit an `await` on something that isn't ready yet, in which case it parks in **Suspended** until that awaitable resolves. When the body returns or raises, it enters **Done** with a result or an exception. A cancellation signal can move it from either Running or Suspended into **Cancelled**.
+
+Two of these states deserve attention. **Suspended** is the state where the loop is free to run other coroutines, which is the whole point of cooperative concurrency. **Cancelled** is a special kind of Done: the coroutine ended early because something else asked it to.
+
+The state shift is visible through `coro.cr_running` and `coro.cr_frame`:
+
+```python
+import asyncio
+
+async def fetch_price(product_id: str) -> float:
+    await asyncio.sleep(0.5)
+    return 29.99
+
+async def main() -> None:
+    coro = fetch_price("wireless-mouse")
+
+    print("Before scheduling:")
+    print(f"  cr_running: {coro.cr_running}")
+    print(f"  cr_frame: {coro.cr_frame is not None}")
+
+    task = asyncio.create_task(coro)
+    await asyncio.sleep(0.01)
+
+    print("\nWhile suspended:")
+    print(f"  cr_running: {coro.cr_running}")
+    print(f"  cr_frame: {coro.cr_frame is not None}")
+
+    result = await task
+
+    print("\nAfter completion:")
+    print(f"  cr_running: {coro.cr_running}")
+    print(f"  cr_frame: {coro.cr_frame is not None}")
+    print(f"  result: {result}")
+
+asyncio.run(main())
+```
+
+A few observations. `cr_running` is `True` only when the coroutine's body is actively executing on the call stack. Between awaits, the body isn't running, even though the coroutine isn't done. `cr_frame` points to the suspended frame while the coroutine still has work to do, and goes to `None` once the body returns. These attributes are mostly used by debuggers and profilers; normal code rarely needs to inspect them, but they help locate where something is stuck.
+
+<h1 id="introspection-iscoroutine-and-iscoroutinefunction">
+  Introspection: iscoroutine and iscoroutinefunction
+</h1>
+
+Two helpers in the `asyncio` and `inspect` modules answer the question "is this thing a coroutine?". They look similar and are easy to mix up.
+
+`asyncio.iscoroutine(obj)` returns `True` if `obj` is a coroutine **object** (the thing you get back from calling an `async def`). `asyncio.iscoroutinefunction(func)` returns `True` if `func` is a coroutine **function** (the thing defined with `async def`).
+
+```python
+import asyncio
+
+async def fetch_price(product_id: str) -> float:
+    return 29.99
+
+coro = fetch_price("wireless-mouse")
+
+print(asyncio.iscoroutinefunction(fetch_price))
+print(asyncio.iscoroutine(fetch_price))
+print(asyncio.iscoroutinefunction(coro))
+print(asyncio.iscoroutine(coro))
+
+coro.close()
+```
+
+The pattern is the same one that applies to any value/type pair. `iscoroutinefunction` is about the callable; `iscoroutine` is about the value the callable produces.
+
+The `inspect` module has equivalent functions with the same names. `inspect.iscoroutine` and `inspect.iscoroutinefunction` are the historical originals; `asyncio.iscoroutine` and `asyncio.iscoroutinefunction` accept slightly broader inputs (they also return `True` for some asyncio-managed callables that wrap coroutines). In day-to-day code either pair works.
+
+These helpers come up in library code that needs to handle a value or an async function that produces one:
+
+```python
+import asyncio
+from typing import Awaitable, Callable
+
+async def resolve(value_or_callable) -> int:
+    if asyncio.iscoroutinefunction(value_or_callable):
+        return await value_or_callable()
+    if asyncio.iscoroutine(value_or_callable):
+        return await value_or_callable
+    return value_or_callable
+
+async def async_count() -> int:
+    return 7
+
+async def main() -> None:
+    print(await resolve(5))
+    print(await resolve(async_count))
+    print(await resolve(async_count()))
+
+asyncio.run(main())
+```
+
+This kind of "accept anything reasonable" function appears at the boundary of a framework used by both sync and async callers. The introspection lets the helper figure out what kind of input it got and drive it appropriately.
+
+<h1 id="coroutines-vs-threads-cooperative-vs-preemptive">
+  Coroutines vs Threads: Cooperative vs Preemptive
+</h1>
+
+The contrast between cooperative and preemptive concurrency deserves detail because it changes how concurrent code should be reasoned about.
+
+A **thread** runs on top of the OS scheduler. The OS can interrupt a thread at any bytecode instruction and switch to a different thread. There's no "yield" keyword. The thread doesn't choose when it gets paused. This is called **preemptive multitasking**.
+
+A **coroutine** runs on top of an event loop. The loop switches between coroutines only at `await` expressions. A coroutine that doesn't `await` keeps the loop until it returns. There is no way for the loop to forcibly take control back. This is called **cooperative multitasking**.
+
+The practical implications are large:
+
+The diagram shows the difference at the switching boundary. Threads can be paused mid-instruction, which is why threaded code needs locks: a thread reading a shared variable can be interrupted between the read and the write, leaving another thread to change the value in between. Coroutines can only be paused at `await`, so between awaits the coroutine has the loop to itself. Most of the lock dance in threading code disappears in asyncio.
+
+The trade-off is that cooperative concurrency works only if every coroutine cooperates. A coroutine that runs a heavy computation for ten seconds without awaiting blocks every other coroutine on the loop for those ten seconds. There is no preemption fallback. The asyncio model trades the safety of locks for the responsibility of yielding.
+
+| Aspect                | Threads              | Coroutines                        |
+| --------------------- | -------------------- | --------------------------------- |
+| Switching boundary    | Any instruction      | Only at `await`                   |
+| Switching cost        | OS context switch    | Function call to the loop         |
+| Locks usually needed? | Yes                  | Rarely                            |
+| Stack per worker      | OS thread stack (KB) | Coroutine frame (bytes)           |
+| Max practical count   | Thousands            | Tens of thousands                 |
+| Risk of starvation    | Low (preempted)      | High if a coroutine doesn't yield |
+
+Most modern Python network libraries support asyncio (HTTP clients, database drivers, message brokers) because cooperative concurrency gives high throughput for I/O-bound work without the per-thread memory tax. CPU-bound libraries don't because asyncio doesn't help them: pure computation never yields.
+
+<h1 id="composing-coroutines">Composing Coroutines</h1>
+
+Coroutines can call other coroutines, like normal functions call other functions. The catch is that the call site has to use `await`, otherwise the result is a coroutine object that gets discarded.
+
+```python
+import asyncio
+
+async def fetch_price(product_id: str) -> float:
+    await asyncio.sleep(0.05)
+    return 29.99 if product_id == "wireless-mouse" else 14.99
+
+async def fetch_total(product_ids: list[str]) -> float:
+    total = 0.0
+    for product_id in product_ids:
+        price = await fetch_price(product_id)
+        total += price
+    return total
+
+async def main() -> None:
+    total = await fetch_total(["wireless-mouse", "usb-cable", "wireless-mouse"])
+    print(f"total: ${total:.2f}")
+
+asyncio.run(main())
+```
+
+`fetch_total` is itself a coroutine. It awaits `fetch_price` inside a loop, gathering the results sequentially. From the event loop's point of view, both functions are coroutines and the call chain looks no different from a regular function call chain. The only extra detail is the `await` at every async-to-async hop.
+
+A coroutine that awaits another coroutine is **sequential**: the outer one waits for the inner one to finish before moving on. This is the right choice when one step depends on the previous (read user, then fetch their cart, then compute total). When the steps are independent, concurrent execution applies, which means `asyncio.gather`, `asyncio.create_task`, or `TaskGroup`.
+
+A common composition pattern is the **async helper**: a small coroutine that wraps a single piece of work, used inside a larger coroutine that decides how to fan out:
+
+```python
+import asyncio
+import time
+
+async def fetch_price(product_id: str) -> float:
+    await asyncio.sleep(0.2)
+    return 29.99
+
+async def fetch_all_prices(product_ids: list[str]) -> dict[str, float]:
+    prices = await asyncio.gather(*(fetch_price(pid) for pid in product_ids))
+    return dict(zip(product_ids, prices))
+
+async def main() -> None:
+    start = time.perf_counter()
+    prices = await fetch_all_prices(["wireless-mouse", "usb-cable", "keyboard"])
+    print(prices)
+    print(f"took {time.perf_counter() - start:.2f}s")
+
+asyncio.run(main())
+```
+
+The helper `fetch_price` is sequential within itself, but `fetch_all_prices` runs three of them concurrently. Three 0.2-second sleeps complete in about 0.2 seconds total, because all three coroutines hit their `await asyncio.sleep` at roughly the same wall-clock moment and the loop wakes them up together.
+
+Awaiting in a tight loop runs the inner coroutine sequentially. With a hundred product IDs, `for pid in ids: await fetch_price(pid)` takes `100 * 0.2 = 20 seconds`, not `0.2`. Use `gather` or a `TaskGroup` when the calls are independent.
+
+<h1 id="common-pitfalls">Common Pitfalls</h1>
+
+A few mistakes show up repeatedly once coroutines move into real code.
+
+**Creating but not awaiting.** Calling a coroutine function without `await` is almost always a bug.
+
+```python
+import asyncio
+
+async def update_order_status(order_id: str, status: str) -> None:
+    await asyncio.sleep(0.05)
+    print(f"order {order_id} -> {status}")
+
+async def main() -> None:
+    update_order_status("ORD-1001", "shipped")  # missing await
+    print("done")
+
+asyncio.run(main())
+```
+
+The status update never happened. The fix is `await update_order_status(...)`.
+
+**Mixing sync blocking calls into a coroutine.** This bug is hard to spot: the code runs, looks correct, but concurrency disappears because one call is blocking the loop.
+
+```python
+import asyncio
+import time
+
+async def slow_step() -> None:
+    time.sleep(0.5)  # blocks the entire loop
+
+async def main() -> None:
+    start = time.perf_counter()
+    await asyncio.gather(slow_step(), slow_step())
+    print(f"took {time.perf_counter() - start:.2f}s")
+
+asyncio.run(main())
+```
+
+Two 0.5-second sleeps should take 0.5 seconds with `gather`, but `time.sleep` blocks the whole thread, so they run sequentially. The fix is `await asyncio.sleep(0.5)`. For sync libraries that can't be replaced, use `await asyncio.to_thread(blocking_func, ...)`.
+
+**Confusing the coroutine object with its result.** The coroutine object is not the value; awaiting it produces the value. The mistake is especially common when the return type is `bool`:
+
+```python
+import asyncio
+
+async def has_stock(product_id: str) -> bool:
+    return False
+
+async def main() -> None:
+    result = has_stock("wireless-mouse")
+    if result:
+        print("yes")
+    else:
+        print("no")
+
+asyncio.run(main())
+```
+
+The function returns `False`, but the `if` tests the coroutine object, which is truthy. The body never ran. The fix is `result = await has_stock("wireless-mouse")`.
+
+**Awaiting the same coroutine twice.** Once driven, a coroutine is exhausted. Awaiting it again raises:
+
+```python
+import asyncio
+
+async def get_price() -> float:
+    return 29.99
+
+async def main() -> None:
+    coro = get_price()
+    a = await coro
+    b = await coro
+
+asyncio.run(main())
+```
+
+To run the same work twice, call the function twice to get two distinct coroutine objects.
+
+<h1 id="inspecting-a-stuck-coroutine">Inspecting a Stuck Coroutine</h1>
+
+When something hangs, the first question is usually "where is it stuck?". asyncio exposes a small set of helpers that answer this.
+
+`asyncio.all_tasks(loop)` returns the set of tasks currently scheduled on the loop. For each task, `task.get_stack()` returns the suspended frames, which is the line where the coroutine is parked.
+
+```python
+import asyncio
+
+async def fetch_price(product_id: str) -> float:
+    await asyncio.sleep(10.0)  # pretending the API is slow
+    return 29.99
+
+async def report_pending() -> None:
+    await asyncio.sleep(0.1)
+    for task in asyncio.all_tasks():
+        if task is asyncio.current_task():
+            continue
+        name = task.get_coro().__qualname__
+        frames = task.get_stack()
+        if frames:
+            line = frames[-1].f_lineno
+            print(f"{name} suspended at line {line}")
+
+async def main() -> None:
+    fetch_task = asyncio.create_task(fetch_price("wireless-mouse"))
+    await report_pending()
+    fetch_task.cancel()
+    try:
+        await fetch_task
+    except asyncio.CancelledError:
+        pass
+
+asyncio.run(main())
+```
+
+The reporting coroutine asks the loop for every task, skips itself, then prints where each other task is parked. This pattern is used to dump stuck tasks during shutdown or in health checks. Frameworks like `aiomonitor` and `aiodebug` build on the same primitives.
+
+For ad-hoc debugging, running with `PYTHONASYNCIODEBUG=1` (or `asyncio.run(main(), debug=True)`) prints warnings when a coroutine takes too long between awaits, which usually signals that a sync call has crept in.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,490 @@
+---
+title: "Connection Pooling"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Connection Pooling explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="why-a-pool-at-all">Why a Pool At All</h1>
+
+The basic way to open a connection is `DriverManager.getConnection(url, user, password)`. That call works, but each call does a lot of work internally. The driver opens a fresh TCP socket to the database, completes the three-way handshake, sends the authentication credentials, waits for the server to validate them, negotiates session parameters like character set and timezone, and finally hands you back a `Connection` object. For a remote Postgres or MySQL server, a realistic budget for all of that is somewhere between 50 ms and 200 ms.
+
+That is fine for a one-off script. It is a disaster for a web app. If every HTTP request opens and closes a connection, the database setup cost dominates whatever the request was actually trying to do. A 5 ms `SELECT` becomes a 100 ms request, almost all of it spent on connection plumbing.
+
+Opening a fresh database connection takes roughly 50-200 ms over a network (TCP handshake plus authentication plus session setup). Borrowing one from a pool takes roughly 0.1 ms. That is a 500x to 2000x speedup for the same `Connection` object, before you have run a single query.
+
+A connection pool fixes this by opening a handful of connections once, at startup, and then keeping them alive in memory. When your code needs a connection, the pool hands you one that is already open and authenticated. When your code is done, the pool takes it back instead of throwing it away. The expensive setup happens N times for the lifetime of the application, not once per request.
+
+The pool sits between your code and the database. Connections are opened once and reused indefinitely. The two arrows on the right are dotted because the actual wire connections to the database are long-lived. The two arrows on the left, between the app and the pool, are the only things that happen on every request.
+
+This is also where the running E-Commerce theme starts to matter. A shop's read-heavy traffic, looking up products, listing orders, fetching cart contents, is exactly the workload that benefits most from pooling. A product page might run six queries against the database; without a pool, each one pays a fresh handshake. With a pool, the six queries share connections that opened minutes or hours ago and will keep running for as long as the app stays up.
+
+<h1 id="the-pool-lifecycle-borrow-use-return">
+  The Pool Lifecycle: Borrow, Use, Return
+</h1>
+
+A key detail is what `connection.close()` does on a pooled connection. With raw `DriverManager`, closing tears down the TCP socket and the database session. With a pool, the same call hands the connection back to the pool. The connection stays open at the network level; only your hold on it is released.
+
+The pool itself runs through four states for each connection it manages: `IDLE` (sitting in the pool waiting), `IN_USE` (handed out to a thread), `CLOSED` (physically torn down because it was idle too long or hit its max lifetime), and a transient `VALIDATING` state when the pool checks that a connection is still alive before lending it out.
+
+The diagram is the whole story of one connection's life inside the pool. It starts `IDLE`, gets briefly `VALIDATING` when an app thread asks for it, becomes `IN_USE` while the thread holds it, and returns to `IDLE` when the thread calls `close()`. It eventually moves to `CLOSED` either because it sat idle too long, hit its configured max lifetime, leaked (the app forgot to close it), or the pool shut down. A new connection is then opened to replace it if the pool's min-idle target is not met.
+
+The shift in meaning of `close()` is the key difference. Reading the JDBC code looks identical to the unpooled version:
+
+```java
+try (Connection conn = dataSource.getConnection()) {
+    // run queries
+}
+```
+
+But the `try-with-resources` block now triggers a return-to-pool, not a TCP shutdown. The pool implements this by giving you a wrapper object that delegates every method to the real connection except `close`, which is intercepted and rerouted to "give me back."
+
+A pooled `connection.close()` is a method call on a wrapper, around 0.1 ms. The same call on a raw `DriverManager` connection runs the TCP four-way shutdown handshake, which is two more round trips on top of any pending data. Pools turn one of the most expensive JDBC calls into one of the cheapest.
+
+<h1 id="the-datasource-interface">The DataSource Interface</h1>
+
+The JDBC API exposes connections through two entry points. `DriverManager.getConnection` is the one beginners meet first; it opens a fresh connection on every call. `javax.sql.DataSource` is the pooled equivalent, and it is the interface every connection pool implements. Your application code calls `dataSource.getConnection()`, and the pool decides whether to hand you an existing idle connection or open a new one.
+
+```java
+public interface DataSource {
+    Connection getConnection() throws SQLException;
+    Connection getConnection(String username, String password) throws SQLException;
+    // ... a few other methods for logging and timeouts
+}
+```
+
+The signature is intentionally identical at the call site. Swapping `DriverManager` for a `DataSource` is a one-line change everywhere a connection is borrowed; the rest of your JDBC code (statements, result sets, transactions) is unchanged. Frameworks like Spring, Hibernate, and Jakarta EE all take a `DataSource` as their primary configuration handle, not a JDBC URL. The pool implementation is plugged in once, at startup, and the rest of the app sees only the interface.
+
+The H2 in-memory database plays nicely here. H2 ships its own non-pooled `JdbcDataSource`, but for any real-looking application you wrap it with a pool. The JDBC URL `jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1` tells H2 to run an in-process database named `shop` and to keep it alive as long as the JVM is up, even when no connections are currently open. Without `DB_CLOSE_DELAY=-1`, H2 destroys the database the moment the last connection closes, which is exactly what a pool does between borrows and would wipe your data.
+
+<h1 id="hikaricp-dbcp2-c3p0">HikariCP, DBCP2, c3p0</h1>
+
+There are three connection pool libraries you'll meet in Java code today. They have slightly different histories, knob sets, and performance profiles, but they all implement `javax.sql.DataSource` and they all do the same fundamental job.
+
+| Library              | Maturity       | Throughput | Defaults     | Typical use                                          |
+| -------------------- | -------------- | ---------- | ------------ | ---------------------------------------------------- |
+| HikariCP             | Active, modern | Highest    | Sensible     | Default in Spring Boot 2+, almost every new project  |
+| Apache Commons DBCP2 | Active, mature | Good       | Conservative | Long-running JBoss/Tomcat deployments, legacy stacks |
+| c3p0                 | Older, stable  | Lower      | Forgiving    | Hibernate's old bundled pool, legacy projects        |
+
+HikariCP is the one to learn first. It is the default in modern Spring Boot, the implementation Hibernate recommends, and the fastest of the three by a meaningful margin (its core borrow path is around 100 nanoseconds). The library is small, opinionated, and has a short list of well-named configuration properties. Once you can read a Hikari config, the other two pools read like dialects of the same language.
+
+The Maven dependency is straightforward:
+
+```text
+<dependency>
+    <groupId>com.zaxxer</groupId>
+    <artifactId>HikariCP</artifactId>
+    <version>5.1.0</version>
+</dependency>
+<dependency>
+    <groupId>com.h2database</groupId>
+    <artifactId>h2</artifactId>
+    <version>2.2.224</version>
+</dependency>
+```
+
+Add those to your `pom.xml` (or the equivalent `build.gradle` entries) and HikariCP plus the H2 driver are on the classpath. From there everything is plain Java.
+
+<h1 id="a-first-hikaricp-setup">A First HikariCP Setup</h1>
+
+The smallest useful program: create a pool, borrow a connection, run a query, return the connection, shut the pool down. The query bootstraps a tiny `products` table and fetches one row so you can see the round trip end to end.
+
+```java
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
+
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class FirstPool {
+    public static void main(String[] args) throws Exception {
+        HikariConfig config = new HikariConfig();
+        config.setJdbcUrl("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1");
+        config.setUsername("sa");
+        config.setPassword("");
+        config.setMaximumPoolSize(5);
+
+        try (HikariDataSource pool = new HikariDataSource(config)) {
+            try (Connection conn = pool.getConnection();
+                 Statement stmt = conn.createStatement()) {
+
+                stmt.execute("CREATE TABLE products (id INT PRIMARY KEY, name VARCHAR(64), price DECIMAL(8,2))");
+                stmt.execute("INSERT INTO products VALUES (1, 'Wireless Mouse', 24.99)");
+
+                ResultSet rs = stmt.executeQuery("SELECT name, price FROM products WHERE id = 1");
+                if (rs.next()) {
+                    System.out.println(rs.getString("name") + " costs $" + rs.getBigDecimal("price"));
+                }
+            }
+        }
+    }
+}
+```
+
+Walk through what is happening. The `HikariConfig` object collects the JDBC URL, credentials, and pool sizing. `new HikariDataSource(config)` opens an initial set of connections (one per `minimumIdle`, defaulting to whatever `maximumPoolSize` is set to when not specified otherwise). The outer `try-with-resources` makes sure the pool is shut down at the end, which closes every underlying connection. The inner `try-with-resources` borrows one connection, runs three statements, and returns the connection. The borrow-and-return is the entire lifecycle the pool cares about.
+
+What is _missing_ matters too. There is no `Class.forName("org.h2.Driver")`. Modern JDBC drivers register themselves automatically through the service loader, and HikariCP picks them up from the classpath. There is no manual connection counting. The pool keeps track. There is no "is this connection still alive" check in your code. HikariCP validates connections internally before lending them out.
+
+Constructing the `HikariDataSource` opens `minimumIdle` connections up front, which means startup pays the connection setup cost N times in parallel. That's a one-time price you take so request-handling threads never pay it. For a 5-connection pool to a remote database, expect 100-300 ms of startup latency before the pool reports ready.
+
+<h1 id="tuning-the-knobs">Tuning the Knobs</h1>
+
+Once the basic pool works, the configuration is mostly about size and timeouts. The properties below are the ones you will set on every real pool. The names are HikariCP's, but Commons DBCP2 and c3p0 have direct equivalents.
+
+| Property                 | Default     | What it controls                                                                     |
+| ------------------------ | ----------- | ------------------------------------------------------------------------------------ |
+| `jdbcUrl`                | none        | The JDBC URL to connect to.                                                          |
+| `username` / `password`  | none        | Database credentials.                                                                |
+| `maximumPoolSize`        | 10          | The most connections the pool will ever have, idle plus in-use.                      |
+| `minimumIdle`            | same as max | The number of idle connections the pool tries to keep ready.                         |
+| `connectionTimeout`      | 30000 ms    | How long `getConnection()` will wait before throwing `SQLException`.                 |
+| `idleTimeout`            | 600000 ms   | How long an idle connection sits before being closed.                                |
+| `maxLifetime`            | 1800000 ms  | How long any connection (idle or in-use) can live before being retired.              |
+| `leakDetectionThreshold` | 0 (off)     | If a borrowed connection isn't returned in N ms, log a stack trace.                  |
+| `validationTimeout`      | 5000 ms     | How long a pre-borrow validation check can take.                                     |
+| `connectionTestQuery`    | none        | A query (e.g. `SELECT 1`) used to validate connections, only needed for old drivers. |
+
+A configuration that exercises all of those together for the shop database:
+
+```java
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
+
+import java.sql.Connection;
+import java.sql.Statement;
+
+public class TunedPool {
+    public static void main(String[] args) throws Exception {
+        HikariConfig config = new HikariConfig();
+        config.setJdbcUrl("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1");
+        config.setUsername("sa");
+        config.setPassword("");
+
+        config.setMaximumPoolSize(10);
+        config.setMinimumIdle(2);
+        config.setConnectionTimeout(2000);
+        config.setIdleTimeout(60000);
+        config.setMaxLifetime(300000);
+        config.setLeakDetectionThreshold(5000);
+        config.setValidationTimeout(1000);
+        config.setPoolName("shop-pool");
+
+        try (HikariDataSource pool = new HikariDataSource(config)) {
+            try (Connection conn = pool.getConnection();
+                 Statement stmt = conn.createStatement()) {
+                stmt.execute("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(64))");
+                stmt.execute("INSERT INTO customers VALUES (1, 'Priya')");
+                System.out.println("Pool '" + pool.getPoolName() + "' is up; inserted customer 1");
+            }
+        }
+    }
+}
+```
+
+A few of those settings deserve more than a line in a table.
+
+`maxLifetime` is the safety net against connections going stale on the network. Many cloud databases, load balancers, and firewalls silently drop TCP sessions that have been open longer than some internal limit (Amazon RDS proxies cap at around 24 hours, AWS NLB at around 350 seconds). When that happens, your pool still believes the connection is alive, the next borrow returns it, and the first query on it fails with a confusing "connection closed" error. `maxLifetime` rotates connections out before the network does. The HikariCP default of 30 minutes is shorter than most server-side limits, which is the whole point. **Always set `maxLifetime` shorter than your database's or load balancer's idle/max session timeout.**
+
+`leakDetectionThreshold` is off by default but worth turning on in development. If a thread borrows a connection and doesn't return it within the threshold, HikariCP logs the stack trace of the thread that borrowed it. That stack trace tells you exactly which code path forgot to close. Five seconds is a reasonable dev value; in production it is usually disabled to avoid log noise on legitimately slow queries.
+
+`connectionTestQuery` is the one setting modern users can usually leave alone. JDBC 4 drivers implement `Connection.isValid(int timeout)` natively, which HikariCP uses to validate connections in microseconds. Setting `connectionTestQuery` forces a full round-trip `SELECT 1` instead and is only useful for ancient JDBC 3 drivers.
+
+<h1 id="sizing-the-pool">Sizing the Pool</h1>
+
+The most common pool-sizing mistake is "more is better." It is not. A pool of 200 connections handling 100 simultaneous requests will perform worse than a pool of 20 connections handling the same load, because every database has a finite number of cores, a finite amount of shared memory, and a finite number of disk spindles. Past a certain point, additional connections only add lock contention and context switches.
+
+HikariCP's wiki popularized a starting formula based on PostgreSQL's experience:
+
+```text
+connections = ((core_count * 2) + effective_spindle_count)
+```
+
+For a database server with 8 CPU cores and SSD storage (treat SSDs as one effective spindle, conservatively), that comes out to `(8 * 2) + 1 = 17` connections. Round to 20 for headroom. That sizing assumes one application instance; if you run 10 application instances against the same database, divide by 10 to get the per-pool size, so each instance keeps 2 connections.
+
+The formula is a starting point, not a law. Real tuning means measuring `threads-awaiting-connection` under load and the database's CPU utilization, and adjusting until both look healthy. Two signals that the pool is too small: high wait counts on the application side, and low CPU on the database side (workers idle, can't get in). Two signals that the pool is too large: connection counts near the database's max, and the database hitting CPU or lock-wait saturation while the app threads still have idle time.
+
+The diagram walks through the decisions the pool makes on every `getConnection()`. If an idle connection is sitting in the pool, the borrow is essentially free. If not and the pool isn't at its cap, a new connection is opened (paying the 50-200 ms cost once). If the pool is full, the caller waits up to `connectionTimeout` for someone else to return a connection. If nobody does, the call throws `SQLException`. That last branch is the one to instrument; a healthy production pool should almost never time out a borrow.
+
+Each extra connection beyond what the database can productively use costs roughly 5-10 MB of database server memory plus a few hundred KB on the application side. A pool of 500 connections per app instance is not "fast"; it consumes memory and runs slower than a pool of 20.
+
+<h1 id="pool-exhaustion-and-connection-leaks">
+  Pool Exhaustion and Connection Leaks
+</h1>
+
+Two failure modes will dominate the bugs you see with pools in production. They look almost identical from the application side (`getConnection()` takes a long time, then throws), but they have different root causes.
+
+**Pool exhaustion** is when every connection in the pool is in use and new requests have to wait. Common causes are a sudden traffic spike, a long-running query holding a connection, or a downstream slowness that backs up requests inside your app. The HikariCP error message is precise: `Connection is not available, request timed out after Nms.`
+
+**Connection leaks** are when one or more connections were borrowed but never returned. The pool slowly drains, every borrow gets harder, and eventually every request times out. The leak is almost always a missing `close()` somewhere; the fix is `try-with-resources`. `leakDetectionThreshold` exists exactly to find these, by logging the stack trace of whoever held a connection for too long.
+
+An accidental leak example and the fix:
+
+**What's wrong with this code?**
+
+```java
+import com.zaxxer.hikari.HikariDataSource;
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class LeakyLookup {
+    static String findProductName(HikariDataSource pool, int id) throws Exception {
+        Connection conn = pool.getConnection();
+        Statement stmt = conn.createStatement();
+        ResultSet rs = stmt.executeQuery("SELECT name FROM products WHERE id = " + id);
+        if (rs.next()) {
+            return rs.getString("name");
+        }
+        return null;
+    }
+}
+```
+
+The method opens a connection on every call and returns without closing it. Each invocation leaks one connection. After `maximumPoolSize` calls, the pool is drained and the next call hangs for `connectionTimeout` ms, then throws. The fix is `try-with-resources`:
+
+**Fix:**
+
+```java
+static String findProductName(HikariDataSource pool, int id) throws Exception {
+    String sql = "SELECT name FROM products WHERE id = ?";
+    try (Connection conn = pool.getConnection();
+         java.sql.PreparedStatement stmt = conn.prepareStatement(sql)) {
+        stmt.setInt(1, id);
+        try (ResultSet rs = stmt.executeQuery()) {
+            return rs.next() ? rs.getString("name") : null;
+        }
+    }
+}
+```
+
+The new version uses three nested `try-with-resources` blocks. The connection, the statement, and the result set all close even when the method throws or returns early. The pool now sees one borrow and one return per call, exactly as intended. The version with `PreparedStatement` is also safer against SQL injection, which is reason enough to use it on its own.
+
+<h1 id="stale-connections-and-validation">Stale Connections and Validation</h1>
+
+Even a healthy pool has to deal with the network occasionally betraying it. Three scenarios produce a connection that the pool thinks is alive but isn't:
+
+- The database server restarted. Every connection's underlying socket is now dead, but the pool's bookkeeping hasn't caught up.
+- A stateful firewall or load balancer dropped an idle session it considered stale. The application-side socket is half-open; the next write succeeds locally but the response never arrives.
+- The database server killed the connection because its own `wait_timeout` elapsed (MySQL's default is 8 hours; Postgres has `idle_in_transaction_session_timeout`).
+
+HikariCP's defenses are the validation step before each borrow plus `maxLifetime`. Before lending out a connection, the pool calls `Connection.isValid(validationTimeout)`, which makes the driver issue a cheap heartbeat to the server. If it fails, the connection is discarded and a fresh one is opened. The cost is small; the validation takes microseconds on modern drivers because most of them implement it as a pre-built protocol-level ping.
+
+The interaction with `maxLifetime` is what closes the loop. Even if the validation never catches a particular failure mode, every connection is retired after `maxLifetime` and replaced. Pick `maxLifetime` to be at least 30 seconds shorter than the most aggressive timeout in the network path between your app and the database. That guarantees the pool retires connections on its own schedule, not on the network's.
+
+```java
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
+
+import java.sql.Connection;
+
+public class StaleAware {
+    public static void main(String[] args) throws Exception {
+        HikariConfig config = new HikariConfig();
+        config.setJdbcUrl("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1");
+        config.setUsername("sa");
+        config.setPassword("");
+        config.setMaximumPoolSize(5);
+        // If the network path has a 5-minute idle timeout, retire well before that.
+        config.setMaxLifetime(240000);   // 4 minutes
+        config.setKeepaliveTime(60000);  // ping idle conns once a minute
+        config.setValidationTimeout(1000);
+
+        try (HikariDataSource pool = new HikariDataSource(config);
+             Connection conn = pool.getConnection()) {
+            System.out.println("got a connection, valid = " + conn.isValid(1));
+        }
+    }
+}
+```
+
+`keepaliveTime` is the newer HikariCP setting (added in version 4.0) that pings each idle connection on a schedule. Without it, the pool only validates at borrow time, so a long-idle connection might be marked stale and discarded on the first borrow after a network blip. With it, the pool actively keeps connections warm and catches dead ones before the application ever sees them.
+
+Validation on each borrow is around 100 microseconds for a JDBC 4 driver, and around 1-5 ms if you fall back to `connectionTestQuery`. The latter does a full SQL round trip; the former usually doesn't. Leave `connectionTestQuery` unset unless your driver predates JDBC 4.
+
+<h1 id="monitoring-with-hikaripoolmxbean">Monitoring with HikariPoolMXBean</h1>
+
+A pool that you can't see into is a pool you can't trust. HikariCP exposes its runtime state through a JMX MBean, `HikariPoolMXBean`, which gives you four counters:
+
+| Counter                     | Meaning                                                          |
+| --------------------------- | ---------------------------------------------------------------- |
+| `activeConnections`         | Connections currently borrowed (`IN_USE`)                        |
+| `idleConnections`           | Connections currently in the pool (`IDLE`)                       |
+| `totalConnections`          | active + idle                                                    |
+| `threadsAwaitingConnection` | App threads blocked in `getConnection()` waiting for one to free |
+
+Any non-trivial spike in `threadsAwaitingConnection` is your first warning of an undersized pool or a slow query holding a connection too long. In production these are typically exported to Prometheus or another metrics system; in development a quick poll prints them.
+
+```java
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
+import com.zaxxer.hikari.HikariPoolMXBean;
+
+import java.sql.Connection;
+
+public class PoolStats {
+    public static void main(String[] args) throws Exception {
+        HikariConfig config = new HikariConfig();
+        config.setJdbcUrl("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1");
+        config.setUsername("sa");
+        config.setPassword("");
+        config.setMaximumPoolSize(5);
+        config.setMinimumIdle(2);
+        config.setPoolName("shop-pool");
+
+        try (HikariDataSource pool = new HikariDataSource(config)) {
+            HikariPoolMXBean bean = pool.getHikariPoolMXBean();
+            System.out.println("before borrow: total=" + bean.getTotalConnections()
+                    + " active=" + bean.getActiveConnections()
+                    + " idle=" + bean.getIdleConnections()
+                    + " waiting=" + bean.getThreadsAwaitingConnection());
+
+            try (Connection conn = pool.getConnection()) {
+                System.out.println("during borrow: total=" + bean.getTotalConnections()
+                        + " active=" + bean.getActiveConnections()
+                        + " idle=" + bean.getIdleConnections());
+            }
+
+            System.out.println("after return: total=" + bean.getTotalConnections()
+                    + " active=" + bean.getActiveConnections()
+                    + " idle=" + bean.getIdleConnections());
+        }
+    }
+}
+```
+
+Two connections are open at startup because `minimumIdle = 2`. Borrowing one moves it from idle to active; returning it moves it back. The total never changes here because the pool sized itself once at startup and the workload didn't push it past the cap.
+
+For production, the HikariCP docs recommend setting `registerMbeans = true` on the config so the bean is visible to JConsole, VisualVM, or any other JMX-aware tool without writing custom plumbing. If you use a metrics library (Micrometer, Dropwizard Metrics), HikariCP also has direct integrations: set `config.setMetricRegistry(...)` and every counter shows up in your dashboards alongside HTTP latency.
+
+<h1 id="a-realistic-shop-example">A Realistic Shop Example</h1>
+
+To pull the lesson together, here's an E-Commerce module with all of this wired up. The program creates a pool, sets up product and order tables, and runs a handful of operations through the pool to demonstrate borrow-and-return on each call.
+
+```java
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
+
+import javax.sql.DataSource;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class ShopWithPool {
+
+    public static void main(String[] args) throws Exception {
+        HikariConfig config = new HikariConfig();
+        config.setJdbcUrl("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1");
+        config.setUsername("sa");
+        config.setPassword("");
+        config.setMaximumPoolSize(8);
+        config.setMinimumIdle(2);
+        config.setConnectionTimeout(2000);
+        config.setMaxLifetime(300000);
+        config.setLeakDetectionThreshold(5000);
+        config.setPoolName("shop-pool");
+
+        try (HikariDataSource pool = new HikariDataSource(config)) {
+            createSchema(pool);
+            insertProduct(pool, 1, "Wireless Mouse", 24.99);
+            insertProduct(pool, 2, "USB-C Cable",     9.99);
+            insertProduct(pool, 3, "Mechanical Keyboard", 129.00);
+
+            placeOrder(pool, 1001, 1, 2);  // 2 mice
+            placeOrder(pool, 1002, 3, 1);  // 1 keyboard
+
+            System.out.println("Catalog:");
+            listProducts(pool);
+
+            System.out.println("Orders:");
+            listOrders(pool);
+        }
+    }
+
+    static void createSchema(DataSource pool) throws Exception {
+        try (Connection conn = pool.getConnection();
+             Statement stmt = conn.createStatement()) {
+            stmt.execute("CREATE TABLE products (" +
+                    "id INT PRIMARY KEY, name VARCHAR(64), price DECIMAL(8,2))");
+            stmt.execute("CREATE TABLE orders (" +
+                    "id INT PRIMARY KEY, product_id INT, quantity INT)");
+        }
+    }
+
+    static void insertProduct(DataSource pool, int id, String name, double price) throws Exception {
+        String sql = "INSERT INTO products (id, name, price) VALUES (?, ?, ?)";
+        try (Connection conn = pool.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setInt(1, id);
+            ps.setString(2, name);
+            ps.setDouble(3, price);
+            ps.executeUpdate();
+        }
+    }
+
+    static void placeOrder(DataSource pool, int orderId, int productId, int qty) throws Exception {
+        String sql = "INSERT INTO orders (id, product_id, quantity) VALUES (?, ?, ?)";
+        try (Connection conn = pool.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setInt(1, orderId);
+            ps.setInt(2, productId);
+            ps.setInt(3, qty);
+            ps.executeUpdate();
+        }
+    }
+
+    static void listProducts(DataSource pool) throws Exception {
+        try (Connection conn = pool.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT id, name, price FROM products ORDER BY id")) {
+            while (rs.next()) {
+                System.out.println("  " + rs.getInt("id") + ": " + rs.getString("name")
+                        + " ($" + rs.getBigDecimal("price") + ")");
+            }
+        }
+    }
+
+    static void listOrders(DataSource pool) throws Exception {
+        String sql = "SELECT o.id, p.name, o.quantity " +
+                "FROM orders o JOIN products p ON p.id = o.product_id ORDER BY o.id";
+        try (Connection conn = pool.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            while (rs.next()) {
+                System.out.println("  #" + rs.getInt("id") + " " + rs.getString("name")
+                        + " x" + rs.getInt("quantity"));
+            }
+        }
+    }
+}
+```
+
+Every helper takes a `DataSource`, not a `HikariDataSource`. That is deliberate. Business code should depend on the interface, not the implementation, so swapping HikariCP for DBCP2 or for a test stub never touches the methods that run queries. Each helper borrows its own connection with `try-with-resources` and returns it as soon as it is done. No method tries to hold a connection across calls; that pattern is what destroys pool capacity.
+
+There is also a design choice to call out. None of the helpers manage transactions explicitly. With a pool, the transaction rule is: if you turn auto-commit off on a borrowed connection, keep it on that one connection for the whole transaction and don't borrow a second one in the middle. Returning a connection with auto-commit still off is also a bug HikariCP can detect (via `autoCommit` config) and reset for you.
+
+The five method calls in this example borrow and return one connection each. With a pool of 8 connections, that's at most one connection in use at a time and four idle. Without a pool, the same five operations would have paid five times the open-and-auth cost, easily 250-1000 ms of pure overhead, before any query actually ran.
+
+<h1 id="common-anti-patterns">Common Anti-Patterns</h1>
+
+A few patterns show up repeatedly in code reviews and are worth flagging before they bite you.
+
+**Storing a borrowed connection in a field.** A connection belongs to one operation. Holding it across requests, in a controller or service field, prevents the pool from reusing it and effectively shrinks the pool to one. Always borrow, use, return.
+
+**Wrapping `getConnection()` calls inside loops without `try-with-resources`.** Even without a leak, opening connections inside a loop slows the loop down by the borrow time times the iteration count, when a single borrow outside the loop would do.
+
+**Mixing pooled and unpooled connections.** Once a `DataSource` exists, every connection should come from it. Pages of code that still call `DriverManager.getConnection` in one corner and `pool.getConnection` in another fight for resources, behave differently under load, and make debugging harder.
+
+**Setting `maximumPoolSize` to "lots."** Throughput drops, not increases. Start with the formula, measure, and adjust. The default of 10 is a reasonable starting point for almost any single-instance app.
+
+**Not closing the pool itself at shutdown.** `HikariDataSource` is `Closeable`. If the program exits without closing it, the JVM eventually does, but the orderly path is `pool.close()` (or letting `try-with-resources` do it). This sends a clean teardown to every underlying connection instead of relying on the OS to clean them up later.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

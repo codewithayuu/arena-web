@@ -1,0 +1,462 @@
+---
+title: "with Statement"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "with Statement explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="the-exact-desugaring-of-with">The Exact Desugaring of with</h1>
+
+The rough equivalence between `with` and `try/finally` is well known. The real desugaring (defined in PEP 343 and the language reference) is a little more careful. Here's the form for `with EXPR as VAR:`:
+
+```python
+manager = EXPR
+exit_method = type(manager).__exit__
+value = type(manager).__enter__(manager)
+exc = True
+try:
+    try:
+        VAR = value
+        # block body runs here
+    except:
+        exc = False
+        if not exit_method(manager, *sys.exc_info()):
+            raise
+finally:
+    if exc:
+        exit_method(manager, None, None, None)
+```
+
+Two details from that desugaring are worth pulling out, because they trip up real code.
+
+First, `__enter__` and `__exit__` are looked up on the **class**, not on the instance. The line that calls `__enter__` is `type(manager).__enter__(manager)`, not `manager.__enter__()`. This is the same rule Python uses for all special methods (`__len__`, `__iter__`, `__eq__`, and so on). If you assign a different `__enter__` function to an instance, `with` ignores it.
+
+```python
+class Cart:
+    def __enter__(self):
+        print("class __enter__")
+        return self
+    def __exit__(self, exc_type, exc_value, tb):
+        print("class __exit__")
+        return False
+
+cart = Cart()
+cart.__enter__ = lambda: print("instance __enter__ (will be ignored)")
+
+with cart:
+    print("inside block")
+```
+
+The instance-level `__enter__` is never called. `with` resolved `type(cart).__enter__` and used the class version. If you ever wonder why monkey-patching `__enter__` on a single instance doesn't take effect, this is the reason.
+
+Second, the `as VAR` assignment happens **after** `__enter__` returns. If `__enter__` raises, `VAR` is never bound. The block body never runs. And, importantly, `__exit__` is also not called for that manager, because the manager never entered in the first place. The protocol is symmetric: `__exit__` only matches a successful `__enter__`.
+
+```python
+class FailEnter:
+    def __enter__(self):
+        raise RuntimeError("setup failed")
+    def __exit__(self, exc_type, exc_value, tb):
+        print("__exit__ ran")  # never prints
+        return False
+
+try:
+    with FailEnter() as x:
+        print("body")
+except RuntimeError as e:
+    print(f"caught: {e}")
+```
+
+`__exit__` didn't print. The body didn't print. `x` was never bound. The exception from `__enter__` propagated directly to the caller, with no cleanup attempt. That's correct: there was nothing to clean up.
+
+> **Cost:** A heavy `__enter__` (opening a database connection, doing a TCP handshake) runs at the top of the block, before the body. If the body might short-circuit and not need the resource, consider moving the `with` inside a conditional branch rather than wrapping the whole function in it.
+
+<h1 id="entry-and-exit-order-for-multiple-managers">
+  Entry and Exit Order for Multiple Managers
+</h1>
+
+The comma form `with open(a) as fa, open(b) as fb:` is equivalent to a nested pair of `with` statements, and the nesting order matters.
+
+```python
+with open("orders.csv") as orders, open("customers.csv") as customers:
+    ...
+```
+
+is desugared into:
+
+```python
+with open("orders.csv") as orders:
+    with open("customers.csv") as customers:
+        ...
+```
+
+Two consequences fall out of that:
+
+1. **Entry order is left to right.** `orders` is opened first. Only if that succeeds does `customers` get opened.
+2. **Exit order is right to left.** When the block ends, `customers.__exit__` runs first, then `orders.__exit__`.
+
+This mirrors how stacks work everywhere else in Python: last in, first out. The reason it's "right to left" rather than "right to left" being a quirk is that each manager is responsible for cleaning up after itself, and the inner manager (which may depend on the outer one being alive) has to release before the outer does.
+
+```python
+class Resource:
+    def __init__(self, name):
+        self.name = name
+    def __enter__(self):
+        print(f"enter {self.name}")
+        return self
+    def __exit__(self, exc_type, exc_value, tb):
+        print(f"exit {self.name}")
+        return False
+
+with Resource("cart") as c, Resource("order") as o, Resource("invoice") as i:
+    print("body")
+```
+
+You can see the LIFO behavior plainly: enter `cart`, `order`, `invoice`, then exit in reverse.
+
+The diagram below shows the same lifecycle as a flow:
+
+The asymmetry (top down for entry, bottom up for exit) is the same shape you see in function calls, `try/finally` chains, and any other LIFO setup-teardown pattern in the language. It's not specific to `with`; it just shows up clearly here because the protocol makes it explicit.
+
+<h3 id="the-parenthesized-form-python-310">
+  The Parenthesized Form (Python 3.10+)
+</h3>
+
+Comma chains get awkward past two or three managers. Python 3.10 added a parenthesized form that lets you break the list across multiple lines, with optional trailing commas:
+
+```python
+with (
+    open("orders.csv") as orders,
+    open("customers.csv") as customers,
+    open("products.csv") as products,
+    open("inventory.csv") as inventory,
+):
+    print(orders.readline())
+    print(customers.readline())
+    print(products.readline())
+    print(inventory.readline())
+```
+
+This is purely a parsing change. The semantics are identical to a single comma-separated list. The parentheses aren't a tuple; they're part of the `with` syntax. You can use them whenever a single line gets too long to read comfortably, which in practice is around three managers.
+
+Before 3.10, the workaround was either a single long line or `contextlib.ExitStack`. After 3.10, parenthesized `with` is the idiomatic choice for static lists of managers.
+
+A small e-commerce example: exporting an order to three formats in one block.
+
+```python
+with (
+    open("export.csv", "w") as csv_file,
+    open("export.json", "w") as json_file,
+    open("export.txt", "w") as txt_file,
+):
+    csv_file.write("order_id,total\n1001,124.95\n")
+    json_file.write('{"order_id": 1001, "total": 124.95}')
+    txt_file.write("Order 1001: $124.95")
+
+print("all three exports closed cleanly")
+```
+
+All three files are opened in order, the body writes to each, and all three are closed in reverse order before the program continues. If the disk filled up halfway through and the third `open` raised, the first two would still be closed cleanly.
+
+<h1 id="partial-setup-when-a-later-__enter__-raises">
+  Partial Setup: When a Later __enter__ Raises
+</h1>
+
+If a later manager's `__enter__` fails, earlier ones get cleaned up. Here's the full picture, because the rule is subtle.
+
+When `with A() as a, B() as b, C() as c:` runs:
+
+1. `A.__enter__` is called. Suppose it succeeds.
+2. `B.__enter__` is called. Suppose it succeeds.
+3. `C.__enter__` is called. Suppose it **raises** `RuntimeError`.
+4. Python is now stuck between "C didn't enter" and "A and B did". It treats this as a normal exception in flight after the inner `with` block was opened, so it unwinds:
+
+- `B.__exit__(RuntimeError, ..., ...)` runs.
+- Then `A.__exit__(RuntimeError, ..., ...)` runs.
+- The `RuntimeError` then propagates out of the `with` statement.
+
+1. `C.__exit__` is **never** called, because `C` never entered. The protocol guarantees `__exit__` matches a successful `__enter__`, not an attempted one.
+
+Here's a worked trace using small custom classes:
+
+```python
+class Step:
+    def __init__(self, name, fail_enter=False):
+        self.name = name
+        self.fail_enter = fail_enter
+    def __enter__(self):
+        print(f"  __enter__({self.name})")
+        if self.fail_enter:
+            raise RuntimeError(f"{self.name} setup failed")
+        return self
+    def __exit__(self, exc_type, exc_value, tb):
+        print(f"  __exit__({self.name}, exc={exc_type.__name__ if exc_type else None})")
+        return False
+
+print("--- attempting nested setup ---")
+try:
+    with Step("A") as a, Step("B") as b, Step("C", fail_enter=True) as c:
+        print("  body (never reached)")
+except RuntimeError as e:
+    print(f"caught: {e}")
+```
+
+Notice the order: A enters, B enters, C tries to enter and raises. B's `__exit__` runs first (it was entered most recently), then A's. Both `__exit__` calls see the `RuntimeError` info, because that's the exception currently in flight. C's `__exit__` is absent, because C never returned from `__enter__`.
+
+This is the exact behavior PEP 343 specifies, and it's also what `contextlib.ExitStack` produces. The takeaway: even with a partial entry, every resource that did enter gets a paired exit. You can't leak the first two files because the third one failed to open.
+
+> **Cost:** If `__enter__` is slow (a remote call, a heavy allocation), failing late in the chain means you paid for every successful enter before the failure. For chains where any step can fail, it's worth ordering managers so the most likely failures go first.
+
+<h1 id="what-__enter__-returns">What __enter__ Returns</h1>
+
+The value bound by `as VAR` is whatever `__enter__` returns. There's no rule that says it has to be `self`, and different built-ins make different choices.
+
+| Manager                         | What `__enter__` returns          | Why                                                              |
+| ------------------------------- | --------------------------------- | ---------------------------------------------------------------- |
+| `open(path)`                    | The file object itself (`self`)   | The file is what you want to read and write                      |
+| `threading.Lock()`              | The lock itself                   | You typically don't reference it inside the block                |
+| `decimal.localcontext()`        | A **copy** of the current context | Mutating the copy doesn't disturb other code outside the block   |
+| `tempfile.TemporaryDirectory()` | The directory path (a string)     | The path is what you actually pass to `open`, `os.listdir`, etc. |
+| `contextlib.suppress(...)`      | `self` (irrelevant)               | You don't use the binding; you don't write `as name` either      |
+
+The two interesting cases are "returns self" and "returns a copy".
+
+When `__enter__` returns `self`, you're working with the same object that owns the cleanup. Files are the classic example:
+
+```python
+with open("orders.log", "w") as log:
+    print(log is open)  # False; log is the file object, not the function
+    print(type(log).__name__)
+```
+
+`log` and the manager are the same object. If you wanted to call other methods on the file (`log.flush()`, `log.fileno()`), they're right there.
+
+When `__enter__` returns a **separate** object, the `as` binding gives you that separate thing, while the manager stays in the background. `decimal.localcontext` is the canonical example:
+
+```python
+from decimal import Decimal, getcontext, localcontext
+
+print(f"outside: precision={getcontext().prec}")
+
+with localcontext() as ctx:
+    ctx.prec = 6
+    print(f"inside:  precision={getcontext().prec}")
+    print(Decimal("1") / Decimal("7"))
+
+print(f"after:   precision={getcontext().prec}")
+```
+
+`ctx` is a copy of the current decimal context. Setting `ctx.prec = 6` changes that copy, which is the active context inside the block. On exit, `localcontext` restores the original context, so the precision goes back to 28. The trick is that mutating `ctx` doesn't accidentally bleed into other parts of the program; the copy is scoped to the `with` block.
+
+The shape "enter clones state, exit restores it" shows up in a lot of well-designed managers: `numpy.errstate`, `warnings.catch_warnings`, and Python's own `unittest.mock.patch` all work this way. Recognizing the pattern makes their behavior predictable.
+
+For `contextlib.suppress`, the return from `__enter__` is `self`, but you almost never write `as name` for it, because there's nothing useful to do with the suppressor inside the block. You'd just write `with suppress(KeyError):` and the body alone.
+
+<h1 id="when-__exit__-itself-raises">When __exit__ Itself Raises</h1>
+
+Most of the time, `__exit__` returns normally. When the body of a `with` block raised, `__exit__` does its cleanup, returns `False`/`None`, and the original exception keeps propagating. Clean.
+
+But what if `__exit__` itself raises? Imagine a database manager whose `commit()` on the way out fails because the connection died, or a file whose `close()` raises on a flushed write error. Python has a specific rule for this case: **the new exception from `__exit__` replaces the original exception, and the original is attached to the new one as `__context__`.**
+
+This is the same chaining mechanism `raise from` uses. The exception that propagates out of the `with` statement is the one `__exit__` raised, but the one that was in flight when `__exit__` was called is preserved on the chain so you don't lose the diagnostic.
+
+Here's a concrete demo:
+
+```python
+class FlakyManager:
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc_value, tb):
+        print(f"__exit__ saw {exc_type.__name__ if exc_type else None}")
+        raise RuntimeError("cleanup failed")
+
+try:
+    with FlakyManager():
+        raise ValueError("body failed")
+except RuntimeError as e:
+    print(f"propagated: {type(e).__name__}: {e}")
+    print(f"context:    {type(e.__context__).__name__}: {e.__context__}")
+```
+
+Walk through this. The body raises `ValueError`. Python catches it (just long enough to call cleanup), invokes `FlakyManager.__exit__(ValueError, ..., ...)`, which prints the type and then raises `RuntimeError("cleanup failed")`. Python sees the new exception, replaces the in-flight `ValueError` with it, and sets `__context__` on the `RuntimeError` to the original `ValueError`. The `except RuntimeError` clause catches the new exception; the original is still reachable through `__context__`.
+
+If you let the exception propagate all the way to the interpreter, the traceback prints both, separated by:
+
+```text
+During handling of the above exception, another exception occurred:
+```
+
+That's the "implicit context" wording you see in real tracebacks when one exception fires while handling another. The `with` statement is one of the most common sources of it.
+
+The diagram below shows the replacement flow:
+
+There's one more wrinkle worth flagging. If `__exit__` raises while the body **did not** raise (so the block was about to exit normally), the new exception simply propagates out, with no `__context__` to attach. That's the same as any other normal-path raise.
+
+```python
+class CleanupFailure:
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc_value, tb):
+        raise IOError("disk full on close")
+
+try:
+    with CleanupFailure():
+        print("body ran fine")
+except IOError as e:
+    print(f"caught: {e}")
+    print(f"context: {e.__context__}")
+```
+
+The body finished without raising. `__exit__` raised `IOError` on the way out, and that's the exception the caller sees. There's no original to chain to, so `__context__` is `None`.
+
+This behavior is why you should write `__exit__` methods carefully. If cleanup itself can fail, decide in advance whether the cleanup error or the body error is more important to the caller. Most well-designed managers try to do all their cleanup work and then re-raise the original exception (if there was one), rather than masking it.
+
+<h1 id="reusable-reentrant-and-one-shot-managers">
+  Reusable, Reentrant, and One-Shot Managers
+</h1>
+
+When you write `with cart_lock:`, can you use the same `cart_lock` object again in a different `with` block later? What if you use it again **inside** the first block, before the first one has exited? The answer depends on which of three categories the manager falls into.
+
+**One-shot:** the manager can be entered exactly once. After exit, calling `__enter__` again raises. Generators wrapped with `@contextmanager` are one-shot by default.
+
+**Reusable:** the manager can be entered multiple times in sequence, but not while it's already inside an active `with` block of its own. File objects are this way: you can `open()` a file, use it, close it, then open it again, but you can't enter the same file object while it's already inside an enclosing `with`. Actually file objects allow reentry on the same file object, but reading and writing through it after close fails. The exact rule varies by class.
+
+**Reentrant:** the manager can be entered again while a prior entry is still active. `threading.RLock` (reentrant lock) is the canonical example: a thread that already holds the lock can acquire it again, and the lock keeps a count of how many times the same thread has entered. The lock is only fully released when the count drops back to zero.
+
+A short demo of each:
+
+```python
+# Reusable: open a file twice in sequence
+with open("cart.log", "w") as f:
+    f.write("item 1\n")
+with open("cart.log", "a") as f:
+    f.write("item 2\n")
+print("two sequential withs worked")
+```
+
+```python
+# Reentrant: enter the same RLock twice in nested blocks
+import threading
+
+cart_lock = threading.RLock()
+
+with cart_lock:
+    print("outer: holding lock")
+    with cart_lock:
+        print("inner: holding lock again on same thread")
+    print("inner released; outer still holds")
+print("outer released")
+```
+
+```python
+# One-shot: a generator-based context manager raises on second use.
+from contextlib import contextmanager
+
+@contextmanager
+def one_shot():
+    print("setup")
+    yield
+    print("teardown")
+
+cm = one_shot()
+with cm:
+    print("first use")
+
+try:
+    with cm:
+        print("second use (will not print)")
+except RuntimeError as e:
+    print(f"second use raised: {type(e).__name__}: {e}")
+```
+
+The first `with` consumed the generator. Trying to reuse the same `cm` raises, because the generator is exhausted.
+
+The point here is to recognize the distinction when reading docs: "the lock is reentrant" or "this manager is one-shot" tells you something specific about whether you can use it twice.
+
+A practical implication for e-commerce code: if you're using a single connection object as a context manager to wrap a transaction, check whether the driver supports reentry. Some drivers do; some don't. The wrong assumption can lead to surprising deadlocks or "transaction already in progress" errors in production.
+
+<h1 id="the-as-name-outlives-the-block">The as Name Outlives the Block</h1>
+
+A `with` block does not introduce a new scope. The name bound by `as` is a regular local variable in the surrounding function (or module). It's still accessible after the block ends, with whatever value it held at exit.
+
+```python
+with open("orders.log", "w") as log:
+    log.write("order 1001\n")
+
+print(type(log))
+print(log.closed)
+```
+
+`log` is still defined after the `with` block. The file object is closed (the `__exit__` flipped `closed` to `True`), but the variable hasn't gone anywhere. You could call `log.closed` or `log.name` and get sensible answers; just don't try to read or write through it, because the file is shut.
+
+This catches some readers off guard, especially anyone who's used to languages where block constructs (for-loop variables, `if`-bound names, scoped declarations) limit visibility. In Python, the only constructs that introduce a new scope are functions, classes, modules, and generator expressions/comprehensions. Statements like `if`, `for`, `while`, `try`, and `with` do not. A name assigned inside any of those is visible after the construct.
+
+```python
+def latest_order_id():
+    with open("orders.log") as f:
+        last_line = f.readlines()[-1]
+    # f is still in scope here, and so is last_line
+    return last_line.strip()
+```
+
+`f` and `last_line` are both reachable on the `return` line. `f` happens to be a closed file (touching it for I/O would raise), but the binding is alive. Python's scoping rules don't care that you "left the with block"; the function is one scope, top to bottom.
+
+If you want a name scoped to the block, you have to delete it explicitly:
+
+```python
+with open("orders.log") as f:
+    print(f.readline())
+del f
+# now `f` is gone
+
+try:
+    print(f)
+except NameError as e:
+    print(f"NameError: {e}")
+```
+
+In practice, you rarely care. The closed file object isn't going to do anything dangerous, and the name typically goes out of scope when the function returns anyway. Just know the rule so it doesn't bite you in a code review: "the variable from a `with` block is still in scope" is a Python answer that surprises people.
+
+<h1 id="putting-it-all-together-a-worked-e-commerce-example">
+  Putting It All Together: A Worked E-Commerce Example
+</h1>
+
+To pull the pieces from this chapter together, here's a small program that exports a cart to two files (CSV and JSON), guarded by a lock, and demonstrates how the layers nest and unwind cleanly.
+
+```python
+import threading
+import json
+
+cart_lock = threading.Lock()
+cart = [
+    {"name": "Wireless Mouse", "price": 29.99, "quantity": 1},
+    {"name": "USB Cable",      "price": 9.99,  "quantity": 2},
+]
+
+with cart_lock, (
+    open("cart_export.csv", "w") as csv_file,
+    open("cart_export.json", "w") as json_file,
+):
+    csv_file.write("name,price,quantity\n")
+    for item in cart:
+        csv_file.write(f"{item['name']},{item['price']},{item['quantity']}\n")
+    json.dump(cart, json_file, indent=2)
+
+print("cart exported and lock released")
+```
+
+A few things to notice:
+
+- Three managers in one statement: the lock plus the two files. The parenthesized form holds the two file managers; the lock sits outside it. (You could nest the lock inside the parens too. Both are valid syntax.)
+- The lock enters first, then the CSV file, then the JSON file. If the JSON `open` had failed (disk full, permission denied), the CSV would still be closed and the lock would still be released, in that order, before the exception propagated.
+- If any line in the body raised, all three managers would still exit. The lock release is the last thing to happen, so other threads aren't stuck behind a crashed exporter.
+- The names `csv_file` and `json_file` are still bound after the block; the files they point to are closed. You wouldn't read from them, but you could log `csv_file.name` if you wanted to record what was written where.
+
+This is the shape that most real `with` usage takes: a couple of resources, opened together, guaranteed to release together, regardless of what the body does. The cleanup story is the same whether the body finishes normally, raises, or returns from the enclosing function partway through.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,442 @@
+---
+title: "Descriptors"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "Descriptors explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="what-a-descriptor-is">What a Descriptor Is</h1>
+
+A descriptor is a class that implements at least one of three special methods: `__get__`, `__set__`, or `__delete__`. When you put an instance of that class on another class as an attribute, Python routes attribute access through those methods instead of just storing and returning a plain value.
+
+Here is the smallest possible descriptor:
+
+```python
+class LoudAttribute:
+    def __get__(self, instance, owner):
+        print(f"__get__ called: instance={instance}, owner={owner.__name__}")
+        return 42
+
+    def __set__(self, instance, value):
+        print(f"__set__ called: instance={instance}, value={value}")
+
+class Product:
+    price = LoudAttribute()
+
+shirt = Product()
+print(shirt.price)
+shirt.price = 99
+```
+
+Notice the two important things. `shirt.price` did not return the `LoudAttribute` object itself, it called `__get__` on it. And `shirt.price = 99` did not replace the class attribute, it called `__set__`. The descriptor sits between the user and the value, and it can do whatever it wants in between, validate, transform, log, fetch from a database, anything.
+
+The signatures matter:
+
+| Method         | Signature                         | Called when                     |
+| -------------- | --------------------------------- | ------------------------------- |
+| `__get__`      | `__get__(self, instance, owner)`  | Attribute is read               |
+| `__set__`      | `__set__(self, instance, value)`  | Attribute is assigned           |
+| `__delete__`   | `__delete__(self, instance)`      | Attribute is deleted with `del` |
+| `__set_name__` | `__set_name__(self, owner, name)` | Class is being created          |
+
+`instance` is the object the attribute was accessed through (or `None` if accessed through the class). `owner` is the class itself. `value` is what was assigned. `name` is the attribute name the descriptor was bound to.
+
+One critical rule: **descriptors only fire when they live on a class, not when they live on an instance.** If you put a descriptor in `shirt.__dict__`, Python will not call `__get__` on it. The whole mechanism is wired through the class object's lookup chain.
+
+<h1 id="the-attribute-lookup-order">The Attribute Lookup Order</h1>
+
+When you write `shirt.price`, Python doesn't just glance at `shirt.__dict__`. It runs through a specific sequence, and descriptors get priority at two different points in that sequence. Understanding this order is the difference between "descriptors are magic" and "descriptors are predictable."
+
+For reading an attribute on `instance.attr`, Python (roughly) does:
+
+In plain words:
+
+1. Look at the **type** of `instance` and walk its MRO (method resolution order) looking for `attr`. If it finds a **data descriptor** (one with `__set__` or `__delete__`), call its `__get__` and return that. Done.
+2. Otherwise look in `instance.__dict__`. If `attr` is there, return that value directly.
+3. Otherwise go back to the type chain. If it finds a **non-data descriptor** (one with only `__get__`) or any other class attribute, return that (calling `__get__` if it's a descriptor).
+4. Otherwise raise `AttributeError`.
+
+This is implemented in C inside `object.__getattribute__`. You can read the equivalent Python in the official "Descriptor HowTo" guide on docs.python.org.
+
+The thing to take away: data descriptors win against instance `__dict__`, but non-data descriptors lose to instance `__dict__`. That single asymmetry is what makes `@property` immutable from instance code but lets regular methods be overridden on a per-instance basis.
+
+<h1 id="data-descriptors-vs-non-data-descriptors">
+  Data Descriptors vs Non-Data Descriptors
+</h1>
+
+The terms are unfortunately bureaucratic, but the distinction is simple.
+
+| Kind                | Defines                                               | Wins against `instance.__dict__`? | Typical use                                                                   |
+| ------------------- | ----------------------------------------------------- | --------------------------------- | ----------------------------------------------------------------------------- |
+| Data descriptor     | `__set__` and/or `__delete__` (and usually `__get__`) | Yes, on both read and write       | `property`, validating fields, ORM columns                                    |
+| Non-data descriptor | Only `__get__`                                        | No, instance dict can shadow it   | Methods, `classmethod`, `staticmethod`, `functools.cached_property` (kind of) |
+
+Here's the decision diagram for how a class designer should pick:
+
+A concrete demonstration of the shadowing difference:
+
+```python
+class NonDataLogger:
+    def __get__(self, instance, owner):
+        return "from descriptor"
+
+class DataLogger:
+    def __get__(self, instance, owner):
+        return "from descriptor"
+    def __set__(self, instance, value):
+        raise AttributeError("read-only")
+
+class Product:
+    name = NonDataLogger()
+    price = DataLogger()
+
+shirt = Product()
+
+# Non-data descriptor: instance dict can shadow it.
+shirt.__dict__["name"] = "blue t-shirt"
+print(shirt.name)
+
+# Data descriptor: instance dict cannot shadow it.
+shirt.__dict__["price"] = 19.99
+print(shirt.price)
+```
+
+The `name` attribute returns the value stuffed into the instance dict because the non-data descriptor lost the lookup race. The `price` attribute still goes through the descriptor because the data descriptor won. This is exactly the behavior that lets Python use regular functions as non-data descriptors and still let subclasses or instances replace them at will.
+
+> **Cost:** Every attribute access on a class with descriptors costs a small dictionary lookup on the type chain. For hot loops, that adds up versus a plain `instance.__dict__` lookup. A pure data class with descriptors is roughly 1.5-3x slower per attribute read than a dataclass with plain attributes. Profile before worrying.
+
+<h1 id="__set_name__-for-clean-attribute-names">
+  __set_name__ for Clean Attribute Names
+</h1>
+
+Descriptors usually need to know which attribute name they were assigned to, so they can store and fetch the underlying value cleanly. Before Python 3.6, you had to pass the name in by hand:
+
+```python
+class Field:
+    def __init__(self, name):
+        self.name = name
+    def __get__(self, instance, owner):
+        return instance.__dict__[self.name]
+    def __set__(self, instance, value):
+        instance.__dict__[self.name] = value
+
+class Product:
+    price = Field("price")
+    stock = Field("stock")
+```
+
+That repetition (writing `"price"` twice, `"stock"` twice) was a known annoyance. Python 3.6 added `__set_name__`, a hook the interpreter calls during class creation:
+
+```python
+class Field:
+    def __set_name__(self, owner, name):
+        self.name = name
+    def __get__(self, instance, owner):
+        return instance.__dict__[self.name]
+    def __set__(self, instance, value):
+        instance.__dict__[self.name] = value
+
+class Product:
+    price = Field()
+    stock = Field()
+```
+
+When Python finishes building the `Product` class object, it walks each class-level attribute. If that attribute has a `__set_name__` method, it calls it with the class and the attribute name. The descriptor now knows it's the `price` field without anyone telling it twice.
+
+<h1 id="a-validating-field-descriptor">A Validating Field Descriptor</h1>
+
+Here is where descriptors stop being a curiosity and start paying rent. Suppose you want every `Product` in your e-commerce app to enforce that `price` is a non-negative number, `stock` is a non-negative integer, and `name` is a non-empty string. You could write the same `if`/`raise` block inside every method, or you could write it once as a descriptor and reuse it everywhere.
+
+```python
+class Field:
+    def __init__(self, expected_type, min_value=None, allow_empty=True):
+        self.expected_type = expected_type
+        self.min_value = min_value
+        self.allow_empty = allow_empty
+
+    def __set_name__(self, owner, name):
+        self.name = name
+        self.private_name = f"_{name}"
+
+    def __get__(self, instance, owner):
+        if instance is None:
+            return self
+        return getattr(instance, self.private_name)
+
+    def __set__(self, instance, value):
+        if not isinstance(value, self.expected_type):
+            raise TypeError(
+                f"{self.name} must be {self.expected_type.__name__}, "
+                f"got {type(value).__name__}"
+            )
+        if self.min_value is not None and value < self.min_value:
+            raise ValueError(
+                f"{self.name} must be >= {self.min_value}, got {value}"
+            )
+        if not self.allow_empty and isinstance(value, str) and value == "":
+            raise ValueError(f"{self.name} cannot be empty")
+        setattr(instance, self.private_name, value)
+
+class Product:
+    name = Field(str, allow_empty=False)
+    price = Field((int, float), min_value=0)
+    stock = Field(int, min_value=0)
+
+    def __init__(self, name, price, stock):
+        self.name = name
+        self.price = price
+        self.stock = stock
+```
+
+Try it out:
+
+```python
+shirt = Product("blue t-shirt", 19.99, 50)
+print(shirt.name, shirt.price, shirt.stock)
+
+shirt.price = 24.99
+print(shirt.price)
+
+try:
+    shirt.price = -5
+except ValueError as e:
+    print(f"caught: {e}")
+
+try:
+    shirt.stock = "lots"
+except TypeError as e:
+    print(f"caught: {e}")
+
+try:
+    shirt.name = ""
+except ValueError as e:
+    print(f"caught: {e}")
+```
+
+A few things are worth pointing out about that implementation.
+
+The `__init__` of the descriptor takes the validation rules, not a value. The descriptor lives once on the class. Each `Product` instance gets its own value stored under `_price`, `_stock`, etc. inside its own `__dict__`. That is why the validation can be configured once at class-definition time but run for every instance.
+
+The `__get__` method has a `if instance is None: return self` line. This handles the case where someone accesses `Product.price` (through the class, not an instance). Without that line, `getattr(None, "_price")` would explode with an unhelpful error. Returning `self` is the standard convention so that things like `Product.price` give you back the descriptor object (useful for introspection).
+
+The `__set__` method stores the validated value with `setattr(instance, self.private_name, value)`. Critically, it does **not** call `setattr(instance, self.name, value)`, that would recurse forever because `self.name` is the attribute the descriptor itself manages. The leading underscore in `_price` is a separate storage key.
+
+<h1 id="storage-strategies-for-per-instance-state">
+  Storage Strategies for Per-Instance State
+</h1>
+
+The "where do I keep the value?" question has three common answers, and each has different trade-offs.
+
+**Strategy 1: Instance `__dict__` with a different key (what we used above).**
+
+```python
+def __set__(self, instance, value):
+    instance.__dict__[self.private_name] = value
+```
+
+Pros: simple, no extra data structures, the value lives with the instance. Cons: pollutes the instance's `__dict__` with a `_price` key that isn't really meant for users.
+
+**Strategy 2: Instance `__dict__` with the same key as the descriptor.**
+
+```python
+def __get__(self, instance, owner):
+    return instance.__dict__[self.name]
+
+def __set__(self, instance, value):
+    # validation...
+    instance.__dict__[self.name] = value
+```
+
+This works **only** for data descriptors. The data descriptor wins the lookup, so `instance.price` calls `__get__`, which reads from `instance.__dict__["price"]`. There's no infinite loop because the read goes through `__dict__` directly. Pros: the dict key matches the attribute name, very clean. Cons: confusing the first time you see it, and you cannot share this code with non-data descriptors because they would lose the lookup race.
+
+**Strategy 3: `WeakKeyDictionary` on the descriptor itself.**
+
+```python
+from weakref import WeakKeyDictionary
+
+class Field:
+    def __init__(self):
+        self._values = WeakKeyDictionary()
+    def __get__(self, instance, owner):
+        if instance is None:
+            return self
+        return self._values[instance]
+    def __set__(self, instance, value):
+        self._values[instance] = value
+```
+
+The descriptor keeps a per-instance dictionary keyed by the instance object. `WeakKeyDictionary` holds references that don't prevent garbage collection, so instances can still be collected normally. Pros: nothing leaks into the instance's `__dict__`, works with `__slots__` classes that have no `__dict__` at all. Cons: instances must be hashable, and the descriptor accumulates entries across every instance it ever sees.
+
+| Strategy                       | Pollutes instance dict? | Works with `__slots__`? | Extra storage           |
+| ------------------------------ | ----------------------- | ----------------------- | ----------------------- |
+| Different key in instance dict | Yes (with `_name`)      | No                      | None                    |
+| Same key in instance dict      | No (key is the attr)    | No                      | None                    |
+| `WeakKeyDictionary`            | No                      | Yes                     | One dict per descriptor |
+
+For most code, the third strategy is overkill, and the first or second is plenty. Reach for `WeakKeyDictionary` when you specifically need slots compatibility, or when the descriptor manages an expensive resource you want to clean up automatically.
+
+<h1 id="how-property-classmethod-staticmethod-and-methods-use-the-protocol">
+  How property, classmethod, staticmethod, and Methods Use the Protocol
+</h1>
+
+The descriptor protocol is not a niche tool. Most of the things that look magical about Python's class machinery are descriptors under the hood.
+
+**`property`** is a data descriptor written in C. A simplified Python version:
+
+```python
+class my_property:
+    def __init__(self, fget=None, fset=None):
+        self.fget = fget
+        self.fset = fset
+
+    def __set_name__(self, owner, name):
+        self.name = name
+
+    def __get__(self, instance, owner):
+        if instance is None:
+            return self
+        if self.fget is None:
+            raise AttributeError(f"unreadable attribute {self.name}")
+        return self.fget(instance)
+
+    def __set__(self, instance, value):
+        if self.fset is None:
+            raise AttributeError(f"can't set attribute {self.name}")
+        self.fset(instance, value)
+
+    def setter(self, fset):
+        return type(self)(self.fget, fset)
+
+class Product:
+    def __init__(self, price):
+        self._price = price
+
+    @my_property
+    def price(self):
+        return self._price
+
+    @price.setter
+    def price(self, value):
+        if value < 0:
+            raise ValueError("price must be non-negative")
+        self._price = value
+
+shirt = Product(19.99)
+print(shirt.price)
+shirt.price = 24.99
+print(shirt.price)
+```
+
+That is the whole trick. `@property` is just a class that wraps the getter and setter functions and implements the descriptor protocol. The real `property` adds `fdel`, `__doc__`, and `deleter`, but the core is what's above.
+
+**Functions are non-data descriptors.** When you write `class Cart: def total(self): ...`, the function `total` lives on the class. The function class itself defines `__get__`, which is what produces a "bound method" when you access `cart.total`:
+
+```python
+def total(self):
+    return sum(self.items.values())
+
+class Cart:
+    items = {"shirt": 19.99, "cable": 9.99}
+
+cart = Cart()
+# Manually invoke the descriptor protocol that 'cart.total' triggers.
+bound = total.__get__(cart, Cart)
+print(bound)
+print(bound())
+```
+
+The function's `__get__` returns a `MethodType` object that has `cart` glued in as the first argument. That's why `cart.total()` knows what `self` is. And because functions are non-data descriptors (no `__set__`), you can shadow a method on a per-instance basis if you really want to:
+
+```python
+cart.total = lambda: 0  # instance dict wins for non-data descriptors
+print(cart.total())
+```
+
+This monkey-patching behavior is occasionally useful for mocking in tests and is essentially never useful in production code.
+
+**`classmethod`** is a non-data descriptor whose `__get__` returns a bound method where the first argument is the class itself rather than an instance:
+
+```python
+class classmethod_demo:
+    def __init__(self, func):
+        self.func = func
+    def __get__(self, instance, owner):
+        def wrapper(*args, **kwargs):
+            return self.func(owner, *args, **kwargs)
+        return wrapper
+
+class Product:
+    instances_created = 0
+
+    @classmethod_demo
+    def total_created(cls):
+        return cls.instances_created
+
+Product.instances_created = 5
+print(Product.total_created())
+```
+
+**`staticmethod`** is also a non-data descriptor, even simpler: its `__get__` returns the wrapped function untouched, throwing away `instance` and `owner` entirely.
+
+The pattern is consistent: any time Python does something interesting when you read or write an attribute, look for a descriptor.
+
+> **Cost:** Bound methods are created lazily on every attribute access. `cart.total` does not give you the same object twice. In tight loops where you call `obj.method()` millions of times, caching the bound method in a local variable (`m = obj.method; m()`) skips that allocation each call.
+
+<h1 id="slots-metaclasses-and-where-descriptors-fit">
+  Slots, Metaclasses, and Where Descriptors Fit
+</h1>
+
+`__slots__` replaces the instance `__dict__` with a fixed set of slot descriptors. Each slot is itself a data descriptor that reads and writes a specific memory offset. Your own descriptors still work fine on slotted classes, you just need to use the `WeakKeyDictionary` storage strategy because there's no instance `__dict__` to write into.
+
+Metaclasses can scan a class at creation time and collect every descriptor that was declared. Libraries like SQLAlchemy and Pydantic use this pattern: a metaclass walks `cls.__dict__` looking for `Field` descriptors, records them in a `_fields_` list, and uses that list later to drive serialization, schema generation, or database mapping. You don't need a metaclass to use descriptors, but the two combine well.
+
+<h1 id="common-pitfalls">Common Pitfalls</h1>
+
+A few patterns trip up almost everyone the first time they write a descriptor.
+
+**Putting the descriptor on the instance, not the class.** This silently does nothing:
+
+```python
+class Product:
+    def __init__(self, price):
+        self.price = Field()  # Wrong: descriptor on the instance.
+        self.price = price
+```
+
+The descriptor only fires when it lives on the class. An instance-level descriptor is just a regular attribute that holds the descriptor object.
+
+**Forgetting that one descriptor is shared across all instances.** If you store the value as an attribute of `self` inside the descriptor:
+
+```python
+class BrokenField:
+    def __set__(self, instance, value):
+        self.value = value  # Wrong: one storage slot, shared.
+    def __get__(self, instance, owner):
+        return self.value
+```
+
+Every instance writes to the same `self.value` because there is only one descriptor object per class. Two `Product` instances would clobber each other's prices. The fix is one of the three storage strategies covered earlier.
+
+**Forgetting `__set_name__` and never knowing the field name.** If your descriptor needs the attribute name for storage and you skip `__set_name__`, you'll either hard-code the name in the constructor (repetitive) or get a `KeyError` later when something looks up an attribute that was never set.
+
+**Recursion in `__set__`.** Calling `setattr(instance, self.name, value)` from inside `__set__` re-triggers the descriptor protocol. The fix is to write into `instance.__dict__` directly, or use a different key (`self.private_name`).
+
+```python
+def __set__(self, instance, value):
+    # Bad: infinite recursion.
+    setattr(instance, self.name, value)
+
+def __set__(self, instance, value):
+    # Good: bypass the descriptor.
+    instance.__dict__[self.name] = value
+```
+
+**Assuming descriptors fire on instance-level dict pokes.** `shirt.__dict__["price"] = 99` bypasses the descriptor entirely. For data descriptors this means a future `shirt.price` read goes through the descriptor and ignores the poked value, which can look like the assignment vanished. For non-data descriptors the poked value wins. Either way, accessing `__dict__` directly is rarely what you want.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

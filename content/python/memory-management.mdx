@@ -1,0 +1,431 @@
+---
+title: "Memory Management & Garbage Collection"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Memory Management explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+Python hides memory management behind a friendly surface: you allocate objects, they vanish when nothing points at them anymore, and most of the time you never think about it. Underneath, CPython runs a two-part system, a reference counter that fires on every assignment and a generational cycle collector that catches what the counter can't. This lesson walks through how that system actually works, why long-running programs can still leak memory, and how to inspect and fix the problem when it shows up.
+
+<h1 id="how-cpython-stores-objects">How CPython Stores Objects</h1>
+
+Every Python value, an integer, a `Product`, a list of `Order` objects, is a `PyObject` on the heap. The `PyObject` header is small, but the two fields it carries are the foundation of everything in this lesson:
+
+| Field       | Purpose                                                          |
+| ----------- | ---------------------------------------------------------------- |
+| `ob_refcnt` | A counter for how many references point at this object right now |
+| `ob_type`   | A pointer to the object's type (its class)                       |
+
+A `Product` instance is a chunk of memory that holds these two fields plus whatever attributes the class defines. There's no separate "Python value" floating in the interpreter, only `PyObject` headers and the data after them.
+
+The diagram shows one name (`headphones`) pointing at one `Product` object. The header tracks how many such pointers exist; when that count hits zero, CPython frees the memory immediately.
+
+Allocating small objects all the time would be slow if every `Product` or `Order` triggered a fresh call to the operating system. CPython works around that with **pymalloc**, a small-object allocator that manages memory in big chunks and hands out tiny slices on demand.
+
+| Level | Size           | Role                                                         |
+| ----- | -------------- | ------------------------------------------------------------ |
+| Arena | 256 KB         | Block of memory pymalloc grabs from the OS                   |
+| Pool  | 4 KB           | A page-sized chunk inside an arena, all blocks the same size |
+| Block | 8 to 512 bytes | The slot a single small object lives in                      |
+
+Anything 512 bytes or smaller goes through pymalloc. Bigger requests, a 10 MB string of product reviews, for example, go straight to the system allocator. This split matters because allocating a `Cart` (small) is essentially free, while allocating a huge image blob is not.
+
+> **Cost:** Creating many short-lived small objects (think one `Order` per request) is cheap because pymalloc recycles their blocks. Creating many short-lived large objects allocates and frees through the OS each time, which is much more expensive.
+
+<h1 id="reference-counting">Reference Counting</h1>
+
+Every `PyObject` carries `ob_refcnt`. CPython increments it whenever a new reference is made and decrements it when a reference goes away. When the count drops to zero, the object is freed right then, no waiting for a garbage collector.
+
+```python
+import sys
+
+product = {"name": "headphones", "price": 59.99, "stock": 20}
+print(sys.getrefcount(product))
+
+backup = product
+print(sys.getrefcount(product))
+
+del backup
+print(sys.getrefcount(product))
+```
+
+The exact numbers depend on implementation details (passing `product` to `sys.getrefcount` itself adds a temporary reference), so what matters is the direction. Adding a name (`backup = product`) bumps the count, removing a name (`del backup`) brings it back down.
+
+Lots of everyday operations change refcounts without looking like they should:
+
+| Operation                  | Effect on refcount of the target    |
+| -------------------------- | ----------------------------------- |
+| `x = obj`                  | +1 (new name)                       |
+| `del x`                    | -1 (name removed)                   |
+| `cart.append(obj)`         | +1 (list holds it)                  |
+| `cart.pop()`               | -1 (list releases it)               |
+| `func(obj)`                | +1 during the call, -1 after return |
+| Variable goes out of scope | -1                                  |
+
+Here's a small experiment that makes the lifecycle concrete:
+
+```python
+class Order:
+    def __init__(self, id):
+        self.id = id
+
+    def __del__(self):
+        print(f"Order {self.id} freed")
+
+def process():
+    o = Order(101)
+    print("inside process()")
+
+process()
+print("after process()")
+```
+
+The `Order(101)` instance has exactly one reference (`o`). When `process()` returns, `o` disappears, the refcount drops to zero, and `__del__` runs before the next line of `main` executes. No collector involved, no delay.
+
+The lifecycle is deterministic for objects that aren't part of a cycle. That's a useful property, you can write context managers and `__del__` cleanup hooks and trust them to run promptly.
+
+<h1 id="why-reference-counting-alone-isnt-enough">
+  Why Reference Counting Alone Isn't Enough
+</h1>
+
+Reference counting is fast and predictable, but it has one fatal weakness: cycles. If two objects refer to each other, their refcounts never reach zero, even when no outside code can reach them.
+
+```python
+import gc
+
+class Customer:
+    def __init__(self, name):
+        self.name = name
+        self.orders = []
+
+    def __del__(self):
+        print(f"Customer {self.name} freed")
+
+class Order:
+    def __init__(self, id, customer):
+        self.id = id
+        self.customer = customer
+        customer.orders.append(self)
+
+    def __del__(self):
+        print(f"Order {self.id} freed")
+
+def create_cycle():
+    c = Customer("Priya")
+    Order(101, c)
+    Order(102, c)
+
+gc.disable()
+create_cycle()
+print("after create_cycle()")
+gc.enable()
+```
+
+Neither the customer nor the orders were freed. After `create_cycle()` returns, no Python name reaches them, but the customer points at the orders (through `orders`) and each order points back at the customer (through `customer`). Their refcounts stay positive forever as long as the cycle exists.
+
+The cycle is unreachable from outside but internally consistent: every refcount has at least one pointer keeping it alive. Refcounting can't tell that the whole subgraph is garbage. That's why CPython ships a second mechanism on top.
+
+<h1 id="the-generational-cycle-collector">The Generational Cycle Collector</h1>
+
+The `gc` module runs a tracing collector that periodically scans for unreachable cycles. It only looks at **container** objects, things that can hold references to other Python objects: lists, dicts, sets, tuples, instances of user-defined classes, and so on. Atoms like ints, floats, and strings can't form cycles by themselves, so the collector skips them.
+
+To keep the scan cheap, the collector splits container objects into three **generations**:
+
+| Generation | What's there            | When it's collected |
+| ---------- | ----------------------- | ------------------- |
+| 0 (young)  | Just-created objects    | Most often          |
+| 1 (middle) | Survived one collection | Less often          |
+| 2 (old)    | Long-lived objects      | Rarely              |
+
+The intuition: most objects die young (an `Order` built for one request, used, discarded). If they survive a few sweeps, they probably won't be cleaned up soon, so it's wasteful to keep checking them on every pass.
+
+You can inspect and tune the collector at runtime:
+
+```python
+import gc
+
+print("Counts:", gc.get_count())
+print("Thresholds:", gc.get_threshold())
+
+class Product:
+    def __init__(self, name):
+        self.name = name
+
+products = [Product(f"product_{i}") for i in range(1000)]
+print("After allocations:", gc.get_count())
+
+gc.collect()
+print("After gc.collect():", gc.get_count())
+```
+
+`gc.get_count()` returns the current counters for each generation. `gc.get_threshold()` returns the cutoffs: by default, when generation 0 grows by 700 since the last sweep, the collector runs on gen 0. Every 10 sweeps of gen 0 trigger a sweep of gen 1, and every 10 sweeps of gen 1 trigger a sweep of gen 2.
+
+The diagram shows the promotion path. A `Product` starts in gen 0. If it's still alive at the next gen 0 sweep, it moves to gen 1. If it survives a gen 1 sweep, it moves to gen 2. Most short-lived objects never leave gen 0; they're freed immediately by refcounting, and gen 0 sweeps just catch the leftover cycles among the young.
+
+Now if you re-run the cycle example with the collector enabled:
+
+```python
+import gc
+
+class Customer:
+    def __init__(self, name):
+        self.name = name
+        self.orders = []
+
+    def __del__(self):
+        print(f"Customer {self.name} freed")
+
+class Order:
+    def __init__(self, id, customer):
+        self.id = id
+        self.customer = customer
+        customer.orders.append(self)
+
+    def __del__(self):
+        print(f"Order {self.id} freed")
+
+def create_cycle():
+    c = Customer("Priya")
+    Order(101, c)
+    Order(102, c)
+
+create_cycle()
+print("after create_cycle()")
+gc.collect()
+print("after gc.collect()")
+```
+
+The collector finds the cycle, recognizes that nothing outside it can reach those three objects, and frees them. The `__del__` methods run during the collection.
+
+> **Cost:** Cycle collection isn't free; it walks every container in the generation being collected and traces references. For latency-sensitive code (a hot request path), unexpected gen 2 sweeps can cause occasional millisecond-scale pauses.
+
+<h1 id="tuning-and-disabling-the-collector">
+  Tuning and Disabling the Collector
+</h1>
+
+You rarely need to touch the defaults, but two knobs are useful when you do.
+
+`gc.set_threshold(threshold0, threshold1, threshold2)` changes how often each generation runs. Raising the gen 0 threshold from 700 to, say, 10000 makes gen 0 sweeps less frequent at the cost of letting short-lived cycles linger longer.
+
+```python
+import gc
+
+gc.set_threshold(10000, 20, 20)
+print(gc.get_threshold())
+```
+
+`gc.disable()` turns off the cycle collector entirely. Reference counting still runs, so anything that's not part of a cycle still gets freed promptly. The reasons to disable it are narrow:
+
+- A startup or load phase that allocates millions of objects you know aren't cyclic. Disabling gc through that phase avoids wasted sweeps; you re-enable it once steady state begins.
+- A tight latency budget where you'd rather call `gc.collect()` manually between requests than have the collector kick in mid-request.
+- Benchmark code where you want deterministic timing.
+
+```python
+import gc
+
+gc.disable()
+try:
+    # Load 1M product records here.
+    pass
+finally:
+    gc.enable()
+```
+
+The risk: if any of that code creates cycles, they accumulate until you re-enable the collector or call `gc.collect()`. Don't disable gc and forget about it.
+
+<h1 id="__del__-and-why-its-risky">__del__ and Why It's Risky</h1>
+
+`__del__` (the finalizer) runs when an object's refcount hits zero or when the cycle collector frees it. It looks like a destructor from other languages, but the timing is fuzzier:
+
+- For non-cyclic objects, `__del__` fires immediately when the last reference goes away. Predictable.
+- For cyclic objects, `__del__` fires only when the collector runs, which could be much later.
+- During interpreter shutdown, module globals may already be `None`, so a `__del__` that calls into other modules can crash.
+
+In older Python versions (before 3.4), the collector refused to break cycles that contained any object with `__del__`, on the grounds that finalizer order is undefined. PEP 442 fixed this: as of Python 3.4, the collector calls `__del__` on each object in a safe order, then breaks the cycle. The pathological "cycle never freed because of `__del__`" problem is mostly gone in modern Python.
+
+Even so, finalizers are not a great place for important work:
+
+```python
+class Order:
+    def __init__(self, id, log_file):
+        self.id = id
+        self.log_file = log_file
+
+    def __del__(self):
+        # Risky: log_file may already be closed if the program is shutting down.
+        self.log_file.write(f"Order {self.id} closed\n")
+```
+
+Two ways to ship this safely:
+
+1. Use a context manager (`with` statement) so cleanup happens at a well-defined point in your code, not whenever the collector gets around to it.
+2. Use `weakref.finalize` for a safer finalization callback that runs at predictable times.
+
+> **Cost:** Heavy work inside `__del__` (network calls, file I/O on large buffers) blocks whichever thread is freeing the object. During a gen 2 sweep, that can mean a noticeable pause.
+
+<h1 id="inspecting-memory-with-tracemalloc">
+  Inspecting Memory with tracemalloc
+</h1>
+
+`tracemalloc` is the standard-library tool for tracking where memory is being allocated. You start it, take a snapshot, do some work, take another snapshot, and compare. It's the right starting point for "my long-running process keeps growing in memory."
+
+```python
+import tracemalloc
+
+tracemalloc.start()
+
+snapshot1 = tracemalloc.take_snapshot()
+
+# Simulate a service handling 50,000 orders.
+orders = []
+for i in range(50_000):
+    orders.append({
+        "id": i,
+        "customer": f"customer_{i}@example.com",
+        "total": 19.99 + i * 0.01,
+        "items": ["headphones", "cable"],
+    })
+
+snapshot2 = tracemalloc.take_snapshot()
+
+stats = snapshot2.compare_to(snapshot1, "lineno")
+for stat in stats[:3]:
+    print(stat)
+```
+
+The output ranks lines by how much memory they allocated between the two snapshots. The top line is the dict comprehension creating each order, the next is the customer-email string, then the items list. `tracemalloc` doesn't tell you whether the memory is a leak; it tells you where it went. You decide.
+
+For a one-shot question about a single object's size, `sys.getsizeof` is enough:
+
+```python
+import sys
+
+product = {"name": "headphones", "price": 59.99, "stock": 20}
+order = {
+    "id": 101,
+    "customer": "priya@example.com",
+    "total": 79.97,
+    "items": ["headphones", "cable"],
+}
+
+print("product:", sys.getsizeof(product), "bytes")
+print("order:", sys.getsizeof(order), "bytes")
+```
+
+`sys.getsizeof` returns the size of the immediate object, not the things it points at. The dict header is the same regardless of the values inside, because the values are separate objects.
+
+> **Cost:** `tracemalloc.start()` instruments every allocation, which slows the program down (often 30 to 50 percent). Use it in a debug session, not in production hot paths. Stop it with `tracemalloc.stop()` when you're done.
+
+<h1 id="common-leak-patterns">Common Leak Patterns</h1>
+
+Long-running Python services usually don't leak from "Python bugs." They leak because the code is holding references the developer forgot about. A few patterns show up over and over.
+
+**Pattern 1: A global registry that never releases.**
+
+```python
+ORDER_CACHE = {}
+
+def process_order(order):
+    ORDER_CACHE[order["id"]] = order
+    # ... do work ...
+```
+
+`ORDER_CACHE` grows forever. Every order ever processed stays in memory. The fix is either a bounded cache (`functools.lru_cache` with `maxsize`, or `collections.OrderedDict` with manual eviction), or storing weak references using `weakref.WeakValueDictionary` so entries vanish when nobody else holds them.
+
+**Pattern 2: Cycles holding large data.**
+
+A `Customer` holding a list of `Order` objects, and each `Order` holding a back-reference to the customer. Refcount never reaches zero. The collector eventually frees them, but if the cycle holds large attachments (product images, audit logs), peak memory stays high until the collector runs.
+
+The fix is `weakref.ref` on the back-reference so the order points at the customer weakly, breaking the cycle.
+
+The dotted weakref doesn't count toward refcount. When the customer's last strong reference disappears, the customer is freed even though the order still has its weak handle.
+
+**Pattern 3: Stuck async tasks.**
+
+`asyncio.create_task(...)` schedules a coroutine and returns a `Task` handle. Many programs hold onto the task as `self.task = asyncio.create_task(...)` and never clear it. If the task captures large data in its frame (a `Cart` with thousands of items, for instance), that data sticks around until the task completes and the reference is dropped.
+
+```python
+import asyncio
+
+class OrderProcessor:
+    def __init__(self):
+        self.tasks = []
+
+    def start(self, order):
+        # Without weak handling, every task keeps the order alive
+        # until the task itself is cleaned up.
+        task = asyncio.create_task(self._process(order))
+        self.tasks.append(task)
+
+    async def _process(self, order):
+        await asyncio.sleep(1)
+```
+
+The fix is to remove the task from `self.tasks` once it finishes (`task.add_done_callback(self.tasks.remove)`), so the captured `order` can be freed.
+
+**Pattern 4: Closures capturing more than you think.**
+
+```python
+def make_discount_calculator(catalog):
+    huge_data = build_lookup_table(catalog)
+
+    def apply(price):
+        return price * 0.9
+
+    return apply
+```
+
+`apply` doesn't use `huge_data`, but if it's defined in a frame that also defines `huge_data`, Python may keep the entire frame's locals alive depending on how the closure captures them. The safer pattern is to compute `huge_data` outside, then free it, before returning the closure that doesn't need it.
+
+<h1 id="when-to-call-gccollect-manually">When to Call gc.collect() Manually</h1>
+
+The collector runs on its own schedule, so manual `gc.collect()` is mostly a tool for special cases:
+
+- **Latency control.** A web server can call `gc.collect()` between requests, on an idle thread, to keep gen 2 sweeps from happening during a live request.
+- **Tests.** A test that wants to verify "this cache is empty after the context manager exits" may need a `gc.collect()` to break any cycles before asserting.
+- **Long batch jobs.** After processing a large chunk (every 10,000 orders, say), a `gc.collect()` reclaims peak memory before moving on.
+
+```python
+import gc
+
+def process_batch(orders):
+    for order in orders:
+        handle(order)
+
+def handle(order):
+    pass
+
+batches = [[{"id": i} for i in range(10000)] for _ in range(5)]
+
+for batch in batches:
+    process_batch(batch)
+    collected = gc.collect()
+    print(f"Reclaimed {collected} objects after batch")
+```
+
+In this example, refcounting alone frees every batch (no cycles), so the manual call finds nothing to reclaim. That's the normal case. `gc.collect()` is only doing work when there are unreachable cycles.
+
+The general rule: don't sprinkle `gc.collect()` calls everywhere. Use them only where you can measure that they help. The default schedule is fine for the overwhelming majority of programs.
+
+<h1 id="a-practical-workflow-for-memory-issues">
+  A Practical Workflow for Memory Issues
+</h1>
+
+When a Python service starts using too much memory, the path of investigation usually looks like this:
+
+1. Run `tracemalloc` on the suspect code path. Compare snapshots taken at the beginning and end of an operation that should leave no extra memory behind.
+2. If the top allocation sites are obvious (a global cache, a list that keeps growing), fix the data structure.
+3. If allocations look normal but memory still grows, check for cycles holding large data. `gc.get_objects()` returns every tracked object; `gc.get_referrers(obj)` returns who points at it. These tools quickly turn "where is this leaked thing" into "here is the cycle."
+4. If a cycle holds a back-reference, replace it with a weak reference via `weakref.ref`, `WeakValueDictionary`, or `WeakSet`.
+5. If you're running async code, audit your task lifecycles. Tasks that never get cleaned up keep their captured locals alive.
+6. Only consider manual `gc.collect()` or threshold tuning after you've exhausted the data-structure fixes.
+
+The reason this order matters is that 90 percent of "memory leak" investigations end at step 2. The remaining 10 percent are real cycles or async-related issues, and that's where the lower-level tools earn their keep.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

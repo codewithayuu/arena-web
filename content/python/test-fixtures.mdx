@@ -1,0 +1,750 @@
+---
+title: "Test Fixtures"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "Test Fixtures explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="the-problem-fixtures-solve">The Problem Fixtures Solve</h1>
+
+If you've come from `unittest`, you've used `setUp` and `tearDown`: methods that run before and after every test in a class. They work, but they have problems. The setup is implicit (you don't see it in the test signature, you have to remember the class runs it). It's all-or-nothing (every test in the class gets the same setup, even tests that don't need half of it). And the teardown runs in a different scope, which means sharing state with `self` is the only option, and `self` becomes a junk drawer.
+
+Here's what the duplication looks like without any helpers:
+
+```python
+def test_cart_total_with_items():
+    cart = {"items": [], "discount": 0}
+    cart["items"].append({"product": "mouse", "price": 29.99, "quantity": 2})
+    cart["items"].append({"product": "cable", "price": 9.99, "quantity": 1})
+    total = sum(item["price"] * item["quantity"] for item in cart["items"])
+    assert total == 69.97
+
+def test_cart_total_with_discount():
+    cart = {"items": [], "discount": 10}
+    cart["items"].append({"product": "mouse", "price": 29.99, "quantity": 2})
+    cart["items"].append({"product": "cable", "price": 9.99, "quantity": 1})
+    subtotal = sum(item["price"] * item["quantity"] for item in cart["items"])
+    total = subtotal * (1 - cart["discount"] / 100)
+    assert round(total, 2) == 62.97
+```
+
+The first three lines of each test do the same thing. If the cart's shape changes (say `quantity` becomes `qty`), every test breaks. Worse, the actual subject of each test (the total calculation, the discount) is buried under setup noise.
+
+The `unittest` way to fix this looks like:
+
+```python
+import unittest
+
+class TestCart(unittest.TestCase):
+    def setUp(self):
+        self.cart = {"items": [], "discount": 0}
+        self.cart["items"].append({"product": "mouse", "price": 29.99, "quantity": 2})
+        self.cart["items"].append({"product": "cable", "price": 9.99, "quantity": 1})
+
+    def test_total_with_items(self):
+        total = sum(item["price"] * item["quantity"] for item in self.cart["items"])
+        self.assertEqual(total, 69.97)
+
+    def test_total_with_discount(self):
+        self.cart["discount"] = 10
+        subtotal = sum(item["price"] * item["quantity"] for item in self.cart["items"])
+        total = subtotal * (1 - self.cart["discount"] / 100)
+        self.assertAlmostEqual(total, 62.97, places=2)
+```
+
+Better, but `setUp` is implicit (you can't tell from `test_total_with_discount` that it depends on cart setup unless you read the class) and it's an all-or-nothing affair. A test that doesn't need a cart still pays for one. And if you have two different starting carts, you end up with two test classes or conditional logic in `setUp`.
+
+Pytest fixtures fix both problems. Setup becomes a named function. Tests declare what they need by listing fixture names as parameters. Pytest figures out which fixtures to call, in what order, and when to tear them down.
+
+<h1 id="pytestfixture-basics">@pytest.fixture Basics</h1>
+
+A fixture is a function decorated with `@pytest.fixture`. The function builds whatever the test needs and returns it. Tests request the fixture by adding a parameter with the matching name. Pytest sees the parameter name, calls the fixture, and passes the return value in.
+
+```python
+import pytest
+
+@pytest.fixture
+def sample_cart():
+    return {
+        "items": [
+            {"product": "mouse", "price": 29.99, "quantity": 2},
+            {"product": "cable", "price": 9.99, "quantity": 1},
+        ],
+        "discount": 0,
+    }
+
+def test_cart_total(sample_cart):
+    total = sum(item["price"] * item["quantity"] for item in sample_cart["items"])
+    assert total == 69.97
+
+def test_cart_item_count(sample_cart):
+    assert len(sample_cart["items"]) == 2
+```
+
+Run that file with `pytest -v`:
+
+```text
+test_cart.py::test_cart_total PASSED
+test_cart.py::test_cart_item_count PASSED
+```
+
+Two tests, one fixture, zero duplication. Each test parameter named `sample_cart` triggers a call to the `sample_cart` fixture function, and the return value gets passed in. The test doesn't import anything; pytest finds the fixture by name.
+
+Notice each test gets its own copy. The fixture function runs once per test by default, so if `test_cart_total` mutated the cart, `test_cart_item_count` would still see the original two items. Test isolation is the default, and that's almost always what you want.
+
+You can request multiple fixtures by listing more parameters:
+
+```python
+import pytest
+
+@pytest.fixture
+def empty_cart():
+    return {"items": [], "discount": 0}
+
+@pytest.fixture
+def customer():
+    return {"id": 501, "name": "Priya Shah", "email": "priya@example.com"}
+
+def test_new_customer_starts_with_empty_cart(empty_cart, customer):
+    assert empty_cart["items"] == []
+    assert customer["name"] == "Priya Shah"
+```
+
+Pytest reads the parameter names, calls each fixture, and injects the results. Order doesn't matter; you can ask for them in any sequence.
+
+<h1 id="fixture-scopes">Fixture Scopes</h1>
+
+By default, a fixture runs once per test. That's fine for cheap setup (building a dict, instantiating a class), but expensive setup (spinning up a database, loading a large file, starting a server) becomes painful if it repeats for every test. Scopes let you control how often a fixture runs.
+
+A scope says "reuse the same fixture value across this group of tests". Pytest gives you five scopes, listed from narrowest to widest:
+
+| Scope                | Fixture runs once per | Use when                                             |
+| -------------------- | --------------------- | ---------------------------------------------------- |
+| `function` (default) | Test function         | Setup is cheap, isolation matters                    |
+| `class`              | Test class            | Tests in a class share read-only data                |
+| `module`             | File                  | A whole file of tests shares an expensive resource   |
+| `package`            | Directory             | All tests in a subdirectory share something          |
+| `session`            | Whole test run        | The setup is heavy and the result is truly immutable |
+
+Set the scope by passing it to the decorator: `@pytest.fixture(scope="module")`.
+
+```python
+import pytest
+
+@pytest.fixture(scope="function")
+def fresh_cart():
+    print("\n[function] building fresh cart")
+    return {"items": [], "discount": 0}
+
+@pytest.fixture(scope="module")
+def inventory_db():
+    print("\n[module] loading inventory")
+    return {"mouse": 50, "cable": 200, "keyboard": 30}
+
+def test_add_item(fresh_cart, inventory_db):
+    fresh_cart["items"].append({"product": "mouse", "quantity": 1})
+    assert inventory_db["mouse"] == 50
+
+def test_starts_empty(fresh_cart, inventory_db):
+    assert fresh_cart["items"] == []
+    assert "keyboard" in inventory_db
+```
+
+Run with `pytest -v -s` (the `-s` lets the print output through):
+
+```text
+[module] loading inventory
+[function] building fresh cart
+test_scopes.py::test_add_item PASSED
+[function] building fresh cart
+test_scopes.py::test_starts_empty PASSED
+```
+
+`inventory_db` builds once. `fresh_cart` builds twice, once per test. The `test_starts_empty` test sees an empty cart, not the one `test_add_item` mutated, because the function-scoped fixture rebuilt it.
+
+> **Cost:** A `function`-scoped fixture that takes 100ms to set up costs 100ms times the number of tests that use it. Switch to `module` or `session` only when you can guarantee tests don't mutate the shared value, or you'll get tests that pass alone and fail together.
+
+The relationship between scopes is strictly nested. A session-scoped fixture lives longer than a module-scoped fixture, which lives longer than a function-scoped one. The diagram below shows how they nest in time.
+
+A higher-scoped fixture cannot depend on a lower-scoped one. A `session` fixture can use other `session` fixtures, but it can't request a `function`-scoped fixture; that would break the contract, since the function-scoped one is supposed to be rebuilt per test. Pytest enforces this and gives you a clear error if you mix scopes wrong:
+
+```text
+ScopeMismatch: You tried to access the function scoped fixture fresh_cart with a module scoped request object.
+```
+
+Picking the right scope is mostly about answering "if test B sees what test A did to this fixture, is that a bug?" If yes, use `function`. If no, you can widen it.
+
+<h1 id="yield-fixtures-and-teardown">Yield Fixtures and Teardown</h1>
+
+Fixtures need to clean up after themselves. A fixture that opens a temporary database has to close it. A fixture that creates a file has to delete it. Pytest handles teardown with a `yield` statement: the code before `yield` is setup, the code after is teardown.
+
+```python
+import pytest
+
+@pytest.fixture
+def inventory_db():
+    print("\nsetup: opening inventory")
+    db = {"mouse": 50, "cable": 200, "keyboard": 30}
+    yield db
+    print("teardown: closing inventory")
+    db.clear()
+
+def test_read_inventory(inventory_db):
+    print("running test")
+    assert inventory_db["mouse"] == 50
+```
+
+Run with `pytest -v -s`:
+
+```text
+setup: opening inventory
+running test
+test_yield.py::test_read_inventory PASSED
+teardown: closing inventory
+```
+
+The flow is clear: pytest runs the setup, hands the yielded value to the test, runs the test, then runs the teardown. Note the structure: one `yield` per fixture. The value after `yield` becomes the fixture's value. Anything before `yield` is setup; anything after is teardown.
+
+The big guarantee here is that the teardown runs even if the test fails. Mutate the dict to prove it:
+
+```python
+import pytest
+
+@pytest.fixture
+def inventory_db():
+    print("\nsetup")
+    db = {"mouse": 50, "cable": 200}
+    yield db
+    print(f"teardown, final state: {db}")
+    db.clear()
+
+def test_decrement_then_fail(inventory_db):
+    inventory_db["mouse"] -= 1
+    assert inventory_db["mouse"] == 999  # wrong, will fail
+```
+
+```text
+setup
+test_yield.py::test_decrement_then_fail FAILED
+teardown, final state: {'mouse': 49, 'cable': 200}
+```
+
+The teardown still ran even though the assertion failed. That's the point: cleanup isn't tied to the test passing. This is what makes `yield` fixtures dramatically safer than `unittest`'s `setUp`/`tearDown` pair, where errors in `setUp` or `tearDown` can mask each other.
+
+A `return` fixture is fine when there's nothing to clean up:
+
+```python
+@pytest.fixture
+def customer():
+    return {"id": 501, "name": "Priya Shah"}
+```
+
+A `yield` fixture is what you reach for the moment cleanup is needed:
+
+```python
+@pytest.fixture
+def temp_orders_file(tmp_path):
+    path = tmp_path / "orders.csv"
+    path.write_text("id,product,quantity\n")
+    yield path
+    # tmp_path cleans itself up, but if we'd opened a connection here,
+    # this is where we'd close it
+```
+
+If you find yourself wanting two `yield`s in one fixture, split it into two fixtures. The `yield` is supposed to mark a single transition from setup to teardown.
+
+<h1 id="fixture-composition">Fixture Composition</h1>
+
+Fixtures can depend on other fixtures. The composition rule is simple: list the dependency as a parameter, the same way a test does. Pytest builds a dependency graph, calls each fixture in the right order, and reuses values where scopes allow.
+
+```python
+import pytest
+
+@pytest.fixture
+def inventory_db():
+    return {"mouse": 50, "cable": 200, "keyboard": 30}
+
+@pytest.fixture
+def customer():
+    return {"id": 501, "name": "Priya Shah", "email": "priya@example.com"}
+
+@pytest.fixture
+def empty_cart(customer):
+    return {
+        "customer_id": customer["id"],
+        "items": [],
+        "discount": 0,
+    }
+
+@pytest.fixture
+def sample_cart(empty_cart, inventory_db):
+    empty_cart["items"].append({"product": "mouse", "price": 29.99, "quantity": 1})
+    empty_cart["items"].append({"product": "cable", "price": 9.99, "quantity": 2})
+    return empty_cart
+
+def test_sample_cart_belongs_to_customer(sample_cart, customer):
+    assert sample_cart["customer_id"] == customer["id"]
+
+def test_sample_cart_item_count(sample_cart):
+    assert len(sample_cart["items"]) == 2
+```
+
+Reading top to bottom: `sample_cart` depends on `empty_cart` and `inventory_db`. `empty_cart` depends on `customer`. When `test_sample_cart_belongs_to_customer` runs, pytest figures out the order: build `customer`, then `inventory_db`, then `empty_cart`, then `sample_cart`. The test asks for `sample_cart` and `customer`, and pytest reuses the same `customer` value across both, because it's the same test and the default scope reuses values within one test.
+
+The diagram below shows the resolution and teardown order pytest follows when a test requests `sample_cart` and `customer`:
+
+Setup order, deepest first: `customer` and `inventory_db`, then `empty_cart`, then `sample_cart`, then the test runs. Teardown order is LIFO (last in, first out): if `sample_cart` had a `yield`, its teardown would run first; then `empty_cart`'s teardown; then `inventory_db`'s; then `customer`'s. That's the same order you'd get from nested `with` blocks, and it's what you want, since later fixtures may depend on earlier ones still being alive.
+
+Composition is the trick that makes fixtures scale. Instead of one giant `mega_fixture` that builds everything, you have small named fixtures that snap together. Tests pick the ones they need. New fixtures reuse existing ones. Refactoring a single fixture updates everywhere it's used.
+
+<h1 id="conftestpy-shared-fixtures">conftest.py: Shared Fixtures</h1>
+
+Fixtures defined in a test file are only visible to that file. When you want a fixture shared across multiple test files, put it in `conftest.py`. Pytest auto-discovers `conftest.py` files: it walks up from each test file's directory and loads any `conftest.py` it finds, making the fixtures in those files available to every test in the subtree.
+
+A typical layout:
+
+```text
+tests/
+    conftest.py              <- fixtures available to all tests
+    cart/
+        conftest.py          <- fixtures available to cart tests only
+        test_cart_total.py
+        test_cart_discount.py
+    inventory/
+        test_stock.py
+```
+
+The top-level `conftest.py` might look like:
+
+```python
+# tests/conftest.py
+import pytest
+
+@pytest.fixture
+def customer():
+    return {"id": 501, "name": "Priya Shah", "email": "priya@example.com"}
+
+@pytest.fixture
+def inventory_db():
+    return {"mouse": 50, "cable": 200, "keyboard": 30}
+```
+
+The cart-specific one adds cart fixtures:
+
+```python
+# tests/cart/conftest.py
+import pytest
+
+@pytest.fixture
+def empty_cart(customer):
+    return {"customer_id": customer["id"], "items": [], "discount": 0}
+
+@pytest.fixture
+def sample_cart(empty_cart):
+    empty_cart["items"].append({"product": "mouse", "price": 29.99, "quantity": 1})
+    empty_cart["items"].append({"product": "cable", "price": 9.99, "quantity": 2})
+    return empty_cart
+```
+
+And the test file just uses them:
+
+```python
+# tests/cart/test_cart_total.py
+def test_total_with_two_items(sample_cart):
+    total = sum(item["price"] * item["quantity"] for item in sample_cart["items"])
+    assert total == 49.97
+
+def test_customer_belongs_to_cart(sample_cart, customer):
+    assert sample_cart["customer_id"] == customer["id"]
+```
+
+No imports. Pytest walks `tests/cart/` upward, finds `conftest.py` there, then walks to `tests/`, finds `conftest.py` there, and registers every fixture from both. `customer` is from the outer file, `sample_cart` is from the inner one, and the test gets both.
+
+Why this matters: visibility is scoped by location. The cart-specific `empty_cart` doesn't leak into `tests/inventory/`. If `tests/inventory/test_stock.py` tries to use `sample_cart`, pytest reports the fixture as not found. The same fixture name can even be redefined in a deeper `conftest.py`, and the deeper one wins for tests in that subtree. That's how you specialize a fixture for one part of the suite without breaking everything else.
+
+A few rules to remember:
+
+- `conftest.py` is never imported manually. Pytest finds and loads it. If you write `from conftest import sample_cart`, you've misunderstood the design.
+- Fixtures in `conftest.py` are pytest-visible only. You can't call them as regular functions from production code; they're test infrastructure.
+- The closest `conftest.py` wins for shadowed names. If `tests/conftest.py` defines `customer` and `tests/cart/conftest.py` redefines it, cart tests see the inner one and other tests see the outer one.
+
+> **Cost:** Pytest loads every `conftest.py` along the path to every test file at collection time. Hundreds of `conftest.py` files in a deep directory tree can slow collection. One root-level `conftest.py` plus a handful of section-specific ones is the sweet spot.
+
+<h1 id="autousetrue-and-why-to-be-careful">
+  autouse=True (and Why to Be Careful)
+</h1>
+
+A fixture marked `autouse=True` runs for every test in its scope, whether or not the test asked for it by parameter name. It's the closest pytest gets to `unittest`'s implicit `setUp`.
+
+```python
+import pytest
+
+@pytest.fixture(autouse=True)
+def reset_metrics():
+    print("\n[autouse] resetting metrics")
+    yield
+    print("[autouse] flushing metrics")
+
+def test_one():
+    print("test_one body")
+    assert True
+
+def test_two():
+    print("test_two body")
+    assert True
+```
+
+```text
+[autouse] resetting metrics
+test_one body
+test_autouse.py::test_one PASSED
+[autouse] flushing metrics
+[autouse] resetting metrics
+test_two body
+test_autouse.py::test_two PASSED
+[autouse] flushing metrics
+```
+
+Neither test mentioned `reset_metrics` in its signature, but the fixture still ran before and after each one. That's useful when you genuinely want every test in a file to get a piece of setup: clearing a singleton between tests, resetting a global counter, freezing a clock.
+
+Be careful. Autouse is implicit. The reader of `test_one` can't see that `reset_metrics` runs without scanning the conftest or the surrounding file. Every autouse fixture is a hidden dependency, and hidden dependencies are how test suites become hard to reason about.
+
+A reasonable rule: use `autouse=True` only when the fixture's effect is invisible (it resets state, doesn't return anything the test uses) and skipping it would cause silent test pollution. For anything the test consumes, name the fixture in the parameter list. That keeps the dependency visible and lets pytest still cache and reuse it correctly.
+
+Autouse also takes a scope. An `autouse=True, scope="module"` fixture runs once per module, not once per test, which is the right tool when you need exactly-once setup for a whole file.
+
+```python
+@pytest.fixture(autouse=True, scope="module")
+def warm_up_caches():
+    print("\nwarming caches once per module")
+    yield
+    print("clearing caches once per module")
+```
+
+<h1 id="built-in-fixtures">Built-in Fixtures</h1>
+
+Pytest ships with fixtures you don't have to define. Knowing them saves a lot of boilerplate.
+
+<h3 id="tmp_path-and-tmp_path_factory">tmp_path and tmp_path_factory</h3>
+
+`tmp_path` is a function-scoped fixture that gives each test its own unique `pathlib.Path` to a temporary directory. Pytest creates the directory before the test and cleans it up afterward (with some retention so you can inspect failures).
+
+```python
+def test_writes_order_export(tmp_path):
+    export_path = tmp_path / "orders.csv"
+    export_path.write_text("id,product,quantity\n1001,mouse,2\n")
+    assert export_path.exists()
+    assert "mouse" in export_path.read_text()
+```
+
+The `tmp_path` value is already a `pathlib.Path`, so `/` builds child paths and `.write_text` / `.read_text` work directly. No `os.path.join`, no manual cleanup. Each test gets a fresh directory, so two tests writing the same filename never collide.
+
+For tests that share a directory across the module or session, use `tmp_path_factory`. It's session-scoped and lets you mint named directories at any scope.
+
+```python
+import pytest
+
+@pytest.fixture(scope="module")
+def shared_export_dir(tmp_path_factory):
+    return tmp_path_factory.mktemp("exports")
+
+def test_writes_one(shared_export_dir):
+    (shared_export_dir / "a.csv").write_text("a\n")
+
+def test_writes_two(shared_export_dir):
+    (shared_export_dir / "b.csv").write_text("b\n")
+    # both files coexist in the same dir
+    assert (shared_export_dir / "a.csv").exists()
+```
+
+`mktemp("exports")` gives you a fresh directory named with that prefix plus a counter, scoped to whichever fixture is calling it. The second test sees the file the first one wrote because the directory persists for the whole module.
+
+> **Cost:** `tmp_path` directories live on disk until pytest cleans them up, which it does after a few runs (it keeps the last 3 by default for debugging). On systems with tiny `/tmp` partitions, watch for buildup; configure `tmp_path_retention_count` if needed.
+
+<h3 id="monkeypatch-preview">monkeypatch (Preview)</h3>
+
+`monkeypatch` is a built-in fixture for temporarily changing things during a test: environment variables, attributes, dictionary keys, `sys.path` entries. The changes get reverted automatically when the test ends, so tests don't bleed state into each other.
+
+A common use is patching an environment variable. Suppose code reads `DISCOUNT_PERCENT` from the environment:
+
+```python
+import os
+
+def get_discount_percent():
+    return int(os.environ.get("DISCOUNT_PERCENT", "0"))
+
+def test_default_discount_is_zero(monkeypatch):
+    monkeypatch.delenv("DISCOUNT_PERCENT", raising=False)
+    assert get_discount_percent() == 0
+
+def test_discount_from_env(monkeypatch):
+    monkeypatch.setenv("DISCOUNT_PERCENT", "15")
+    assert get_discount_percent() == 15
+```
+
+Each test changes the environment, runs its assertion, and pytest reverts the change before the next test. No leaked env vars, no need to remember to set them back.
+
+That's enough for now.
+
+<h3 id="capsys-capfd-and-caplog">capsys, capfd, and caplog</h3>
+
+When a test needs to verify what code prints or logs, the capture fixtures grab the output.
+
+`capsys` captures `sys.stdout` and `sys.stderr` writes (i.e., `print` calls). After the test, you read the captured text with `capsys.readouterr()`, which returns a tuple-like object with `.out` and `.err` strings.
+
+```python
+def show_order_status(order):
+    print(f"Order {order['id']}: {order['status']}")
+
+def test_show_order_status(capsys):
+    show_order_status({"id": 1001, "status": "shipped"})
+    captured = capsys.readouterr()
+    assert captured.out == "Order 1001: shipped\n"
+    assert captured.err == ""
+```
+
+`capfd` is the same idea, but it captures at the file-descriptor level. Use it when the code under test bypasses Python's `sys.stdout` (for example, a C extension or a subprocess that writes to FD 1 directly). For most pure-Python code, `capsys` is what you want.
+
+`caplog` captures records emitted through the `logging` module. You can assert on log levels, messages, or attribute values.
+
+```python
+import logging
+
+def reject_cart_if_empty(cart):
+    if not cart["items"]:
+        logging.warning("rejected empty cart for customer %s", cart["customer_id"])
+        return False
+    return True
+
+def test_logs_warning_for_empty_cart(caplog):
+    caplog.set_level(logging.WARNING)
+    result = reject_cart_if_empty({"customer_id": 501, "items": []})
+    assert result is False
+    assert "rejected empty cart" in caplog.text
+    assert caplog.records[0].levelname == "WARNING"
+```
+
+`caplog.set_level(logging.WARNING)` makes sure the test captures at that threshold; without it, pytest's default capture level may hide messages. `caplog.text` is the formatted output, and `caplog.records` gives you the raw `LogRecord` objects for finer assertions.
+
+<h3 id="request-briefly">request (Briefly)</h3>
+
+Most fixtures don't need it, but `request` is a built-in fixture that gives you metadata about the test or fixture being set up. It's the way fixtures introspect themselves: which test is using me, what node id am I in, what parameters did I receive. Two common uses are accessing the current test's name (`request.node.name`) and finalizing teardown the older way with `request.addfinalizer` (mostly superseded by `yield`).
+
+For now, treat `request` as "the thing fixtures use when they need to know about the test that called them". A typical sighting:
+
+```python
+import pytest
+
+@pytest.fixture
+def named_cart(request):
+    name = request.node.name
+    return {"items": [], "label": f"cart_for_{name}"}
+
+def test_alpha(named_cart):
+    assert named_cart["label"] == "cart_for_test_alpha"
+
+def test_beta(named_cart):
+    assert named_cart["label"] == "cart_for_test_beta"
+```
+
+The fixture labels each cart with the test name. Useful for debugging output and not much else day-to-day.
+
+<h1 id="parametrizing-a-fixture-preview">Parametrizing a Fixture (Preview)</h1>
+
+Sometimes you want the same test to run against multiple variations of a fixture: a cart with 1 item, 10 items, 100 items; an inventory with three different stock levels. Adding `params=[...]` to the fixture decorator turns the fixture into a multi-value source. Pytest runs each test that uses the fixture once per parameter value.
+
+```python
+import pytest
+
+@pytest.fixture(params=[1, 5, 25])
+def cart_with_quantity(request):
+    return {
+        "items": [{"product": "mouse", "price": 29.99, "quantity": request.param}],
+        "discount": 0,
+    }
+
+def test_total_scales_with_quantity(cart_with_quantity):
+    item = cart_with_quantity["items"][0]
+    total = item["price"] * item["quantity"]
+    assert total == 29.99 * item["quantity"]
+```
+
+Running this produces three test entries from one function:
+
+```text
+test_param_fixture.py::test_total_scales_with_quantity[1] PASSED
+test_param_fixture.py::test_total_scales_with_quantity[5] PASSED
+test_param_fixture.py::test_total_scales_with_quantity[25] PASSED
+```
+
+Inside the fixture, `request.param` gives the current value. The `[1]`, `[5]`, `[25]` in the test names are the parameter IDs pytest auto-generates.
+
+That's the preview. `@pytest.mark.parametrize` covers test-level parameters, multi-parameter combinations, custom IDs, conditional skips, and how parametrized fixtures and parametrized tests interact.
+
+<h1 id="putting-it-together-a-cart-test-suite">
+  Putting It Together: A Cart Test Suite
+</h1>
+
+A small end-to-end example showing fixtures, scopes, yields, composition, and conftest sharing working together. Imagine the layout below, where the package code lives in `shop/` and the tests are under `tests/cart/`:
+
+```text
+shop/
+    discount.py
+tests/
+    conftest.py
+    cart/
+        conftest.py
+        test_cart_total.py
+```
+
+`shop/discount.py`:
+
+```python
+class DiscountCalculator:
+    def __init__(self, percent):
+        self.percent = percent
+
+    def apply(self, subtotal):
+        return round(subtotal * (1 - self.percent / 100), 2)
+```
+
+`tests/conftest.py`:
+
+```python
+import pytest
+
+@pytest.fixture(scope="session")
+def inventory_db():
+    print("\n[session] loading inventory")
+    return {"mouse": 50, "cable": 200, "keyboard": 30}
+
+@pytest.fixture
+def customer():
+    return {"id": 501, "name": "Priya Shah"}
+```
+
+`tests/cart/conftest.py`:
+
+```python
+import pytest
+from shop.discount import DiscountCalculator
+
+@pytest.fixture
+def empty_cart(customer):
+    return {"customer_id": customer["id"], "items": [], "discount": 0}
+
+@pytest.fixture
+def sample_cart(empty_cart, inventory_db):
+    empty_cart["items"].append({"product": "mouse", "price": 29.99, "quantity": 2})
+    empty_cart["items"].append({"product": "cable", "price": 9.99, "quantity": 1})
+    return empty_cart
+
+@pytest.fixture
+def discount_calc():
+    yield DiscountCalculator(percent=10)
+    print("\nteardown: discount calc done")
+```
+
+`tests/cart/test_cart_total.py`:
+
+```python
+def test_empty_cart_has_no_items(empty_cart):
+    assert empty_cart["items"] == []
+
+def test_sample_cart_subtotal(sample_cart):
+    subtotal = sum(i["price"] * i["quantity"] for i in sample_cart["items"])
+    assert subtotal == 69.97
+
+def test_sample_cart_with_discount(sample_cart, discount_calc):
+    subtotal = sum(i["price"] * i["quantity"] for i in sample_cart["items"])
+    total = discount_calc.apply(subtotal)
+    assert total == 62.97
+
+def test_inventory_has_keyboard(inventory_db):
+    assert inventory_db["keyboard"] == 30
+```
+
+Run `pytest -v -s tests/cart/`:
+
+```text
+[session] loading inventory
+tests/cart/test_cart_total.py::test_empty_cart_has_no_items PASSED
+tests/cart/test_cart_total.py::test_sample_cart_subtotal PASSED
+tests/cart/test_cart_total.py::test_sample_cart_with_discount PASSED
+teardown: discount calc done
+tests/cart/test_cart_total.py::test_inventory_has_keyboard PASSED
+```
+
+`inventory_db` ran once for the whole session (the print appears once, even though three tests use it). `customer`, `empty_cart`, `sample_cart`, and `discount_calc` all rebuilt per test. `discount_calc` had a yield teardown, which shows the after-test print. No test re-imported a fixture; pytest pulled them by name across both conftests.
+
+This is the picture you should hold in your head: small fixtures, narrow scopes by default, widening scope only for things that are expensive and immutable, with `conftest.py` files mapping the shape of the test directory tree.
+
+<h1 id="quiz">Quiz</h1>
+
+<h1 id="quiz-questions">Quiz Questions</h1>
+
+**Question 1: What is the main pytest fixture improvement over a unittest setUp method?**
+
+- [x] Tests declare needed setup with named parameters, making dependencies explicit.
+- [ ] Every test in a class receives the same setup through self attributes.
+- [ ] Fixture functions must be imported directly by each test function.
+- [ ] Pytest keeps setup hidden so all test signatures remain empty.
+
+**Question 2: What is the default scope of a pytest fixture?**
+
+- [ ] module: it runs once for every Python test file.
+- [x] function: it runs separately for each test that requests it.
+- [ ] class: it runs once for every test class by default.
+- [ ] session: it runs once and shares one value across the run.
+
+**Question 3: What is the output of this Python program that simulates a function-scoped fixture?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 4: A module-scoped fixture returns a mutable list, and one test appends to it. What should you expect?**
+
+- [x] Later tests can see mutations because the same object is reused.
+- [ ] Pytest deep-copies the list before injecting it into each test.
+- [ ] The list becomes immutable because the scope is wider than function.
+- [ ] Only equality changes; object identity is refreshed for each test.
+
+**Question 5: What is the output of this Python program that simulates a module-scoped fixture cache?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 7: In a yield-style pytest fixture, what is the purpose of the code after yield?**
+
+- [ ] It builds the value that pytest injects into the test.
+- [x] It runs during teardown, even if the test fails.
+- [ ] It changes the fixture name used in test parameters.
+- [ ] It stores cleanup state on self for pytest to inspect.
+
+**Question 8: What is the output of this Python program that models yield-fixture teardown?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 9: A fixture named order depends on a fixture named customer by listing customer as a parameter. What does pytest do?**
+
+- [x] Pytest resolves fixture dependencies before calling the dependent fixture.
+- [ ] Pytest passes the string "customer" into order unless imported.
+- [ ] Pytest uses Python's MRO to choose between fixture functions.
+- [ ] Pytest calls order first, then patches customer into its locals.
+
+<QuizCard />
+
+<CommentsSection />
+
+</LessonCard>

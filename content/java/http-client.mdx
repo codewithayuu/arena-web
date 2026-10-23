@@ -1,0 +1,764 @@
+---
+title: "HTTP Client"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "HTTP Client explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+The running example is the same e-commerce backend. We will call product detail APIs, place orders, fan out to several regional inventory services in parallel, retry a flaky CDN, and stream a large image upload.
+
+<h1 id="why-a-new-http-client">Why a New HTTP Client?</h1>
+
+`HttpURLConnection` predates generics, lambdas, `CompletableFuture`, and HTTP/2. It was designed for Java 1.1. A simple GET requires opening a connection, configuring the request method, reading bytes through an `InputStream`, checking the response code, and then closing the stream in a `finally` block. There is no built-in async support. There is no HTTP/2. Connection pooling exists, but it is buried in system properties.
+
+The Java team did not patch the old class. They shipped a new one. `HttpClient` arrived as an incubator module in Java 9 and was promoted to a standard API in `java.net.http` in Java 11. Use it any time you write Java code that talks to an HTTP server.
+
+The three top-level types are:
+
+| Type              | Role                                                                                            |
+| ----------------- | ----------------------------------------------------------------------------------------------- |
+| `HttpClient`      | A configured, reusable client. Holds the executor, connection pool, default version, and proxy. |
+| `HttpRequest`     | An immutable description of one request: URI, method, headers, body publisher, timeout.         |
+| `HttpResponse<T>` | An immutable result: status code, headers, and a body of type `T` produced by the body handler. |
+
+The diagram shows the object model. The `HttpClient` is the long-lived component you build once. Every call composes a fresh `HttpRequest` with a `BodyPublisher` for the outgoing body, picks a `BodyHandler` that describes how to read the response, and gets back an `HttpResponse` parameterized on the body type. Everything below `HttpClient` is immutable and cheap to construct.
+
+<h1 id="building-an-httpclient">Building an HttpClient</h1>
+
+The simplest constructor is one line.
+
+```java
+import java.net.http.HttpClient;
+
+public class DefaultClient {
+    public static void main(String[] args) {
+        HttpClient client = HttpClient.newHttpClient();
+        System.out.println("Default version: " + client.version());
+        System.out.println("Follows redirects: " + client.followRedirects());
+    }
+}
+```
+
+`HttpClient.newHttpClient()` returns a client that prefers HTTP/2, never follows redirects, has no connect timeout, and uses a default executor for async work. That is a sensible baseline, and for many quick scripts it is all you need.
+
+Real applications usually want more control. The builder lets you set each option explicitly.
+
+```java
+import java.net.http.HttpClient;
+import java.time.Duration;
+import java.util.concurrent.Executors;
+
+public class ConfiguredClient {
+    public static void main(String[] args) {
+        HttpClient client = HttpClient.newBuilder()
+                .version(HttpClient.Version.HTTP_2)
+                .connectTimeout(Duration.ofSeconds(5))
+                .followRedirects(HttpClient.Redirect.NORMAL)
+                .executor(Executors.newFixedThreadPool(8))
+                .build();
+
+        System.out.println("Version: " + client.version());
+        System.out.println("Connect timeout: " + client.connectTimeout().orElseThrow());
+        System.out.println("Redirect policy: " + client.followRedirects());
+    }
+}
+```
+
+A few of these settings deserve a closer look.
+
+| Setting                        | What It Does                                                                              |
+| ------------------------------ | ----------------------------------------------------------------------------------------- |
+| `version(HTTP_2)`              | Prefer HTTP/2. Falls back to HTTP/1.1 if the server does not negotiate it.                |
+| `connectTimeout(Duration)`     | Maximum time to establish the TCP connection. Distinct from request timeout.              |
+| `followRedirects(...)`         | `NEVER`, `ALWAYS`, or `NORMAL` (follows except HTTPS-to-HTTP downgrades).                 |
+| `proxy(ProxySelector)`         | Route requests through a proxy. Use `ProxySelector.getDefault()` to honor system proxies. |
+| `cookieHandler(CookieHandler)` | Plug in a cookie store so the client persists cookies between requests.                   |
+| `executor(Executor)`           | The thread pool used for async sends and HTTP/2 stream demultiplexing.                    |
+| `authenticator(Authenticator)` | Respond to HTTP 401 challenges with credentials.                                          |
+
+The `connectTimeout` is one of the most important settings for production reliability. Without it, a misbehaving server can leave a connection attempt hanging at the OS default (often 75 seconds or more) before the JVM gives up. Five seconds is a reasonable starting point for service-to-service calls.
+
+Building an `HttpClient` is not free. It starts a selector thread and an executor (unless you provide one). Build one per application, reuse it for every request. Creating one per call defeats connection pooling and floods the OS with sockets.
+
+<h1 id="building-an-httprequest">Building an HttpRequest</h1>
+
+`HttpRequest` is built the same way: builder pattern, fluent calls, one terminal `build()`.
+
+```java
+import java.net.URI;
+import java.net.http.HttpRequest;
+import java.time.Duration;
+
+public class SimpleGetRequest {
+    public static void main(String[] args) {
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create("https://api.example.com/products/42"))
+                .header("Accept", "application/json")
+                .header("User-Agent", "shopnow-backend/1.0")
+                .timeout(Duration.ofSeconds(10))
+                .GET()
+                .build();
+
+        System.out.println(request.method() + " " + request.uri());
+        System.out.println("Headers: " + request.headers().map());
+    }
+}
+```
+
+The most common builder methods:
+
+| Method                                   | Purpose                                                        |
+| ---------------------------------------- | -------------------------------------------------------------- |
+| `uri(URI)`                               | The target URI. Required.                                      |
+| `header(name, value)`                    | Add a single header. Call multiple times to add several.       |
+| `headers(name, value, name, value, ...)` | Add several headers in one call (varargs in name/value pairs). |
+| `GET()`                                  | HTTP GET. The default if no method is set.                     |
+| `POST(BodyPublisher)`                    | HTTP POST with a request body.                                 |
+| `PUT(BodyPublisher)`                     | HTTP PUT with a request body.                                  |
+| `DELETE()`                               | HTTP DELETE.                                                   |
+| `method(name, BodyPublisher)`            | Any custom method (e.g., `PATCH`).                             |
+| `timeout(Duration)`                      | Maximum time for the whole request, not just connect.          |
+| `version(Version)`                       | Override the client's default HTTP version for this request.   |
+| `expectContinue(boolean)`                | Send `Expect: 100-continue` for large uploads.                 |
+
+Two details to point out. First, `HttpRequest` is immutable. Once you call `build()`, you cannot change it. If you need a variant (say, the same URL with different headers), call `HttpRequest.newBuilder(existing)` to copy and modify. Second, the timeout on a request is the deadline for the entire exchange, including connect, send, and receive. It triggers `HttpTimeoutException` (a subclass of `IOException`) when the budget runs out.
+
+<h1 id="bodypublishers-sending-the-request-body">
+  BodyPublishers: Sending the Request Body
+</h1>
+
+For methods that have a body (`POST`, `PUT`, `PATCH`), you supply a `BodyPublisher` that knows how to stream the bytes out. The static factory `HttpRequest.BodyPublishers` covers the common cases.
+
+```java
+import java.net.URI;
+import java.net.http.HttpRequest;
+import java.nio.file.Path;
+
+public class BodyPublisherExamples {
+    public static void main(String[] args) throws Exception {
+        // JSON body from a String
+        HttpRequest postOrder = HttpRequest.newBuilder()
+                .uri(URI.create("https://api.example.com/orders"))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(
+                        "{\"productId\":42,\"quantity\":2}"))
+                .build();
+
+        // Form-encoded body
+        HttpRequest postLogin = HttpRequest.newBuilder()
+                .uri(URI.create("https://api.example.com/login"))
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .POST(HttpRequest.BodyPublishers.ofString(
+                        "email=alice@example.com&password=hunter2"))
+                .build();
+
+        // File upload
+        HttpRequest uploadImage = HttpRequest.newBuilder()
+                .uri(URI.create("https://cdn.example.com/products/42/image"))
+                .header("Content-Type", "image/jpeg")
+                .PUT(HttpRequest.BodyPublishers.ofFile(Path.of("notebook.jpg")))
+                .build();
+
+        // No body (DELETE has no body by definition; some POSTs are empty too)
+        HttpRequest deleteCart = HttpRequest.newBuilder()
+                .uri(URI.create("https://api.example.com/carts/abc-123"))
+                .DELETE()
+                .build();
+
+        System.out.println("Order body length: " +
+                postOrder.bodyPublisher().orElseThrow().contentLength());
+        System.out.println("Login body length: " +
+                postLogin.bodyPublisher().orElseThrow().contentLength());
+    }
+}
+```
+
+The publisher options:
+
+| Publisher                              | When to Use                                                                             |
+| -------------------------------------- | --------------------------------------------------------------------------------------- |
+| `ofString(String)`                     | JSON, form-encoded text, anything that fits comfortably in memory.                      |
+| `ofString(String, Charset)`            | When the body needs an explicit charset.                                                |
+| `ofByteArray(byte[])`                  | Pre-encoded binary or pre-serialized JSON.                                              |
+| `ofByteArrays(Iterable<byte[]>)`       | Streamed binary in chunks. Lets you control allocation for very large bodies.           |
+| `ofFile(Path)`                         | File upload. The publisher streams the file from disk; nothing is buffered into memory. |
+| `ofInputStream(Supplier<InputStream>)` | Streaming from any source. The supplier returns a fresh stream on each subscribe.       |
+| `noBody()`                             | Explicit empty body. The client adds `Content-Length: 0`.                               |
+
+`ofString` requires the body to be assembled in memory. For a small JSON payload that is fine. For a multi-gigabyte file, use `ofFile` or `ofInputStream` so the publisher can stream chunks without buffering.
+
+`ofString` allocates the entire byte array upfront. If you are uploading a 2 GB video, that is 2 GB on the heap. Use `ofFile(Path)` to stream from disk with a small buffer, or `ofInputStream(...)` for anything else.
+
+<h1 id="sending-synchronously">Sending Synchronously</h1>
+
+The synchronous send is one line. You hand the client your request and a body handler, and you get a response back.
+
+```java
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+
+public class SyncGetProduct {
+
+    private static final HttpClient client = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(5))
+            .build();
+
+    public static void main(String[] args) throws Exception {
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create("https://fakestoreapi.com/products/1"))
+                .header("Accept", "application/json")
+                .GET()
+                .build();
+
+        HttpResponse<String> response = client.send(
+                request, HttpResponse.BodyHandlers.ofString());
+
+        System.out.println("Status: " + response.statusCode());
+        System.out.println("Content-Type: " +
+                response.headers().firstValue("content-type").orElse("unknown"));
+        System.out.println("Body length: " + response.body().length());
+    }
+}
+```
+
+**Output (will vary by network):**
+
+```text
+Status: 200
+Content-Type: application/json; charset=utf-8
+Body length: 198
+```
+
+The call `client.send(request, BodyHandlers.ofString())` blocks the current thread until the response arrives or the timeout fires. The generic type on `HttpResponse<T>` matches the body handler: `ofString()` produces `HttpResponse<String>`, `ofByteArray()` produces `HttpResponse<byte[]>`, and so on.
+
+The response gives you everything about the result:
+
+| Method               | Returns                                                                    |
+| -------------------- | -------------------------------------------------------------------------- |
+| `statusCode()`       | The integer HTTP status (200, 404, 503).                                   |
+| `body()`             | The decoded body of type `T`.                                              |
+| `headers()`          | An `HttpHeaders` object with case-insensitive lookup.                      |
+| `uri()`              | The final URI (different from the request URI if redirects were followed). |
+| `version()`          | The actual HTTP version used (HTTP_1_1 or HTTP_2).                         |
+| `request()`          | The original `HttpRequest` that produced this response.                    |
+| `previousResponse()` | If redirects were followed, the previous response in the chain.            |
+
+A note on checked exceptions. `send` throws two: `IOException` (network problems, TLS failure, timeout) and `InterruptedException` (the thread was interrupted while waiting). Both must be handled, either with `throws` or with a try/catch.
+
+<h1 id="bodyhandlers-reading-the-response-body">
+  BodyHandlers: Reading the Response Body
+</h1>
+
+The body handler is the dual of the body publisher. It tells the client how to turn the incoming bytes into a value of type `T`. The static factory `HttpResponse.BodyHandlers` covers the common shapes.
+
+```java
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.file.Path;
+import java.util.stream.Stream;
+
+public class BodyHandlerExamples {
+
+    private static final HttpClient client = HttpClient.newHttpClient();
+
+    public static void main(String[] args) throws Exception {
+        HttpRequest get = HttpRequest.newBuilder()
+                .uri(URI.create("https://fakestoreapi.com/products/1"))
+                .GET()
+                .build();
+
+        // 1. String body (small JSON / text)
+        HttpResponse<String> asString =
+                client.send(get, HttpResponse.BodyHandlers.ofString());
+        System.out.println("As String length: " + asString.body().length());
+
+        // 2. Byte array (binary)
+        HttpResponse<byte[]> asBytes =
+                client.send(get, HttpResponse.BodyHandlers.ofByteArray());
+        System.out.println("As byte[] length: " + asBytes.body().length);
+
+        // 3. Stream of lines (line-delimited JSON, logs)
+        HttpResponse<Stream<String>> asLines =
+                client.send(get, HttpResponse.BodyHandlers.ofLines());
+        try (Stream<String> lines = asLines.body()) {
+            System.out.println("Line count: " + lines.count());
+        }
+
+        // 4. Discard (we only care about status)
+        HttpResponse<Void> discarded =
+                client.send(get, HttpResponse.BodyHandlers.discarding());
+        System.out.println("Status only: " + discarded.statusCode());
+
+        // 5. Stream to file (large download)
+        HttpResponse<Path> toFile = client.send(get,
+                HttpResponse.BodyHandlers.ofFile(Path.of("product1.json")));
+        System.out.println("Saved to: " + toFile.body());
+    }
+}
+```
+
+**Output (varies):**
+
+```text
+As String length: 198
+As byte[] length: 198
+Line count: 1
+Status only: 200
+Saved to: product1.json
+```
+
+The handler options:
+
+| Handler                    | Body Type                          | Best For                                                           |
+| -------------------------- | ---------------------------------- | ------------------------------------------------------------------ |
+| `ofString()`               | `String`                           | Small JSON or text responses.                                      |
+| `ofString(Charset)`        | `String`                           | When the server returns text in a non-UTF-8 charset.               |
+| `ofByteArray()`            | `byte[]`                           | Small binary responses (thumbnails, signed blobs).                 |
+| `ofInputStream()`          | `InputStream`                      | When you want to parse the body incrementally without buffering.   |
+| `ofLines()`                | `Stream<String>`                   | Line-delimited responses (NDJSON, log streams, SSE).               |
+| `ofFile(Path)`             | `Path`                             | Streaming download to disk without going through the heap.         |
+| `discarding()`             | `Void`                             | Health checks, fire-and-forget calls where the body is irrelevant. |
+| `buffering(downstream, n)` | matches downstream                 | Buffer up to `n` bytes before invoking the downstream handler.     |
+| `ofPublisher()`            | `Flow.Publisher<List<ByteBuffer>>` | Reactive streaming for large or unbounded responses.               |
+
+`ofString` is fine for tens of kilobytes. For a 500 MB image download, `ofFile` streams it straight to disk with constant memory. For a server-sent events endpoint that never ends, `ofLines` (or `ofPublisher`) keeps you flowing without buffering the whole stream.
+
+`ofString` and `ofByteArray` materialize the full body before returning. `ofInputStream` and `ofFile` stream chunks. A 1 GB response with `ofString` is a 1 GB allocation; the same response with `ofFile` peaks at a few kilobytes of buffer.
+
+<h1 id="sending-asynchronously">Sending Asynchronously</h1>
+
+`sendAsync` returns a `CompletableFuture<HttpResponse<T>>` instead of blocking. The current thread continues immediately, and the response is delivered through the future's completion stage.
+
+```java
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.util.concurrent.CompletableFuture;
+
+public class AsyncGetProduct {
+
+    private static final HttpClient client = HttpClient.newHttpClient();
+
+    public static void main(String[] args) throws Exception {
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create("https://fakestoreapi.com/products/1"))
+                .GET()
+                .build();
+
+        CompletableFuture<HttpResponse<String>> future =
+                client.sendAsync(request, HttpResponse.BodyHandlers.ofString());
+
+        future.thenApply(HttpResponse::body)
+              .thenAccept(body -> System.out.println("Received: " + body.length() + " bytes"))
+              .exceptionally(error -> {
+                  System.out.println("Failed: " + error.getMessage());
+                  return null;
+              });
+
+        future.join(); // wait for the demo to finish before main exits
+    }
+}
+```
+
+**Output (varies):**
+
+```text
+Received: 198 bytes
+```
+
+The async API is most useful when you have many requests in flight and you do not want to tie up a thread per request. Each call is handed off to the client's executor, which uses non-blocking I/O internally. The number of threads you need is bounded by the executor's pool size, not by the number of in-flight requests.
+
+The diagram contrasts the two send modes. In the sync version, the calling thread parks until the response arrives, which is fine for a one-off CLI tool but disastrous if the same code runs inside a request handler on a busy server. In the async version, the call returns immediately with a future, and the response is delivered later on a pool thread. You can chain transformations with `.thenApply`, side effects with `.thenAccept`, and error handlers with `.exceptionally`, just like any other `CompletableFuture`.
+
+The most common async pattern is fan-out: kick off N requests, wait for all of them, combine the results. `CompletableFuture.allOf` is built for exactly this.
+
+```java
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.stream.Collectors;
+
+public class ParallelInventoryQuery {
+
+    private static final HttpClient client = HttpClient.newHttpClient();
+
+    public static void main(String[] args) {
+        List<String> regions = List.of("us-east", "us-west", "eu-central", "ap-south");
+        int productId = 42;
+
+        List<CompletableFuture<String>> futures = regions.stream()
+                .map(region -> queryInventory(region, productId))
+                .collect(Collectors.toList());
+
+        CompletableFuture<Void> all = CompletableFuture.allOf(
+                futures.toArray(new CompletableFuture[0]));
+
+        all.thenRun(() -> {
+            for (int i = 0; i < regions.size(); i++) {
+                System.out.println(regions.get(i) + " -> " + futures.get(i).join());
+            }
+        }).join();
+    }
+
+    private static CompletableFuture<String> queryInventory(String region, int productId) {
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create("https://inventory-" + region +
+                        ".example.com/products/" + productId))
+                .GET()
+                .build();
+        return client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+                .thenApply(HttpResponse::body)
+                .exceptionally(err -> "ERROR: " + err.getClass().getSimpleName());
+    }
+}
+```
+
+If each regional inventory service takes 200 ms, the synchronous version of this code takes 800 ms. The async version takes about 200 ms, because the four requests run in parallel and you wait once for the slowest. This is why fan-out workloads should be async.
+
+Async is not free. There is a small per-request overhead for scheduling onto the executor. For a single sequential call, sync is simpler and just as fast. The benefit shows up when you have multiple independent calls or when blocking would tie up a thread (like a Netty event loop or a UI thread).
+
+<h1 id="reading-the-response">Reading the Response</h1>
+
+Once you have an `HttpResponse<T>`, the shape is the same whether you got it from `send` or `sendAsync`.
+
+```java
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+
+public class InspectResponse {
+
+    public static void main(String[] args) throws Exception {
+        HttpClient client = HttpClient.newHttpClient();
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create("https://fakestoreapi.com/products/1"))
+                .GET()
+                .build();
+
+        HttpResponse<String> response = client.send(
+                request, HttpResponse.BodyHandlers.ofString());
+
+        System.out.println("Status:       " + response.statusCode());
+        System.out.println("HTTP version: " + response.version());
+        System.out.println("Final URI:    " + response.uri());
+        System.out.println("Content-Type: " +
+                response.headers().firstValue("content-type").orElse("?"));
+        System.out.println("Server hdrs:  " + response.headers().allValues("server"));
+        System.out.println("Body chars:   " + response.body().length());
+
+        if (response.statusCode() >= 200 && response.statusCode() < 300) {
+            System.out.println("OK");
+        } else if (response.statusCode() == 404) {
+            System.out.println("Product not found");
+        } else {
+            System.out.println("Server returned " + response.statusCode());
+        }
+    }
+}
+```
+
+**Output (varies):**
+
+```text
+Status:       200
+HTTP version: HTTP_2
+Final URI:    https://fakestoreapi.com/products/1
+Content-Type: application/json; charset=utf-8
+Server hdrs:  [cloudflare]
+Body chars:   198
+HTTP version: HTTP_2
+OK
+```
+
+Several patterns matter here. First, header lookup is case-insensitive. `firstValue("Content-Type")`, `firstValue("content-type")`, and `firstValue("CONTENT-TYPE")` all return the same value. Second, a header can have multiple values (for example, `Set-Cookie`), so `allValues` returns a `List<String>`. Third, the API treats non-2xx responses as normal completions, not exceptions. A 404 is not an `IOException`; it is a successful HTTP exchange that returned a 404 body. Check `statusCode()` explicitly to treat non-2xx as a failure.
+
+<h1 id="error-handling">Error Handling</h1>
+
+`send` throws `IOException` and `InterruptedException`. `sendAsync` completes the future exceptionally with the same set of causes, plus anything thrown by your downstream handlers.
+
+```java
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
+import java.time.Duration;
+
+public class HandlingErrors {
+
+    public static void main(String[] args) {
+        HttpClient client = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(2))
+                .build();
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create("https://api.example.com/orders/123"))
+                .timeout(Duration.ofMillis(500))
+                .GET()
+                .build();
+
+        try {
+            HttpResponse<String> response = client.send(
+                    request, HttpResponse.BodyHandlers.ofString());
+            System.out.println("Got " + response.statusCode());
+        } catch (HttpTimeoutException e) {
+            System.out.println("Request did not complete within 500 ms");
+        } catch (java.io.IOException e) {
+            System.out.println("Network failure: " + e.getMessage());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            System.out.println("Interrupted while waiting");
+        }
+    }
+}
+```
+
+**Output (when server is unreachable):**
+
+```text
+Network failure: api.example.com
+```
+
+The exception hierarchy is straightforward: `HttpTimeoutException` extends `IOException`, so if you only catch `IOException` you handle both. Catch `HttpTimeoutException` separately when you want to distinguish a timeout from a connection refused, since the retry strategy is usually different (retry the timeout, fail fast on a refusal).
+
+The `InterruptedException` deserves the canonical fix shown above: restore the interrupt flag with `Thread.currentThread().interrupt()` before exiting the catch. Otherwise upstream code that checks the flag will miss the interrupt.
+
+<h1 id="reusing-one-httpclient">Reusing One HttpClient</h1>
+
+A common mistake is treating `HttpClient` like a request object and building a fresh one for every call.
+
+**What's wrong with this code?**
+
+```java
+public class OrderService {
+    public String fetchOrder(long orderId) throws Exception {
+        HttpClient client = HttpClient.newHttpClient(); // fresh client every call
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create("https://api.example.com/orders/" + orderId))
+                .build();
+        return client.send(request, HttpResponse.BodyHandlers.ofString()).body();
+    }
+}
+```
+
+Every call to `fetchOrder` creates a brand-new client. The new client starts a fresh executor, opens a fresh TCP connection (full TCP and TLS handshake), uses it once, and lets it sit unused until garbage collection closes it. None of the connection pool, none of the HTTP/2 stream reuse, none of the executor warm-up survives between calls.
+
+**Fix:**
+
+```java
+public class OrderService {
+    private static final HttpClient client = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(5))
+            .build();
+
+    public String fetchOrder(long orderId) throws Exception {
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create("https://api.example.com/orders/" + orderId))
+                .build();
+        return client.send(request, HttpResponse.BodyHandlers.ofString()).body();
+    }
+}
+```
+
+One client, shared across all calls. The class is thread-safe by design. Internally it keeps a pool of TCP connections per host, reuses them across requests, and multiplexes streams over a single HTTP/2 connection. The cost of the first request to a host is the connection setup; subsequent requests to the same host reuse the existing connection.
+
+The same anti-pattern shows up in another form: blocking `send` on the wrong thread.
+
+**What's wrong with this code?**
+
+```java
+button.setOnAction(event -> {
+    HttpResponse<String> response = client.send(request,
+            HttpResponse.BodyHandlers.ofString());
+    label.setText(response.body());
+});
+```
+
+This call happens on the UI event thread. While `send` blocks, the UI is frozen. The same problem appears on Netty event loops, Vert.x verticles, and any reactive framework where the calling thread is non-blocking by contract.
+
+**Fix:**
+
+```java
+button.setOnAction(event -> {
+    client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+          .thenApply(HttpResponse::body)
+          .thenAccept(body -> Platform.runLater(() -> label.setText(body)));
+});
+```
+
+`sendAsync` returns immediately. The response is delivered on the client's executor. `Platform.runLater` (or the equivalent for your UI toolkit) hops back to the UI thread to update the label.
+
+Connection setup is the expensive part. A cold TCP connect plus TLS handshake to a remote service can be 100-300 ms. Reusing an existing connection drops that to single-digit milliseconds. One shared `HttpClient` per process matters more than almost any other optimization here.
+
+<h1 id="http2-and-multiplexing">HTTP/2 and Multiplexing</h1>
+
+The new client speaks HTTP/2 out of the box. That matters because HTTP/2 multiplexes many logical streams over a single TCP connection, while HTTP/1.1 has to either pipeline (rarely used) or open multiple connections in parallel.
+
+In HTTP/1.1, a browser or client typically opens up to six parallel connections per host. Each connection carries one request at a time. With HTTP/2, a single connection carries many concurrent streams. There is one TCP handshake, one TLS handshake, one congestion window. The savings are largest on high-latency links and on workloads that fan out many small requests to the same host (which is exactly what microservice meshes do).
+
+The client picks HTTP/2 automatically when the server supports it. Negotiation happens via ALPN during the TLS handshake. If the server only supports HTTP/1.1, the client falls back transparently. You can force the version per request:
+
+```java
+HttpRequest http1Request = HttpRequest.newBuilder()
+        .uri(URI.create("https://legacy.example.com/orders"))
+        .version(HttpClient.Version.HTTP_1_1)
+        .GET()
+        .build();
+```
+
+This is occasionally useful when an HTTP/2 server has a bug or an intermediate proxy mangles HTTP/2 frames. For most code, leave the default alone.
+
+A burst of 50 requests to the same host on HTTP/2 uses one TCP socket, one TLS session, and a single congestion window. The same burst on HTTP/1.1 opens six sockets and queues the rest, multiplying handshake cost and head-of-line latency. For a fan-out heavy service, HTTP/2 is often the biggest single throughput improvement available.
+
+<h1 id="httpurlconnection-vs-httpclient">HttpURLConnection vs HttpClient</h1>
+
+The same GET with the legacy `HttpURLConnection` and with the new `HttpClient`:
+
+```java
+// Legacy: HttpURLConnection
+public static String fetchLegacy(String url) throws Exception {
+    java.net.HttpURLConnection conn =
+            (java.net.HttpURLConnection) java.net.URI.create(url).toURL().openConnection();
+    conn.setRequestMethod("GET");
+    conn.setRequestProperty("Accept", "application/json");
+    conn.setConnectTimeout(5000);
+    conn.setReadTimeout(10000);
+    try (java.io.InputStream in = conn.getInputStream();
+         java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream()) {
+        in.transferTo(out);
+        return out.toString(java.nio.charset.StandardCharsets.UTF_8);
+    } finally {
+        conn.disconnect();
+    }
+}
+```
+
+```java
+// Modern: HttpClient
+public static String fetchModern(HttpClient client, String url) throws Exception {
+    HttpRequest request = HttpRequest.newBuilder()
+            .uri(URI.create(url))
+            .header("Accept", "application/json")
+            .timeout(Duration.ofSeconds(10))
+            .GET()
+            .build();
+    return client.send(request, HttpResponse.BodyHandlers.ofString()).body();
+}
+```
+
+Side by side:
+
+| Aspect                        | `HttpURLConnection`                                 | `HttpClient`                                               |
+| ----------------------------- | --------------------------------------------------- | ---------------------------------------------------------- |
+| Lines of code for a basic GET | 10-12                                               | 4-6                                                        |
+| Builder / fluent API          | No                                                  | Yes                                                        |
+| Async support                 | None (DIY with threads)                             | `sendAsync` returns `CompletableFuture`                    |
+| HTTP/2                        | No                                                  | Yes (negotiated by default)                                |
+| HTTPS / TLS                   | Yes (via `HttpsURLConnection`)                      | Yes, single class                                          |
+| Body publisher abstraction    | None (write bytes to `OutputStream`)                | `BodyPublishers.ofString/ofFile/...`                       |
+| Body handler abstraction      | None (read bytes from `InputStream`)                | `BodyHandlers.ofString/ofFile/...`                         |
+| Timeout API                   | Two ints (`connect`, `read`) in ms                  | `Duration` for connect and request                         |
+| Connection pooling            | Yes (via JVM defaults)                              | Yes (built-in per-host pool)                               |
+| Thread safety of client       | N/A (one connection per object)                     | Yes (one shared client, many requests)                     |
+| Cookie handling               | Manual via `CookieHandler` system                   | Configured on the builder                                  |
+| Redirect handling             | Manual on by default, controlled by system property | `Redirect.NEVER` / `NORMAL` / `ALWAYS`                     |
+| Error model                   | Mix of return codes and exceptions                  | Single `IOException` hierarchy plus `HttpTimeoutException` |
+
+For new code, there is no good reason to use `HttpURLConnection`. It only survives in legacy codebases targeting Java 8 and below, and a few third-party libraries that have not been updated. Any Java 11+ project should standardize on `HttpClient`.
+
+<h1 id="the-request-response-lifecycle">The Request-Response Lifecycle</h1>
+
+What happens between `client.send(request, ...)` and the returned response:
+
+The diagram traces a single call through the client. The connection pool is what makes "one client per app" so much faster than "one client per call." The first request to a host pays the connect-and-handshake cost; every subsequent request to the same host skips to the write step. On HTTP/2, even concurrent requests share one connection because each one runs on its own stream.
+
+When the response arrives, the body handler decides how to consume it. `ofString` accumulates bytes into a buffer and decodes once the stream ends. `ofFile` writes chunks to disk as they arrive. `ofInputStream` returns immediately with a stream the caller pulls from. The choice of handler controls memory pressure for large responses.
+
+The connection goes back into the pool when the body has been fully consumed. For `ofString` and `ofByteArray`, that happens automatically. For `ofInputStream`, the stream must be drained or closed. Leaving it open keeps the connection in use and starves the pool.
+
+<h1 id="a-note-on-websockets">A Note on WebSockets</h1>
+
+The `java.net.http` package also includes `WebSocket`, a separate but related API. It is built from the same client (`client.newWebSocketBuilder().buildAsync(uri, listener)`), and gives full-duplex messaging once the upgrade handshake completes. Use it for chat features, live order tracking dashboards, and price ticker streams. Its API is not covered here because it is a different surface, but it lives in the same package and reuses the same `HttpClient`.
+
+<h1 id="bringing-it-together">Bringing It Together</h1>
+
+A short end-to-end example: an order placement flow that calls product detail, runs an inventory check across regions, and then POSTs the order.
+
+```java
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+
+public class OrderPlacement {
+
+    private static final HttpClient client = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(3))
+            .version(HttpClient.Version.HTTP_2)
+            .build();
+
+    public static void main(String[] args) {
+        long productId = 42;
+
+        CompletableFuture<String> productDetail = fetch(
+                "https://catalog.example.com/products/" + productId);
+
+        CompletableFuture<List<String>> inventoryByRegion = CompletableFuture.allOf(
+                fetch("https://inventory-us.example.com/products/" + productId),
+                fetch("https://inventory-eu.example.com/products/" + productId)
+        ).thenApply(v -> List.of("us:ok", "eu:ok"));
+
+        CompletableFuture<HttpResponse<String>> orderPosted =
+                productDetail.thenCombine(inventoryByRegion, (detail, inv) -> {
+                    String body = "{\"productId\":" + productId + ",\"quantity\":1}";
+                    HttpRequest req = HttpRequest.newBuilder()
+                            .uri(URI.create("https://orders.example.com/orders"))
+                            .header("Content-Type", "application/json")
+                            .POST(HttpRequest.BodyPublishers.ofString(body))
+                            .build();
+                    return req;
+                }).thenCompose(req ->
+                        client.sendAsync(req, HttpResponse.BodyHandlers.ofString()));
+
+        orderPosted.thenAccept(resp ->
+                System.out.println("Order POST status: " + resp.statusCode())
+        ).exceptionally(err -> {
+            System.out.println("Order flow failed: " + err.getMessage());
+            return null;
+        }).join();
+    }
+
+    private static CompletableFuture<String> fetch(String url) {
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .GET()
+                .build();
+        return client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+                .thenApply(HttpResponse::body);
+    }
+}
+```
+
+The product detail and the inventory check run in parallel because nothing in the flow needs one before the other. Only the order POST depends on both, and `thenCombine` waits for both before composing the request. The whole call graph runs on the client's executor; the main thread blocks once at the end with `.join()` so the program can finish. In a production service, that final `.join()` would be replaced with returning the future to a framework like Spring WebFlux or Helidon, which propagates it back to the HTTP client without ever blocking a request-handling thread.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

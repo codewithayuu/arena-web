@@ -1,0 +1,359 @@
+---
+title: "Stream Operations"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Stream Operations explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+Every stream pipeline is a chain of operations, but those operations aren't all the same kind. Some return another stream and stay lazy; others run the pipeline and produce a result. Some look at one element at a time; others need to see the whole sequence. This lesson maps the categories that stream operations fall into.
+
+<h1 id="intermediate-vs-terminal">Intermediate vs Terminal</h1>
+
+Every operation on a stream is either intermediate or terminal. That single split decides whether the operation extends the pipeline or executes it.
+
+An **intermediate** operation takes a stream, returns another stream, and does not consume any elements when called. Methods like `filter`, `map`, `sorted`, and `limit` all fit here. Chaining them just stacks more steps onto the recipe.
+
+A **terminal** operation takes a stream, returns something that isn't a stream (a value, a collection, a primitive, or `void`), and triggers execution of every intermediate step that came before it. Methods like `forEach`, `count`, `collect`, `reduce`, and `findFirst` belong to this group.
+
+A pipeline with no terminal operation does nothing. Building it allocates a few small objects, but no element ever moves through the chain. The example below shows the silence.
+
+```java
+import java.util.List;
+import java.util.stream.Stream;
+
+public class NoTerminal {
+    public static void main(String[] args) {
+        List<String> products = List.of("Notebook", "Pen", "Eraser");
+
+        Stream<String> pipeline = products.stream()
+            .filter(name -> {
+                System.out.println("Filtering " + name);
+                return name.length() > 3;
+            })
+            .map(name -> {
+                System.out.println("Mapping " + name);
+                return name.toUpperCase();
+            });
+
+        System.out.println("Pipeline built. Nothing ran yet.");
+    }
+}
+```
+
+No "Filtering" or "Mapping" lines appear because no terminal operation pulled elements through. Add `.count()` or `.forEach(System.out::println)` to the end and the chain comes alive.
+
+A pipeline can have any number of intermediate operations, but it needs **exactly one** terminal operation. Zero terminals means nothing executes. After a terminal runs, the stream is consumed, and you can't add another operation to it.
+
+The shape of every well-formed stream pipeline is:
+
+```text
+source -> 0..N intermediate ops -> 1 terminal op
+```
+
+<h1 id="stateless-vs-stateful-intermediate-operations">
+  Stateless vs Stateful Intermediate Operations
+</h1>
+
+Intermediate operations split into two sub-categories based on whether processing one element needs information about other elements.
+
+A **stateless** intermediate operation processes each element independently. The decision to keep, transform, or drop the element depends only on that element. `filter`, `map`, `flatMap`, and `peek` are stateless. Pushing one element through any of them doesn't require looking at what came before or what comes after.
+
+A **stateful** intermediate operation has to remember elements it has already seen, and sometimes it has to see the entire stream before producing the next output. `sorted`, `distinct`, `limit`, `skip`, and the Java 9 additions `takeWhile` and `dropWhile` are stateful.
+
+Some examples make the difference concrete.
+
+```java
+import java.util.List;
+
+public class StatelessVsStateful {
+    public static void main(String[] args) {
+        List<Integer> prices = List.of(120, 80, 60, 200, 40);
+
+        // Stateless: each price is checked alone
+        long inStock = prices.stream()
+            .filter(price -> price <= 100)
+            .count();
+
+        // Stateful: sorted needs to see every price before emitting any
+        List<Integer> sorted = prices.stream()
+            .sorted()
+            .toList();
+
+        System.out.println("Affordable count: " + inStock);
+        System.out.println("Sorted: " + sorted);
+    }
+}
+```
+
+The `filter` makes its choice one price at a time. The `sorted` step can't emit a single element until it has buffered the entire input, because the smallest value might be the very last one the source produces.
+
+The same pattern applies to `distinct`, which has to remember every element it has already let through to know whether the next one is a duplicate. `limit(n)` is stateful in a milder way: it has to count how many elements it has emitted so it knows when to stop. `skip(n)` is the mirror image.
+
+Stateful operations cost more memory than stateless ones. `sorted` and `distinct` typically buffer the entire stream. In a sequential pipeline this is fine for normal-sized inputs, but on a parallel stream the buffering and coordination across threads makes stateful operations noticeably slower than their stateless counterparts.
+
+One more detail: a stateful operation breaks the per-element flow of the pipeline. With only stateless ops, each element streams from source to terminal in one pass. The moment you add `sorted`, the pipeline has to pause at that step, collect everything, sort, and then push the sorted sequence to whatever comes after. That pause is invisible in code but matters when reasoning about memory or performance.
+
+<h1 id="short-circuiting-operations">Short-Circuiting Operations</h1>
+
+Some operations let the pipeline stop early, before consuming every element. These are called **short-circuiting** operations, and they come in both intermediate and terminal flavors.
+
+A short-circuiting intermediate operation may produce a finite stream from an arbitrarily large input. `limit(n)` is the obvious example: no matter how many elements upstream produces, the pipeline never asks for more than `n`. `takeWhile(predicate)` is the other one: it keeps elements as long as the predicate holds and stops at the first failure.
+
+A short-circuiting terminal operation may finish without examining the rest of the stream. `findFirst`, `findAny`, `anyMatch`, `allMatch`, and `noneMatch` are all short-circuiting. `findFirst` stops at the first element. `anyMatch` stops at the first element that satisfies the predicate. `allMatch` stops at the first element that fails it. `noneMatch` stops at the first element that satisfies it.
+
+The classic example is asking the first available product from a list.
+
+```java
+import java.util.List;
+import java.util.Optional;
+
+public class FirstAvailable {
+    public static void main(String[] args) {
+        List<String> shelf = List.of("Notebook", "Pen", "Eraser", "Marker");
+
+        Optional<String> first = shelf.stream()
+            .filter(name -> {
+                System.out.println("Checking " + name);
+                return name.length() > 3;
+            })
+            .findFirst();
+
+        System.out.println("First match: " + first.orElse("none"));
+    }
+}
+```
+
+The `filter` check runs once. `findFirst` got its answer at the first element and shut the pipeline down. The other three names never get checked. Without `findFirst`, a terminal like `count()` would force the filter to run for every element.
+
+Short-circuiting is the reason infinite streams are usable. A source like `Stream.iterate` produces values forever, but a pipeline that ends with `limit(5).toList()` or `findFirst()` will terminate.
+
+```java
+import java.util.List;
+import java.util.stream.Stream;
+
+public class FirstFiveOrderIds {
+    public static void main(String[] args) {
+        List<Integer> ids = Stream.iterate(1001, id -> id + 1)
+            .limit(5)
+            .toList();
+
+        System.out.println(ids);
+    }
+}
+```
+
+The `Stream.iterate` source would generate order ids forever. The `limit(5)` short-circuits it after five elements, so the pipeline finishes. Without `limit`, `toList()` would never return.
+
+A short-circuiting operation tells the pipeline "I'm done, stop pulling elements." Upstream sees the signal and shuts off. Operations that aren't short-circuiting always need to see the whole input to compute their answer.
+
+The diagram shows what happens when an infinite source feeds a pipeline with short-circuiting ops. `findFirst` decides it has enough after one element flows through, and the request to pull more never reaches the source. Both `limit` and `findFirst` participate in shutting the pipeline down, which is why the program returns instead of looping forever.
+
+<h1 id="encounter-order">Encounter Order</h1>
+
+Streams have a concept called **encounter order**. It's the order in which the source produces elements: the iteration order of a `List`, the natural order of a sorted set, the order returned by a generator. Some sources have an encounter order (lists, arrays, `Stream.of`), others don't (a `HashSet`).
+
+Operations interact with encounter order in three ways. Most ops preserve it: `filter`, `map`, `peek`, and `sorted` all hand elements to the next step in the same order they came in (or in sorted order, for `sorted`). A few care about it: `findFirst` returns the first element in encounter order, while `findAny` is free to return any element. And one op explicitly drops it: `unordered()` tells the pipeline "I don't care about order, optimize freely."
+
+The difference between `findFirst` and `findAny` is subtle in sequential streams. In a sequential pipeline both usually return the same thing, because the only element the pipeline has examined is the first one. In parallel pipelines, `findAny` can return whichever match a worker thread finds first, which is often faster.
+
+```java
+import java.util.List;
+
+public class FindFirstVsAny {
+    public static void main(String[] args) {
+        List<String> products = List.of("Notebook", "Pen", "Eraser", "Marker", "Folder");
+
+        // Sequential: findFirst and findAny both return "Notebook"
+        System.out.println(products.stream().findFirst().orElse("none"));
+        System.out.println(products.stream().findAny().orElse("none"));
+
+        // Parallel: findAny may return any element, findFirst still returns the first
+        System.out.println(products.parallelStream().findFirst().orElse("none"));
+        System.out.println(products.parallelStream().findAny().orElse("none"));
+    }
+}
+```
+
+The last line isn't stable. Run the program again and `findAny` on the parallel stream might return `Pen` or `Marker` instead. That's the point: `findAny` gives up the encounter-order guarantee so worker threads don't have to coordinate.
+
+`forEach` and `forEachOrdered` show the same trade-off on the terminal side. `forEach` runs its action on each element in whatever order the pipeline produces them. In a parallel stream, that order is undefined and threads may interleave. `forEachOrdered` forces the actions to run in encounter order, even in a parallel pipeline, which means it has to synchronize between threads.
+
+```java
+import java.util.List;
+
+public class OrderedForEach {
+    public static void main(String[] args) {
+        List<String> products = List.of("Notebook", "Pen", "Eraser", "Marker");
+
+        System.out.println("forEach (parallel):");
+        products.parallelStream().forEach(System.out::println);
+
+        System.out.println("forEachOrdered (parallel):");
+        products.parallelStream().forEachOrdered(System.out::println);
+    }
+}
+```
+
+**Output (one possible run):**
+
+```text
+forEach (parallel):
+Eraser
+Notebook
+Marker
+Pen
+forEachOrdered (parallel):
+Notebook
+Pen
+Eraser
+Marker
+```
+
+The `forEach` block's order varies between runs. The `forEachOrdered` block always prints in source order, paying for that guarantee with cross-thread coordination.
+
+Calling `.unordered()` on a stream is a separate signal. It tells the pipeline that downstream operations don't require encounter order, which lets ops like `distinct` and `limit` skip extra coordination on parallel streams. Most code doesn't need it. When you do, it's a performance hint.
+
+`forEachOrdered` on a parallel stream forces threads to wait for elements to arrive in the right order before they can hand off to the action. If that order isn't required, `forEach` is faster.
+
+<h1 id="lazy-vs-eager">Lazy vs Eager</h1>
+
+Intermediate operations are **lazy**: they record what they're supposed to do and emit nothing until a terminal operation pulls. Terminal operations are **eager**: they drive the whole pipeline, requesting elements from the source through the chain of intermediates.
+
+The earlier `NoTerminal` example was the visible side of laziness. Until a terminal runs, the filter and map closures never execute. Even the source isn't asked for any elements. Building a stream pipeline is just composing a recipe.
+
+When a terminal runs, the pipeline pulls elements one by one (for sequential streams), passing each through the chain of stateless ops before fetching the next. Stateful ops break this per-element flow: `sorted` pauses the pipeline at its step, drains everything, sorts, then resumes. Short-circuiting ops can stop the pull at any point.
+
+A useful exercise is to predict the print order from a pipeline with a `peek` at each step.
+
+```java
+import java.util.List;
+
+public class LazyOrder {
+    public static void main(String[] args) {
+        List<String> products = List.of("Notebook", "Pen", "Eraser", "Marker");
+
+        long count = products.stream()
+            .peek(p -> System.out.println("source: " + p))
+            .filter(p -> p.length() > 3)
+            .peek(p -> System.out.println("after filter: " + p))
+            .map(String::toUpperCase)
+            .peek(p -> System.out.println("after map: " + p))
+            .count();
+
+        System.out.println("Final count: " + count);
+    }
+}
+```
+
+Each element flows all the way through the pipeline before the next one is pulled. `Notebook` goes source -> filter -> map; then `Pen` enters the source and is dropped by the filter, so the rest of the chain never sees it; then `Eraser` and `Marker` each take their full trip. This per-element flow is what stateless intermediate ops give you. Add a `sorted` step and the output reorganizes, because the stream has to be fully buffered at that point.
+
+<h1 id="side-effects-are-discouraged">Side Effects Are Discouraged</h1>
+
+Streams operations should ideally be pure: they take input, produce output, and don't touch state outside themselves. A `filter` predicate that reads only its argument is pure. A `map` function that returns a new value based only on its input is pure. The opposite of pure is having a **side effect**, where an operation mutates state outside itself, like writing to a shared variable, modifying a collection, or printing to a file.
+
+Side effects work in sequential streams, but they range from awkward to broken on parallel ones. The textbook bad example is collecting results by appending to an `ArrayList` inside `forEach`.
+
+**What's wrong with this code?**
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class BrokenAccumulator {
+    public static void main(String[] args) {
+        List<String> products = List.of("Notebook", "Pen", "Eraser", "Marker", "Folder");
+        List<String> uppercase = new ArrayList<>();
+
+        products.parallelStream()
+            .map(String::toUpperCase)
+            .forEach(uppercase::add); // side effect on shared mutable state
+
+        System.out.println(uppercase.size());
+    }
+}
+```
+
+**Fix:** use a terminal operation that collects without side effects.
+
+```java
+import java.util.List;
+
+public class FixedAccumulator {
+    public static void main(String[] args) {
+        List<String> products = List.of("Notebook", "Pen", "Eraser", "Marker", "Folder");
+
+        List<String> uppercase = products.parallelStream()
+            .map(String::toUpperCase)
+            .toList();
+
+        System.out.println(uppercase.size());
+    }
+}
+```
+
+The broken version may print `5`, or `4`, or throw an `ArrayIndexOutOfBoundsException` from inside `ArrayList`, depending on timing. `ArrayList` isn't thread-safe, so multiple worker threads writing to it concurrently can corrupt its internal state. The fix replaces the mutation with `toList()`, which is a terminal operation designed for collecting results and handles the merging across threads internally.
+
+The same principle applies more subtly. A `filter` predicate that reads a shared counter, a `map` function that increments a static field, or a `peek` that logs to a non-thread-safe logger can all misbehave in parallel pipelines. The general rule: closures inside stream operations should read only their arguments and (effectively final) outer variables, not mutate them. If you need to accumulate, use a terminal operation like `collect`, `reduce`, or `toList`.
+
+Trying to fix the broken accumulator by switching `ArrayList` to a synchronized list or `CopyOnWriteArrayList` works, but it serializes the threads at the contended write point. Most of the parallel speed-up is lost, and the design is still a tangle. `toList()` and `collect` are cheaper because they let each thread accumulate into its own local container and merge at the end.
+
+`peek` is the one intermediate op that's expected to have side effects, and the docs are explicit that it's mainly a debugging aid. Using `peek` to update real program state is a common anti-pattern.
+
+<h1 id="the-categorization-table">The Categorization Table</h1>
+
+The table below sorts the standard `java.util.stream.Stream` operations into the four cells we care about: intermediate-stateless, intermediate-stateful, terminal-short-circuiting, and terminal-non-short-circuiting. Use it as the map for the next two lessons.
+
+| Category                       | Operations                                                                                                                             | Notes                                                                                                                                  |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Intermediate, stateless        | `filter`, `map`, `mapToInt` / `mapToLong` / `mapToDouble`, `mapToObj`, `flatMap` (and primitive variants), `peek`                      | Process each element independently. Cheap and parallelism-friendly.                                                                    |
+| Intermediate, stateful         | `distinct`, `sorted` (natural and with `Comparator`), `limit`, `skip`, `takeWhile`, `dropWhile`                                        | Need to see prior elements (or all elements). More expensive in parallel pipelines. `limit` and `takeWhile` are also short-circuiting. |
+| Terminal, short-circuiting     | `findFirst`, `findAny`, `anyMatch`, `allMatch`, `noneMatch`                                                                            | May finish without consuming the whole stream. Make infinite streams usable.                                                           |
+| Terminal, non-short-circuiting | `forEach`, `forEachOrdered`, `count`, `min`, `max`, `reduce`, `sum` / `average` (on primitive streams), `collect`, `toArray`, `toList` | Must drain the stream to compute their answer.                                                                                         |
+
+A few notes to keep in mind when reading across the rows:
+
+`limit` and `takeWhile` are stateful **and** short-circuiting, which is unusual. Most intermediate ops fall in one category or the other.
+
+`skip` is stateful but not short-circuiting: it still has to let the stream produce its later elements.
+
+The primitive specializations (`IntStream`, `LongStream`, `DoubleStream`) carry their own versions of these ops with the same categorization. `sum()` on an `IntStream` is a non-short-circuiting terminal, just like `count()` on a regular stream.
+
+`Stream.iterate(seed, hasNext, next)`, the three-argument form added in Java 9, lets the source itself short-circuit when `hasNext` returns `false`. It's the closest thing to a "finite generator" in the stream API.
+
+<h1 id="putting-the-categories-together">Putting the Categories Together</h1>
+
+A real pipeline mixes ops from several categories. Reading a pipeline well is partly knowing which category each step belongs to, because that tells you what the pipeline costs and whether parallelization makes sense.
+
+A small example:
+
+```java
+import java.util.List;
+
+public class FirstAffordable {
+    public static void main(String[] args) {
+        List<Integer> prices = List.of(120, 80, 60, 200, 40, 150);
+
+        Integer firstUnderHundred = prices.stream()  // source
+            .filter(price -> price < 100)            // intermediate, stateless
+            .sorted()                                // intermediate, stateful
+            .findFirst()                             // terminal, short-circuiting
+            .orElse(-1);
+
+        System.out.println("First (sorted) under 100: " + firstUnderHundred);
+    }
+}
+```
+
+The categories tell a story. `filter` is stateless, so it lets through elements one at a time. `sorted` is stateful: when the pipeline reaches it, every filtered element gets buffered, the buffer is sorted, and the sorted sequence flows out. `findFirst` is short-circuiting, but only after `sorted` has emitted its first element (which is the smallest in the buffer). So `findFirst` reads exactly one element from `sorted`'s output, but `sorted` itself read every element from `filter`.
+
+The pipeline above runs the filter on six prices, sorts three, and returns one. If the original list had ten thousand prices, the filter would still run ten thousand times and the sort would buffer everything that passed it. The "short-circuit" only takes effect after the stateful op finishes its job.
+
+That's the practical point of categorizing operations. The category of an op tells you most of what you need to know about its cost, its laziness, and how it behaves in parallel.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

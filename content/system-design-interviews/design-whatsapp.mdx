@@ -1,0 +1,922 @@
+---
+title: "Design WhatsApp"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Design WhatsApp explained with clear examples, visuals, and practice questions in Mindflare's System Design Interviews course."
+---
+
+<LessonCard>
+
+Here is an example of how a discussion between the candidate and the interviewer might unfold:
+
+> **Candidate:** "What is the expected scale? How many users and messages per day should the system support?"
+>
+> **Interviewer:** "Let's design for 500 million daily active users (DAU) sending an average of 40 messages per day."
+>
+> **Candidate:** "Should we support only one-on-one messaging, or also group chats?"
+>
+> **Interviewer:** "Both. Group chats should support up to 500 members."
+>
+> **Candidate:** "What types of content should messages support? Text only, or also media like images and videos?"
+>
+> **Interviewer:** "Focus on text messages for the core design. You can mention media handling at a high level, but detailed media processing is out of scope."
+>
+> **Candidate:** "Do we need to show online/offline status and typing indicators?"
+>
+> **Interviewer:** "Yes, presence indicators (online/offline/last seen) are important. Typing indicators are nice-to-have."
+>
+> **Candidate:** "What about message delivery guarantees? Should users see read receipts?"
+>
+> **Interviewer:** "Yes. Users should see when their message is delivered and when it's read. Messages should never be lost."
+>
+> **Candidate:** "Should messages be stored permanently, or can they expire?"
+>
+> **Interviewer:** "Messages should be stored until explicitly deleted by the user. We need to support message history sync across devices."
+>
+> **Candidate:** "What about end-to-end encryption?"
+>
+> **Interviewer:** "You can mention it conceptually, but detailed cryptographic implementation is out of scope."
+
+After gathering the details, we can summarize the key system requirements.
+
+> To keep our discussion focused, we will set aside a few features that, while important, would expand the scope beyond a single interview:
+>
+> - **Media Messages:** Images, videos, voice notes (mentioned conceptually only).
+> - **Voice/Video Calls:** Real-time audio and video communication.
+> - **End-to-End Encryption:** Detailed cryptographic implementation.
+> - **Stories/Status Updates:** Ephemeral content sharing.
+
+<h1 id="2-back-of-the-envelope-estimation">
+  2. Back-of-the-Envelope Estimation
+</h1>
+
+With our requirements clear, lets understand the scale we are dealing with. In most interviews, you are not required to do a detailed estimation.
+
+> We will use these baseline numbers throughout our calculations:
+>
+> - **Daily Active Users (DAU):** 500 million
+> - **Messages per user per day:** 40
+> - **Average message size:** 100 bytes (text content + metadata)
+> - **Average group size:** 20 members
+> - **Percentage of group messages:** 30%
+
+<h4 id="message-throughput">Message Throughput</h4>
+
+Let's start with the fundamental question: how many messages flow through this system?
+
+- **Total messages per day:** 500 million users x 40 messages = **20 billion messages/day**
+
+Twenty billion. That is 20,000,000,000 messages every single day. Let's convert that to something more tangible:
+
+- **Average messages per second:** 20 billion / 86,400 seconds = **~230,000 messages/second**
+- **Peak load (3x average):** **~700,000 messages/second**
+
+The 3x multiplier accounts for peak hours when everyone is awake and chatting. Traffic is never uniform throughout the day.
+
+These numbers tell us something important: we are looking at hundreds of thousands of concurrent operations per second. This rules out naive approaches like having clients poll the database for new messages. We need persistent connections, efficient routing, and aggressive caching.
+
+<h4 id="connection-load">Connection Load</h4>
+
+Messaging systems differ from typical web applications here. Unlike a website where users make requests and disconnect, a messaging app needs to push messages to users the instant they arrive.
+
+That means maintaining persistent connections with every online user.
+
+- **Concurrent connections:** If 10% of DAU are online at any time = **50 million concurrent connections**
+- **Peak concurrent connections:** **~100 million**
+
+Each of these 50 million connections requires maintaining a persistent WebSocket. This is a fundamentally different challenge from handling 50 million HTTP requests per day. These connections stay open, consuming memory and file descriptors on our servers.
+
+If a single well-tuned server can handle 50,000 concurrent WebSocket connections (a reasonable estimate for modern hardware with proper kernel tuning), we need:
+
+```text
+50 million connections / 50,000 per server = 1,000 chat servers
+```
+
+That covers the average load. To absorb the ~100 million peak, we provision roughly double, around 2,000 servers. For connection handling alone, we are looking at a fleet of a couple thousand servers.
+
+<h4 id="storage-per-day">Storage (Per Day)</h4>
+
+Storage requirements for a text-only system are more modest than you might expect:
+
+- **Message storage:** 20 billion messages x 100 bytes = **2 TB/day**
+- **Annual storage:** 2 TB x 365 = **730 TB/year** (messages alone)
+
+730 TB/year is well within reach of distributed databases like Cassandra or ScyllaDB (with replication, plan for roughly 3x). The real challenge is not capacity but access patterns: we write 230,000 messages per second while simultaneously reading history and syncing devices, so latency matters more than raw throughput.
+
+<h4 id="bandwidth">Bandwidth</h4>
+
+Inbound is modest: 230K msg/sec x 100 bytes is about 23 MB/sec. Outbound is higher because group messages fan out to multiple devices, but even so we stay in the range of hundreds of megabytes per second, which modern network infrastructure handles easily. Bandwidth is not the bottleneck for text messaging.
+
+<h1 id="3-core-apis">3. Core APIs</h1>
+
+Defining the APIs early forces us to think concretely about what users can do and what data flows through the system. A messaging system's API is unusual: most real-time communication happens over persistent WebSocket connections rather than HTTP request-response, but we still need REST endpoints for operations that do not require instant delivery, like fetching message history.
+
+Let's walk through the essential APIs.
+
+<h3 id="1-send-message">1. Send Message</h3>
+
+<h4 id="endpoint-websocket-message-or-post-messages">
+  Endpoint: WebSocket message or POST /messages
+</h4>
+
+This is the most frequent operation in the system. When a user taps send, this API handles getting the message from their device to ours.
+
+In practice, this almost always goes over the WebSocket connection for lowest latency, but having a REST fallback is useful when WebSocket connections fail.
+
+<h5 id="request-parameters">Request Parameters</h5>
+
+| Parameter           | Required | Description                                         |
+| ------------------- | -------- | --------------------------------------------------- |
+| `sender_id`         | Yes      | ID of the user sending the message                  |
+| `recipient_id`      | Yes      | ID of the recipient user or group                   |
+| `recipient_type`    | Yes      | Whether the recipient is a `user` or `group`        |
+| `content`           | Yes      | The actual message text                             |
+| `content_type`      | No       | Content kind: `text` (default), `image`, `video`    |
+| `client_message_id` | Yes      | Client-generated unique ID for deduplication        |
+| `timestamp`         | Yes      | Client-side timestamp when the message was composed |
+
+<h5 id="sample-response">Sample Response</h5>
+
+```json
+{
+  "message_id": "msg_123abc",
+  "status": "sent",
+  "server_timestamp": "2024-01-15T10:30:00.123Z"
+}
+```
+
+The `client_message_id` matters for reliability. If the network drops and the app retries a send, the server uses this ID to recognize the duplicate and store the message only once, which gives effectively-once delivery.
+
+<h3 id="2-fetch-messages">2. Fetch Messages</h3>
+
+<h4 id="endpoint-get-conversationsconversation_idmessages">
+  Endpoint: GET /conversations/{conversation_id}/messages
+</h4>
+
+When a user opens an old conversation or logs in on a new device, they need to see their message history. This endpoint retrieves messages for a conversation, typically the most recent ones first.
+
+<h5 id="request-parameters">Request Parameters</h5>
+
+| Parameter         | Required | Description                                          |
+| ----------------- | -------- | ---------------------------------------------------- |
+| `conversation_id` | Yes      | ID of the conversation to fetch                      |
+| `cursor`          | No       | Pagination cursor for fetching older messages        |
+| `limit`           | No       | Number of messages to return (default: 50, max: 100) |
+
+<h5 id="sample-response">Sample Response</h5>
+
+```json
+{
+  "messages": [
+    {
+      "message_id": "msg_123",
+      "sender_id": "user_456",
+      "content": "Hey, how are you?",
+      "timestamp": "2024-01-15T10:30:00Z",
+      "status": "read"
+    }
+  ],
+  "next_cursor": "eyJtc2dfaWQiOiJtc2dfMTIyIn0=",
+  "has_more": true
+}
+```
+
+We use cursor-based pagination rather than offset-based. With billions of messages, a query like `OFFSET 1000000` would be slow, requiring the database to skip over a million rows. Cursor-based pagination uses an indexed value (like a message ID or timestamp) to efficiently jump to the right position.
+
+<h3 id="3-update-message-status">3. Update Message Status</h3>
+
+<h4 id="endpoint-post-messagesmessage_idstatus">
+  Endpoint: POST /messages/{message_id}/status
+</h4>
+
+This is what powers those checkmarks. When a message is delivered to the recipient's device or opened by the user, we need to update its status and notify the sender.
+
+<h5 id="request-parameters">Request Parameters</h5>
+
+| Parameter    | Required | Description                       |
+| ------------ | -------- | --------------------------------- |
+| `message_id` | Yes      | ID of the message to update       |
+| `status`     | Yes      | New status: `delivered` or `read` |
+| `timestamp`  | Yes      | When the status change occurred   |
+
+Status updates flow in one direction: `sent → delivered → read`. We never go backwards. The timestamp helps with edge cases where status updates arrive out of order due to network delays.
+
+<h3 id="4-get-user-presence">4. Get User Presence</h3>
+
+<h4 id="endpoint-get-usersuser_idpresence">
+  Endpoint: GET /users/{user_id}/presence
+</h4>
+
+Returns whether a user is currently online and, if offline, when they were last active. This powers the "online" indicator and "last seen" text in the UI.
+
+<h5 id="sample-response">Sample Response</h5>
+
+```json
+{
+  "user_id": "user_456",
+  "status": "offline",
+  "last_seen": "2024-01-15T09:45:00Z"
+}
+```
+
+Presence is intentionally kept simple. We do not need to know exactly what a user is doing, only whether they are actively connected. Privacy controls allow users to hide their last seen time, in which case we omit that field.
+
+With our API contract defined, we have a clear picture of what the system needs to do. Now let's design the architecture that makes these APIs work at scale.
+
+<h1 id="4-high-level-design">4. High-Level Design</h1>
+
+We will build this system incrementally rather than presenting a full architecture diagram up front and explaining each box afterward.
+
+We will start with the simplest possible design that solves our first requirement, then add components only as we encounter new challenges. This mirrors how you should think through the problem in an interview.
+
+Our system must ultimately satisfy three core requirements:
+
+1. **Real-time Message Delivery:** Messages should reach online recipients within milliseconds.
+2. **Offline Message Handling:** Messages for offline users need to be stored and delivered when they come back online.
+3. **Group Message Distribution:** A single message should efficiently reach all group members.
+
+Before designing the architecture, one property shapes the rest: messaging is fundamentally a **push-based** system.
+
+Think about how a typical web application works. Your browser requests a page, the server responds, and the connection closes. If you want new data, you request again. This request-response pattern works great for most applications, but it falls apart for messaging.
+
+You cannot expect users to constantly refresh to check for new messages. The moment a message arrives at our servers, we need to push it to the recipient's device immediately.
+
+This push-based nature is why we need persistent WebSocket connections rather than traditional HTTP. And maintaining millions of persistent connections creates a whole set of challenges that we need to address.
+
+Let's start building, one requirement at a time.
+
+<h2 id="41-requirement-1-real-time-one-on-one-messaging">
+  4.1 Requirement 1: Real-time One-on-One Messaging
+</h2>
+
+Let's start with the simplest possible scenario: User A sends a message to User B, and User B is currently online with the app open.
+
+**What do we need to make this work?**
+
+With both users online, we push the message to User B the instant it arrives over a persistent connection. The question is which components make that happen.
+
+<h3 id="the-components-we-need">The Components We Need</h3>
+
+Let's introduce the components one by one, understanding why each exists.
+
+<h4 id="chat-servers">Chat Servers</h4>
+
+Chat servers handle most of the system's work. Each one maintains persistent WebSocket connections with thousands of clients simultaneously.
+
+When User A opens the messaging app, their phone establishes a WebSocket connection to one of the chat servers. This connection stays open for as long as the app is in use. When User A sends a message, it travels over this existing connection, no need to establish a new one.
+
+Beyond holding connections, a chat server routes messages to recipients that may live on other chat servers, sends heartbeats to detect dead connections, and handles reconnection when users switch networks.
+
+Chat servers are **stateful**. Unlike typical web servers where any server can handle any request, User B's messages must go to the specific chat server where User B's connection lives. If User B is connected to Chat Server 2, sending their message to Chat Server 1 will not help.
+
+This statefulness creates a routing challenge. When User A sends a message to User B, how does Chat Server 1 know that User B is on Chat Server 2?
+
+<h4 id="session-service">Session Service</h4>
+
+This is where the Session Service comes in. It maintains a simple but critical mapping: which user is connected to which chat server.
+
+When User B connects to Chat Server 2, that server registers the connection: "User B is on Chat Server 2." When User A wants to send a message to User B, we query the Session Service: "Where is User B?" It responds: "Chat Server 2."
+
+We typically implement this using **Redis** because it offers exactly what we need: fast key-value lookups with built-in expiration for handling disconnections. The data structure is simple:
+
+```text
+user_a -> chat_server_1
+user_b -> chat_server_2
+user_c -> chat_server_1
+...
+```
+
+<h4 id="message-service">Message Service</h4>
+
+While routing messages in real-time is essential, we also need to persist them. Users expect to see their message history. If User B's phone dies right as a message arrives, we do not want to lose it.
+
+The Message Service persists every message to the database before attempting delivery, generates server-side message IDs and timestamps for ordering, tracks message status (sent, delivered, read), and serves message history queries for the Fetch Messages API.
+
+<h3 id="putting-it-together-the-message-flow">
+  Putting It Together: The Message Flow
+</h3>
+
+Now let's trace what happens when User A sends "Hey, how's it going?" to User B. Both users are online, connected to different chat servers.
+
+Let's walk through the flow:
+
+When User A taps send, the message travels over the existing WebSocket to Chat Server 1, which first asks the Message Service to persist it. Persisting before anything else means the message survives even if a later step fails.
+
+The Message Service writes it to the database and returns a server-generated message ID and timestamp; the server's clock, not the client's, is the source of truth for ordering. With the message stored, Chat Server 1 queries the Session Service ("Where is User B?") and gets back "Chat Server 2" in under a millisecond.
+
+Chat Server 1 then forwards the message to Chat Server 2, typically over gRPC, and Chat Server 2 pushes it to User B. Direct server-to-server forwarding is simple, but maintaining a full mesh across thousands of chat servers is hard to manage.
+
+A common alternative is a publish/subscribe backplane (Redis Pub/Sub or Kafka) where each server subscribes to a channel for the users it holds, so the sender publishes to the recipient's channel instead of addressing a specific server.
+
+Finally, User B's client acknowledges receipt, the status updates to "delivered" along the way, and User A's UI shows the double checkmark. When both users are online, this round trip completes in under 100 milliseconds.
+
+This raises the next question: **what happens when User B is not online?**
+
+<h2 id="42-requirement-2-handling-offline-users">
+  4.2 Requirement 2: Handling Offline Users
+</h2>
+
+The flow we designed works when both users are online. Real-world messaging is messier than that. What happens when User B's phone is in airplane mode? What if they have not opened the app in hours? What if they are in a subway tunnel with no signal?
+
+We cannot drop the message; that would violate our reliability requirement. Users expect that once they tap send, the message eventually arrives, even if the recipient is unreachable for hours or days. So instead of pushing a message and forgetting about it, we need to track pending deliveries and retry when users come back online.
+
+<h3 id="new-components-for-offline-handling">
+  New Components for Offline Handling
+</h3>
+
+Let's introduce two new pieces to our architecture.
+
+<h4 id="offline-message-handling">Offline Message Handling</h4>
+
+The message is already persisted in the message database, so durability is covered. What we still need is a way to know which messages a user has not yet received, plus a pipeline to deliver them once the user returns.
+
+We track delivery progress with a per-user marker: the ID of the last message the user's device has acknowledged. Any message newer than that marker is pending. When the user reconnects, we read everything after their marker straight from the message store, in order.
+
+This is the same catch-up mechanism we use for multi-device sync later in the design, so offline delivery and device sync share one path instead of two.
+
+For the active delivery path (attempting delivery, retrying, and waking devices through push), we use a queue like **Kafka**. One detail matters here: we do not create a topic per user, which at our scale would mean hundreds of millions of topics, something Kafka does not handle well.
+
+Instead, a small number of partitioned topics carry delivery tasks, partitioned by recipient ID so each user's tasks stay ordered. The queue handles retries and backpressure; the database remains the durable source of truth for the messages themselves.
+
+<h4 id="push-notification-service">Push Notification Service</h4>
+
+Even though we cannot deliver the message content directly to an offline user, we can still tell them something is waiting. This is where push notifications come in.
+
+The Push Notification Service integrates with Apple Push Notification Service (APNs) for iOS and Firebase Cloud Messaging (FCM) for Android. It sends a notification like "New message from User A" to wake up the device, while respecting user preferences such as muted conversations and quiet hours.
+
+<h3 id="the-offline-message-flow">The Offline Message Flow</h3>
+
+Let's trace what happens when User A sends a message but User B is offline.
+
+<h4 id="when-the-message-is-sent">When the message is sent</h4>
+
+The diagram traces the two paths Chat Server 1 can take after persisting the message: forward it directly if User B is online, or route it through the message queue and push notification pipeline if not.
+
+1. User A sends a message to User B. The message arrives at Chat Server 1.
+2. Chat Server 1 persists the message via the Message Service. It is now safely stored.
+3. Chat Server 1 queries the Session Service: "Where is User B?"
+4. The Session Service finds no entry for User B, meaning they are offline.
+5. Instead of failing, Chat Server 1 leaves the message marked undelivered in the store and enqueues a delivery task for User B.
+6. The Push Notification Service sends a notification to User B's phone: "New message from User A."
+7. User A sees a single checkmark (sent) but not a double checkmark (delivered) yet.
+
+<h4 id="when-user-b-comes-back-online">When User B comes back online</h4>
+
+Once User B reconnects, the chat server reads their last-delivered marker and fetches every pending message from the store in one pass, ensuring nothing sent during the offline period is skipped.
+
+1. User B opens the app and establishes a WebSocket connection to a chat server (maybe Chat Server 3 this time).
+2. During the connection handshake, Chat Server 3 reads User B's last-delivered marker and fetches every message after it from the message store.
+3. The store returns all pending messages, ordered by time.
+4. Chat Server 3 pushes these messages to User B over the WebSocket connection.
+5. User B's client acknowledges receipt.
+6. User B's marker advances to the latest delivered message, and the message statuses are updated to "delivered."
+7. Back at User A's device, the checkmarks update from single to double.
+
+With this design, the message is never lost. Whether User B comes online in 10 seconds or 10 days, the message will be waiting, because it is persisted to the database before anything else and the queue is only an optimization for fast delivery.
+
+<h2 id="43-requirement-3-group-messaging">
+  4.3 Requirement 3: Group Messaging
+</h2>
+
+So far we have handled one-on-one messaging. But groups introduce a new challenge that fundamentally changes our design: **fanout**.
+
+Consider this scenario: User A sends "Happy New Year!" to a group with 500 members, our maximum size. That single message needs to reach 500 different devices, potentially scattered across dozens of different chat servers, some members online and some offline, some on fast WiFi and some on spotty mobile networks.
+
+With one-on-one messaging, one input means one output. With groups, one input means many outputs. This multiplier effect is called fanout, and it can easily overwhelm a naive implementation.
+
+<h3 id="understanding-the-fanout-problem">Understanding the Fanout Problem</h3>
+
+Let's visualize what happens when a message goes to a group:
+
+If User A sends a message to a group with 500 members (our maximum), and the sender's chat server has to individually deliver to all 500, we have a problem. That server becomes a bottleneck, and if it crashes mid-delivery, some members get the message and some do not. Large groups would also create noticeable delays.
+
+There are several ways to handle fanout. Let's examine each and understand their trade-offs.
+
+<h3 id="approach-1-sender-side-fanout">Approach 1: Sender-Side Fanout</h3>
+
+The simplest approach is to have the sender's chat server do all the work. When User A sends a group message, Chat Server 1 looks up all group members, finds their chat servers, and delivers to each one.
+
+<h4 id="how-it-works">How it works</h4>
+
+1. Chat Server 1 queries the Group Service for all members of the group
+2. For each member, it queries the Session Service to find their chat server
+3. It forwards the message to each destination chat server
+4. Each chat server delivers to their connected members
+
+This approach works fine for small groups (under 50-100 members), which are the majority of groups in typical usage patterns.
+
+<h3 id="approach-2-message-queue-fanout">Approach 2: Message Queue Fanout</h3>
+
+For larger groups, we can use a message queue to distribute the work across multiple workers.
+
+<h4 id="how-it-works">How it works</h4>
+
+1. Chat Server 1 publishes the message to a Kafka topic for the group
+2. Multiple worker processes consume from this topic in parallel
+3. Each worker is responsible for delivering to a subset of group members
+4. The work is automatically distributed based on worker capacity
+
+<h3 id="approach-3-hybrid-approach-recommended">
+  Approach 3: Hybrid Approach (Recommended)
+</h3>
+
+We can combine both approaches, choosing based on group size:
+
+- **Small groups (under 100 members):** Use direct fanout from the sender's server. This is faster and simpler, and most groups fall into this category.
+- **Large groups (100+ members):** Route through Kafka for distributed fanout. The added latency is acceptable for groups where reliability and scalability matter more.
+
+The threshold of 100 is not fixed; it is a tunable parameter based on your server capacity. Different group sizes warrant different delivery strategies: low latency for the common case of small groups, and scalable distributed fanout for large ones.
+
+<h3 id="the-complete-group-message-flow">The Complete Group Message Flow</h3>
+
+Let's put it all together and trace a group message from send to delivery:
+
+<h4 id="step-by-step">Step by step</h4>
+
+1. **Persist first:** User A sends a message to the group. Chat Server 1 immediately persists it via the Message Service with the `group_id` instead of a single recipient. The message is now durable.
+2. **Get members:** Chat Server 1 queries the Group Service: "Who are the members of this group?" The Group Service returns the list of member IDs.
+3. **Find member locations:** For each member, we need to know where they are connected (or if they are offline). Instead of making 50 individual queries, we batch this: "Where are users [B, C, D, E, ...]?" The Session Service returns a map of user IDs to chat server locations.
+4. **Batch by server:** Instead of forwarding to each member individually, we group members by their chat server. If members B, C, and E are all on Chat Server 2, we send one message to Chat Server 2 with all three recipient IDs. This reduces network overhead.
+5. **Parallel delivery:** Chat Server 1 sends messages to Chat Server 2 and Chat Server 3 in parallel. Each receiving chat server pushes the message to its connected members.
+6. **Handle offline members:** For members who are offline, the message goes to their queue. When they reconnect, they will receive it along with any other pending messages.
+
+This flow handles groups of any size efficiently. For small groups, it completes in tens of milliseconds. For larger groups using the queue-based approach, delivery might take a bit longer but remains reliable.
+
+<h2 id="44-putting-it-all-together">4.4 Putting It All Together</h2>
+
+We have now addressed each requirement incrementally. Let's step back and see the complete picture. This is the architecture you would draw on the whiteboard after explaining each component:
+
+The system breaks into clear layers. Clients (mobile and web) are WebSocket clients. The edge layer load-balances incoming connections, using sticky sessions (or consistent hashing by user ID) so a connection stays on the same chat server.
+
+The chat layer is stateful, since each server holds specific users' connections, while the service layer (messages, groups, users, presence) is stateless and scales horizontally. The data layer combines Redis (sessions and presence), Kafka (delivery pipeline), Cassandra (message history), and PostgreSQL (user and group data).
+
+With the high-level architecture clear, let's look at how we store all this data efficiently.
+
+<h1 id="5-database-design">5. Database Design</h1>
+
+With 20 billion messages per day and 500 million users, database choices matter. The wrong one becomes a bottleneck that is hard to fix later.
+
+<h2 id="51-sql-vs-nosql">5.1 SQL vs NoSQL</h2>
+
+A messaging system has two very different kinds of data, and each deserves its own storage strategy.
+
+<h3 id="message-data-write-heavy-and-time-ordered">
+  Message Data: Write-Heavy and Time-Ordered
+</h3>
+
+Messages have a clear access pattern:
+
+- **Write-heavy workload:** We are writing 230,000 messages per second. Every single message needs to be persisted.
+- **Simple queries:** "Get me the last 50 messages for this conversation." No complex joins, no aggregations.
+- **Time-series nature:** Recent messages are accessed constantly. Messages from last year are rarely touched.
+- **No transactions needed:** A message either exists or it does not. We do not need to atomically update multiple messages.
+- **High availability is critical:** If the message database goes down, messaging stops.
+
+A **wide-column NoSQL database** like **Apache Cassandra** or **ScyllaDB** fits these patterns: log-structured storage absorbs high write throughput, adding nodes scales capacity linearly, clustering keys keep each conversation sorted by time on disk, and consistency is tunable per query.
+
+<h3 id="user-and-group-data-relational-and-consistent">
+  User and Group Data: Relational and Consistent
+</h3>
+
+User and group data is different:
+
+- **Complex relationships:** Which groups does this user belong to? Who are the admins of this group?
+- **Transactions:** When adding a user to a group, we need to update the group membership and the user's group list atomically
+- **Strong consistency:** If I just added you to a group, you should see it immediately
+- **Read-heavy:** User profiles are read often but updated rarely
+
+A **relational database** like **PostgreSQL** fits these needs: joins and complex filters for the relationships, ACID transactions for atomic multi-table updates, and strong consistency so reads always see the latest writes.
+
+<h2 id="52-database-schema">5.2 Database Schema</h2>
+
+Now the schemas. Each table is shaped around its access pattern and stored in the technology best suited to it:
+
+<h3 id="1-messages-table-cassandra">1. Messages Table (Cassandra)</h3>
+
+This is the central table in our storage layer. The schema design is driven by a single question: "What is the most common query we need to answer?"
+
+For a messaging app, that query is: **"Get the last 50 messages for this conversation, ordered by time."**
+
+We design the entire table around this access pattern:
+
+| Field             | Type                      | Description                                  |
+| ----------------- | ------------------------- | -------------------------------------------- |
+| `conversation_id` | UUID (Partition Key)      | Unique identifier for the conversation       |
+| `message_id`      | TimeUUID (Clustering Key) | Time-based UUID for ordering                 |
+| `sender_id`       | UUID                      | ID of the message sender                     |
+| `content`         | Text                      | Message content                              |
+| `content_type`    | Text                      | Content kind: `text`, `image`, `video`       |
+| `status`          | Text                      | Delivery status: `sent`, `delivered`, `read` |
+| `created_at`      | Timestamp                 | Server timestamp                             |
+
+**Partition Key (**`conversation_id`**):** This determines which nodes store the data. All messages in a single conversation live together on the same nodes. When we query "last 50 messages for conversation X", Cassandra knows exactly which nodes to ask. This is what makes reads fast.
+
+A natural question is where `conversation_id` comes from, since the Send Message API only carries `sender_id` and `recipient_id`. We derive it deterministically so both participants resolve to the same partition. For a one-on-one chat, we sort the two user IDs and hash the pair, for example `conversation_id = hash(min(A, B) + max(A, B))`.
+
+Sorting first guarantees that A messaging B and B messaging A land in the same conversation. For a group chat, the `conversation_id` is the `group_id`, which already uniquely identifies the conversation.
+
+This is why the Send API takes a `recipient_type`: it tells the server whether to derive the ID from a user pair or use the group ID directly. The client never has to know the `conversation_id`; the server computes it on write, and the Fetch Messages API uses the same derivation to read.
+
+**Clustering Key (**`message_id`** as TimeUUID):** Within a partition (a conversation), messages are physically sorted on disk by the clustering key. A TimeUUID is a special UUID that encodes the timestamp, so messages are automatically ordered by time. Fetching "the last 50 messages" becomes a simple range scan, not a full table scan.
+
+Together, these keys let the common query hit a single partition and read data that is already sorted.
+
+One caveat: partitioning purely by `conversation_id` lets a busy, long-lived conversation grow without bound, and very large partitions hurt Cassandra's read performance. In practice we add a time bucket to the partition key, for example `(conversation_id, year_month)`, so each partition covers a bounded window. Reads for recent messages hit the current bucket, and older history pages into earlier buckets.
+
+<h3 id="2-user-conversations-table-cassandra">
+  2. User Conversations Table (Cassandra)
+</h3>
+
+When a user opens the app, the first thing they see is their conversation list. We need to answer: "What are this user's recent conversations, and what was the last message in each?"
+
+| Field                  | Type                             | Description               |
+| ---------------------- | -------------------------------- | ------------------------- |
+| `user_id`              | UUID (Partition Key)             | User ID                   |
+| `last_message_at`      | Timestamp (Clustering Key, DESC) | Time of last message      |
+| `conversation_id`      | UUID (Clustering Key)            | Conversation ID           |
+| `unread_count`         | Integer                          | Number of unread messages |
+| `last_message_preview` | Text                             | Preview of last message   |
+
+We denormalize `last_message_preview` and `unread_count` directly into this table so rendering the conversation list takes one read instead of a join or a second query against the messages table. Storing data in the shape you read it, even at the cost of duplication, is a common Cassandra pattern.
+
+The clustering key is `last_message_at` in descending order, not `conversation_id`. This matters because the conversation list is shown most-recent-first, and clustering by `last_message_at` means Cassandra returns the rows already in that order. The trade-off is that `last_message_at` changes every time a new message arrives, and a clustering key cannot be updated in place.
+
+So on each new message we delete the old row and insert a new one at the updated position, which moves the conversation to the top of the list. Because we are rewriting the row anyway, the new row carries the recomputed `unread_count` and `last_message_preview`, so a regular column write is enough; we do not need a separate Cassandra counter.
+
+<h4 id="the-cost-of-this-table-is-write-amplification">
+  The cost of this table is write amplification
+</h4>
+
+Updating it is a per-recipient operation, not a per-message one. A one-on-one message touches two rows (one per participant). A 500-member group message touches up to 500 rows, one for each member's conversation list.
+
+So a single group send becomes a fanout of writes here, on top of the one durable write to the messages table.
+
+This is an acceptable trade because the conversation list is read far more often than it is written, and these writes are small and can be applied asynchronously after the message is durably stored.
+
+For very large or very active groups, this fanout is also a reason to cap group size and to update each member's list lazily (for example, only refreshing `unread_count` when that member is online or opens the app) rather than writing to all 500 rows on every message.
+
+<h3 id="3-groups-table-postgresql">3. Groups Table (PostgreSQL)</h3>
+
+Group metadata lives in PostgreSQL where we can use proper relational modeling:
+
+| Field          | Type         | Description                |
+| -------------- | ------------ | -------------------------- |
+| `group_id`     | UUID (PK)    | Unique group identifier    |
+| `name`         | VARCHAR(100) | Group name                 |
+| `creator_id`   | UUID (FK)    | User who created the group |
+| `created_at`   | Timestamp    | Creation time              |
+| `member_count` | Integer      | Number of members          |
+
+The `member_count` is denormalized here even though we could compute it from the members table. This avoids a COUNT query every time we need to display group info.
+
+<h3 id="4-group-members-table-postgresql">
+  4. Group Members Table (PostgreSQL)
+</h3>
+
+This is the join table that maps users to groups:
+
+| Field       | Type          | Description             |
+| ----------- | ------------- | ----------------------- |
+| `group_id`  | UUID (PK, FK) | Group ID                |
+| `user_id`   | UUID (PK, FK) | User ID                 |
+| `role`      | VARCHAR(20)   | Role: `admin`, `member` |
+| `joined_at` | Timestamp     | When user joined        |
+
+The composite primary key `(group_id, user_id)` serves two purposes:
+
+1. It ensures a user can only be in a group once (no duplicates)
+2. It creates an index that allows efficient queries in both directions: "all members of group X" and "all groups user Y belongs to"
+
+With these tables, we can handle all group operations with standard SQL queries and proper transaction support. When a user joins a group, we update both the membership table and the group's member_count in a single transaction.
+
+<h3 id="5-message-receipts-table-cassandra">
+  5. Message Receipts Table (Cassandra)
+</h3>
+
+The single `status` field on the messages table is enough for a one-on-one chat, where a message has exactly one recipient. Group chats break this assumption. A message sent to 50 people is delivered and read by each member at a different time, and we cannot represent "delivered to 30 of 50, read by 12" with one column.
+
+We track per-recipient status in a separate table:
+
+| Field        | Type                     | Description                               |
+| ------------ | ------------------------ | ----------------------------------------- |
+| `message_id` | TimeUUID (Partition Key) | The message being tracked                 |
+| `user_id`    | UUID (Clustering Key)    | A recipient of the message                |
+| `status`     | Text                     | Per-recipient status: `delivered`, `read` |
+| `updated_at` | Timestamp                | When this recipient's status last changed |
+
+Partitioning by `message_id` keeps all receipts for a single message together, so answering "who has read this?" is a single-partition read. For a one-on-one chat this table holds one row per message; for a group, one row per member.
+
+The sender's UI shows the double checkmark once every recipient has a `delivered` row, and blue checkmarks once everyone has a `read` row. The messages table itself stays small, storing each message only once.
+
+Now let's move on to the deep dive into specific challenges.
+
+<h1 id="6-design-deep-dive">6. Design Deep Dive</h1>
+
+The high-level architecture gives us the skeleton. The deep dive is where you show that you understand how the components work and why one approach beats another. Let's explore the more challenging parts of building a messaging system.
+
+<h2 id="61-websocket-vs-long-polling-vs-server-sent-events">
+  6.1 WebSocket vs Long Polling vs Server-Sent Events
+</h2>
+
+We have used WebSocket connections throughout this design, but why WebSocket specifically? There are several ways to achieve real-time communication between client and server, each with different trade-offs in latency, resource usage, and complexity.
+
+<h3 id="approach-1-http-long-polling">Approach 1: HTTP Long Polling</h3>
+
+Long polling is the oldest technique for achieving real-time-like behavior with plain HTTP. It predates WebSockets and was the backbone of early real-time web apps like Gmail's chat.
+
+**The idea is simple:** the client makes an HTTP request asking "any new messages for me?" Instead of responding immediately with "no," the server holds the connection open. If a new message arrives while the connection is open, the server responds with it immediately.
+
+If nothing happens for 30-60 seconds, the server responds with an empty result, and the client immediately makes another request.
+
+The client creates a continuous loop of requests, effectively creating a "persistent" connection using standard HTTP semantics.
+
+Long polling got us through the early web era, but it is not ideal for a modern messaging system with millions of concurrent users.
+
+<h3 id="approach-2-server-sent-events-sse">
+  Approach 2: Server-Sent Events (SSE)
+</h3>
+
+SSE improves on long polling by establishing a true persistent connection, but only in one direction. The server can push events to the client continuously, but the client still needs to use regular HTTP requests to send data back.
+
+Think of SSE as a one-way pipe from server to client. The server can push events whenever it wants, but sending a message back requires a separate HTTP POST.
+
+SSE is a good fit for notification streams, live feeds, or stock tickers where the server broadcasts and the client mostly listens. For chat, where both sides constantly send data, we need something better.
+
+<h3 id="approach-3-websocket-recommended">
+  Approach 3: WebSocket (Recommended)
+</h3>
+
+WebSocket is the modern solution. It provides a true bidirectional channel where both client and server can send messages at any time, over a single persistent TCP connection.
+
+The connection starts with a standard HTTP request that includes an "Upgrade" header. If the server supports WebSocket, it responds with 101 Switching Protocols, and from that point on, the connection is a full WebSocket. Both sides can send frames whenever they want, there is no request/response dance.
+
+<h3 id="which-should-you-choose">Which Should You Choose?</h3>
+
+| Approach         | Latency | Overhead | Bidirectional | Best For                    |
+| ---------------- | ------- | -------- | ------------- | --------------------------- |
+| **Long Polling** | High    | High     | No            | Legacy systems, fallback    |
+| **SSE**          | Medium  | Low      | No            | Notifications, live feeds   |
+| **WebSocket**    | Lowest  | Lowest   | Yes           | Chat, gaming, collaboration |
+
+**For a messaging system, WebSocket is the best fit.** The bidirectional nature matches how chat works: both users send and receive constantly, the low latency keeps conversations feeling instant, and a single connection per user lets each server hold more of them. Its one real drawback, the stateful nature, we have already handled with the Session Service.
+
+> Always implement long polling as a fallback. Some corporate networks and older proxies still block WebSocket connections. Your client should detect this and gracefully fall back to long polling
+
+<h2 id="62-message-delivery-guarantees">6.2 Message Delivery Guarantees</h2>
+
+Everyone who has used WhatsApp knows the checkmarks: one gray for sent, two gray for delivered, two blue for read. These simple icons hide a lot of complexity.
+
+How do we track message state reliably across unreliable networks, flaky mobile connections, and devices that go offline unpredictably?
+
+Let's break down what each state means and how we guarantee correct transitions:
+
+1. **Sent (single gray checkmark):** The message has been persisted on our servers. The user can close the app knowing the message will not be lost.
+2. **Delivered (double gray checkmarks):** The message has reached the recipient's device. They may not have seen it yet, but it is on their phone.
+3. **Read (double blue checkmarks):** The recipient has opened the conversation and viewed the message.
+
+Networks fail, devices go offline mid-delivery, and the same message can be sent twice due to retries, so getting these transitions right takes care.
+
+<h3 id="the-delivery-flow">The Delivery Flow</h3>
+
+The sequence below maps each checkmark transition to the exact server event that triggers it, showing how a single "Hello!" moves from the sender's tap through persistence, delivery, and the final read acknowledgment:
+
+<h3 id="ensuring-at-least-once-delivery">Ensuring At-Least-Once Delivery</h3>
+
+The cardinal rule of messaging: **messages must never be lost.** A user who sees the "sent" checkmark should be confident that their message will eventually reach its destination, even if networks fail, servers crash, or the recipient's phone runs out of battery.
+
+Achieving this requires a combination of two techniques: the client retries aggressively, and the server deduplicates.
+
+<h4 id="client-side-retry-with-idempotency">
+  Client-Side Retry with Idempotency
+</h4>
+
+Reliable messaging relies on one idea: if the server can detect duplicate messages, the client can retry as many times as needed without the message appearing twice.
+
+Here is how this works in practice:
+
+1. Before sending, the client generates a unique `client_message_id` (typically a UUID). This ID is the message's fingerprint.
+2. The client sends the message to the server and starts a timer.
+3. If no acknowledgment arrives within a timeout (say, 5 seconds), the client assumes something went wrong and retries with the exact same `client_message_id`.
+4. When the server receives a message, it checks: "Have I seen this `client_message_id` before?"
+5. If yes, it is a duplicate. The server returns success without storing again.
+6. If no, it is a new message. The server stores it and returns success.
+
+This is **idempotent delivery**: the same send can be retried any number of times, and the server still stores and delivers it once.
+
+<h4 id="server-side-persistence-before-acknowledgment">
+  Server-Side Persistence Before Acknowledgment
+</h4>
+
+There is one more critical rule for reliable messaging: **never acknowledge a message until it is persisted to durable storage.**
+
+If the server crashes between receiving a message and persisting it, the message is lost. By only sending ACK after persistence, we guarantee that any acknowledged message is safely stored.
+
+<h3 id="handling-out-of-order-messages">Handling Out-of-Order Messages</h3>
+
+A single connection preserves order, since TCP delivers bytes in sequence. Messages can still arrive out of order for other reasons: a message that timed out and was retried, messages sent from a user's different devices, or messages that travel through different servers and queues on the way to the recipient.
+
+The order is established on the server, not the client. The client's clock cannot be trusted (it may be wrong or deliberately set), so we never order by the client timestamp.
+
+1. **Server-assigned ordering:** When the Message Service persists a message, it assigns a server timestamp and a TimeUUID. That TimeUUID is the `message_id` we use as the clustering key in the messages table, so the database stores messages in this exact order. This is the authoritative order for a conversation.
+2. **Per-conversation sequence numbers (when you need gap detection):** A timestamp tells you the order but not whether a message is missing. If the client needs to detect gaps ("I have messages 1, 2, and 4, so 3 is missing"), assign a monotonic per-conversation sequence number. Generating one requires routing all of a conversation's messages through a single writer (the partition leader for that conversation), which is why this is reserved for cases that need it rather than applied everywhere.
+3. **Client-side reordering:** The client buffers incoming messages and sorts them by the server order before display, so a late or retried message slots into its correct position instead of appearing at the bottom.
+
+<h2 id="63-presence-system-onlineoffline-status">
+  6.3 Presence System (Online/Offline Status)
+</h2>
+
+The green "online" dot and "last seen at 3:45 PM" text seem like simple features. But think about what they require at scale: tracking 50 million concurrent users, notifying their contacts when status changes, and doing it all without overwhelming the system.
+
+Presence is a trade-off between accuracy and efficiency, and the hard part is doing it at scale.
+
+<h3 id="the-challenges">The Challenges</h3>
+
+The core challenges with presence are:
+
+- **Constant churn:** Users open and close apps constantly. Their phones switch between WiFi, cellular, and airplane mode. Status changes happen all the time.
+- **Fanout volume:** If User A has 500 contacts and comes online, do we notify all 500? What if 1000 users come online in the same second?
+- **Accuracy vs. efficiency:** Users want accurate presence, but broadcasting every change would overwhelm the system.
+
+<h3 id="approach-heartbeat-based-presence-with-lazy-queries">
+  Approach: Heartbeat-Based Presence with Lazy Queries
+</h3>
+
+The practical solution is a combination of heartbeats for tracking and lazy queries for display.
+
+<h4 id="how-it-works">How It Works</h4>
+
+The mechanism is simple:
+
+1. **Connection:** When a user connects, the chat server sets a key in Redis: `presence:user_123 = online` with a TTL of 30 seconds.
+2. **Heartbeat:** Every 10 seconds, the client sends a heartbeat over the WebSocket. The server refreshes the TTL, resetting it to 30 seconds.
+3. **Disconnect:** If heartbeats stop (the user closed the app, lost network, or the phone died), the key expires automatically after 30 seconds.
+4. **Query:** When User B opens a chat with User A, the app queries: "What is the presence of User A?" Redis returns the value if the key exists, or nothing if it has expired.
+
+The 30-second TTL is a deliberate choice. It means users appear offline within 30 seconds of going offline, which is acceptable for casual chat. If you needed faster detection (for a stock trading app, say), you could reduce the TTL and heartbeat interval, at the cost of more traffic.
+
+<h4 id="optimizing-presence-fanout">Optimizing Presence Fanout</h4>
+
+Broadcasting every status change to all contacts does not scale, so instead we query presence only when it is needed:
+
+When User A opens a chat with User B:
+
+1. Query Redis for User B's presence
+2. Display result in UI
+3. Subscribe to presence updates (via Redis pub/sub) for real-time changes while chat is open
+4. Unsubscribe when chat is closed
+
+This drastically reduces presence traffic. We only track presence for users the client is actively viewing.
+
+<h3 id="last-seen-timestamp">Last Seen Timestamp</h3>
+
+Instead of binary online/offline, many apps show "last seen at [time]":
+
+1. Update `last_seen` timestamp on every meaningful user action
+2. When queried, return the timestamp
+3. Client displays relative time ("last seen 5 minutes ago")
+
+This provides useful information without the complexity of real-time presence. A common variation is to compute live "online" status only for a conversation the user currently has open, and fall back to "last seen" everywhere else.
+
+<h2 id="64-scaling-chat-servers">6.4 Scaling Chat Servers</h2>
+
+Chat servers are stateful: each one holds specific users' WebSocket connections, so a user's messages must reach the exact server they are connected to. That makes them harder to scale than stateless API servers. Let's walk through how to handle it.
+
+<h3 id="connection-limits">Connection Limits</h3>
+
+A well-tuned server with proper kernel configuration can handle 50,000 to 100,000 concurrent WebSocket connections, bounded by file descriptors, memory, and CPU.
+
+As estimated earlier, covering 50 million average (and ~100 million peak) connections at 50,000 each puts the fleet on the order of 1,000 to 2,000 servers, with headroom so a spike or the loss of a few servers does not exhaust capacity.
+
+<h3 id="sticky-sessions-and-connection-affinity">
+  Sticky Sessions and Connection Affinity
+</h3>
+
+Because a user's connection is pinned to one server until they disconnect, the load balancer must keep routing that user to the same place. Common options:
+
+1. **Consistent hashing by user_id:** Same user always routes to the same server (until server list changes)
+2. **Connection tracking:** Load balancer remembers which server each connection went to
+3. **Client-side server assignment:** Server tells client which specific server to connect to on subsequent attempts
+
+<h3 id="handling-server-failures">Handling Server Failures</h3>
+
+What happens when a chat server crashes? With 50,000 users per server, a crash is a significant event.
+
+The recovery flow:
+
+1. **Detection:** Client detects disconnection (heartbeat timeout, connection close event)
+2. **Reconnection:** Client connects to load balancer, which routes to a healthy server
+3. **State Recovery:** New server registers the connection in Session Service
+4. **Message Recovery:** Pending messages are fetched from the queue
+5. **Resume:** Normal operation continues
+
+Message persistence (in the database and queue) is separate from connection state. Even if a server crashes mid-delivery, the message is safe and will be delivered on reconnection.
+
+<h3 id="graceful-shutdown">Graceful Shutdown</h3>
+
+Production systems need regular maintenance: OS patches, code deployments, hardware replacements. Graceful shutdown minimizes user impact:
+
+1. **Mark as draining:** Remove server from load balancer pool
+2. **Stop new connections:** Reject any new WebSocket handshakes
+3. **Notify clients:** Send a "please reconnect elsewhere" message
+4. **Wait for drain:** Give clients time to gracefully disconnect (typically 30-60 seconds)
+5. **Force close:** Terminate any remaining connections
+6. **Shutdown:** Server can now safely restart
+
+Most clients will reconnect to other servers during the drain period, making the maintenance nearly invisible to users.
+
+<h1 id="7-follow-ups">7. Follow-ups</h1>
+
+With the core design in place, a few extensions commonly come up as follow-up questions. Two worth being ready for are syncing messages across a user's devices and end-to-end encryption.
+
+<h2 id="71-message-synchronization-across-devices">
+  7.1 Message Synchronization Across Devices
+</h2>
+
+Modern users expect their messages on every device: phone, tablet, laptop, web browser. When they read a message on their phone, it should show as read on their laptop too. This is multi-device sync.
+
+<h3 id="the-challenge">The Challenge</h3>
+
+A single incoming message must reach all of a user's connected devices immediately, and queue for the ones that are offline, so the state stays consistent regardless of which device the user picks up next.
+
+When a message arrives for User A, we need to:
+
+1. Push to all online devices immediately
+2. Queue for offline devices
+3. Sync read/delivered status across all devices
+
+<h3 id="hybrid-sync-strategy">Hybrid Sync Strategy</h3>
+
+The best approach combines real-time push with catch-up pull:
+
+<h4 id="real-time-push-online-devices">Real-time Push (Online Devices)</h4>
+
+When User A has multiple devices connected, the Session Service tracks all of them:
+
+```text
+user_a -> [chat_server_1 (phone), chat_server_3 (web)]
+```
+
+When a message arrives:
+
+1. Session Service returns all device connections
+2. Message is pushed to all connected devices simultaneously
+3. Each device sends independent ACK
+4. "Delivered" status is set when ANY device acknowledges
+
+<h4 id="catch-up-pull-reconnecting-devices">
+  Catch-up Pull (Reconnecting Devices)
+</h4>
+
+When a device comes online after being offline:
+
+The device sends its last sync timestamp when connecting. The server fetches all messages since then and delivers them in bulk. This ensures no messages are ever missed, regardless of how long the device was offline.
+
+<h3 id="read-status-synchronization">Read Status Synchronization</h3>
+
+When User A reads a message on their phone:
+
+All of User A's devices see the same read status. The sender (User B) also gets notified that the message was read.
+
+<h2 id="72-end-to-end-encryption-conceptual">
+  7.2 End-to-End Encryption (Conceptual)
+</h2>
+
+End-to-end encryption (E2EE) ensures that only the sender and recipient can read messages. Even the service provider (WhatsApp, Signal, etc.) cannot decrypt message content.
+
+<h3 id="how-it-works-signal-protocol">How It Works (Signal Protocol)</h3>
+
+Most modern messaging apps use the Signal Protocol or something similar:
+
+The basic flow:
+
+1. **Key Generation:** Each user's device generates a set of long-term and short-term (prekey) key pairs
+2. **Key Registration:** The public keys and prekeys are uploaded to the server
+3. **Key Agreement:** To start a conversation, the sender fetches the recipient's prekey bundle and runs a key agreement (X3DH) to derive a shared secret. Both sides can compute the same secret without ever transmitting it.
+4. **Encryption:** The message is encrypted with a symmetric session key derived from that shared secret. The Double Ratchet algorithm advances the keys for each message, so a compromised key does not expose past or future messages.
+5. **Transmission:** The encrypted message travels through servers, which can store and route it but cannot decrypt it
+6. **Decryption:** The recipient derives the same session key and decrypts the message
+
+<h3 id="what-the-server-can-and-cannot-do">
+  What the Server Can and Cannot Do
+</h3>
+
+With E2EE in place, the server's role is limited to routing and storage. The diagram separates what the server retains the ability to do from what it permanently loses access to once encryption is in force:
+
+<h3 id="trade-offs-of-e2e-encryption">Trade-offs of E2E Encryption</h3>
+
+**Benefits:** E2EE provides strong privacy protection, makes users trust the system more, and helps with regulatory compliance in some regions.
+
+<h4 id="challenges">Challenges</h4>
+
+- **Multi-device complexity:** Each device has its own key pair. Syncing messages across devices requires encrypting for each device separately.
+- **Key changes:** If a user reinstalls the app or gets a new phone, their keys change. The system must handle this securely without enabling man-in-the-middle attacks.
+- **Limited server features:** Search, spam detection, and content moderation become difficult or impossible when the server can't read content.
+- **Backup challenges:** If users back up their messages, the backup is also encrypted. Losing the key means losing access to message history.
+
+For an interview, it's sufficient to mention that E2EE is important for privacy and explain the high-level concept. The cryptographic details (perfect forward secrecy, double ratchet algorithm, etc.) are typically out of scope unless the interviewer specifically asks.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

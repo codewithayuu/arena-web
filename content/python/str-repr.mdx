@@ -1,0 +1,540 @@
+---
+title: "__str__ & __repr__"
+readTime: "10 min read"
+lastUpdated: "June 6, 2026"
+description: "__str__ & __repr__ explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="two-strings-two-audiences">Two Strings, Two Audiences</h1>
+
+When you write `print(order)`, Python has to turn the order into a string. There's no single "right" way to do that, because a string for a customer's receipt and a string for a developer's debug log have different goals. Python solves the problem by giving classes two hooks: `__str__` for the user-facing version and `__repr__` for the developer-facing version.
+
+The two methods are called by different builtins:
+
+- `str(obj)`, `print(obj)`, and f-strings like `f"{obj}"` call `obj.__str__()`.
+- `repr(obj)`, the REPL's automatic echo, and `print` on a list that contains the object all call `obj.__repr__()`.
+
+Here's what happens when a class defines neither:
+
+```python
+class Order:
+    def __init__(self, order_id, total):
+        self.order_id = order_id
+        self.total = total
+
+order = Order(101, 59.99)
+print(order)
+print(repr(order))
+print([order])
+```
+
+None of those are useful. Without `__str__` or `__repr__`, Python falls back to the default behavior inherited from `object`: print the class name and the memory address. That tells you the object exists but nothing about what's in it.
+
+Define both methods and the output changes:
+
+```python
+class Order:
+    def __init__(self, order_id, total):
+        self.order_id = order_id
+        self.total = total
+
+    def __repr__(self):
+        return f"Order(order_id={self.order_id!r}, total={self.total!r})"
+
+    def __str__(self):
+        return f"Order #{self.order_id}: ${self.total:.2f}"
+
+order = Order(101, 59.99)
+print(order)        # uses __str__
+print(repr(order))  # uses __repr__
+print([order])      # list uses __repr__ on each element
+```
+
+The first line is the user-facing receipt format. The second line is the developer-facing debug format. The third line shows that the list display always uses `__repr__` on its elements, regardless of how you'd normally print them, which is why a class without a good `__repr__` makes every list print look ugly.
+
+| Method     | Triggered by                                       | Audience   | Goal                                              |
+| ---------- | -------------------------------------------------- | ---------- | ------------------------------------------------- |
+| `__repr__` | `repr(obj)`, REPL echo, `print([obj])`, tracebacks | Developers | Unambiguous, debug-friendly, ideally re-creatable |
+| `__str__`  | `print(obj)`, `str(obj)`, f-strings with `{obj}`   | End users  | Readable, presentation-friendly                   |
+
+The two methods aren't in competition. Most classes benefit from both, and the rest of this lesson covers when each one matters, how they relate to each other, and what conventions exist for writing them well.
+
+Pick the operation, follow the arrow, and the diagram tells you which method runs. Two paths, two methods, two audiences.
+
+<h1 id="__str__-the-user-friendly-version">
+  __str__: The User-Friendly Version
+</h1>
+
+`__str__` is the readable, presentation-friendly string. It should look like something a non-developer could understand. No memory addresses, no internal field names, no debugging hints. Just the thing you'd write on a receipt or a status page.
+
+```python
+class Product:
+    def __init__(self, name, price):
+        self.name = name
+        self.price = price
+
+    def __str__(self):
+        return f"{self.name} (${self.price:.2f})"
+
+mouse = Product("Wireless Mouse", 29.99)
+print(mouse)
+print(str(mouse))
+print(f"You added: {mouse}")
+```
+
+Three different ways of stringifying the product run the same method. `print(mouse)` calls `str(mouse)`, which calls `mouse.__str__()`. `f"You added: {mouse}"` does the same thing when it interpolates the value into the format string.
+
+`__str__` can return anything you want, as long as it's a string. The only hard requirement is that the return value is a `str`; returning a number, a list, or `None` raises `TypeError`. The convention is that it should be a useful display, not the full debug dump:
+
+```python
+class Order:
+    def __init__(self, order_id, items, total, status):
+        self.order_id = order_id
+        self.items = items
+        self.total = total
+        self.status = status
+
+    def __str__(self):
+        return f"Order #{self.order_id} ({self.status}): {len(self.items)} items, total ${self.total:.2f}"
+
+order = Order(101, ["Wireless Mouse", "USB Cable"], 39.98, "shipped")
+print(order)
+```
+
+The user-facing string summarizes the order: who, what state, how much. It doesn't list every field. A receipt doesn't say `items=['Wireless Mouse', 'USB Cable']`; it says "2 items". The level of detail in `__str__` is a presentation choice, and the appropriate amount depends on the context. A short summary works for log lines and status displays; a longer multi-line format might work for a printed receipt.
+
+There's no rule that `__str__` has to fit on one line. Multi-line strings are fine when the natural display is multi-line:
+
+```python
+class Receipt:
+    def __init__(self, items, tax_rate):
+        self.items = items
+        self.tax_rate = tax_rate
+
+    def __str__(self):
+        lines = ["Receipt:"]
+        for name, price in self.items:
+            lines.append(f"  {name:<20} ${price:.2f}")
+        subtotal = sum(price for _, price in self.items)
+        tax = subtotal * self.tax_rate
+        lines.append(f"  {'Tax':<20} ${tax:.2f}")
+        lines.append(f"  {'Total':<20} ${subtotal + tax:.2f}")
+        return "\n".join(lines)
+
+receipt = Receipt([("Wireless Mouse", 29.99), ("USB Cable", 9.99)], 0.08)
+print(receipt)
+```
+
+`__str__` built a multi-line string, and `print` rendered it as-is. The method is doing the layout work that, in a less hands-on setup, might live in a separate `render_receipt(order)` function. Putting it on `__str__` is fine when there's exactly one natural display for the class.
+
+<h1 id="__repr__-the-developer-friendly-version">
+  __repr__: The Developer-Friendly Version
+</h1>
+
+`__repr__` is for developers. The goal is **unambiguity**: looking at the string, you should be able to tell exactly what the object is and what's in it, without guessing. The Python docs put it like this: `__repr__` should ideally return a string that, if you typed it back into the REPL, would give you back an equal object.
+
+That's an ideal, not a hard requirement. For simple value classes, you can hit it exactly:
+
+```python
+class Point:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+    def __repr__(self):
+        return f"Point(x={self.x!r}, y={self.y!r})"
+
+p = Point(3, 4)
+print(repr(p))
+```
+
+Pasting `Point(x=3, y=4)` into a Python REPL with `Point` defined produces an equal `Point` back. That's the "eval-able" property the docs are after. It isn't strictly required, but when achievable, it makes the repr a self-documenting description of the object's state.
+
+The convention has three parts:
+
+1. **Start with the class name.** `Point(...)`, not `point(...)` or `<Point x=3 y=4>`. This makes the repr look like a constructor call.
+2. **Show the fields by keyword.** `x=3, y=4`, not just `3, 4`. Keyword form is clearer and survives small changes to the constructor signature.
+3. **Use `!r` on string values.** Otherwise the repr loses the quote marks and becomes ambiguous, which defeats the purpose.
+
+Without `!r`, a string field in a repr looks like a bare identifier:
+
+```python
+class Customer:
+    def __init__(self, name, email):
+        self.name = name
+        self.email = email
+
+    def __repr__(self):
+        return f"Customer(name={self.name}, email={self.email})"
+
+alice = Customer("Alice", "alice@example.com")
+print(repr(alice))
+```
+
+That output is hard to read. Is `Alice` the value of `name` or a variable? Is `alice@example.com` a string or some expression? The repr doesn't say. Pasting it into a REPL would raise `NameError` since `Alice` isn't defined.
+
+Using `!r` fixes it:
+
+```python
+class Customer:
+    def __init__(self, name, email):
+        self.name = name
+        self.email = email
+
+    def __repr__(self):
+        return f"Customer(name={self.name!r}, email={self.email!r})"
+
+alice = Customer("Alice", "alice@example.com")
+print(repr(alice))
+```
+
+Now the string values are unambiguously strings, and the form can be pasted back into the REPL to re-create the object. That's the "ideally eval-able" property in action.
+
+A class with no `__repr__` makes every error message harder to read. Tracebacks call `repr()` on the objects they mention, so without an implementation, logs contain `<__main__.Order object at 0x10d4f2a10>` instead of the order's actual contents. Adding a `__repr__` is a few lines of code and pays back every time something goes wrong.
+
+For more complex objects where a fully eval-able repr would be too long or impractical, the convention is to use angle brackets to signal "this isn't a literal expression, it's a description":
+
+```python
+class Cart:
+    def __init__(self, items):
+        self.items = items
+
+    def __repr__(self):
+        return f"<Cart with {len(self.items)} items, total ${sum(self.items):.2f}>"
+
+cart = Cart([29.99, 14.99, 9.99])
+print(repr(cart))
+```
+
+The angle brackets are a long-standing Python convention for "informative but not eval-able". Use them when a constructor-style repr would be too long, too lossy, or impossible to reconstruct.
+
+<h1 id="when-__str__-falls-back-to-__repr__">
+  When __str__ Falls Back to __repr__
+</h1>
+
+There's a small but important rule about how Python chooses between the two methods: **if a class defines `__repr__` but not `__str__`, then `str(obj)` falls back to `__repr__`.** The reverse is not true. A class that defines only `__str__` still gets the default `<... object at 0x...>` for `repr()`.
+
+That asymmetry is the reason for the rule that comes up over and over in Python style guides: **define `__repr__` first.** A single well-written `__repr__` covers `print(obj)`, `str(obj)`, f-strings, `repr(obj)`, the REPL, list displays, dict displays, and tracebacks at once. Only when the user-facing display genuinely needs to differ from the debug display should you write `__str__` separately.
+
+A small demonstration:
+
+```python
+class Order:
+    def __init__(self, order_id):
+        self.order_id = order_id
+
+    def __repr__(self):
+        return f"Order(order_id={self.order_id!r})"
+
+order = Order(101)
+print(order)        # uses __repr__ because __str__ isn't defined
+print(str(order))   # same: falls back to __repr__
+print(repr(order))  # uses __repr__ directly
+print([order])      # list always uses __repr__
+```
+
+One method, four useful displays. The fallback chain is `__str__` -> `__repr__` -> default `object` form. Defining `__repr__` covers the first two levels. Defining only `__str__` covers exactly one of them.
+
+The reverse case shows the trap:
+
+```python
+class Order:
+    def __init__(self, order_id):
+        self.order_id = order_id
+
+    def __str__(self):
+        return f"Order #{self.order_id}"
+
+order = Order(101)
+print(order)        # uses __str__
+print(repr(order))  # falls back to default object repr
+print([order])      # uses default object repr inside the list
+```
+
+`print(order)` is fine, but the moment the order goes into a list or triggers a traceback, the output is back to the useless `<...>` form. This is why "define `__repr__` first" is the rule. Even when code doesn't seem to call `repr()` directly, the language calls it constantly.
+
+A practical workflow:
+
+1. Always define `__repr__`.
+2. Define `__str__` only if the user-facing display genuinely needs to be different from the debug display.
+3. If `__str__` and `__repr__` would be the same, skip `__str__` and let the fallback handle it.
+
+For many classes, step 2 doesn't apply, and `__repr__` alone is enough.
+
+<h1 id="f-string-conversion-flags-s-and-r">
+  F-string Conversion Flags: !s and !r
+</h1>
+
+F-strings provide a quick way to choose between `__str__` and `__repr__` at the call site, using conversion flags. `!s` forces `str()`, `!r` forces `repr()`. There's also `!a` for `ascii()`, which is mostly useful for ensuring non-ASCII characters get escaped.
+
+```python
+class Customer:
+    def __init__(self, name):
+        self.name = name
+
+    def __repr__(self):
+        return f"Customer(name={self.name!r})"
+
+    def __str__(self):
+        return f"Customer {self.name}"
+
+alice = Customer("Alice")
+
+print(f"default: {alice}")
+print(f"with !s: {alice!s}")
+print(f"with !r: {alice!r}")
+```
+
+`{alice}` and `{alice!s}` produce the same output because the default behavior of f-strings is to call `str()` on the value. `{alice!r}` explicitly switches to the repr form.
+
+The flags are most useful when building a debug log or an error message and the developer-facing version of a value is wanted even though the surrounding context would normally use the user-facing form:
+
+```python
+class Order:
+    def __init__(self, order_id, total):
+        self.order_id = order_id
+        self.total = total
+
+    def __repr__(self):
+        return f"Order(order_id={self.order_id!r}, total={self.total!r})"
+
+    def __str__(self):
+        return f"Order #{self.order_id}: ${self.total:.2f}"
+
+order = Order(101, 59.99)
+print(f"shipping {order}")           # user-facing: __str__
+print(f"debug info: {order!r}")      # developer-facing: __repr__
+```
+
+The convention shows up a lot in `__repr__` definitions themselves. The `!r` flag inside an f-string is how string fields get quoted automatically, which is why every `__repr__` example in this lesson uses it. Without the flag, the alternative is to write `repr(self.name)` and concatenate, which is uglier.
+
+There's a small wrinkle around `format()` and `__format__`. F-strings also support a format spec after a colon (`{value:.2f}`, `{name:<20}`), which calls the object's `__format__` method. The conversion flags `!s`, `!r`, and `!a` run before the format spec, so they combine: `f"{value!r:>30}"` first reprs the value, then right-aligns it in a 30-character field. For now, the takeaway is that `!s` and `!r` exist, and they're a clean way to pick which method runs.
+
+<h1 id="worked-examples-for-common-classes">
+  Worked Examples for Common Classes
+</h1>
+
+The two methods come up often enough that a few representative classes are worth seeing. The patterns repeat: short, presentation-friendly `__str__`; longer, eval-able `__repr__`.
+
+<h3 id="a-point-class">A Point Class</h3>
+
+```python
+class Point:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+    def __repr__(self):
+        return f"Point(x={self.x!r}, y={self.y!r})"
+
+    def __str__(self):
+        return f"({self.x}, {self.y})"
+
+p = Point(3, 4)
+print(p)          # __str__
+print(repr(p))    # __repr__
+print([p, p])     # list uses __repr__
+```
+
+The user-facing form is the coordinate notation a math-style display would use. The debug form is the constructor-style version. Both are short, both are useful, and the list display picks up the repr automatically.
+
+<h3 id="a-money-class">A Money Class</h3>
+
+```python
+class Money:
+    def __init__(self, amount, currency="USD"):
+        self.amount = amount
+        self.currency = currency
+
+    def __repr__(self):
+        return f"Money(amount={self.amount!r}, currency={self.currency!r})"
+
+    def __str__(self):
+        symbols = {"USD": "$", "EUR": "â¬", "GBP": "Â£", "JPY": "Â¥"}
+        symbol = symbols.get(self.currency, self.currency + " ")
+        return f"{symbol}{self.amount:.2f}"
+
+price = Money(29.99)
+euro_price = Money(24.99, "EUR")
+print(price)
+print(euro_price)
+print(repr(price))
+print(repr(euro_price))
+```
+
+The user-facing string uses a currency symbol and two decimal places, the format that fits on a price tag. The debug string is unambiguous: which field is the amount, which is the currency, no symbol-decoding required. Two different displays serve two different needs.
+
+<h3 id="an-order-class">An Order Class</h3>
+
+```python
+class Order:
+    def __init__(self, order_id, items, status):
+        self.order_id = order_id
+        self.items = items
+        self.status = status
+
+    def __repr__(self):
+        return (
+            f"Order(order_id={self.order_id!r}, "
+            f"items={self.items!r}, "
+            f"status={self.status!r})"
+        )
+
+    def __str__(self):
+        return f"Order #{self.order_id} ({self.status}, {len(self.items)} items)"
+
+order = Order(101, ["Wireless Mouse", "USB Cable"], "shipped")
+print(order)
+print(repr(order))
+print([order])
+```
+
+The `__str__` is a one-line summary, the kind that fits in a list view of recent orders. The `__repr__` shows every field, including the full items list, which is what a log line needs when the order looks wrong. Both versions follow the conventions: short and friendly for `__str__`, full and unambiguous for `__repr__`.
+
+<h1 id="common-mistakes">Common Mistakes</h1>
+
+A handful of mistakes come up with these two methods. Each one has a quick fix.
+
+<h3 id="returning-something-that-isnt-a-string">
+  Returning Something That Isn't a String
+</h3>
+
+Both `__str__` and `__repr__` must return a `str`. Returning anything else raises `TypeError` at the call site:
+
+```python
+class Order:
+    def __init__(self, order_id):
+        self.order_id = order_id
+
+    def __str__(self):
+        return self.order_id   # int, not str
+
+order = Order(101)
+print(order)
+```
+
+The error message is helpful enough: `__str__` returned a non-string. The fix is to wrap the value: `return str(self.order_id)` or `return f"{self.order_id}"`. The same rule applies to `__repr__`.
+
+<h3 id="infinite-recursion-in-__repr__">Infinite Recursion in __repr__</h3>
+
+A `__repr__` that calls itself recurses until the stack limit and raises `RecursionError`. The most common shape is a class whose `__repr__` formats itself by including the object inside the f-string:
+
+**What's wrong with this code?**
+
+```python
+class Cart:
+    def __init__(self, items):
+        self.items = items
+
+    def __repr__(self):
+        return f"Cart(items={self})"   # {self} calls str(self), which calls __repr__
+
+cart = Cart(["mouse"])
+print(repr(cart))
+```
+
+`{self}` in the f-string calls `str(self)`, and `str(self)` falls back to `__repr__` (since `__str__` isn't defined), which contains the same `{self}` and recurses again. The fix is to include the actual fields, not the whole object:
+
+```python
+class Cart:
+    def __init__(self, items):
+        self.items = items
+
+    def __repr__(self):
+        return f"Cart(items={self.items!r})"
+
+cart = Cart(["mouse"])
+print(repr(cart))
+```
+
+A similar trap shows up with circular object graphs (a `Parent` whose repr includes its `Child`, whose repr includes its `Parent`). The safe pattern is to repr the field values, not the related objects, and to truncate or summarize when the graph gets big.
+
+<h3 id="missing-__repr__-on-a-domain-class">
+  Missing __repr__ on a Domain Class
+</h3>
+
+The most common "mistake" is not defining `__repr__` at all. The code runs, nothing crashes, and then a year later someone is debugging a production issue and the log is full of `<__main__.Order object at 0x10d4f2a10>` lines that tell them nothing.
+
+```python
+class Order:
+    def __init__(self, order_id, items):
+        self.order_id = order_id
+        self.items = items
+
+orders = [Order(101, ["mouse"]), Order(102, ["keyboard"])]
+print(orders)
+```
+
+Anyone reading that log has no way to tell which orders are in the list. The fix is small: add `__repr__`. Once every domain class has one, the log lines, error messages, and debugger displays all become readable.
+
+This is the reason the rule leans so hard toward "define `__repr__` first". A missing `__str__` is usually a cosmetic issue. A missing `__repr__` is a debugging cost that compounds every time the code breaks.
+
+The default `__repr__` from `object` is fast (it formats the type name and the id), but it's information-free. Every log line and traceback decoded without help is a small debugging tax. Writing a one-line `__repr__` once removes that tax for every future failure.
+
+<h1 id="quiz">Quiz</h1>
+
+<h1 id="quiz-questions">Quiz Questions</h1>
+
+**Question 1: Which operation uses an object's **repr** method rather than its **str** method?**
+
+- [ ] print(order), because print always wants debug text
+- [x] repr(order), because repr asks for developer text
+- [ ] str(order), because str prefers unambiguous text
+- [ ] f"{order}", because f-strings always use repr
+
+**Question 2: A class defines **repr** but does not define **str**. What does str(obj) normally display?**
+
+- [ ] It raises TypeError because **str** is missing
+- [x] It falls back to the class's **repr** result
+- [ ] It always shows the default memory-address form
+- [ ] It returns an empty string for user-facing output
+
+**Question 3: Which statement best describes the usual goal of **repr**?**
+
+- [ ] It should be short, friendly, and aimed at end users
+- [ ] It must always be valid code that eval can recreate
+- [x] It should be unambiguous and helpful while debugging
+- [ ] It should hide internal state from logs and tracebacks
+
+**Question 4: In an f-string, what do the conversion flags !s and !r do?**
+
+- [x] !s calls str(obj), while !r calls repr(obj)
+- [ ] !s calls repr(obj), while !r calls str(obj)
+- [ ] !s formats strings only, while !r formats numbers only
+- [ ] !s suppresses output, while !r repeats the value
+
+**Question 5: What happens if **str** returns a list instead of a string?**
+
+- [ ] Python joins the list items with spaces automatically
+- [ ] Python calls repr on the list and uses that result
+- [ ] Python ignores **str** and tries **repr** instead
+- [x] Python raises TypeError during string conversion
+
+**Question 6: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 7: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 8: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+<QuizCard />
+
+<CommentsSection />
+
+</LessonCard>

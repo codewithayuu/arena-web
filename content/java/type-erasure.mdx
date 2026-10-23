@@ -1,0 +1,403 @@
+---
+title: "Type Erasure"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "Type Erasure explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="generics-live-at-compile-time">Generics Live at Compile Time</h1>
+
+For `Box<Product>`, the compiler does three things in order. It checks that every operation on the box uses `Product` correctly. It inserts casts wherever a value is read out of the box. Then it throws away the `<Product>` part and emits a class file that knows only about the raw `Box`.
+
+A small example makes this concrete. Here's a generic box that stores one value.
+
+```java
+public class Box<T> {
+    private T value;
+
+    public void set(T value) {
+        this.value = value;
+    }
+
+    public T get() {
+        return value;
+    }
+}
+```
+
+And a tiny program that uses it.
+
+```java
+public class BoxDemo {
+    public static void main(String[] args) {
+        Box<String> productName = new Box<>();
+        productName.set("Notebook");
+        String name = productName.get();
+        System.out.println("Product: " + name);
+    }
+}
+```
+
+The source code looks like `Box<String>` is a class that holds a `String`. After compilation, the class file tells a different story. The compiler effectively rewrites the box and the caller to look like this.
+
+```java
+// The class, after erasure (conceptual view)
+public class Box {
+    private Object value;
+
+    public void set(Object value) {
+        this.value = value;
+    }
+
+    public Object get() {
+        return value;
+    }
+}
+
+// The caller, after erasure (conceptual view)
+public class BoxDemo {
+    public static void main(String[] args) {
+        Box productName = new Box();
+        productName.set("Notebook");
+        String name = (String) productName.get();  // cast inserted by compiler
+        System.out.println("Product: " + name);
+    }
+}
+```
+
+The class field is now `Object`, and the `get()` method returns `Object`. The cast `(String)` in the caller didn't exist in the source. The compiler inserted it, using the declared type argument.
+
+This is the whole mechanism. Generics provide type safety and remove cast clutter from source code. Internally, the JVM keeps doing what it did before generics shipped: storing references as `Object` and casting where needed.
+
+The diagram shows the pipeline from source code to the running JVM. The type parameter `T` exists in the first two stages. It does not survive into the bytecode, and so it doesn't exist at runtime. Every restriction and gotcha around generics traces back to this single fact.
+
+<h1 id="why-java-erases-instead-of-reifying">
+  Why Java Erases Instead of Reifying
+</h1>
+
+The obvious question is why Java doesn't keep the type around. C# does. C++ templates do. The answer is migration compatibility, and it's the single design constraint that shaped how Java generics work.
+
+Generics arrived in Java 5, in 2004. By that point, Java had been out for nine years. Code written before generics used raw types everywhere: `ArrayList list = new ArrayList()` with no `<T>`. The Java standard library shipped without generics for the first eight versions. The classes in `java.util` were all raw.
+
+Sun (then the steward of Java) needed pre-generics code to keep working after generics shipped. Specifically:
+
+- An old class file compiled against `ArrayList` (no type argument) had to keep running on a new JVM.
+- A new class using `ArrayList<String>` had to interoperate with old library code that returned a raw `ArrayList`.
+- Library authors had to be able to add generics to existing classes without breaking callers.
+
+If generics had been reified (kept at runtime), `ArrayList<String>` and `ArrayList` would have been different classes. Old code calling new code, or new code calling old code, would have hit type mismatches at runtime. Migration would have meant rewriting every library and every caller in lockstep.
+
+Erasure sidesteps the problem. `ArrayList<String>` and `ArrayList` are the same class at runtime, both backed by the original raw `ArrayList`. Old bytecode keeps working because nothing about its view of `ArrayList` changed. New bytecode benefits from compile-time checks, but compiles down to the same raw `ArrayList` calls the old code made.
+
+The price you pay is everything in the rest of this lesson: no `T` at runtime, no `new T[]`, no `instanceof T`, and bridge methods to paper over the gap. The benefit was that a decade-old Java ecosystem migrated to generics without a flag day.
+
+<h1 id="the-erasure-rules">The Erasure Rules</h1>
+
+Erasure isn't a black box. The rules are precise enough to predict exactly what the compiler produces for any generic class or method.
+
+Apply these rules mechanically to any generic signature to determine what shows up in the bytecode.
+
+For an unbounded `T`, every use of `T` becomes `Object`. That includes field types, parameter types, return types, and local variable types inside generic methods. The earlier `Box<T>` example shows this: `T value`, `set(T)`, and `T get()` all became `Object`.
+
+For a bounded `T`, every use of `T` becomes the bound. Consider a generic class restricted to numeric products.
+
+```java
+public class PriceTag<T extends Number> {
+    private T price;
+
+    public void set(T price) {
+        this.price = price;
+    }
+
+    public T get() {
+        return price;
+    }
+
+    public double asDouble() {
+        return price.doubleValue();
+    }
+}
+```
+
+After erasure, `T` becomes `Number`. The field is `Number price`, `set` takes `Number`, `get` returns `Number`, and the call `price.doubleValue()` works because `Number` declares that method. If `T` had been unbounded and erased to `Object`, `doubleValue()` wouldn't compile, because `Object` doesn't have it. The bound is what makes this work.
+
+Multiple bounds erase to the leftmost one. The Java rule is that the first bound is special: it's the one used in erasure, and so the first bound must be a class (or an interface treated as the "primary" type). The rest are interfaces.
+
+```java
+public class SortablePrice<T extends Number & Comparable<T>> {
+    private T price;
+
+    public void set(T price) {
+        this.price = price;
+    }
+
+    public int compareTo(SortablePrice<T> other) {
+        return this.price.compareTo(other.price);
+    }
+}
+```
+
+Here `T extends Number & Comparable<T>` means `T` must be both. The erased signature uses `Number` for fields and most parameters. The compiler inserts casts to `Comparable` wherever it needs the `compareTo` method, which is the trade-off it makes to keep erasure simple.
+
+Wildcards follow the same logic. `List<? extends Number>` erases to plain `List`, with the element type treated as `Number` at use sites. `List<?>` erases to `List` with elements treated as `Object`.
+
+<h1 id="bridge-methods">Bridge Methods</h1>
+
+Erasure breaks something important if the compiler doesn't fix it up: polymorphism. When a method is overridden from a generic supertype, the erased signature of the override may not match the erased signature of the parent. The JVM then doesn't recognize the method as an override, and dynamic dispatch does the wrong thing. The compiler fixes this by synthesizing a bridge method.
+
+Consider a `Product` class that implements `Comparable<Product>` so products can be sorted by price.
+
+```java
+public class Product implements Comparable<Product> {
+    private String name;
+    private double price;
+
+    public Product(String name, double price) {
+        this.name = name;
+        this.price = price;
+    }
+
+    @Override
+    public int compareTo(Product other) {
+        return Double.compare(this.price, other.price);
+    }
+
+    @Override
+    public String toString() {
+        return name + " ($" + price + ")";
+    }
+}
+```
+
+Here's the problem. The `Comparable<T>` interface declares `int compareTo(T other)`. After erasure, that becomes `int compareTo(Object other)`. But `Product.compareTo` takes a `Product`, so its erased signature is `int compareTo(Product other)`. The two don't match. From the JVM's point of view, `Product` doesn't override `Comparable.compareTo` at all; it just defines a new method that happens to have a similar name.
+
+The compiler papers over this by adding a synthetic bridge method to the `Product` class. The bridge has the parent's erased signature and forwards to the real implementation with a cast inserted.
+
+```text
+// Conceptual bytecode view of Product after compilation
+public class Product implements Comparable {
+    // Your method, with its real signature
+    public int compareTo(Product other) {
+        return Double.compare(this.price, other.price);
+    }
+
+    // Synthetic bridge method generated by the compiler
+    public int compareTo(Object other) {
+        return this.compareTo((Product) other);
+    }
+
+    // ... plus toString, fields, etc.
+}
+```
+
+Both `compareTo` methods exist in the class file. The bridge has the erased signature `int compareTo(Object)`, which is what the JVM looks for when something calls `compareTo` through a `Comparable` reference. It casts and forwards to the real `compareTo(Product)`. If the runtime argument isn't actually a `Product`, the cast throws `ClassCastException`, which preserves type safety.
+
+Reflection reports both methods.
+
+```java
+import java.lang.reflect.Method;
+
+public class BridgeInspector {
+    public static void main(String[] args) {
+        for (Method method : Product.class.getDeclaredMethods()) {
+            if (method.getName().equals("compareTo")) {
+                System.out.println(
+                    method + " | bridge=" + method.isBridge() + ", synthetic=" + method.isSynthetic()
+                );
+            }
+        }
+    }
+}
+```
+
+The `isBridge()` flag is the JVM's way of telling reflection "this method was generated by the compiler to make the override work." Code rarely needs to care about bridge methods, but knowing they exist explains otherwise confusing behavior. "Duplicate methods" complaints from tools that scan class files usually trace back to bridges.
+
+<h1 id="no-liststringclass-at-runtime">
+  No List&lt;String&gt;.class at Runtime
+</h1>
+
+Every parameterized type in source code maps to a single raw class at runtime. `List<String>` and `List<Integer>` are the same `ArrayList` class. `Box<Product>` and `Box<String>` are the same `Box` class. The type argument isn't part of the class identity.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class ClassIdentity {
+    public static void main(String[] args) {
+        List<String> names = new ArrayList<>();
+        List<Integer> stock = new ArrayList<>();
+
+        System.out.println("names class: " + names.getClass().getName());
+        System.out.println("stock class: " + stock.getClass().getName());
+        System.out.println("Same class? " + (names.getClass() == stock.getClass()));
+    }
+}
+```
+
+Both calls to `getClass()` return the same `Class<ArrayList>` object. The runtime has no notion of "`ArrayList` of `String`" as a distinct class. This is why `List<String>.class` isn't legal; the compiler rejects it because there's no such thing as a `Class<List<String>>` to fetch.
+
+Overloading methods on type arguments alone also fails, because after erasure the overloads collide.
+
+**What's wrong with this code?**
+
+```java
+public class Cart {
+    public void addAll(List<Product> products) { /* ... */ }
+    public void addAll(List<String> productNames) { /* ... */ }
+}
+```
+
+**Fix:** rename one of them, or take a different distinguishing parameter. The two methods erase to `addAll(List)` and `addAll(List)`, which is a duplicate method. The compiler error reads like:
+
+```text
+name clash: addAll(List<String>) and addAll(List<Product>) have the same erasure
+```
+
+Generic methods that look distinct in source can collide after erasure. "Same erasure" errors aren't generics bugs; they signal that the JVM can't tell those methods apart.
+
+<h1 id="generics-and-reflection">Generics and Reflection</h1>
+
+Erasure throws away the type parameter, but not all generic information disappears. The compiler preserves type arguments in the class file's signature metadata, which reflection can read. Reflection can fetch the formal type parameters of a class, the generic types of fields, and the generic return types of methods.
+
+The following example uses a class that holds a cart of products.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+import java.lang.reflect.Field;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
+
+public class Cart {
+    private List<Product> items = new ArrayList<>();
+}
+
+public class ReflectGenerics {
+    public static void main(String[] args) throws NoSuchFieldException {
+        Field field = Cart.class.getDeclaredField("items");
+
+        // Erased type (what the JVM stores)
+        System.out.println("Field type: " + field.getType().getName());
+
+        // Generic type (from class file signature metadata)
+        Type generic = field.getGenericType();
+        System.out.println("Generic type: " + generic);
+
+        if (generic instanceof ParameterizedType pt) {
+            Type[] args = pt.getActualTypeArguments();
+            for (Type arg : args) {
+                System.out.println("Type argument: " + arg.getTypeName());
+            }
+        }
+    }
+}
+```
+
+The `getType()` call returns `java.util.List`, the erased type. The `getGenericType()` call returns a richer `Type` that includes `<Product>`, because the compiler stored that in the class file's signature. Frameworks like Jackson, Spring, and Hibernate use exactly this trick to figure out what to deserialize a JSON array into, or what kind of entities a JPA `List<T>` field holds.
+
+The catch: this metadata only exists for things declared at compile time. The type argument of a `Cart` field is available because the field has a declared type. The type argument of a local variable, or of an instance returned from a method that returns `List<T>`, is gone.
+
+```java
+public class LostAtRuntime {
+    public static void main(String[] args) {
+        List<Product> products = new ArrayList<>();
+        // products.getClass() is ArrayList, with no notion of Product
+        System.out.println(products.getClass().getName());
+        // There's no way to ask the products variable what its T was.
+    }
+}
+```
+
+The variable was declared `List<Product>`, but the runtime only sees an `ArrayList`. The compile-time type lived in the source. Once the program runs, only the instance and its raw class remain.
+
+<h1 id="you-cant-ask-instanceof-t-or-new-t">
+  You Can't Ask instanceof T or new T[]
+</h1>
+
+This is the visible consequence of everything above. Inside a generic method or class, the type parameter has no runtime existence, so the language forbids operations that would need it.
+
+```java
+public class Storage<T> {
+    public boolean isMatching(Object obj) {
+        // return obj instanceof T;  // compile error: illegal generic type for instanceof
+        return false;
+    }
+
+    public T[] makeArray(int size) {
+        // return new T[size];       // compile error: generic array creation
+        return null;
+    }
+}
+```
+
+The compiler errors are:
+
+```text
+error: illegal generic type for instanceof
+        return obj instanceof T;
+                              ^
+error: generic array creation
+        return new T[size];
+                   ^
+```
+
+Both errors trace to the same root: at the moment the JVM would need to perform the type check or pick the array's component type, `T` is gone. There's nothing to check against, and nothing to use as the array's component class.
+
+These restrictions are part of a longer list, and the standard workarounds involve passing a `Class<T>` token, using `Array.newInstance`, and so on. The takeaway is that every restriction starts from this single mechanism: erasure removes `T`, so any runtime operation that would need `T` is rejected at compile time.
+
+Workarounds for these restrictions usually mean passing a `Class<T>` token explicitly, which adds a parameter to constructors and methods. It's a small ergonomic tax, not a performance one.
+
+<h1 id="a-quick-tour-of-the-class-file">A Quick Tour of the Class File</h1>
+
+The clearest way to see erasure in action is to look at the compiled class file. The `javap` tool ships with the JDK and disassembles bytecode. Running `javap -c -p Box.class` on the `Box<T>` class from earlier shows roughly this output.
+
+```text
+public class Box {
+  private java.lang.Object value;
+
+  public Box();
+    Code:
+       0: aload_0
+       1: invokespecial #1   // Method java/lang/Object."<init>":()V
+       4: return
+
+  public void set(java.lang.Object);
+    Code:
+       0: aload_0
+       1: aload_1
+       2: putfield #2        // Field value:Ljava/lang/Object;
+       5: return
+
+  public java.lang.Object get();
+    Code:
+       0: aload_0
+       1: getfield #2        // Field value:Ljava/lang/Object;
+       4: areturn
+}
+```
+
+The field is `java.lang.Object`. The method signatures use `java.lang.Object`. The bytecode doesn't have any reference to `T` or to `String`, even though the source was `Box<T>` and was called with `Box<String>`. The caller's class file, on its side, would show a `checkcast String` instruction right after the call to `get()`, because the compiler inserted the cast there.
+
+If the class were `Box<T extends Number>`, the bytecode would substitute `java.lang.Number` for `Object` throughout. Same mechanism, different erased type.
+
+Running `javap -s Box.class` (the `-s` flag prints internal signatures) also shows the preserved generic signature alongside the erased one, which is the metadata that powers `getGenericType()` from the reflection example.
+
+<h1 id="why-this-matters-in-practice">Why This Matters in Practice</h1>
+
+Most of the time, generic code is written without thinking about erasure. The compiler does the work, the casts happen quietly, and a `List<Product>` behaves like a list of products. Erasure becomes visible in three situations.
+
+The first is hitting a restriction. Trying to do `new T[size]` or `obj instanceof T` and finding a compile error is the moment the JVM's lack of knowledge about `T` surfaces. That leads to learning the standard workarounds.
+
+The second is reading a stack trace and seeing a synthetic bridge method in it. Frames like `Product.compareTo(Object)` appearing alongside `Product.compareTo(Product)` are the runtime's view of the bridge. With the mechanism in mind, the duplicate doesn't look like a bug.
+
+The third is when a framework needs the actual type of a generic field. Jackson deserializing a JSON array into `List<Product>`, Spring binding a request body to `List<Order>`, JPA mapping a `Set<Tag>` field, all of these rely on `getGenericType()` to recover the type argument from class metadata. They work for fields and method signatures, but not for runtime values whose generic types weren't declared anywhere.
+
+The model is small. Generics are a compile-time contract. The compiler verifies the contract and erases it. The JVM runs raw, cast-augmented bytecode. The places where this leaks out are the restrictions on `T`, the bridge methods that preserve polymorphism, and the reflection APIs that pull type arguments back out of class file metadata.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

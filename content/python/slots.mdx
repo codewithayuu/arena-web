@@ -1,0 +1,392 @@
+---
+title: "__slots__"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "__slots__ explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="why-every-instance-has-a-__dict__">
+  Why Every Instance Has a __dict__
+</h1>
+
+When you write a normal class and assign to `self.name`, Python doesn't store the value on the instance in some compact way. It puts it in a per-instance dictionary, which is exposed as `obj.__dict__`. Here's a `Product` with three attributes:
+
+```python
+class Product:
+    def __init__(self, name, price, stock):
+        self.name = name
+        self.price = price
+        self.stock = stock
+
+mug = Product("Ceramic Mug", 12.99, 50)
+print(mug.__dict__)
+print(type(mug.__dict__))
+```
+
+That dict is real. It supports arbitrary attribute names, you can poke new ones in at runtime, and you can read them back through `getattr`. The flexibility is what makes "ducktyping" work, and what lets libraries patch behavior onto objects after the fact.
+
+The catch: a dict, even an empty one, isn't free. CPython has compacted the internal layout heavily over the years, but each per-instance dict still has bookkeeping, a key table, and a value table. When you have one `Product`, that's invisible. When you have ten million `Product`s in memory at once (an inventory snapshot, a batch loader, a feature pipeline), the per-instance dict becomes the dominant memory cost.
+
+> **Cost:** Each per-instance `__dict__` in CPython 3.12+ adds roughly 100 to 250 bytes per instance on top of the object header and the attribute values, depending on how many keys are stored and whether the dict uses the compact key-sharing layout. Multiply by millions of instances and the difference adds up to gigabytes.
+
+The point of `__slots__` is to remove that dict entirely and put attributes into fixed positions on the instance instead, the way a C struct stores its fields. Same attribute access from your code, much smaller object.
+
+The diagram shows the layout difference. Without slots, the instance keeps a pointer to a dict, and the dict holds your attributes. With slots, the attributes live directly on the instance at fixed offsets, no dict involved.
+
+<h1 id="declaring-__slots__">Declaring __slots__</h1>
+
+`__slots__` is a class-level attribute. You set it to a tuple, list, or any iterable of attribute names, and the class is built without an instance dict.
+
+```python
+class Product:
+    __slots__ = ("name", "price", "stock")
+
+    def __init__(self, name, price, stock):
+        self.name = name
+        self.price = price
+        self.stock = stock
+
+mug = Product("Ceramic Mug", 12.99, 50)
+print(mug.name, mug.price, mug.stock)
+```
+
+From the outside, nothing changed. You set attributes, you read them, the syntax is identical. The difference shows up the moment you try to use a `__dict__` that isn't there:
+
+```python
+class Product:
+    __slots__ = ("name", "price", "stock")
+
+    def __init__(self, name, price, stock):
+        self.name = name
+        self.price = price
+        self.stock = stock
+
+mug = Product("Ceramic Mug", 12.99, 50)
+print(mug.__dict__)
+```
+
+The instance has no dict at all. The attribute names you declared in `__slots__` are the only ones allowed. Try to set anything else and you get the same `AttributeError`:
+
+```python
+class Product:
+    __slots__ = ("name", "price", "stock")
+
+mug = Product.__new__(Product)
+mug.name = "Ceramic Mug"
+mug.description = "Hand-thrown stoneware"
+```
+
+This is a feature, not a bug. Typos that would silently create new attributes on a normal class (`mug.proce = 10` instead of `mug.price = 10`) now raise loudly. The class is closed: the only attributes that exist on an instance are the ones you listed.
+
+A small note on mechanics. Each name in `__slots__` becomes a member descriptor on the class. When you read `mug.name`, Python looks up `name` on the class, finds a descriptor whose job is "read slot 0 from the instance," and runs it. The takeaway is that slot access goes through C-level machinery that's faster than the dict path, but the speed gain is small. The real win is memory.
+
+<h1 id="measuring-the-savings">Measuring the Savings</h1>
+
+Slot savings aren't theoretical. You can see them with `sys.getsizeof` and confirm them by allocating a lot of objects and watching process memory.
+
+A direct comparison of two near-identical classes:
+
+```python
+import sys
+
+class ProductDict:
+    def __init__(self, name, price, stock):
+        self.name = name
+        self.price = price
+        self.stock = stock
+
+class ProductSlots:
+    __slots__ = ("name", "price", "stock")
+
+    def __init__(self, name, price, stock):
+        self.name = name
+        self.price = price
+        self.stock = stock
+
+d = ProductDict("Mug", 12.99, 50)
+s = ProductSlots("Mug", 12.99, 50)
+
+print("dict-based instance:", sys.getsizeof(d))
+print("dict-based __dict__:", sys.getsizeof(d.__dict__))
+print("slots-based instance:", sys.getsizeof(s))
+```
+
+`sys.getsizeof` only reports the size of the object you pass it, not anything it references. So the dict-based number, 48 bytes, looks small until you add the dict it points at, which adds another 296 bytes. The slots-based instance is 56 bytes total, full stop. The exact numbers shift between Python versions and platforms; the ratio is what matters.
+
+> **Cost:** Don't compare `sys.getsizeof(instance)` between dict and slots classes directly. The dict version's reported size leaves out the `__dict__` it points to, which is the bulk of the memory. Always add `sys.getsizeof(instance.__dict__)` to the dict version before comparing.
+
+The savings really show up at scale. Here's a measurement over 10 million instances using `tracemalloc`, which tracks actual allocations rather than per-object self-reports:
+
+```python
+import tracemalloc
+
+class ProductDict:
+    def __init__(self, name, price, stock):
+        self.name = name
+        self.price = price
+        self.stock = stock
+
+class ProductSlots:
+    __slots__ = ("name", "price", "stock")
+
+    def __init__(self, name, price, stock):
+        self.name = name
+        self.price = price
+        self.stock = stock
+
+N = 10_000_000
+
+tracemalloc.start()
+inventory = [ProductDict("Mug", 12.99, 50) for _ in range(N)]
+dict_peak = tracemalloc.get_traced_memory()[1]
+tracemalloc.stop()
+del inventory
+
+tracemalloc.start()
+inventory = [ProductSlots("Mug", 12.99, 50) for _ in range(N)]
+slots_peak = tracemalloc.get_traced_memory()[1]
+tracemalloc.stop()
+
+print(f"dict version peak: {dict_peak / 1024 / 1024:.0f} MiB")
+print(f"slots version peak: {slots_peak / 1024 / 1024:.0f} MiB")
+print(f"savings: {(1 - slots_peak / dict_peak) * 100:.0f}%")
+```
+
+Roughly 57% off for an object with three small attributes. The exact ratio depends on attribute count and Python version, but for "lots of small objects with a handful of fields each," cuts in the 40-60% range are typical. That can be the difference between a process that fits in RAM and one that swaps to disk.
+
+The diagram makes the scale concrete. Same data, same access patterns, almost half the memory. For an in-memory product catalog or a feature-engineering pipeline, that gap is what makes slots worth the friction we'll talk about later.
+
+<h1 id="inheritance-rules">Inheritance Rules</h1>
+
+`__slots__` plus inheritance is where most people get bitten. The rule is straightforward, but it's easy to miss the first time: every class in the chain has to declare `__slots__` for the savings to hold. A single class without slots in the chain reintroduces `__dict__` on every instance, and the slots in the other classes don't help anymore.
+
+A clean two-level hierarchy:
+
+```python
+class Product:
+    __slots__ = ("name", "price")
+
+    def __init__(self, name, price):
+        self.name = name
+        self.price = price
+
+class PhysicalProduct(Product):
+    __slots__ = ("weight",)
+
+    def __init__(self, name, price, weight):
+        super().__init__(name, price)
+        self.weight = weight
+
+mug = PhysicalProduct("Ceramic Mug", 12.99, 0.5)
+print(mug.name, mug.price, mug.weight)
+print(hasattr(mug, "__dict__"))
+```
+
+The subclass only declares the **new** attributes in its `__slots__`. Inherited slots come from the parent automatically. The instance has all three attributes and still no `__dict__`.
+
+Now the broken case:
+
+```python
+class Product:
+    __slots__ = ("name", "price")
+
+class PhysicalProduct(Product):
+    pass
+
+mug = PhysicalProduct.__new__(PhysicalProduct)
+mug.name = "Ceramic Mug"
+mug.price = 12.99
+mug.weight = 0.5
+mug.description = "Hand-thrown stoneware"
+print(hasattr(mug, "__dict__"))
+print(mug.__dict__)
+```
+
+`PhysicalProduct` inherited `Product`'s slots, but because the subclass didn't declare its own `__slots__`, Python re-added a `__dict__` to every instance. You can still assign `name` and `price` through the parent slots, but `weight` and `description` go into the dict. The memory benefit is gone, and you've also lost the typo-catching property.
+
+The fix is to declare an empty tuple in the subclass to keep the dict away:
+
+```python
+class Product:
+    __slots__ = ("name", "price")
+
+class PhysicalProduct(Product):
+    __slots__ = ()
+
+mug = PhysicalProduct.__new__(PhysicalProduct)
+mug.name = "Ceramic Mug"
+mug.weight = 0.5
+```
+
+An empty `__slots__ = ()` means "no new attributes, no dict." The subclass is now as strict as the parent.
+
+The diagram summarizes the three subclass scenarios. The middle branch is the common mistake: a subclass that doesn't say anything about slots looks harmless, but it silently brings `__dict__` back for every instance.
+
+> **Cost:** A single un-slotted subclass anywhere in the chain reintroduces `__dict__` on instances. If you're using slots for memory, audit the full hierarchy.
+
+<h1 id="the-__weakref__-and-__dict__-slots">
+  The __weakref__ and __dict__ Slots
+</h1>
+
+A normal Python object supports two things "for free" that slots classes lose by default: weak references to the object, and arbitrary attribute storage. Python lets you opt back in to either by listing a special name in `__slots__`.
+
+`__weakref__` is the slot the `weakref` module needs to attach a weak reference to your instance. Without it, you can't `weakref.ref(product)`:
+
+```python
+import weakref
+
+class Product:
+    __slots__ = ("name", "price")
+
+mug = Product()
+mug.name = "Ceramic Mug"
+ref = weakref.ref(mug)
+```
+
+The fix is to list `__weakref__` in `__slots__`:
+
+```python
+import weakref
+
+class Product:
+    __slots__ = ("name", "price", "__weakref__")
+
+mug = Product()
+mug.name = "Ceramic Mug"
+ref = weakref.ref(mug)
+print(ref() is mug)
+```
+
+Same idea for `__dict__`. If you want the typo-catching benefit gone for some attributes but still want slots for the common ones, you can list `__dict__` in slots and get an instance dict back as well:
+
+```python
+class Product:
+    __slots__ = ("name", "price", "__dict__")
+
+mug = Product()
+mug.name = "Ceramic Mug"
+mug.price = 12.99
+mug.description = "Hand-thrown stoneware"
+print(mug.__dict__)
+```
+
+`name` and `price` go into slots; everything else falls back to the dict. You lose most of the memory benefit (a dict is now allocated per instance again), so this is only worth doing when you genuinely need both: a few hot attributes in slots and a few rarely set ones in a dict.
+
+The `__weakref__` slot is the doorway for the `weakref` module: declare it if your instances need to be weak-referencable.
+
+<h1 id="slots-with-dataclassslotstrue">Slots with @dataclass(slots=True)</h1>
+
+Python 3.10 added a `slots=True` argument to `@dataclass`. The decorator now generates a new class with `__slots__` filled from the dataclass fields, so you get the brevity of dataclasses and the memory layout of slots in one line.
+
+Before 3.10 you had to write the slots tuple by hand, and any mismatch with the dataclass fields was a hard-to-debug bug:
+
+```python
+from dataclasses import dataclass
+
+@dataclass(slots=True)
+class Product:
+    name: str
+    price: float
+    stock: int = 0
+
+mug = Product("Ceramic Mug", 12.99, 50)
+print(mug)
+print(hasattr(mug, "__dict__"))
+```
+
+The decorator reads the annotated fields and synthesizes a `__slots__ = ('name', 'price', 'stock')` for you. The class works like any other dataclass (you get `__init__`, `__repr__`, `__eq__`), and instances have no `__dict__`.
+
+One subtle thing about `slots=True`: it returns a brand-new class object. The class you wrote is rebuilt with slots baked in, and the original is discarded. That matters if you've kept a reference to the pre-decorated class somewhere (e.g., in a registry, or in a previously defined subclass). In normal day-to-day use you won't notice, but it's worth knowing if you build classes dynamically.
+
+Slotted dataclasses also work with frozen ones, which gives you immutable, hashable, memory-efficient records, a strong fit for keys in caches or sets:
+
+```python
+from dataclasses import dataclass
+
+@dataclass(frozen=True, slots=True)
+class Product:
+    name: str
+    price: float
+
+a = Product("Mug", 12.99)
+b = Product("Mug", 12.99)
+print(a == b)
+print(hash(a) == hash(b))
+```
+
+`slots=True` requires Python 3.10 or newer. Below 3.10, you can still get the same effect, you just write `__slots__` yourself inside the dataclass body. The catch is that mixing handwritten `__slots__` with a default value in the dataclass field can confuse the descriptor lookup, so the 3.10 approach is cleaner.
+
+<h1 id="trade-offs-and-pitfalls">Trade-offs and Pitfalls</h1>
+
+Slots aren't free, and there are a handful of corners that bite people in practice. Worth knowing all of them before you reach for slots on a class.
+
+**Pickling.** Standard `pickle` handles slotted classes fine because the protocol pulls attributes through `__getstate__`/`__setstate__`. If you override either of those without thinking about slots (for example, returning `self.__dict__`), you'll lose data, because there's no dict to return. The default behavior works; custom overrides need care.
+
+**Multiple inheritance with slot clashes.** Two parents that both define non-empty slots can't be combined into one slotted subclass, because Python doesn't know which parent's slot a given attribute belongs to. You'll get a `TypeError` at class creation time:
+
+```python
+class A:
+    __slots__ = ("name",)
+
+class B:
+    __slots__ = ("name",)
+
+class C(A, B):
+    __slots__ = ()
+```
+
+If you need multiple inheritance with slots, the practical pattern is to have at most one base class with non-empty slots and use mixins with `__slots__ = ()`.
+
+**Name clash with class attributes.** You can't have a name appear both in `__slots__` and as a class attribute with a default value, because the slot descriptor and the class attribute would occupy the same slot.
+
+```python
+class Product:
+    __slots__ = ("name", "price")
+    name = "default"
+```
+
+The fix is to set the default in `__init__` rather than as a class attribute, or to remove `name` from `__slots__` if you really meant a class-level constant.
+
+**Typo behavior is now an error.** On a normal class, `mug.proce = 10` silently creates a new attribute. On a slotted class with `__slots__ = ("name", "price", "stock")` and no `__dict__` slot, the same line raises `AttributeError`. This is mostly a good thing (real bugs caught immediately), but if you have code that relies on stashing attributes opportunistically on objects, it'll break.
+
+**Attribute introspection changes.** `vars(obj)` returns `obj.__dict__`, which doesn't exist on a slotted instance. Calling `vars(mug)` raises `TypeError`. Use `dir(mug)` or iterate `__slots__` directly when you need to inspect attributes.
+
+**Performance is not a primary reason.** Slot attribute access is a bit faster than dict-based access, often a few percent on hot paths. The main win is memory. If you're reaching for slots because you read that they're "faster," you're probably optimizing the wrong thing. Profile first.
+
+> **Cost:** Slot attribute access avoids a dict lookup, which can show up as a small speedup on attribute-heavy loops. Don't expect more than 5-15% on realistic workloads, and only on tight numeric or attribute-walking code.
+
+**Multiple inheritance with `object` is fine.** Slots only clash when two parents both add non-empty slots. Inheriting from `object` plus one slotted base is normal and works without issues.
+
+<h1 id="when-slots-actually-pay-off">When Slots Actually Pay Off</h1>
+
+Slots are a real optimization, but they only matter when the object count is high enough that memory becomes the bottleneck. A rough mental model:
+
+| Situation                                                                         | Use slots?                                |
+| --------------------------------------------------------------------------------- | ----------------------------------------- |
+| A handful of model classes for a web request handler                              | No, complexity not worth it               |
+| A class instantiated once or twice in the program                                 | No                                        |
+| Hundreds of objects in a list at a time                                           | Probably not                              |
+| Tens of thousands of small data objects per request                               | Maybe, measure first                      |
+| Millions of small records in memory (in-memory catalog, feature store, batch job) | Yes                                       |
+| Long-running process where instances accumulate over hours                        | Yes, especially if attribute set is fixed |
+| Dataclass-style record with a known, fixed set of fields                          | Yes, low cost (just `slots=True`)         |
+
+The rough rule: if removing the dict would save a meaningful percentage of process memory, slots are worth it. For an inventory loader holding 10 million products, that's an obvious yes. For the `Order` object created once per request, the friction (inheritance care, pickling, no dynamic attributes) outweighs the savings.
+
+A useful pattern: use `@dataclass(slots=True)` by default for record-style classes you control, where the attribute set is fixed anyway. The cost is one keyword argument, and you get the benefit if the class is ever instantiated at scale. Reserve full hand-written slots for the rare case where you need fine control (no inherited dict, weakref support, mixin combinations).
+
+What slots are **not** good for:
+
+- Classes that are designed to be patched at runtime (testing helpers, plugin objects).
+- Quick scripts where you might add an attribute later as you iterate.
+- Anything where the readability cost of declaring slots outweighs the memory cost of not declaring them.
+
+In a healthy codebase, slots are an opt-in optimization for the few classes where instance count is high. They are not a default style. Don't sprinkle them everywhere.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

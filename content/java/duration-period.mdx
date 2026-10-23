@@ -1,0 +1,519 @@
+---
+title: "Duration & Period"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Duration & Period explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="why-two-types-instead-of-one">Why Two Types Instead of One</h1>
+
+A "day" looks like a single concept until a daylight saving boundary appears. On the spring-forward day in most US time zones, the clock jumps from 02:00 straight to 03:00. That day has 23 hours, not 24. On the fall-back day, the clock falls from 02:00 back to 01:00 and that day has 25 hours. If someone places an order on March 8 and shipping "one day later" means "the same wall-clock time tomorrow" (which is 23 hours away), that's different from "exactly 86,400 seconds from now" (which would land at a different wall-clock time). Both are legitimate answers to different questions.
+
+Java's solution is two different types that force an explicit choice.
+
+| Type       | Models               | Units                | Use When                                                                 |
+| ---------- | -------------------- | -------------------- | ------------------------------------------------------------------------ |
+| `Duration` | Machine-time amount  | seconds, nanoseconds | Cache TTL, countdown, SLA, "X seconds elapsed", anything below a day     |
+| `Period`   | Calendar-time amount | years, months, days  | Subscription length, free-trial days, age, return window, anything dated |
+
+Both live in `java.time`, both are immutable, and both have nothing to do with the legacy `java.util.Date` API.
+
+The split looks pedantic at first, but it eliminates a whole class of bugs. The compiler cannot add a `Duration` to a `LocalDate` (which has no time-of-day), and a `Period` cannot go where a millisecond-precision amount is expected. The types push toward the correct option.
+
+<h1 id="building-a-duration">Building a Duration</h1>
+
+A `Duration` always holds two fields internally: a `long` count of seconds and an `int` of nanoseconds within that second. Every factory method ends up populating those two fields.
+
+```java
+import java.time.Duration;
+
+public class BuildDurations {
+    public static void main(String[] args) {
+        Duration cacheTtl = Duration.ofMinutes(15);
+        Duration flashSale = Duration.ofHours(2);
+        Duration apiTimeout = Duration.ofMillis(500);
+        Duration animationFrame = Duration.ofNanos(16_666_666);
+        Duration deliverySla = Duration.ofDays(2);
+
+        System.out.println("Cache TTL:      " + cacheTtl);
+        System.out.println("Flash sale:     " + flashSale);
+        System.out.println("API timeout:    " + apiTimeout);
+        System.out.println("Frame interval: " + animationFrame);
+        System.out.println("Delivery SLA:   " + deliverySla);
+    }
+}
+```
+
+The `PT...` format is ISO-8601 for time durations. `P` is the prefix for any period of time, `T` separates the date part from the time part, and the units are `H`, `M`, `S` (with fractional seconds allowed). `Duration.ofDays(2)` printed as `PT48H`, not `P2D`. That isn't a bug. A `Duration` doesn't know what a calendar day is; it converts every day to exactly 86,400 seconds and prints in time units.
+
+A `Duration` can also be built from two `Instant` or `LocalDateTime` values:
+
+```java
+import java.time.Duration;
+import java.time.Instant;
+
+public class TimeSincePlaced {
+    public static void main(String[] args) {
+        Instant orderPlaced = Instant.parse("2026-05-14T09:30:00Z");
+        Instant orderShipped = Instant.parse("2026-05-14T11:45:30Z");
+
+        Duration handlingTime = Duration.between(orderPlaced, orderShipped);
+        System.out.println("Handling time: " + handlingTime);
+        System.out.println("In minutes:    " + handlingTime.toMinutes());
+        System.out.println("In seconds:    " + handlingTime.toSeconds());
+    }
+}
+```
+
+`Duration.between` works on any pair of `Temporal` values that carry time-of-day information. It does not work on two `LocalDate` instances because a date alone has no time component. Calling it that way throws `DateTimeException: Unable to obtain Duration from TemporalAmount`.
+
+For reading a duration from a config file or user input, `Duration.parse` accepts ISO-8601:
+
+```java
+import java.time.Duration;
+
+public class ParseDuration {
+    public static void main(String[] args) {
+        Duration sessionTimeout = Duration.parse("PT30M");
+        Duration retryDelay = Duration.parse("PT1.5S");
+        Duration cleanupInterval = Duration.parse("P1DT6H");
+
+        System.out.println("Session timeout: " + sessionTimeout.toMinutes() + " min");
+        System.out.println("Retry delay:     " + retryDelay.toMillis() + " ms");
+        System.out.println("Cleanup every:   " + cleanupInterval.toHours() + " hours");
+    }
+}
+```
+
+`Duration` is immutable and cheap to allocate, but every arithmetic operation creates a new object. In a tight loop that builds millions of durations, prefer working with raw `long` nanoseconds and converting to `Duration` once at the boundary.
+
+<h1 id="reading-and-comparing-durations">Reading and Comparing Durations</h1>
+
+A `Duration` exposes both its raw fields (seconds plus nanos) and a set of convenience converters. The convenience methods handle unit conversion.
+
+| Method         | Returns                                      |
+| -------------- | -------------------------------------------- |
+| `getSeconds()` | The raw seconds field (signed `long`)        |
+| `getNano()`    | Nanoseconds within that second (0-999999999) |
+| `toNanos()`    | Total nanoseconds as a `long`                |
+| `toMillis()`   | Total milliseconds as a `long`               |
+| `toSeconds()`  | Total whole seconds (Java 9+)                |
+| `toMinutes()`  | Total whole minutes                          |
+| `toHours()`    | Total whole hours                            |
+| `toDays()`     | Total whole days (24-hour days)              |
+
+The `to...` methods truncate toward zero. They don't round.
+
+```java
+import java.time.Duration;
+
+public class ReadDuration {
+    public static void main(String[] args) {
+        Duration shipping = Duration.ofHours(50).plusMinutes(45);
+
+        System.out.println("toString:    " + shipping);
+        System.out.println("toDays:      " + shipping.toDays());
+        System.out.println("toHours:     " + shipping.toHours());
+        System.out.println("toMinutes:   " + shipping.toMinutes());
+        System.out.println("toSeconds:   " + shipping.toSeconds());
+        System.out.println("getSeconds:  " + shipping.getSeconds());
+        System.out.println("getNano:     " + shipping.getNano());
+    }
+}
+```
+
+A common gotcha: `getSeconds()` returns the internal field, which is the _total_ count of whole seconds. It's often mistaken for "the seconds part of an HMS breakdown" (like 30 in `1H 2M 30S`). It isn't. Use modular arithmetic on `toSeconds()` to get the breakdown.
+
+For comparisons, `Duration` implements `Comparable<Duration>` and offers state checks:
+
+```java
+import java.time.Duration;
+
+public class CompareDuration {
+    public static void main(String[] args) {
+        Duration freeShippingSla = Duration.ofDays(3);
+        Duration actualDelivery = Duration.ofDays(2).plusHours(18);
+
+        System.out.println("Within SLA:    " + (actualDelivery.compareTo(freeShippingSla) <= 0));
+        System.out.println("Is zero:       " + actualDelivery.isZero());
+        System.out.println("Is negative:   " + actualDelivery.isNegative());
+
+        Duration overrun = actualDelivery.minus(freeShippingSla);
+        System.out.println("Overrun:       " + overrun);
+        System.out.println("Overrun |abs|: " + overrun.abs());
+    }
+}
+```
+
+`compareTo` returns the usual negative, zero, or positive `int`. `isZero` and `isNegative` are the readable spellings of `compareTo(Duration.ZERO) == 0` and `compareTo(Duration.ZERO) < 0`. `abs()` returns the positive magnitude, which is handy when subtracting a deadline from "now" and only the gap matters.
+
+<h1 id="duration-arithmetic">Duration Arithmetic</h1>
+
+`Duration` is immutable, so every arithmetic method returns a new instance.
+
+```java
+import java.time.Duration;
+
+public class DurationArithmetic {
+    public static void main(String[] args) {
+        Duration cacheTtl = Duration.ofMinutes(5);
+
+        Duration doubled = cacheTtl.multipliedBy(2);
+        Duration halved = cacheTtl.dividedBy(2);
+        Duration negated = cacheTtl.negated();
+        Duration extended = cacheTtl.plus(Duration.ofSeconds(30));
+        Duration shortened = cacheTtl.minusSeconds(45);
+
+        System.out.println("Original:  " + cacheTtl);
+        System.out.println("Doubled:   " + doubled);
+        System.out.println("Halved:    " + halved);
+        System.out.println("Negated:   " + negated);
+        System.out.println("Extended:  " + extended);
+        System.out.println("Shortened: " + shortened);
+    }
+}
+```
+
+The fluent methods come in two shapes. `plus(Duration)` and `minus(Duration)` take another duration. `plusSeconds`, `plusMinutes`, `plusHours`, `plusDays`, `plusMillis`, `plusNanos` take a `long`. Use whichever reads better at the call site.
+
+Combine a `Duration` with an `Instant` to compute a future or past point in time:
+
+```java
+import java.time.Duration;
+import java.time.Instant;
+
+public class FlashSaleCountdown {
+    public static void main(String[] args) {
+        Instant saleStart = Instant.parse("2026-05-14T18:00:00Z");
+        Duration saleLength = Duration.ofHours(2);
+
+        Instant saleEnd = saleStart.plus(saleLength);
+        Instant warningTime = saleEnd.minus(Duration.ofMinutes(10));
+
+        System.out.println("Sale starts:  " + saleStart);
+        System.out.println("Sale ends:    " + saleEnd);
+        System.out.println("Final warning:" + warningTime);
+    }
+}
+```
+
+`Instant.plus(Duration)` and `Instant.minus(Duration)` both return a new `Instant`. The `Duration` doesn't change. This is the pattern for computing a deadline: take a starting `Instant`, add a `Duration`, get back the deadline.
+
+<h1 id="building-a-period">Building a Period</h1>
+
+`Period` works the same way conceptually, but it holds years, months, and days separately instead of collapsing everything to seconds. There's no time-of-day component at all.
+
+```java
+import java.time.Period;
+
+public class BuildPeriods {
+    public static void main(String[] args) {
+        Period freeTrial = Period.ofDays(14);
+        Period returnWindow = Period.ofDays(30);
+        Period subscription = Period.ofYears(1);
+        Period quarterlyPlan = Period.ofMonths(3);
+        Period custom = Period.of(1, 6, 15);
+
+        System.out.println("Free trial:    " + freeTrial);
+        System.out.println("Return window: " + returnWindow);
+        System.out.println("Subscription:  " + subscription);
+        System.out.println("Quarterly:     " + quarterlyPlan);
+        System.out.println("Custom plan:   " + custom);
+    }
+}
+```
+
+The ISO-8601 format for periods is `P{years}Y{months}M{days}D`. There's no `T` because there's no time component. `Period.ofWeeks(n)` exists too, but it just calls `Period.ofDays(n * 7)`; the result prints as days, not weeks.
+
+`Period.between(LocalDate, LocalDate)` returns the gap between two calendar dates as a years-months-days breakdown:
+
+```java
+import java.time.LocalDate;
+import java.time.Period;
+
+public class CustomerTenure {
+    public static void main(String[] args) {
+        LocalDate signedUp = LocalDate.of(2024, 1, 15);
+        LocalDate today = LocalDate.of(2026, 5, 14);
+
+        Period tenure = Period.between(signedUp, today);
+        System.out.println("Tenure: " + tenure);
+        System.out.println("Years:  " + tenure.getYears());
+        System.out.println("Months: " + tenure.getMonths());
+        System.out.println("Days:   " + tenure.getDays());
+    }
+}
+```
+
+The breakdown is calendar-aware. `Period.between` walks the calendar respecting month lengths (28-31 days) and leap years. This is why it returns three separate fields: there's no single integer that means "two years, three months, and 29 days" because months don't have a fixed length.
+
+`Period.parse` reads ISO-8601:
+
+```java
+import java.time.Period;
+
+public class ParsePeriod {
+    public static void main(String[] args) {
+        Period annualPlan = Period.parse("P1Y");
+        Period postPurchase = Period.parse("P30D");
+        Period generousReturn = Period.parse("P3M");
+        Period founderOffer = Period.parse("P1Y2M3D");
+
+        System.out.println("Annual:        " + annualPlan);
+        System.out.println("Returns:       " + postPurchase);
+        System.out.println("Generous ret:  " + generousReturn);
+        System.out.println("Founder offer: " + founderOffer);
+    }
+}
+```
+
+<h1 id="reading-a-period">Reading a Period</h1>
+
+`Period` exposes its three fields directly. The only convenience converter is `toTotalMonths()`, which combines years and months into a single `long`.
+
+```java
+import java.time.Period;
+
+public class ReadPeriod {
+    public static void main(String[] args) {
+        Period plan = Period.of(2, 5, 10);
+
+        System.out.println("toString:        " + plan);
+        System.out.println("getYears:        " + plan.getYears());
+        System.out.println("getMonths:       " + plan.getMonths());
+        System.out.println("getDays:         " + plan.getDays());
+        System.out.println("toTotalMonths:   " + plan.toTotalMonths());
+        System.out.println("isZero:          " + plan.isZero());
+        System.out.println("isNegative:      " + plan.isNegative());
+    }
+}
+```
+
+Notice what's missing: there is no `toTotalDays()`. A period of `P1M` has no fixed day count (a January period is 31 days, a February period is 28 or 29). The API refuses to lie about it. For a day count between two specific dates, use `ChronoUnit.DAYS.between(start, end)` instead.
+
+A subtle property: `Period` doesn't normalize on its own. `Period.of(0, 15, 0)` prints as `P15M`, not `P1Y3M`. For the canonical years/months form, call `normalized()`, which rolls 12 months into a year but leaves the day field alone.
+
+```java
+import java.time.Period;
+
+public class PeriodNormalize {
+    public static void main(String[] args) {
+        Period messy = Period.of(0, 15, 45);
+        Period tidy = messy.normalized();
+
+        System.out.println("Messy: " + messy);
+        System.out.println("Tidy:  " + tidy);
+    }
+}
+```
+
+The 45 days stay as 45 days. The library can't safely convert days to months without a reference date because months aren't a fixed number of days.
+
+<h1 id="period-arithmetic">Period Arithmetic</h1>
+
+`Period` arithmetic mirrors `Duration` arithmetic. Every method returns a new `Period`.
+
+```java
+import java.time.Period;
+
+public class PeriodArithmetic {
+    public static void main(String[] args) {
+        Period basePlan = Period.ofMonths(3);
+
+        Period doubled = basePlan.multipliedBy(2);
+        Period negated = basePlan.negated();
+        Period combined = basePlan.plus(Period.ofDays(15));
+        Period reduced = basePlan.minusDays(5);
+
+        System.out.println("Base:     " + basePlan);
+        System.out.println("Doubled:  " + doubled);
+        System.out.println("Negated:  " + negated);
+        System.out.println("Combined: " + combined);
+        System.out.println("Reduced:  " + reduced);
+    }
+}
+```
+
+That last result, `P3M-5D`, looks odd. It is valid ISO-8601, but it's a sign that the fields haven't been normalized against a real date. Until this `Period` is applied to a `LocalDate`, the library doesn't know whether 3 months minus 5 days is "still 3 months back" or "2 months and 26 days back". It defers the math.
+
+Applying a `Period` to a `LocalDate` returns a new date:
+
+```java
+import java.time.LocalDate;
+import java.time.Period;
+
+public class TrialExpiry {
+    public static void main(String[] args) {
+        LocalDate signupDate = LocalDate.of(2026, 5, 14);
+        Period freeTrial = Period.ofDays(14);
+
+        LocalDate trialEnds = signupDate.plus(freeTrial);
+        LocalDate warningDay = trialEnds.minus(Period.ofDays(3));
+
+        System.out.println("Signed up:    " + signupDate);
+        System.out.println("Trial ends:   " + trialEnds);
+        System.out.println("Send warning: " + warningDay);
+    }
+}
+```
+
+Now consider a calendar-aware case: adding one month to January 31.
+
+```java
+import java.time.LocalDate;
+import java.time.Period;
+
+public class MonthlyRenewal {
+    public static void main(String[] args) {
+        LocalDate jan31 = LocalDate.of(2026, 1, 31);
+        LocalDate feb28 = jan31.plus(Period.ofMonths(1));
+        LocalDate mar28 = feb28.plus(Period.ofMonths(1));
+
+        System.out.println("Jan renewal: " + jan31);
+        System.out.println("Feb renewal: " + feb28);
+        System.out.println("Mar renewal: " + mar28);
+    }
+}
+```
+
+Adding one month to January 31 gives February 28 (the last valid day of February), not February 31. From there, adding another month gives March 28, not March 31. The library doesn't try to "remember" that the start was the 31st. For "the last day of the month" behavior, use `TemporalAdjusters.lastDayOfMonth()` instead. That's a separate API and outside the scope of this lesson.
+
+<h1 id="the-dst-trap-when-durationofdays1-and-periodofdays1-disagree">
+  The DST Trap: When Duration.ofDays(1) and Period.ofDays(1) Disagree
+</h1>
+
+This example shows why the split matters. Take a `ZonedDateTime` the night before daylight saving begins, then add "one day" with each type. The results are different.
+
+```java
+import java.time.Duration;
+import java.time.Period;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+
+public class DstTrap {
+    public static void main(String[] args) {
+        // March 8, 2026 is the spring-forward day in US Eastern time.
+        // Clocks jump from 02:00 EST straight to 03:00 EDT.
+        ZonedDateTime before = ZonedDateTime.of(2026, 3, 7, 18, 0, 0, 0, ZoneId.of("America/New_York"));
+
+        ZonedDateTime plusDuration = before.plus(Duration.ofDays(1));
+        ZonedDateTime plusPeriod = before.plus(Period.ofDays(1));
+
+        System.out.println("Start:           " + before);
+        System.out.println("+ Duration.ofDays(1): " + plusDuration);
+        System.out.println("+ Period.ofDays(1):   " + plusPeriod);
+    }
+}
+```
+
+Look at the two results. `Duration.ofDays(1)` added exactly 86,400 seconds. Because the spring-forward day lost an hour, the wall clock advanced by 25 hours of clock time to cover 24 hours of elapsed time. The result is `19:00` on March 8.
+
+`Period.ofDays(1)` added one calendar day. The wall clock stays at `18:00`. The amount of physical time elapsed was only 23 hours, not 24, because the day itself was 23 hours long.
+
+Both answers are correct for different questions:
+
+| Question                                                        | Use        |
+| --------------------------------------------------------------- | ---------- |
+| "Show this banner for exactly 24 hours"                         | `Duration` |
+| "Renew this subscription one day from now (same time tomorrow)" | `Period`   |
+| "Expire this cache after 1 hour"                                | `Duration` |
+| "Give the customer a 7-day free trial"                          | `Period`   |
+| "Bill the customer monthly"                                     | `Period`   |
+| "Time out this API call after 30 seconds"                       | `Duration` |
+
+The same trap exists in reverse on the fall-back day. `Duration.ofDays(1)` advances the wall clock by 23 hours of physical time spread across a 25-hour calendar day. `Period.ofDays(1)` advances the wall clock by exactly one calendar day. The difference is always one hour around a DST boundary.
+
+The DST adjustment only happens when the time math is bound to a real zone. `LocalDateTime.plus(Duration.ofDays(1))` and `LocalDateTime.plus(Period.ofDays(1))` produce the same result because a `LocalDateTime` has no zone. The trap only fires on `ZonedDateTime`.
+
+<h1 id="chronounitbetween-for-a-single-unit-answer">
+  ChronoUnit.between for a Single-Unit Answer
+</h1>
+
+`Period.between` returns years, months, and days. Sometimes the answer should be just one number: "how many days until the trial ends" or "how many hours since the order was placed". `ChronoUnit.between(start, end)` answers that question.
+
+```java
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
+
+public class TotalDaysAndHours {
+    public static void main(String[] args) {
+        LocalDate signedUp = LocalDate.of(2024, 1, 15);
+        LocalDate today = LocalDate.of(2026, 5, 14);
+
+        long totalDays = ChronoUnit.DAYS.between(signedUp, today);
+        long totalMonths = ChronoUnit.MONTHS.between(signedUp, today);
+
+        System.out.println("Days as a customer:   " + totalDays);
+        System.out.println("Months as a customer: " + totalMonths);
+
+        LocalDateTime orderPlaced = LocalDateTime.of(2026, 5, 14, 9, 30);
+        LocalDateTime now = LocalDateTime.of(2026, 5, 14, 14, 15);
+
+        long hoursSince = ChronoUnit.HOURS.between(orderPlaced, now);
+        long minutesSince = ChronoUnit.MINUTES.between(orderPlaced, now);
+
+        System.out.println("Hours since order:    " + hoursSince);
+        System.out.println("Minutes since order:  " + minutesSince);
+    }
+}
+```
+
+`ChronoUnit.DAYS.between` returned 850, where `Period.between` for the same dates returns `P2Y3M29D`. Same range, different shape. Use whichever fits the display.
+
+One rule to remember: `ChronoUnit.MONTHS.between` and `ChronoUnit.YEARS.between` only work on temporal types that carry date information. `ChronoUnit.HOURS.between` and below only work on temporal types that carry time information. The compiler permits any combination, but a runtime exception fires if the underlying temporal can't supply the unit. `LocalDate` plus `ChronoUnit.HOURS.between` throws.
+
+```java
+import java.time.LocalDate;
+import java.time.temporal.ChronoUnit;
+
+public class ChronoUnitMismatch {
+    public static void main(String[] args) {
+        LocalDate a = LocalDate.of(2026, 5, 14);
+        LocalDate b = LocalDate.of(2026, 5, 15);
+
+        try {
+            long hours = ChronoUnit.HOURS.between(a, b);
+            System.out.println("Hours: " + hours);
+        } catch (Exception e) {
+            System.out.println("Failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+    }
+}
+```
+
+Use `LocalDateTime` or `Instant` for hour, minute, or second granularity from `ChronoUnit.between`.
+
+<h1 id="picking-between-duration-period-and-chronounit">
+  Picking Between Duration, Period, and ChronoUnit
+</h1>
+
+Three tools, three questions:
+
+| Question                                                            | Tool                      |
+| ------------------------------------------------------------------- | ------------------------- |
+| "How much physical time passed?" (seconds, minutes, hours)          | `Duration`                |
+| "How many calendar units passed?" (years + months + days breakdown) | `Period`                  |
+| "How many of one specific unit passed?" (just days, or just hours)  | `ChronoUnit.UNIT.between` |
+
+Practical examples from e-commerce code:
+
+| Scenario                                          | Code                                                  |
+| ------------------------------------------------- | ----------------------------------------------------- |
+| Cache product details for 5 minutes               | `Duration.ofMinutes(5)`                               |
+| Flash sale lasts 2 hours                          | `Duration.ofHours(2)`                                 |
+| 30-day return window from order date              | `orderDate.plus(Period.ofDays(30))`                   |
+| Monthly subscription renewal                      | `lastBilling.plus(Period.ofMonths(1))`                |
+| Time since order was placed, in minutes           | `ChronoUnit.MINUTES.between(placedAt, Instant.now())` |
+| Banner runs for exactly 24 hours, ignore DST      | `bannerStart.plus(Duration.ofHours(24))`              |
+| Banner runs until same time tomorrow, respect DST | `bannerStart.plus(Period.ofDays(1))`                  |
+
+`Period.between` walks the calendar and is O(1) but allocates a `Period` object. `ChronoUnit.DAYS.between` returns a primitive `long` and skips the allocation. In hot paths, prefer the `ChronoUnit` approach when a single unit is enough.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

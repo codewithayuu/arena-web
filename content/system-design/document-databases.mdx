@@ -1,0 +1,496 @@
+---
+title: "Document Databases"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Document Databases explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+| id  | name                 | sizes  | material | processor | memory_gb | author   | pages |
+| --- | -------------------- | ------ | -------- | --------- | --------- | -------- | ----- |
+| 1   | Trail Runner         | 8,9,10 | mesh     | NULL      | NULL      | NULL     | NULL  |
+| 2   | ProBook 14           | NULL   | NULL     | M3        | 16        | NULL     | NULL  |
+| 3   | System Design Basics | NULL   | NULL     | NULL      | NULL      | A. Singh | 320   |
+
+There is a second problem. Displaying a single product page might require data from the `products` table, a `variants` table, an `images` table, and a `specifications` table. The application has to **join all of them** just to rebuild one product.
+
+What if we could store the whole product, with all its details, as a **single record** that matches how the application already uses it? That is the idea behind a document database.
+
+<h1 id="2-what-is-a-document-database">2. What Is a Document Database?</h1>
+
+A document database stores data as **documents**. A document is a self-contained record, usually in a **JSON-like format**. MongoDB, for example, stores documents in a binary form of JSON called **BSON**.
+
+Documents are grouped into **collections**. A collection is roughly similar to a table in a relational database.
+
+Each document has a **unique identifier**. In MongoDB, this is a field called `_id`.
+
+| Relational               | Document                                         |
+| ------------------------ | ------------------------------------------------ |
+| Table                    | Collection                                       |
+| Row                      | Document                                         |
+| Column                   | Field                                            |
+| Join table / foreign key | Embedded data or a reference to another document |
+
+Popular document databases include **MongoDB**, **Couchbase**, **Google Firestore**, and **Azure Cosmos DB**. **Amazon DynamoDB** can also store document-style items, although it is usually described as a key-value and document database.
+
+<h3 id="document-ids">Document IDs</h3>
+
+The choice of `_id` matters more than it seems:
+
+- **Database-generated IDs** (like MongoDB's `ObjectId`) are convenient and roughly time-ordered.
+- **UUIDs** can be created by any service before writing. Random ones spread writes well, but make indexes less cache-friendly.
+- **Application IDs**, like an order number, are useful when the business already has one.
+
+Time-ordered IDs keep recent records close together in the index, but can create a write hotspot if used as a shard key (more on that in Section 11).
+
+<h1 id="3-the-structure-of-a-document">3. The Structure of a Document</h1>
+
+Let's look at what a product document might contain.
+
+```json
+{
+  "_id": "prod_1",
+  "name": "Trail Runner",
+  "brand": "Nike",
+  "price": 89.99,
+  "sizes": [8, 9, 10, 11],
+  "specifications": {
+    "material": "mesh",
+    "weight_grams": 280
+  },
+  "variants": [
+    { "color": "red", "size": 9, "stock": 14 },
+    { "color": "red", "size": 10, "stock": 3 },
+    { "color": "black", "size": 9, "stock": 22 }
+  ]
+}
+```
+
+- **Simple fields**, like the name, the brand, and the price.
+- An **array**, like a list of available sizes.
+- A **nested object**, like a `specifications` object with the material and the weight.
+- An **array of objects**, like a list of variants, where each variant has its own color, size, and stock count.
+
+All of this lives in **one document**. So when the application needs the product page, it reads one document and gets everything it needs.
+
+There are no joins, and the data is stored together on disk, so the database can usually load it in a single read. This is often called **data locality**.
+
+The document matches the shape of the object in the application code, which makes it natural to work with.
+
+<h1 id="4-flexible-schema">4. Flexible Schema</h1>
+
+The second big feature of document databases is a **flexible schema**.
+
+In a relational database, every row in a table has the same columns. In a document database, two documents in the same collection can have **completely different fields**. The shoe document and the laptop document can both live in the same `products` collection, each with its own fields.
+
+```json
+// products collection
+[
+  {
+    "_id": "prod_1",
+    "name": "Trail Runner",
+    "price": 89.99,
+    "sizes": [8, 9, 10],
+    "material": "mesh"
+  },
+
+  {
+    "_id": "prod_2",
+    "name": "ProBook 14",
+    "price": 1299,
+    "processor": "M3",
+    "memory_gb": 16
+  },
+
+  {
+    "_id": "prod_3",
+    "name": "System Design Basics",
+    "price": 39,
+    "author": "A. Singh",
+    "pages": 320
+  }
+]
+```
+
+Adding a new field does **not require a migration**. The application simply starts writing documents with the new field.
+
+This is useful when the data varies naturally, or when a product is changing quickly and the data model changes with it.
+
+<h3 id="flexibility-comes-with-responsibility">
+  Flexibility Comes with Responsibility
+</h3>
+
+If the database does not enforce structure, the application must handle it. Code that reads documents has to deal with **missing fields**, **old formats**, and **unexpected types**.
+
+For this reason, many teams still add rules. MongoDB, for example, supports **schema validation**, where you can require certain fields and types while still allowing others to vary:
+
+```javascript
+db.createCollection("products", {
+  validator: {
+    $jsonSchema: {
+      bsonType: "object",
+      required: ["name", "price"], // every product must have these
+      properties: {
+        name: { bsonType: "string", minLength: 1 },
+        price: { bsonType: ["double", "int"], minimum: 0 },
+      },
+      // other fields (sizes, processor, author, ...) are still allowed
+    },
+  },
+  validationAction: "error", // reject invalid documents
+});
+```
+
+In production, "schemaless" should not mean "anything goes". Documents in a collection usually share a predictable core shape, with variation only where it is natural.
+
+<h1 id="5-querying-documents">5. Querying Documents</h1>
+
+Unlike a key-value store, a document database **understands what is inside each document**. So we can query by any field, not just the id.
+
+```javascript
+// All products where the brand is Nike and the price is below $100
+db.products.find({ brand: "Nike", price: { $lt: 100 } });
+
+// Nested field: all products where the material is leather
+db.products.find({ "specifications.material": "leather" });
+
+// Inside an array: all products that have a variant in red
+db.products.find({ "variants.color": "red" });
+
+// Return only the fields the page needs (projection)
+db.products.find({ brand: "Nike" }, { name: 1, price: 1 });
+```
+
+<h3 id="aggregation-pipeline">Aggregation Pipeline</h3>
+
+For more complex questions, MongoDB provides an **aggregation pipeline**. A pipeline is a series of **stages**, where each stage transforms the data and passes it to the next.
+
+For example:
+
+1. The first stage could **filter** orders from last month.
+2. The next stage could **group** them by customer and sum the totals.
+3. The last stage could **sort** the customers by total spending.
+
+```javascript
+db.orders.aggregate([
+  {
+    $match: {
+      created_at: { $gte: ISODate("2024-09-01"), $lt: ISODate("2024-10-01") },
+    },
+  },
+  { $group: { _id: "$customer_id", total_spent: { $sum: "$total" } } },
+  { $sort: { total_spent: -1 } },
+]);
+```
+
+MongoDB also has a `**$$lookup**` stage that can join data from another collection. But it is generally more efficient to design documents so that most queries do not need joins at all.
+
+<h1 id="6-indexes">6. Indexes</h1>
+
+Just like relational databases, document databases need **indexes** to query efficiently. Without an index, a query has to scan every document in the collection.
+
+Document databases support familiar index types, such as indexes on a **single field** and **compound** indexes on multiple fields. They also support indexes that are specific to documents.
+
+<h3 id="multikey-indexes">Multikey Indexes</h3>
+
+In MongoDB, an index on an array field is called a **multikey index**. It creates an index entry **for each value in the array**.
+
+So if a product has sizes 8, 9, and 10, the index contains an entry for each size, and a search for size 9 can use the index directly.
+
+Indexes on **nested fields** work as well.
+
+```javascript
+// Single field
+db.products.createIndex({ brand: 1 });
+
+// Compound: filter by brand, sort by price
+db.products.createIndex({ brand: 1, price: 1 });
+
+// Multikey: MongoDB makes this multikey automatically because sizes is an array
+db.products.createIndex({ sizes: 1 });
+
+// Nested field
+db.products.createIndex({ "specifications.material": 1 });
+```
+
+| Index Type       | Use Case                           | Example                    |
+| ---------------- | ---------------------------------- | -------------------------- |
+| **Single field** | Query by one field                 | `brand`                    |
+| **Compound**     | Query or sort by multiple fields   | `{ brand, price }`         |
+| **Multikey**     | Query values inside arrays         | `sizes`, `variants.color`  |
+| **Nested field** | Query inside embedded objects      | `specifications.material`  |
+| **Text**         | Basic text search                  | `name`, `description`      |
+| **TTL**          | Expire old documents automatically | sessions, temporary tokens |
+
+The trade-offs are the same as in any database. Indexes **speed up reads**, but every write must also update them, and they use extra memory and disk. Multikey indexes on large arrays can grow especially fast, since one document creates many entries.
+
+<h1 id="7-embedding-vs-referencing">7. Embedding vs Referencing</h1>
+
+The most important decision when modeling data in a document database is whether to **embed** related data or **reference** it.
+
+<h3 id="embedding">Embedding</h3>
+
+**Embedding** means storing related data inside the same document. For example, an order document can embed its line items and the shipping address.
+
+<h3 id="referencing">Referencing</h3>
+
+**Referencing** means storing related data in a separate document and linking to it by id, similar to a foreign key. For example, an order document can store a `customer_id` that points to a separate customer document.
+
+<h3 id="how-to-decide">How to Decide</h3>
+
+A useful rule of thumb:
+
+- **Embed** data that is **read together**, **owned by the parent**, and **limited in size**.
+- **Reference** data that is **shared**, **updated independently**, or **can grow without limit**.
+
+Line items belong to one order, they are always displayed with the order, and an order has a limited number of them. So embedding them makes sense.
+
+A customer places many orders, and their details can change. If we embedded the full customer in every order, updating their email would mean updating every order they ever placed. So we reference the customer instead.
+
+| Factor            | Favor Embedding                | Favor Referencing           |
+| ----------------- | ------------------------------ | --------------------------- |
+| Access pattern    | Read together most of the time | Read independently          |
+| Ownership         | Owned by the parent            | Shared by many documents    |
+| Relationship size | One-to-one or one-to-few       | One-to-many or many-to-many |
+| Growth            | Has a clear limit              | Can grow without limit      |
+| Updates           | Changes with the parent        | Changes independently       |
+
+<h3 id="mixing-both">Mixing Both</h3>
+
+A common design is a mix of both. For example, an order might **reference** the customer by id, but also **embed a snapshot** of the shipping address as it was when the order was placed:
+
+```json
+{
+  "_id": "order_1001",
+  "customer_id": "user_789",
+  "shipping_address": {
+    "street": "123 Main St",
+    "city": "San Francisco",
+    "zip": "94102"
+  },
+  "items": [
+    {
+      "product_id": "prod_1",
+      "name": "Trail Runner",
+      "unit_price": 89.99,
+      "quantity": 1
+    },
+    {
+      "product_id": "prod_9",
+      "name": "Running Socks",
+      "unit_price": 12.0,
+      "quantity": 3
+    }
+  ],
+  "total": 125.99,
+  "status": "shipped"
+}
+```
+
+The address and item prices are **saved copies**. If Alice moves or the product price changes later, this order still shows what was true at purchase time, which is usually exactly what you want for order history.
+
+In short, embedding gives you a single read and atomic updates, at the risk of duplicated data and documents that keep growing. Referencing keeps one official copy and smaller documents, at the cost of extra reads and no database-enforced foreign keys.
+
+<h1 id="8-a-modeling-example-a-blog">8. A Modeling Example: A Blog</h1>
+
+Let's apply this to a **blog**. Each post has a title, an author, some tags, and comments.
+
+- **Tags** are small, belong to the post, and are read with it, so we **embed** them as an array.
+- **The author** is shared across many posts, so we store the **author id**, and maybe the author's name for display.
+- **Comments** are the interesting case.
+
+At first, embedding comments in the post seems natural, because we show them together. But a popular post might receive **tens of thousands of comments**. The document would keep growing, and every new comment would rewrite a larger and larger document. MongoDB also limits a single document to **16 MB**.
+
+So comments are usually stored in **their own collection**, with each comment referencing the post id. The post might still embed the **three most recent comments**, so the page can load quickly without a second query.
+
+```json
+// posts collection
+{
+  "_id": "post_42",
+  "title": "Understanding Document Databases",
+  "author_id": "user_789",
+  "author_name": "Alice Chen",
+  "tags": ["databases", "nosql", "mongodb"],
+  "comment_count": 18432,
+  "recent_comments": [
+    { "user_name": "Bob",   "text": "Clear explanation.", "at": "2024-03-15T12:00:00Z" },
+    { "user_name": "Carol", "text": "Great examples!",    "at": "2024-03-15T11:40:00Z" },
+    { "user_name": "Dave",  "text": "Thanks!",            "at": "2024-03-15T11:02:00Z" }
+  ]
+}
+
+// comments collection (one document per comment)
+{ "_id": "c_90812", "post_id": "post_42", "user_name": "Bob", "text": "Clear explanation.", "at": "2024-03-15T12:00:00Z" }
+```
+
+This shows the general idea. **Model documents around how the application reads and writes data**, not around a fixed set of rules.
+
+<h1 id="9-updates-and-transactions">9. Updates and Transactions</h1>
+
+<h3 id="partial-updates">Partial Updates</h3>
+
+Document databases can update part of a document without rewriting the whole thing from the application. For example, we can **set** a single field, **increment** a counter, or **push** a new item onto an array.
+
+```javascript
+db.products.updateOne(
+  { _id: "prod_1" },
+  {
+    $set: { price: 79.99 }, // set a single field
+    $inc: { "variants.0.stock": -1 }, // increment (here, decrement) a counter
+    $push: { sizes: 12 }, // push a new item onto an array
+  },
+);
+```
+
+<h3 id="single-document-atomicity">Single-Document Atomicity</h3>
+
+An important guarantee is that **operations on a single document are atomic**. If we update three fields in one document, either all three change or none do.
+
+This is one reason embedding is useful. If an order and its line items live in one document, updating them together is automatically safe.
+
+<h3 id="multi-document-transactions">Multi-Document Transactions</h3>
+
+For changes across multiple documents, MongoDB added **multi-document ACID transactions** in version **4.0**, and extended them to sharded clusters in version **4.2**. So we can, for example, create an order and reduce stock in a separate product document within one transaction.
+
+```javascript
+const session = client.startSession();
+try {
+  await session.withTransaction(async () => {
+    await orders.insertOne(
+      {
+        _id: "order_1002",
+        customer_id: "user_789",
+        items: [{ product_id: "prod_1", quantity: 1 }],
+      },
+      { session },
+    );
+    await products.updateOne(
+      { _id: "prod_1", variants: { $elemMatch: { size: 9, color: "red" } } },
+      { $inc: { "variants.$.stock": -1 } },
+      { session },
+    );
+  });
+} finally {
+  await session.endSession();
+}
+```
+
+But these transactions have **more overhead** than single-document operations. So a good document design keeps most related changes inside one document when possible.
+
+<h1 id="10-replication">10. Replication</h1>
+
+Document databases usually replicate data across multiple servers for availability. In MongoDB, this is called a **replica set**.
+
+A replica set has **one primary** and usually **two or more secondaries**.
+
+- All **writes go to the primary**, which records them in a log called the **oplog**.
+- The **secondaries copy the oplog** and apply the same changes.
+- If the primary fails, the remaining members hold an **election**, and one of the secondaries becomes the new primary. This usually happens automatically within seconds.
+
+<h3 id="write-concern-and-read-preference">
+  Write Concern and Read Preference
+</h3>
+
+Applications can also control how safe each operation should be.
+
+- A **write concern of **`**majority**` means the write is only confirmed after most members have it. That protects the write even if the primary fails right after.
+- **Reads can go to secondaries** to spread load, but those reads might return slightly stale data, because secondaries can lag behind the primary.
+
+```javascript
+// Confirm only after a majority of replica set members have the write
+db.orders.insertOne(order, { writeConcern: { w: "majority" } });
+
+// Allow this read to be served by a secondary (may be slightly stale)
+db.products.find({ brand: "Nike" }).readPref("secondaryPreferred");
+```
+
+<h1 id="11-sharding">11. Sharding</h1>
+
+When a collection becomes too large or too busy for one replica set, document databases can **shard** it. The collection is split across multiple shards, and **each shard is its own replica set**.
+
+The data is divided using a **shard key**, which is a field present in every document. For example, an `orders` collection might be sharded by `customer_id`.
+
+MongoDB supports two strategies:
+
+- **Ranged sharding**, where nearby key values are stored together.
+- **Hashed sharding**, where keys are spread evenly using a hash.
+
+<h3 id="the-router">The Router</h3>
+
+A **router** (`mongos` in MongoDB) receives queries from the application and sends them to the right shard.
+
+- If the query **includes the shard key**, the router can send it to a **single shard**.
+- If it **does not**, the router has to send the query to **every shard** and combine the results. This is called a **scatter-gather** query, and it is much more expensive.
+
+So the **shard key should match your most common queries**.
+
+<h3 id="hot-spots">Hot Spots</h3>
+
+A poor shard key can also create **hot spots**, where one shard receives most of the traffic.
+
+| Shard Key                                     | Problem                                                                      |
+| --------------------------------------------- | ---------------------------------------------------------------------------- |
+| `status`                                      | Only a few values, so data cannot spread across many shards                  |
+| `created_at` or a time-ordered `_id` (ranged) | Every new write lands on the shard holding the newest range                  |
+| `country`                                     | One large country dominates one shard                                        |
+| `customer_id` (hashed)                        | Spreads writes evenly, and "orders for this customer" stays a targeted query |
+
+<h1 id="12-document-vs-relational-databases">
+  12. Document vs Relational Databases
+</h1>
+
+Let's compare document databases with relational databases.
+
+|                  | Relational                                            | Document                                                                             |
+| ---------------- | ----------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| **Data layout**  | Normalized tables, combined with joins at query time  | Related data kept together in one document, shaped for how it will be read           |
+| **Schema**       | Fixed, enforced by the database                       | Flexible, with optional validation                                                   |
+| **Strong at**    | Complex joins and ad hoc queries across many entities | Reading and writing whole objects quickly, when each request touches one main entity |
+| **Transactions** | Multi-row ACID is the default                         | Single-document atomic; multi-document transactions available but costlier           |
+
+The line between them has also **blurred**. PostgreSQL supports JSON columns with indexing, and MongoDB supports joins and transactions.
+
+```sql
+-- PostgreSQL: a document-style JSONB column, indexed and queried by nested field
+CREATE TABLE products (id BIGSERIAL PRIMARY KEY, doc JSONB NOT NULL);
+CREATE INDEX ON products USING GIN (doc);
+
+SELECT doc->>'name'
+FROM products
+WHERE doc @> '{"specifications": {"material": "leather"}}';
+```
+
+So the choice is less about features and more about **which model fits your data and access patterns best**.
+
+<h1 id="13-when-to-use-a-document-database">
+  13. When to Use a Document Database
+</h1>
+
+A document database is a good fit when:
+
+- Your data is **naturally shaped like objects with nested details**. Product catalogs, content management systems, user profiles, and game state are common examples.
+- **Records vary in structure**, or the **data model changes often**.
+- **Most requests read or write one main entity at a time**, such as one product, one article, or one user.
+
+It is less suited to:
+
+- Data with **many relationships** that need to be combined in different ways. Financial systems with complex reporting across accounts, transactions, and customers often fit better in a relational database.
+
+And if you find yourself **referencing everything and joining collections on almost every query**, that is a sign the data may be more relational than document-shaped.
+
+<h1 id="summary">Summary</h1>
+
+- Document databases store data as **JSON-like documents** that can contain **nested objects and arrays**, grouped into **collections**.
+- Reading one document returns a whole object, with no joins, thanks to **data locality**.
+- A **flexible schema** lets documents in the same collection have different fields; **schema validation** adds guardrails.
+- Documents can be queried and **indexed by any field**, including nested fields and arrays (**multikey indexes**), and analyzed with the **aggregation pipeline**.
+- Good modeling comes down to deciding what to **embed** and what to **reference**, based on how the application uses the data.
+- **Single-document writes are atomic**; multi-document transactions exist but cost more.
+- With **replica sets** and **sharding**, document databases provide high availability and scale across many servers, as long as the **shard key** matches common queries.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

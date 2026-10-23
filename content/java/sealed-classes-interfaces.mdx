@@ -1,0 +1,380 @@
+---
+title: "Sealed Classes & Interfaces (Java 17): The Modern Java Lens"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Sealed Classes & Interfaces (Java 17) explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+`FullRefund` is `final`: the chain stops. `PartialRefund` is `sealed` and continues with a smaller permits list of its own. `StoreCreditRefund` is `non-sealed`, so anyone, including a separate gifting module, can extend it. From here on, the lesson is about what you can build with this vocabulary.
+
+<h1 id="sealed-interfaces-records-algebraic-data-types-in-java">
+  Sealed Interfaces + Records: Algebraic Data Types in Java
+</h1>
+
+A common pattern in modern Java code is a sealed interface plus records as the permitted subtypes. This pattern has a name borrowed from functional languages: **algebraic data type**, often shortened to ADT. The "sum type" form means "a value of this type is exactly one of these variants, and the list is closed." Java doesn't use the term in the spec, but the pattern is the same thing.
+
+The combination is powerful for three reasons. The sealed interface gives you a closed list of variants. Records make each variant immutable and give you value-based `equals`, `hashCode`, and `toString` automatically. Together, they make exhaustive `switch` possible, which is the payoff.
+
+A `Payment` type modeled this way:
+
+```java
+public class PaymentAdt {
+    public static void main(String[] args) {
+        Payment[] payments = {
+            new CreditCard("4111-1111-1111-1111", "12/29", 250.00),
+            new PayPal("alice@example.com", 89.99),
+            new Cash(45.00)
+        };
+
+        for (Payment p : payments) {
+            System.out.println(describe(p));
+        }
+    }
+
+    public static String describe(Payment payment) {
+        return switch (payment) {
+            case CreditCard c -> "Card ending " + last4(c.cardNumber())
+                + " charged $" + c.amount();
+            case PayPal p     -> "PayPal " + p.email() + " charged $" + p.amount();
+            case Cash cash    -> "Cash payment of $" + cash.amount();
+        };
+    }
+
+    private static String last4(String cardNumber) {
+        return cardNumber.substring(cardNumber.length() - 4);
+    }
+}
+
+sealed interface Payment permits CreditCard, PayPal, Cash {}
+
+record CreditCard(String cardNumber, String expiry, double amount) implements Payment {}
+record PayPal(String email, double amount) implements Payment {}
+record Cash(double amount) implements Payment {}
+```
+
+Look at the shape. Three records, one sealed interface, one switch. Each record carries the data specific to that variant: a card has a card number and an expiry, PayPal has an email, cash has nothing extra. The switch handles each case once, and the compiler accepts it as exhaustive because the sealed declaration tells it the list of variants is complete.
+
+The hierarchy looks like this:
+
+The diagram makes the "closed list" property visible at a glance. The parent declares its variants on one line. Each variant is a record carrying its own data. Nothing else can implement `Payment` from anywhere in the codebase.
+
+Records are reference types, so each variant is a heap allocation. For high-throughput code (millions of `Payment` objects per second), that matters, but for typical request/response code the cost is negligible compared to JSON parsing or database I/O.
+
+This pattern took off in modern Java because it gives you what enums almost give you, but without the constraint that every case has identical fields. Records are covered fully in lesson 06 of this section. Here we use them as the building blocks for closed-variant types.
+
+<h1 id="exhaustive-switch-what-exhaustive-actually-costs-you">
+  Exhaustive Switch: What "Exhaustive" Actually Costs You
+</h1>
+
+When you add a new variant to a sealed type, every exhaustive switch over that type stops compiling until you handle the new case. That's the central trade. It's strictly more work than an open hierarchy, where adding a subtype silently flows through a `default` branch. It's also strictly safer: the compiler tells you exactly where the new variant needs handling.
+
+An example. Suppose the e-commerce team adds a fourth payment method, `BankTransfer`. They update the sealed interface but forget the switch:
+
+```java
+sealed interface Payment permits CreditCard, PayPal, Cash, BankTransfer {}
+
+record CreditCard(String cardNumber, String expiry, double amount) implements Payment {}
+record PayPal(String email, double amount) implements Payment {}
+record Cash(double amount) implements Payment {}
+record BankTransfer(String iban, double amount) implements Payment {}
+
+public class ExhaustivenessBreaks {
+    public static String describe(Payment payment) {
+        return switch (payment) {
+            case CreditCard c -> "Card payment $" + c.amount();
+            case PayPal p     -> "PayPal payment $" + p.amount();
+            case Cash cash    -> "Cash payment $" + cash.amount();
+        };
+    }
+}
+```
+
+The compiler refuses to build this with a message like:
+
+```text
+error: the switch expression does not cover all possible input values
+        return switch (payment) {
+               ^
+```
+
+The compiler points at the switch that's now incomplete, and the fix is mechanical: add the missing case.
+
+```java
+public class ExhaustivenessFixed {
+    public static void main(String[] args) {
+        Payment payment = new BankTransfer("DE89-3704-0044-0532", 1200.00);
+        System.out.println(describe(payment));
+    }
+
+    public static String describe(Payment payment) {
+        return switch (payment) {
+            case CreditCard c   -> "Card payment $" + c.amount();
+            case PayPal p       -> "PayPal payment $" + p.amount();
+            case Cash cash      -> "Cash payment $" + cash.amount();
+            case BankTransfer b -> "Bank transfer from " + b.iban() + " for $" + b.amount();
+        };
+    }
+}
+
+sealed interface Payment permits CreditCard, PayPal, Cash, BankTransfer {}
+
+record CreditCard(String cardNumber, String expiry, double amount) implements Payment {}
+record PayPal(String email, double amount) implements Payment {}
+record Cash(double amount) implements Payment {}
+record BankTransfer(String iban, double amount) implements Payment {}
+```
+
+Compare this to the open-hierarchy approach. With a regular interface, adding `BankTransfer` would let the new class compile fine, the switch would compile fine, and `BankTransfer` payments would hit the `default` branch (or whatever the fallback was) without warning. That kind of failure is much more expensive to find because it surfaces at runtime, often in production, often as a wrong value rather than an exception.
+
+A small but important detail: the exhaustiveness check is a property of `switch` expressions (the arrow form). Classic `switch` statements over sealed types are also exhaustive in modern Java when used with pattern matching, but the older `case X:` colon form with `break` doesn't enforce exhaustiveness in the same way.
+
+<h1 id="modeling-state-machines-with-sealed-types">
+  Modeling State Machines With Sealed Types
+</h1>
+
+State machines are one of the cleanest fits for a sealed interface plus records. An order moves through `Placed`, `Confirmed`, `Shipped`, `Delivered`, and `Cancelled`. Each state has different data attached: a placed order knows when it was placed, a shipped order knows its tracking number, a delivered order knows when it arrived, a cancelled order knows why. Trying to fit that into a single enum forces every state to share one shape.
+
+The model:
+
+```java
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+
+public class OrderStateMachine {
+    public static void main(String[] args) {
+        OrderState[] timeline = {
+            new Placed(1001, LocalDateTime.parse("2026-05-14T09:15:00")),
+            new Confirmed(1001, "warehouse-east"),
+            new Shipped(1001, "TRK-91022", LocalDate.parse("2026-05-15")),
+            new Delivered(1001, LocalDate.parse("2026-05-17")),
+        };
+
+        for (OrderState state : timeline) {
+            System.out.println(describe(state));
+        }
+    }
+
+    public static String describe(OrderState state) {
+        return switch (state) {
+            case Placed p    -> "Order " + p.orderId() + " placed at " + p.placedAt();
+            case Confirmed c -> "Order " + c.orderId() + " confirmed at " + c.warehouse();
+            case Shipped s   -> "Order " + s.orderId() + " shipped (tracking " + s.tracking()
+                + ", expected " + s.expectedDelivery() + ")";
+            case Delivered d -> "Order " + d.orderId() + " delivered on " + d.deliveredOn();
+            case Cancelled x -> "Order " + x.orderId() + " cancelled: " + x.reason();
+        };
+    }
+}
+
+sealed interface OrderState permits Placed, Confirmed, Shipped, Delivered, Cancelled {
+    int orderId();
+}
+
+record Placed(int orderId, LocalDateTime placedAt) implements OrderState {}
+record Confirmed(int orderId, String warehouse) implements OrderState {}
+record Shipped(int orderId, String tracking, LocalDate expectedDelivery) implements OrderState {}
+record Delivered(int orderId, LocalDate deliveredOn) implements OrderState {}
+record Cancelled(int orderId, String reason) implements OrderState {}
+```
+
+First, the sealed interface declares one common method, `orderId()`, that every state must provide. Records satisfy that automatically when one of their components is named `orderId`. That's how you put shared data on the parent without forcing every state into one shape. Second, each state record carries only the data meaningful for that state. There's no `tracking` field on `Placed`, no `placedAt` on `Cancelled`. Nothing sits as `null` waiting to cause errors.
+
+The transitions look like this:
+
+The diagram is the business rule. The sealed interface is the type-level encoding of the same rule, minus the transitions themselves (Java doesn't restrict which transitions are valid; that's enforced by a service layer or a state machine library). What the sealed interface gives you is the closed set of legal states, where each one carries only the data that makes sense for it.
+
+<h3 id="when-an-enum-is-still-the-better-choice">
+  When an Enum Is Still the Better Choice
+</h3>
+
+Sealed interfaces don't replace enums. They replace them only in cases where the variants have different shapes. Compare:
+
+| Property                                   | `enum OrderStatus`                  | `sealed interface OrderState`               |
+| ------------------------------------------ | ----------------------------------- | ------------------------------------------- |
+| Same fields for every case                 | Required                            | Not required, each variant declares its own |
+| Compile-time constants you can `switch` on | Yes                                 | Yes (via pattern matching)                  |
+| Exhaustive switch                          | Yes                                 | Yes                                         |
+| Carries case-specific data                 | No, all enum constants share fields | Yes, each record carries its own            |
+| `values()`, `valueOf()`, `ordinal()`       | Yes                                 | No (would need to write them)               |
+| Allocation cost                            | Singletons, no per-use allocation   | Each new state allocates a record           |
+
+When to use which?
+
+Use an **enum** when:
+
+- Every case is structurally identical. `Priority.LOW`, `Priority.MEDIUM`, `Priority.HIGH`. There's nothing extra to attach.
+- You need the enum's built-in utilities like `values()`, `ordinal()`, or `EnumSet`.
+- The cases are essentially labels, not data carriers.
+
+Use a **sealed interface with records** when:
+
+- Each case carries different data. `Shipped` has a tracking number, `Cancelled` has a reason, `Placed` has a timestamp.
+- You want value-based equality across instances of the same case ("two `Shipped(1001, TRK-91022, 2026-05-15)` records are equal").
+- You're modeling something that's better called a sum type than an enumeration.
+
+A useful check: when writing `if (status == OrderStatus.SHIPPED) { /* read trackingNumber that lives somewhere else */ }`, the enum is doing the wrong job. The state and its data belong together. A sealed interface plus records puts them together.
+
+<h1 id="api-design-returning-a-sealed-result-instead-of-throwing">
+  API Design: Returning a Sealed Result Instead of Throwing
+</h1>
+
+Sealed types fit naturally into API design when a method has more than one normal outcome. The classic example is "look up a customer by email." There are three possible outcomes: the customer exists, the customer doesn't exist, or the lookup failed for a system reason. Modeling this with an exception conflates "expected absence" with "something went wrong," which makes callers handle both with `try`/`catch`.
+
+A sealed result type makes the outcomes explicit. A minimal version:
+
+```java
+public class SealedResult {
+    public static void main(String[] args) {
+        Result<Customer> found = lookupByEmail("alice@example.com");
+        Result<Customer> missing = lookupByEmail("nobody@example.com");
+        Result<Customer> broken = lookupByEmail("system-error@example.com");
+
+        printResult(found);
+        printResult(missing);
+        printResult(broken);
+    }
+
+    public static Result<Customer> lookupByEmail(String email) {
+        if (email.equals("alice@example.com")) {
+            return new Ok<>(new Customer("alice@example.com", "Alice"));
+        }
+        if (email.equals("nobody@example.com")) {
+            return new NotFound<>();
+        }
+        return new Err<>("Database connection refused");
+    }
+
+    public static <T> void printResult(Result<T> result) {
+        String message = switch (result) {
+            case Ok<T> ok          -> "Found: " + ok.value();
+            case NotFound<T> nf    -> "Not found";
+            case Err<T> err        -> "Error: " + err.reason();
+        };
+        System.out.println(message);
+    }
+}
+
+sealed interface Result<T> permits Ok, NotFound, Err {}
+
+record Ok<T>(T value) implements Result<T> {}
+record NotFound<T>() implements Result<T> {}
+record Err<T>(String reason) implements Result<T> {}
+
+record Customer(String email, String name) {}
+```
+
+The caller is forced to think about all three cases because the switch is exhaustive. There's no "I forgot to handle the missing case" failure mode. There's no "I caught the exception and discarded it" failure mode either, because nothing throws.
+
+This is a quick example, not a full pitch for a Try-monad style or Rust-style `Result`. Java doesn't have first-class flat-mapping syntax for chaining these, so deeply nested `Result` pipelines get noisier than the equivalent in Scala or Kotlin. The pattern still pulls its weight in two places: at API boundaries where callers should handle every outcome explicitly, and in domain code where the failure modes are part of the business logic, not a system error.
+
+Don't use this pattern for exceptional failures, like out-of-memory, broken network connections, or programming errors. Those belong in exceptions, which propagate up the stack until somebody decides what to do with them. A sealed `Result` is for expected outcomes that aren't success.
+
+<h1 id="permits-clause-explicit-vs-implicit-and-where-to-put-the-variants">
+  Permits Clause: Explicit vs Implicit, and Where to Put the Variants
+</h1>
+
+The `permits` clause is the line where you write out the closed list. It's required when permitted subtypes live in different source files in the same package. It's optional when all the permitted subtypes are declared in the same compilation unit (the same `.java` file) as the parent. The compiler infers the list in that case.
+
+In one file, you can leave `permits` off:
+
+```java
+public class ImplicitPermits {
+    public static void main(String[] args) {
+        Shipping s = new StandardShipping(5);
+        System.out.println(label(s));
+    }
+
+    public static String label(Shipping s) {
+        return switch (s) {
+            case StandardShipping std -> "Standard, arrives in " + std.businessDays() + " days";
+            case ExpressShipping  exp -> "Express, $" + exp.surcharge() + " surcharge";
+        };
+    }
+}
+
+// No permits clause needed: all subtypes are in this file.
+sealed interface Shipping {}
+
+record StandardShipping(int businessDays) implements Shipping {}
+record ExpressShipping(double surcharge) implements Shipping {}
+```
+
+Once the variants move to their own files, the `permits` clause becomes mandatory. Even if both `StandardShipping.java` and `ExpressShipping.java` sit next to `Shipping.java` in the same package, the compiler needs the parent to spell out the list.
+
+A practical guideline: for small closed families (three or four variants), put everything in one file. The whole hierarchy is visible at a glance and there's no `permits` clause to maintain. For larger families, split into one file per variant and keep the explicit `permits` clause on the parent. The compiler enforces a one-line summary of the variant list either way.
+
+Don't scatter the variants across many packages just to "organize" them. Even where Java modules technically allow it, doing so makes the closed-list property harder for humans to verify. Keep all the variants under the same conceptual roof.
+
+<h1 id="sealed-interfaces-vs-sealed-classes-which-fits-when">
+  Sealed Interfaces vs Sealed Classes: Which Fits When
+</h1>
+
+Most modern uses of sealing favor a sealed interface, not a sealed class. The reasons come down to how the variants are most naturally represented.
+
+Use a **sealed interface** when:
+
+- The variants are best modeled as immutable records, because records can't extend another class but they can implement interfaces.
+- There's no meaningful shared implementation; the variants share a category, not behavior.
+- You want to compose multiple type roles: a variant can implement two unrelated sealed interfaces.
+
+Use a **sealed class** when:
+
+- The variants share real implementation code, and that code involves protected state, constructors, or non-trivial setup that you don't want to repeat in every variant.
+- The variants are open in some controlled way (with `non-sealed`) and need to inherit machinery from the parent.
+- You're modeling a hierarchy that already had a class parent before you sealed it, and refactoring to an interface would ripple through too much call-site code.
+
+**What's wrong with this code?**
+
+```java
+sealed interface Notification permits EmailNotification, SmsNotification {}
+
+record EmailNotification(String address) implements Notification {}
+class SmsNotification {
+    String phoneNumber;
+    SmsNotification(String phoneNumber) { this.phoneNumber = phoneNumber; }
+}
+```
+
+**Fix:**
+
+```java
+sealed interface Notification permits EmailNotification, SmsNotification {}
+
+record EmailNotification(String address) implements Notification {}
+record SmsNotification(String phoneNumber) implements Notification {}
+```
+
+`SmsNotification` is listed in `Notification`'s `permits` clause but doesn't implement `Notification`. The compiler reports something like `class is not a permitted subclass of sealed class`. The fix is to make `SmsNotification` implement `Notification`. A record works, and so does a `final class SmsNotification implements Notification`. Being in the `permits` list is a claim that the listed class is a subtype; if it isn't a subtype, the compiler rejects it.
+
+Sealed classes (not interfaces) also constrain how the variants can declare themselves. Because a class can extend only one parent, a variant of a sealed class can't simultaneously be a variant of another sealed class. With sealed interfaces, a variant can implement multiple sealed interfaces (it can be in two different closed families at once). That's another reason interfaces tend to win in practice: composition is easier.
+
+<h1 id="when-not-to-use-sealed">When NOT to Use Sealed</h1>
+
+Sealing is a strong constraint. It cuts off open extension in exchange for closed-list guarantees and exhaustive switch. Sometimes that trade is wrong.
+
+Don't use sealed when:
+
+- **The set of variants is open.** A `Plugin` interface that third-party libraries implement should stay open. Sealing it would mean every new plugin requires you to ship a new release.
+- **Future variants are unknown.** If you have any expectation that consumers of your code will add variants that you don't control, don't seal.
+- **An enum already suffices.** If every case has the same structure and you only need a fixed set of identifiers, an enum is simpler and lighter than a sealed interface plus records.
+- **You're sealing for its own sake.** Sealing two unrelated types into one family because "they're both outputs of something" is the wrong reason. The variants should share a meaningful abstract concept.
+
+The clearest signal that sealing is right is when you'd otherwise add a `default` branch to every switch that handles the type, and that `default` branch would be wrong for any future case. Sealed types replace that fragile default with a compile-time check.
+
+Sealed types don't have a runtime cost beyond the regular cost of method dispatch. The compiler does its checking at compile time and emits the same kind of class file it would for an unsealed hierarchy, with one extra `PermittedSubclasses` attribute that records the allowed list.
+
+<h3 id="a-brief-note-on-cross-module-sealed-types">
+  A Brief Note on Cross-Module Sealed Types
+</h3>
+
+Sealed types and modules interact through the location rule. In a non-modular project, the parent and every permitted subtype must share a package. In a project that uses Java modules, they can live in different packages as long as those packages are in the same named module.
+
+Sealing only makes sense if the compiler can see the entire family of subtypes at once. A module boundary that the compiler can verify is enough to satisfy that. A package boundary in an unnamed module isn't, because anything outside the package could create a subtype the parent doesn't know about. For most code, the recommendation is the same regardless of modules: keep the parent and the variants in one place, and don't spread a sealed family across compilation units that don't naturally belong together.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

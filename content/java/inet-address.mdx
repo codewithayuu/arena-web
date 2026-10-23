@@ -1,0 +1,549 @@
+---
+title: "InetAddress"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "InetAddress explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+This lesson covers what an `InetAddress` represents, the four common ways to obtain one, the methods that inspect it, the split between `Inet4Address` and `Inet6Address`, and the DNS lookup behavior the class wraps. Sockets, URLs, and HTTP do not appear here. This chapter is purely about identifying a host.
+
+<h1 id="what-inetaddress-represents">What InetAddress Represents</h1>
+
+An `InetAddress` is an immutable Java object that holds two pieces of information: an IP address (a four-byte number for IPv4 or a sixteen-byte number for IPv6) and, optionally, a hostname that resolves to that address. The class lives in `java.net` and has been part of the JDK since Java 1.0.
+
+The simplest way to see one is to look up a host by name:
+
+```java
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+
+public class FirstLookup {
+    public static void main(String[] args) throws UnknownHostException {
+        InetAddress address = InetAddress.getByName("api.payments.example.com");
+        System.out.println("Host: " + address.getHostName());
+        System.out.println("IP:   " + address.getHostAddress());
+    }
+}
+```
+
+The exact IP returned depends on what the DNS resolver returns. `getByName` takes a hostname and produces an `InetAddress` carrying both the original hostname and the IP it resolved to. The object is immutable; once created, the IP and hostname inside it never change.
+
+`InetAddress` itself is an abstract class. The instance returned is either an `Inet4Address` (for IPv4 addresses) or an `Inet6Address` (for IPv6 addresses). Most code only needs the `InetAddress` API, so the abstract type is the usual choice.
+
+The diagram shows the type hierarchy. Code that handles either address family writes against `InetAddress`. Code that specifically cares about IPv6 features (like scope IDs for link-local addresses) can downcast to `Inet6Address`. That distinction is covered in more detail later in the lesson.
+
+<h1 id="why-inetaddress-exists">Why InetAddress Exists</h1>
+
+The class exists because raw IP addresses are inconvenient and hostnames are not directly usable by the network stack. An IP address is a fixed-size number, usually written as a string like `192.168.1.10` or `2001:db8::1`. A hostname is a string, but the network needs a number to route a packet. `InetAddress` collapses both of these into one object so the rest of the networking API can take "a host" as a single argument without caring how it was obtained.
+
+Concrete examples from an online store:
+
+- Resolving the IP of a payment provider's API host before opening a connection.
+- Listing every IP behind a load-balanced product catalog hostname to verify the DNS pool size.
+- Logging the client's IP on a checkout request so abuse-prevention rules can act on it later.
+
+All three are jobs for `InetAddress`. The rest of the lesson is about the methods you call to do them.
+
+<h1 id="obtaining-an-inetaddress">Obtaining an InetAddress</h1>
+
+There are four common entry points to get an `InetAddress`. Each fits a different situation.
+
+| Method                 | Input                           | Returns                                              |
+| ---------------------- | ------------------------------- | ---------------------------------------------------- |
+| `getByName(String)`    | A hostname or numeric IP string | A single `InetAddress` (the first resolved address)  |
+| `getAllByName(String)` | A hostname                      | An array of every `InetAddress` the DNS pool returns |
+| `getLocalHost()`       | Nothing                         | The local machine's primary `InetAddress`            |
+| `getLoopbackAddress()` | Nothing                         | The loopback address (`127.0.0.1` or `::1`)          |
+
+All four are static factories. `InetAddress` does not have a public constructor.
+
+<h3 id="getbynamestring-host">getByName(String host)</h3>
+
+`getByName` is the workhorse. Pass a hostname and it returns an `InetAddress` for the first IP that DNS resolves. Pass a numeric IP string like `"192.168.1.10"` and it skips DNS entirely, just parsing the bytes.
+
+```java
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+
+public class GetByNameExample {
+    public static void main(String[] args) throws UnknownHostException {
+        InetAddress fromHostname = InetAddress.getByName("api.shop.example");
+        InetAddress fromNumeric = InetAddress.getByName("93.184.216.34");
+
+        System.out.println("Hostname lookup -> " + fromHostname.getHostAddress());
+        System.out.println("Numeric input   -> " + fromNumeric.getHostAddress());
+    }
+}
+```
+
+Both calls return an `InetAddress`, but they did different work. The first triggered a DNS query. The second parsed the string into four bytes and produced the address directly, with no network traffic involved.
+
+Passing `null` or an empty string to `getByName` returns the loopback address, which is occasionally useful but mostly error-prone.
+
+A hostname lookup blocks the calling thread on a DNS query. Typical latency is 10 to 100 milliseconds on a warm resolver, but a cold lookup or a slow DNS server can stretch to several seconds. Never call `getByName` in a tight loop or on a request-handling thread without caching the result.
+
+<h3 id="getallbynamestring-host">getAllByName(String host)</h3>
+
+A single hostname often resolves to multiple IPs. Large services put a pool of servers behind one DNS name so that traffic spreads across them and so that the pool can shrink or grow without changing the hostname. `getAllByName` returns the whole list rather than just the first entry.
+
+```java
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+
+public class GetAllByNameExample {
+    public static void main(String[] args) throws UnknownHostException {
+        InetAddress[] catalogHosts = InetAddress.getAllByName("catalog.shop.example");
+        System.out.println("Found " + catalogHosts.length + " IPs:");
+        for (InetAddress addr : catalogHosts) {
+            System.out.println("  " + addr.getHostAddress());
+        }
+    }
+}
+```
+
+The exact number depends on what DNS returns for the hostname. For a small site it might be one IP. For a large CDN-fronted host it could be a handful. The order is not stable; DNS resolvers often rotate the list so that callers that always pick the first entry still spread load across the pool.
+
+The diagram shows the shape of a load-balanced lookup. One hostname, multiple A or AAAA records, returned as an array. Code that needs to manually balance traffic, retry against a different replica, or sanity-check the DNS pool size uses `getAllByName` instead of `getByName`.
+
+<h3 id="getlocalhost">getLocalHost()</h3>
+
+`getLocalHost()` returns an `InetAddress` for the machine the code is running on. The exact value depends on the host's network configuration: on a laptop it might be the LAN-facing IP, in a container it might be the container's internal IP, and on a server it might be a private address that is not reachable from the public internet.
+
+```java
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+
+public class LocalHostExample {
+    public static void main(String[] args) throws UnknownHostException {
+        InetAddress local = InetAddress.getLocalHost();
+        System.out.println("Local host: " + local.getHostName());
+        System.out.println("Local IP:   " + local.getHostAddress());
+    }
+}
+```
+
+The hostname comes from the operating system (usually `/etc/hostname` on Linux or the equivalent on macOS and Windows). The IP comes from resolving that hostname against the local resolver. One source of confusion: `getLocalHost()` returns whatever DNS or `/etc/hosts` says, not necessarily what `ifconfig` shows.
+
+**What's wrong with this code?**
+
+```java
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+
+public class LocalHostMisuse {
+    public static void main(String[] args) throws UnknownHostException {
+        InetAddress local = InetAddress.getLocalHost();
+        System.out.println("Public IP for the API: " + local.getHostAddress());
+    }
+}
+```
+
+The label is wrong. `getLocalHost()` returns whatever IP the local resolver associates with the machine's hostname. On most servers in a real deployment that is a private IP like `10.x.x.x` or `172.16.x.x`, not the public IP that clients see. The fix is to either ask an outside service for the public IP (out of scope for this lesson) or relabel it. The method is fine; the assumption about what it returns is the bug.
+
+**Fix:**
+
+```java
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+
+public class LocalHostFixed {
+    public static void main(String[] args) throws UnknownHostException {
+        InetAddress local = InetAddress.getLocalHost();
+        System.out.println("Local interface IP: " + local.getHostAddress());
+    }
+}
+```
+
+<h3 id="getloopbackaddress">getLoopbackAddress()</h3>
+
+The loopback address is the special IP that always points back at the local machine: `127.0.0.1` for IPv4 and `::1` for IPv6. Connections to it never leave the host. `getLoopbackAddress()` returns it without any DNS work.
+
+```java
+import java.net.InetAddress;
+
+public class LoopbackExample {
+    public static void main(String[] args) {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        System.out.println("Loopback: " + loopback.getHostAddress());
+        System.out.println("Is loopback: " + loopback.isLoopbackAddress());
+    }
+}
+```
+
+`getLoopbackAddress()` does not declare `UnknownHostException`. There is no lookup involved, so it cannot fail. Use it to bind a test server to "localhost" without going through DNS, or as a known-good `InetAddress` sentinel value.
+
+<h1 id="inspecting-an-inetaddress">Inspecting an InetAddress</h1>
+
+Once an `InetAddress` is in hand, the next question is what to do with it. The class exposes a small set of inspection methods that return either a string (for display or logging) or a boolean (for branching).
+
+| Method                     | Returns   | What it tells you                                                                   |
+| -------------------------- | --------- | ----------------------------------------------------------------------------------- |
+| `getHostName()`            | `String`  | The hostname associated with this address, possibly triggering a reverse DNS lookup |
+| `getHostAddress()`         | `String`  | The IP in its standard textual form (`192.168.1.10` or `2001:db8::1`)               |
+| `getCanonicalHostName()`   | `String`  | The fully qualified hostname, always doing a reverse DNS lookup                     |
+| `getAddress()`             | `byte[]`  | The raw IP bytes (4 for IPv4, 16 for IPv6)                                          |
+| `isLoopbackAddress()`      | `boolean` | True for `127.0.0.0/8` and `::1`                                                    |
+| `isAnyLocalAddress()`      | `boolean` | True for the wildcard address (`0.0.0.0` or `::`)                                   |
+| `isMulticastAddress()`     | `boolean` | True for multicast addresses                                                        |
+| `isReachable(int timeout)` | `boolean` | True if the host responds to a ping-like probe within the timeout                   |
+
+The set below is the most commonly used.
+
+<h3 id="gethostname-and-getcanonicalhostname">
+  getHostName() and getCanonicalHostName()
+</h3>
+
+Both methods return a hostname string, but they differ in how they get one.
+
+`getHostName()` returns the hostname that was used to create the `InetAddress` if there is one. If the address was created from a numeric IP and no hostname was ever associated with it, `getHostName()` performs a reverse DNS lookup (taking the IP and asking DNS what hostname points at it) to fill in the value.
+
+`getCanonicalHostName()` always performs a reverse DNS lookup and returns whatever DNS reports as the canonical name, regardless of how the `InetAddress` was originally created.
+
+```java
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+
+public class HostNameMethods {
+    public static void main(String[] args) throws UnknownHostException {
+        InetAddress fromHostname = InetAddress.getByName("checkout.shop.example");
+        InetAddress fromNumeric = InetAddress.getByName("8.8.8.8");
+
+        System.out.println("From hostname:");
+        System.out.println("  getHostName():          " + fromHostname.getHostName());
+        System.out.println("  getCanonicalHostName(): " + fromHostname.getCanonicalHostName());
+
+        System.out.println("From numeric IP:");
+        System.out.println("  getHostName():          " + fromNumeric.getHostName());
+        System.out.println("  getCanonicalHostName(): " + fromNumeric.getCanonicalHostName());
+    }
+}
+```
+
+For an address created from a hostname, `getHostName()` returns the original hostname without going to DNS again. For an address created from a numeric IP, it has no hostname yet, so the first call triggers a reverse lookup. After that, the value is cached on the object.
+
+`getHostName()` on an address built from a numeric IP triggers a reverse DNS lookup the first time it runs. The same 10-100ms latency rule applies. Code that logs the client IP for every checkout request and then calls `getHostName()` to "make it nicer" can add a full second to the request just for DNS. Use `getHostAddress()` for logging unless the hostname is specifically required.
+
+<h3 id="gethostaddress">getHostAddress()</h3>
+
+`getHostAddress()` returns the IP as a string in its standard format. For an `Inet4Address` it is the dotted-quad form `a.b.c.d`. For an `Inet6Address` it is the colon-separated hex form with compression for runs of zero, like `2001:db8::1`.
+
+```java
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+
+public class HostAddressExample {
+    public static void main(String[] args) throws UnknownHostException {
+        InetAddress v4 = InetAddress.getByName("203.0.113.10");
+        InetAddress v6 = InetAddress.getByName("2001:db8::1");
+
+        System.out.println("v4: " + v4.getHostAddress());
+        System.out.println("v6: " + v6.getHostAddress());
+    }
+}
+```
+
+This method never does a DNS lookup. It formats the bytes already in the object. This makes it appropriate for logging or display when a stable, fast representation of the address is needed.
+
+<h3 id="isreachableint-timeout">isReachable(int timeout)</h3>
+
+`isReachable` tries to reach the host with a probe and returns `true` if a response comes back within the timeout (in milliseconds). The probe is "ICMP echo" (ping) where the JVM has the right permissions, and a TCP connection to port 7 (echo) as a fallback. On many setups, one or both of those are blocked by firewalls, so `isReachable` is informational at best.
+
+```java
+import java.net.InetAddress;
+import java.io.IOException;
+
+public class IsReachableExample {
+    public static void main(String[] args) throws IOException {
+        InetAddress payment = InetAddress.getByName("api.payments.example");
+        boolean reachable = payment.isReachable(2000);
+        System.out.println("Payment host reachable: " + reachable);
+    }
+}
+```
+
+The method throws `IOException`, not `UnknownHostException`. The host has already been resolved by the time the `InetAddress` exists; what can fail at this point is the probe itself.
+
+`isReachable` blocks the calling thread for up to the full timeout. Calling it with `timeout=5000` on a host that is firewalled off will pause the thread for five seconds. Avoid it on a request-handling thread, and avoid using it as a health check on a long list of hosts without a thread pool.
+
+<h3 id="the-is-something-methods">The "is something" Methods</h3>
+
+Several boolean methods identify special address ranges. The two most common in application code:
+
+```java
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+
+public class AddressFlagsExample {
+    public static void main(String[] args) throws UnknownHostException {
+        InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        InetAddress wildcard = InetAddress.getByName("0.0.0.0");
+        InetAddress regular = InetAddress.getByName("203.0.113.10");
+
+        System.out.printf("%-15s loopback=%b any=%b%n",
+                loopback.getHostAddress(),
+                loopback.isLoopbackAddress(),
+                loopback.isAnyLocalAddress());
+        System.out.printf("%-15s loopback=%b any=%b%n",
+                wildcard.getHostAddress(),
+                wildcard.isLoopbackAddress(),
+                wildcard.isAnyLocalAddress());
+        System.out.printf("%-15s loopback=%b any=%b%n",
+                regular.getHostAddress(),
+                regular.isLoopbackAddress(),
+                regular.isAnyLocalAddress());
+    }
+}
+```
+
+`isLoopbackAddress()` answers "is this `127.x.x.x` or `::1`". `isAnyLocalAddress()` answers "is this the wildcard `0.0.0.0` or `::`". Server code uses the wildcard check to detect "bind to all interfaces" configurations. Security-sensitive code uses the loopback check to recognize same-host connections.
+
+<h1 id="inet4address-vs-inet6address">Inet4Address vs Inet6Address</h1>
+
+Both subclasses exist because IPv4 and IPv6 are different at the wire level. IPv4 addresses are 32 bits long and look like `203.0.113.10`. IPv6 addresses are 128 bits long and look like `2001:db8::1`. They share no common wire format, and most operating systems handle them with separate kernel data structures. Java models the difference with two concrete subclasses of `InetAddress`.
+
+```java
+import java.net.Inet4Address;
+import java.net.Inet6Address;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+
+public class SubclassCheck {
+    public static void main(String[] args) throws UnknownHostException {
+        InetAddress v4 = InetAddress.getByName("203.0.113.10");
+        InetAddress v6 = InetAddress.getByName("2001:db8::1");
+
+        System.out.println("v4 is Inet4Address: " + (v4 instanceof Inet4Address));
+        System.out.println("v4 is Inet6Address: " + (v4 instanceof Inet6Address));
+        System.out.println("v6 is Inet4Address: " + (v6 instanceof Inet4Address));
+        System.out.println("v6 is Inet6Address: " + (v6 instanceof Inet6Address));
+
+        System.out.println("v4 bytes: " + v4.getAddress().length);
+        System.out.println("v6 bytes: " + v6.getAddress().length);
+    }
+}
+```
+
+The `instanceof` checks allow branching on address family. The byte length is the other clear signal: 4 bytes for v4, 16 bytes for v6. Most application code never needs to care about the distinction and just uses `InetAddress` everywhere. The split matters for:
+
+- Code that has to log the address family separately for analytics.
+- Code that has to format IPv6 zones (link-local addresses carry a "scope ID" that only `Inet6Address` exposes).
+- Code that wants to filter out IPv6 because a downstream service does not support it yet.
+
+For a load-balanced hostname that has both A records (IPv4) and AAAA records (IPv6), `getAllByName` returns a mixed array.
+
+```java
+import java.net.Inet4Address;
+import java.net.Inet6Address;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+
+public class MixedFamilies {
+    public static void main(String[] args) throws UnknownHostException {
+        InetAddress[] all = InetAddress.getAllByName("catalog.shop.example");
+        int v4 = 0, v6 = 0;
+        for (InetAddress addr : all) {
+            if (addr instanceof Inet4Address) v4++;
+            else if (addr instanceof Inet6Address) v6++;
+        }
+        System.out.println("IPv4 count: " + v4);
+        System.out.println("IPv6 count: " + v6);
+    }
+}
+```
+
+Exact counts depend on the host's DNS records and on the JVM's `java.net.preferIPv6Addresses` setting. One call returns both families, and `instanceof` separates them when needed.
+
+<h1 id="dns-lookup-behavior">DNS Lookup Behavior</h1>
+
+A DNS lookup is not free. When `getByName("api.payments.example")` runs, the JVM asks the operating system's resolver, which checks its local cache, possibly consults `/etc/hosts`, and otherwise sends a UDP packet to a recursive DNS server. That server walks the DNS hierarchy until it finds an authoritative answer or times out.
+
+The diagram shows the path. The JVM does not do the protocol work itself; it asks the operating system. The OS might return a cached answer in microseconds or might take hundreds of milliseconds if the cache misses and the network is slow. The first call for a hostname pays the full cost; subsequent calls within the cache window are fast.
+
+<h3 id="caching-networkaddresscachettl">Caching: networkaddress.cache.ttl</h3>
+
+The JVM caches successful DNS lookups in its own process to avoid going through the OS resolver every time. Two security properties control the cache lifetime.
+
+| Property                            | Default                                      | Meaning                                          |
+| ----------------------------------- | -------------------------------------------- | ------------------------------------------------ |
+| `networkaddress.cache.ttl`          | 30 seconds (or the security manager default) | How long to cache successful lookups, in seconds |
+| `networkaddress.cache.negative.ttl` | 10 seconds                                   | How long to cache failed lookups                 |
+
+Override them at startup with `-Dnetworkaddress.cache.ttl=60` or by setting them in `java.security`. A value of `-1` means "cache forever". A value of `0` means "do not cache".
+
+The defaults are conservative. For most applications, a 30-second cache is fine: it shields against DNS hiccups while still picking up new IPs within half a minute. For long-lived services that talk to a DNS-load-balanced backend (a payment provider whose IP pool changes), a short cache moves traffic to new replicas quickly. For batch jobs that hit the same host thousands of times in a few minutes, a longer cache prevents DNS from becoming a bottleneck.
+
+```java
+public class CacheSettings {
+    public static void main(String[] args) {
+        String ttl = java.security.Security.getProperty("networkaddress.cache.ttl");
+        String negTtl = java.security.Security.getProperty("networkaddress.cache.negative.ttl");
+        System.out.println("cache.ttl:         " + ttl);
+        System.out.println("cache.negative.ttl:" + negTtl);
+    }
+}
+```
+
+When a property is not explicitly set in `java.security`, `getProperty` returns `null` and the JVM falls back to its built-in default. The values shown will depend on the JDK and security configuration. The takeaway is that the cache exists and is tunable.
+
+Within the JVM cache window, a repeated `getByName` for the same hostname is effectively free. Outside the window, it pays the full DNS round-trip. Tight loops over a small set of hostnames should still cache the `InetAddress` in application code rather than relying on the JVM cache, because the cache TTL can change.
+
+<h1 id="when-lookups-fail-unknownhostexception">
+  When Lookups Fail: UnknownHostException
+</h1>
+
+When the resolver cannot turn a hostname into an IP, `getByName` and friends throw `UnknownHostException`. The exception is checked, so the compiler forces it to be handled.
+
+Common triggers:
+
+- The hostname does not exist in DNS (typo, expired domain, internal name on the wrong network).
+- The DNS server is unreachable (network outage, misconfigured resolver).
+- The lookup timed out before any server responded.
+
+```java
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+
+public class UnknownHostExample {
+    public static void main(String[] args) {
+        try {
+            InetAddress addr = InetAddress.getByName("definitely-not-a-real-host.invalid");
+            System.out.println("Got: " + addr.getHostAddress());
+        } catch (UnknownHostException e) {
+            System.out.println("Lookup failed: " + e.getMessage());
+        }
+    }
+}
+```
+
+The exception message is the hostname; it does not indicate whether DNS failed, timed out, or returned a "no such record" answer. That is a long-standing pain point of the API. Richer diagnostics require a DNS library or shelling out to a tool like `dig`.
+
+The exception is also what catches a numeric parse failure. Given the string `"999.999.999.999"`, the resolver realizes it is not a legal IPv4 address and throws `UnknownHostException`, even though no network call ever happened.
+
+```java
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+
+public class BadNumeric {
+    public static void main(String[] args) {
+        try {
+            InetAddress addr = InetAddress.getByName("999.999.999.999");
+            System.out.println("Got: " + addr.getHostAddress());
+        } catch (UnknownHostException e) {
+            System.out.println("Rejected: " + e.getMessage());
+        }
+    }
+}
+```
+
+A common pattern for service-to-service calls is to retry the lookup once or twice with a short backoff. Repeated failures within a short window are usually a sign that the DNS server itself is having trouble, in which case retries help. A "no such record" answer should not be retried; the resolver returns that quickly and consistently, and burning more requests on it just wastes time.
+
+<h1 id="reverse-dns">Reverse DNS</h1>
+
+Forward DNS turns a hostname into an IP. Reverse DNS does the opposite: it takes an IP and asks "what hostname is registered for this?". The query traverses a different part of the DNS tree (`in-addr.arpa` for IPv4, `ip6.arpa` for IPv6), and there is no guarantee that any record exists for a given IP. Many IPs have no reverse record at all.
+
+`InetAddress` exposes reverse DNS through `getHostName()` and `getCanonicalHostName()`. Both trigger a reverse lookup when the address has no hostname associated with it (typically when it was constructed from raw bytes or a numeric string).
+
+```java
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+
+public class ReverseDnsExample {
+    public static void main(String[] args) throws UnknownHostException {
+        InetAddress addr = InetAddress.getByName("8.8.8.8");
+        long start = System.nanoTime();
+        String name = addr.getHostName();
+        long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+        System.out.println("Hostname: " + name);
+        System.out.println("Took roughly " + elapsedMs + " ms");
+    }
+}
+```
+
+The exact reverse name and the timing depend on the resolver. `8.8.8.8` is Google's public DNS server and has a stable reverse record, which is why this example resolves cleanly. Many cloud IPs return only generic names like `ec2-203-0-113-10.compute.amazonaws.com`, and many private IPs return nothing at all.
+
+**What's wrong with this code?**
+
+```java
+import java.net.InetAddress;
+
+public class HotLoopReverseDns {
+    public static void main(String[] args) throws Exception {
+        for (int i = 0; i < 1000; i++) {
+            InetAddress client = InetAddress.getByName("203.0.113." + (i % 255));
+            System.out.println("Client " + i + ": " + client.getHostName());
+        }
+    }
+}
+```
+
+`getHostName()` on a numeric-only address triggers a reverse DNS lookup. The loop does that a thousand times, against a thousand different IPs, with no caching. Even at 50 ms per lookup, that is 50 seconds of pure DNS wait, and most of the lookups will fail or return uninteresting cloud-generated names anyway. The code looks safe because the method name does not advertise the network call.
+
+**Fix:** drop hostname lookups on the hot path and log the numeric IP instead.
+
+```java
+import java.net.InetAddress;
+
+public class HotLoopFixed {
+    public static void main(String[] args) throws Exception {
+        for (int i = 0; i < 1000; i++) {
+            InetAddress client = InetAddress.getByName("203.0.113." + (i % 255));
+            System.out.println("Client " + i + ": " + client.getHostAddress());
+        }
+    }
+}
+```
+
+`getHostAddress()` is a pure formatting call; it never goes to the network. For logging, that is almost always what you want.
+
+<h1 id="putting-it-together">Putting It Together</h1>
+
+A small utility ties the methods from this lesson into one snapshot of a host. The same shape appears in startup health checks, ops dashboards, and abuse-detection rules: take a hostname, resolve it, summarize every IP, and label each one.
+
+```java
+import java.net.Inet4Address;
+import java.net.Inet6Address;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+
+public class HostSummary {
+
+    static String familyOf(InetAddress addr) {
+        if (addr instanceof Inet4Address) return "IPv4";
+        if (addr instanceof Inet6Address) return "IPv6";
+        return "unknown";
+    }
+
+    static void summarize(String hostname) {
+        try {
+            InetAddress[] all = InetAddress.getAllByName(hostname);
+            System.out.println("=== " + hostname + " ===");
+            System.out.println("Resolved " + all.length + " address(es)");
+            for (InetAddress addr : all) {
+                System.out.printf("  %-5s %-30s loopback=%b%n",
+                        familyOf(addr),
+                        addr.getHostAddress(),
+                        addr.isLoopbackAddress());
+            }
+        } catch (UnknownHostException e) {
+            System.out.println("Lookup failed for " + hostname + ": " + e.getMessage());
+        }
+        System.out.println();
+    }
+
+    public static void main(String[] args) {
+        summarize("catalog.shop.example");
+        summarize("localhost");
+        summarize("definitely-not-real.invalid");
+    }
+}
+```
+
+Three different inputs exercise three different parts of the API: a load-balanced hostname returning multiple IPs, the local "localhost" alias returning the loopback, and a bogus name triggering `UnknownHostException`. The output is shaped like a typical startup log entry. `InetAddress` is the building block under sockets, URLs, and HTTP clients, and it usually appears in utility code like this.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

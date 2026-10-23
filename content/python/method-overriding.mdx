@@ -1,0 +1,494 @@
+---
+title: "Method Overriding"
+readTime: "10 min read"
+lastUpdated: "June 6, 2026"
+description: "Method Overriding explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="the-dispatch-rule">The Dispatch Rule</h1>
+
+When a method is called on an instance, Python finds the most specific version of that method in the class hierarchy and runs it. The rule is the one shown earlier: walk from the instance's class up through its parents (and grandparents, and so on), and use the first matching method name. The walk stops at the first match; classes further up the chain are ignored for this call.
+
+```python
+class Product:
+    def display_price(self):
+        return f"${self.price:.2f}"
+
+class DiscountedProduct(Product):
+    def display_price(self):
+        return f"${self.price:.2f} (on sale!)"
+
+regular = Product()
+regular.price = 19.99
+
+discounted = DiscountedProduct()
+discounted.price = 19.99
+
+print(regular.display_price())
+print(discounted.display_price())
+```
+
+Both objects have a `price` of `19.99`, but they're different classes. Python finds `display_price` on `Product` for the first object and on `DiscountedProduct` for the second. The override produces the different output; nothing about the call site changes.
+
+This is called **dynamic dispatch** (also "late binding" in some textbooks). The decision about which method to run isn't made when the code is written; it's made when the call happens, based on the actual class of the object. Python looks up the method through the object's type, not through the variable name used to refer to it.
+
+The two calls follow the same algorithm but find their match at different classes. The walk stops at the first definition; on the second call, Python never reaches `Product.display_price` because the subclass has its own.
+
+The same dispatch happens when methods on the parent class call other methods. If `Product.format_label` calls `self.display_price()`, that call goes through the same dispatch and picks up `DiscountedProduct.display_price` for a discounted instance. The parent's code can call methods that the subclass has overridden, and the subclass's version is what runs.
+
+This last point is what makes the **Template Method** pattern work. A parent class defines a method that orchestrates several steps; subclasses override individual steps without rewriting the orchestration.
+
+<h1 id="replace-vs-extend">Replace vs Extend</h1>
+
+Two common reasons to override a method. The first is **replacement**: the parent's version is wrong for this subclass, and the subclass needs to do something entirely different. The second is **extension**: the parent's version is right, but the subclass adds more work (before, after, or around the parent's logic).
+
+Replacement looks like writing a brand-new method that ignores the parent:
+
+```python
+class PaymentMethod:
+    def charge(self, amount):
+        return f"Charging ${amount:.2f} using generic payment"
+
+class CreditCard(PaymentMethod):
+    def charge(self, amount):
+        return f"Charging ${amount:.2f} to card ending 4242"
+
+class GiftCard(PaymentMethod):
+    def charge(self, amount):
+        return f"Deducting ${amount:.2f} from gift card balance"
+
+for method in [PaymentMethod(), CreditCard(), GiftCard()]:
+    print(method.charge(50.00))
+```
+
+`CreditCard.charge` and `GiftCard.charge` don't call `super().charge(amount)`. They have nothing to extend; the parent's generic implementation is a placeholder, not something to build on. This is full replacement.
+
+Extension uses `super()` to run the parent's logic and adds to the result:
+
+```python
+class Product:
+    def describe(self):
+        return f"{self.name}: ${self.price:.2f}"
+
+class DiscountedProduct(Product):
+    def __init__(self, name, price, discount_percent):
+        self.name = name
+        self.price = price
+        self.discount_percent = discount_percent
+
+    def describe(self):
+        base = super().describe()
+        return f"{base} ({self.discount_percent}% off)"
+
+item = DiscountedProduct("Coffee Mug", 12.99, 20)
+print(item.describe())
+```
+
+`DiscountedProduct.describe` calls `super().describe()` to run `Product.describe`, then appends the discount tag. The override keeps the parent's format intact. If `Product.describe` ever changes (different currency formatting, added stock count), the override still produces sensible output because it doesn't duplicate any of the parent's logic.
+
+The choice between replacement and extension is about whether the parent's logic is useful for this subclass.
+
+- If yes, extend (`super().method()` and add to its result).
+- If no, replace (write the whole new method without calling `super()`).
+- When in doubt, ask whether removing the parent's logic from the call would change the output. If it would, extension is needed; if not, replacement is fine.
+
+A third pattern, **wrapping**, has the subclass add work both before and after the parent's call:
+
+```python
+class Logger:
+    def log(self, message):
+        print(f"[LOG] {message}")
+
+class TimestampedLogger(Logger):
+    def log(self, message):
+        import time
+        timestamp = time.strftime("%H:%M:%S")
+        print(f"--- {timestamp} ---")
+        super().log(message)
+        print(f"--- end ---")
+
+TimestampedLogger().log("hello")
+```
+
+The override runs code, calls `super()`, then runs more code. The before/after work bookends the parent's logic. The pattern is useful for cross-cutting concerns like logging, timing, or error handling.
+
+<h1 id="liskov-substitution-dont-break-the-contract">
+  Liskov Substitution: Don't Break the Contract
+</h1>
+
+Overriding is a sharp tool. It lets behavior change, but the change has to stay compatible with what callers of the parent class expect. The Liskov substitution principle, introduced in the single-inheritance lesson, matters most here.
+
+The principle, stated briefly: anywhere code expects a parent instance, an instance of any subclass should work without surprises. In practical terms, an override:
+
+- Should return the same kind of value the parent promised. If `Product.describe` returns a string, `DiscountedProduct.describe` must also return a string, not a dictionary or `None`.
+- Should not raise exceptions the parent didn't declare. If the parent's `charge` never raises an error for valid amounts, the override shouldn't raise either.
+- Should not require more from its inputs than the parent did. If the parent accepts any positive number, the override shouldn't reject odd numbers (that would be a stronger precondition).
+- Should not guarantee less than the parent. If the parent promised the item was saved to the database before returning, the override shouldn't return before the save completes.
+
+The following violation runs without errors but breaks calling code:
+
+```python
+class Account:
+    def __init__(self, balance):
+        self.balance = balance
+
+    def withdraw(self, amount):
+        if amount > self.balance:
+            raise ValueError("Insufficient funds")
+        self.balance -= amount
+        return self.balance
+
+class OverdraftAccount(Account):
+    def withdraw(self, amount):
+        # "Overdraft is allowed", but now any negative balance is fine
+        self.balance -= amount
+        return self.balance
+
+def transfer(source, target, amount):
+    source.withdraw(amount)
+    target.balance += amount
+
+regular = Account(balance=100)
+overdraft = OverdraftAccount(balance=100)
+
+transfer(regular, overdraft, 50)   # works
+transfer(overdraft, regular, 200)  # overdraft.balance goes to -150 silently
+print(regular.balance, overdraft.balance)
+```
+
+`OverdraftAccount.withdraw` substitutes for `Account.withdraw` in a way the caller of `transfer` couldn't anticipate. The parent guarantees that a successful return means the balance wasn't overdrawn; the subclass allows negative balances without signaling. Any auditing code, reporting code, or downstream logic that relied on the parent's guarantee produces wrong results without warning.
+
+The fix is either to make the subclass honor the contract (raise a different exception when overdraft limits are hit, instead of allowing arbitrary negative balances), or to recognize that `OverdraftAccount` isn't a kind of `Account` in the strict sense and shouldn't inherit from it.
+
+Liskov doesn't need to be memorized as a formal rule. The intuition is enough: if the override would surprise code calling the parent's interface, the contract is broken.
+
+<h1 id="calling-the-parent-supermethod">
+  Calling the Parent: super().method()
+</h1>
+
+The mechanics of `super()` are the same as in the inheritance basics lesson, but the patterns are worth restating because overriding is where `super()` matters most.
+
+The simplest pattern is "run the parent's version, then add to its result":
+
+```python
+class Product:
+    def label(self):
+        return f"[{self.product_id}] {self.name}"
+
+class FlashDealProduct(Product):
+    def label(self):
+        return super().label() + " - FLASH SALE!"
+
+flash = FlashDealProduct()
+flash.product_id = 101
+flash.name = "Coffee Mug"
+print(flash.label())
+```
+
+`super()` here is a shorthand. The full form is `super(FlashDealProduct, self)`, but Python 3 allows `super()` without arguments inside any method and figures out the rest from context.
+
+A second pattern is "wrap the parent": run code, call `super()`, run more code. The `TimestampedLogger` example earlier showed this. It's the same idea as decorators applied to methods, expressed through inheritance.
+
+A third pattern is "delegate conditionally": call `super()` only in some cases. The pattern fits when the override sometimes wants the parent's behavior and sometimes doesn't:
+
+```python
+class CartItem:
+    def total(self):
+        return self.price * self.quantity
+
+class BuyOneGetOneFreeItem(CartItem):
+    def total(self):
+        if self.quantity <= 1:
+            return super().total()
+        # Charge for half the items, rounded up
+        chargeable = (self.quantity + 1) // 2
+        return self.price * chargeable
+
+item = BuyOneGetOneFreeItem()
+item.price = 10.00
+item.quantity = 1
+print(f"qty 1: ${item.total():.2f}")
+item.quantity = 2
+print(f"qty 2: ${item.total():.2f}")
+item.quantity = 3
+print(f"qty 3: ${item.total():.2f}")
+```
+
+For one item, the subclass falls back to the parent's calculation. For more, it applies its own discount logic. The override picks when to defer and when to take over, instead of always doing one or the other.
+
+`super().method()` is one extra function call per level. The overhead is negligible for normal use. In hot loops where every fraction of a microsecond matters, profile first before optimizing.
+
+<h1 id="template-method-an-override-friendly-pattern">
+  Template Method: An Override-Friendly Pattern
+</h1>
+
+A common pattern built on top of method overriding is the **Template Method** pattern. The parent class defines a method that lays out the overall flow of an operation, calling smaller methods at each step. Subclasses override only the small steps they care about and inherit the rest. The overall flow stays consistent across all subclasses, and each subclass customizes the pieces that differ.
+
+```python
+class ReportGenerator:
+    def generate(self, data):
+        rows = self.collect_rows(data)
+        formatted = self.format_rows(rows)
+        return self.wrap_output(formatted)
+
+    def collect_rows(self, data):
+        return list(data)
+
+    def format_rows(self, rows):
+        return "\n".join(str(row) for row in rows)
+
+    def wrap_output(self, body):
+        return f"Report:\n{body}"
+
+class CsvReport(ReportGenerator):
+    def format_rows(self, rows):
+        return "\n".join(",".join(str(field) for field in row) for row in rows)
+
+    def wrap_output(self, body):
+        return body  # CSV needs no decoration
+
+class HtmlReport(ReportGenerator):
+    def format_rows(self, rows):
+        items = "".join(f"<li>{row}</li>" for row in rows)
+        return f"<ul>{items}</ul>"
+
+    def wrap_output(self, body):
+        return f"<html><body>{body}</body></html>"
+
+data = [("Alice", 30), ("Bob", 25)]
+
+print(ReportGenerator().generate(data))
+print()
+print(CsvReport().generate(data))
+print()
+print(HtmlReport().generate(data))
+```
+
+`ReportGenerator.generate` is the template. It always does the same three steps in the same order: collect rows, format them, wrap the result. The subclasses don't override `generate` at all. Each one customizes the two steps that differ for its output format, and the orchestration stays untouched.
+
+This is the dispatch rule (from earlier) doing useful work. When `generate` calls `self.format_rows(rows)`, dispatch picks the right override for whichever subclass the instance belongs to. `CsvReport().generate(data)` runs `ReportGenerator.generate`, which calls `self.format_rows` and gets `CsvReport.format_rows`. The parent doesn't need to know what subclasses exist; it calls through `self` and lets dispatch sort it out.
+
+The methods the parent calls are sometimes called **hook methods**: places where subclasses are expected to plug in their customization. A well-designed template documents which methods are hooks (intended to be overridden) and which are part of the orchestration (not meant to be touched). Without that documentation, the structure has to be reconstructed by tracing through the code.
+
+<h1 id="overriding-__init__">Overriding __init__</h1>
+
+`__init__` is the method most commonly overridden, and the rules around it are worth restating because the consequences of getting them wrong are visible right away.
+
+The key facts:
+
+1. The subclass's `__init__` replaces the parent's entirely. Python doesn't call the parent's `__init__` automatically when both classes have one.
+2. To run the parent's setup, the subclass must call `super().__init__(...)` with whatever arguments the parent expects.
+3. By convention, `super().__init__(...)` is called at the top of the subclass's `__init__`, before any subclass-specific work. This ensures parent attributes exist before the subclass touches anything.
+
+A correct subclass `__init__`:
+
+```python
+class Order:
+    def __init__(self, order_id, customer):
+        self.order_id = order_id
+        self.customer = customer
+        self.items = []
+
+class GiftOrder(Order):
+    def __init__(self, order_id, customer, recipient_name, gift_message):
+        super().__init__(order_id, customer)
+        self.recipient_name = recipient_name
+        self.gift_message = gift_message
+
+gift = GiftOrder(
+    order_id=1,
+    customer="Alice",
+    recipient_name="Bob",
+    gift_message="Happy birthday!",
+)
+
+print(gift.order_id, gift.customer, gift.items, gift.recipient_name)
+```
+
+`GiftOrder.__init__` first runs `super().__init__(order_id, customer)` so that `order_id`, `customer`, and `items` are set by `Order.__init__`. Then it adds the gift-specific attributes. Order matters: accessing `self.items` before `super().__init__(...)` would raise `AttributeError` because the attribute wouldn't exist yet.
+
+A common variation is to fix some of the parent's arguments and not expose them to the subclass's caller:
+
+```python
+class DigitalOrder(Order):
+    def __init__(self, order_id, customer, download_url):
+        super().__init__(order_id, customer)
+        # No physical shipping for digital orders, but we still inherit items
+        self.download_url = download_url
+        self.shipping_address = None  # explicitly None for clarity
+```
+
+The subclass doesn't have to pass through every parent argument unchanged. It can hard-code defaults or set fields the parent left out. The only requirement is that whatever the parent's `__init__` needs has to come from somewhere.
+
+Consider this broken code:
+
+```python
+class Customer:
+    def __init__(self, name, email):
+        self.name = name
+        self.email = email
+
+class PremiumCustomer(Customer):
+    def __init__(self, name, email, tier):
+        self.tier = tier  # bug: super() not called, so name/email never set
+
+bob = PremiumCustomer("Bob", "bob@example.com", "gold")
+print(bob.tier)
+print(bob.name)
+```
+
+The override omitted `super().__init__(name, email)`, so `Customer.__init__` never ran. `bob.tier` works because the override did set that. `bob.name` fails because nothing set it. The fix is the standard pattern:
+
+```python
+class PremiumCustomer(Customer):
+    def __init__(self, name, email, tier):
+        super().__init__(name, email)
+        self.tier = tier
+```
+
+This bug is a frequent mistake when overriding `__init__`. It's easy to spot once recognized, but it doesn't fail until something tries to read a missing attribute, which can be far from the actual `__init__` definition.
+
+<h1 id="overriding-dunder-methods">Overriding Dunder Methods</h1>
+
+Dunder (double-underscore) methods are how classes integrate with Python's operators and builtins. Overriding them is how objects behave correctly with `==`, `+`, `len()`, `print()`, and others. The rules for overriding dunder methods differ a bit because Python itself calls them, not user code, so the contract has to be tight.
+
+A common override is `__eq__`, which controls what `==` means for the class. The default (inherited from `object`) compares object identity, which is rarely the right behavior for value-like classes:
+
+```python
+class Product:
+    def __init__(self, product_id, name):
+        self.product_id = product_id
+        self.name = name
+
+a = Product(101, "Mug")
+b = Product(101, "Mug")
+print(a == b)  # False by default; comparing object identity
+```
+
+Two `Product` instances with the same data still compare as unequal because `object.__eq__` compares whether they're the same object in memory. Overriding `__eq__` defines equality by content:
+
+```python
+class Product:
+    def __init__(self, product_id, name):
+        self.product_id = product_id
+        self.name = name
+
+    def __eq__(self, other):
+        if not isinstance(other, Product):
+            return NotImplemented
+        return self.product_id == other.product_id
+
+a = Product(101, "Mug")
+b = Product(101, "Coffee Mug")  # different name, same id
+c = Product(202, "Mug")
+print(a == b)
+print(a == c)
+```
+
+A few important details about overriding `__eq__`:
+
+1. **Check the type of `other`.** The override should handle the case where `other` isn't a `Product` at all. Returning `NotImplemented` (a special builtin singleton) tells Python "comparison undefined here; try the other operand's `__eq__`". Returning `False` would say "they're definitely unequal", which is a stronger claim and can interact badly with other comparisons.
+2. **Override `__hash__` if `__eq__` is overridden.** Python uses `__hash__` for set membership and dict keys, and the contract is that equal objects must hash to the same value. Overriding `__eq__` alone causes Python to set `__hash__` to `None`, making instances unhashable (they can't be put in sets or used as dict keys). The fix is usually to override `__hash__` to return a hash of the same fields compared in `__eq__`.
+
+```python
+class Product:
+    def __init__(self, product_id, name):
+        self.product_id = product_id
+        self.name = name
+
+    def __eq__(self, other):
+        if not isinstance(other, Product):
+            return NotImplemented
+        return self.product_id == other.product_id
+
+    def __hash__(self):
+        return hash(self.product_id)
+
+products = {Product(101, "Mug"), Product(101, "Coffee Mug"), Product(202, "Pen")}
+print(len(products))
+```
+
+Two of the three products are considered equal (same `product_id`), so the set keeps only one of them and the pen, giving a size of two.
+
+Other dunders that often get overridden:
+
+| Dunder                   | Called by                  | Purpose                                       |
+| ------------------------ | -------------------------- | --------------------------------------------- |
+| `__str__`                | `str()`, `print()`         | Human-readable string representation          |
+| `__repr__`               | `repr()`, REPL display     | Unambiguous representation for debugging      |
+| `__eq__`                 | `==`                       | Equality comparison                           |
+| `__hash__`               | `hash()`, set/dict keys    | Integer hash for use in hash-based containers |
+| `__lt__`, `__le__`, etc. | `<`, `<=`, sorting         | Ordering comparisons                          |
+| `__len__`                | `len()`                    | Object's "size"                               |
+| `__iter__`               | `for`, list comprehensions | Iteration                                     |
+| `__contains__`           | `in`                       | Membership testing                            |
+
+Each of these has a specific contract Python expects. Overriding them is how classes become first-class participants in the language. The course has a separate dunder methods chapter that goes deeper; the relevant point for overriding is that dunder methods are still methods, and the same dispatch rule applies. A subclass can override `__eq__` to provide a more specific notion of equality, like any other method.
+
+<h1 id="pitfalls-and-common-mistakes">Pitfalls and Common Mistakes</h1>
+
+A few patterns to watch for when overriding methods.
+
+**Changing the signature.** If the parent's method is `def save(self, validate=True):` and the subclass overrides it as `def save(self):`, calls that pass `validate=False` to the parent's interface fail on subclass instances. The override has narrowed the API by accident. Subclasses should accept at least everything the parent accepted, even if they ignore some of it.
+
+```python
+class Document:
+    def save(self, validate=True):
+        if validate:
+            self._validate()
+        print("saved")
+
+class DraftDocument(Document):
+    def save(self):  # bug: removed the validate parameter
+        print("saved as draft")
+
+Document().save(validate=False)        # works
+DraftDocument().save(validate=False)   # TypeError: unexpected argument
+```
+
+The fix is to accept the same parameters, even if the override doesn't use them:
+
+```python
+class DraftDocument(Document):
+    def save(self, validate=True):
+        print("saved as draft")
+```
+
+**Returning a different type.** Callers of the parent's method have built expectations around its return type. Changing it in the override breaks every assumption built on top. If the parent returns a `dict`, the override should return a `dict` (or a subclass of `dict`), not a `list` or `None`.
+
+**Calling `self.method()` instead of `super().method()`.** Inside an override, `self.method(...)` calls the method through dispatch, which finds the override itself, causing infinite recursion. To call the parent's version explicitly, use `super().method(...)`.
+
+```python
+class A:
+    def label(self):
+        return "A"
+
+class B(A):
+    def label(self):
+        # bug: self.label() calls B.label() (recursion)
+        return self.label() + " from B"
+```
+
+The correct version:
+
+```python
+class B(A):
+    def label(self):
+        return super().label() + " from B"
+```
+
+**Forgetting that the parent's code might call the overridden method.** As shown in the Template Method section, if the parent's code calls `self.format_rows(...)` and the subclass overrides `format_rows`, the override is what runs. This is usually the goal, but it can also surprise code that didn't expect the parent to call into the override. Read the parent class to see which of its methods call other methods on `self`, especially when those other methods are being overridden.
+
+**Overriding a method by accident.** A method on a subclass with the same name as something a parent already defined (even when unintended) shadows the parent. This is most painful when the parent is `object` or a builtin like `list`: subclasses of `list` that define a method called `index` or `pop` are shadowing the list's own without warning. Use a name that doesn't conflict, or confirm the override is intentional.
+
+The pattern across all of these is the same: an override changes how a method behaves, and other code (the parent's own code, the language runtime, callers) might depend on the original behavior in ways that aren't obvious from a single file. Treat overrides as contracts being modified, not as new methods being freely written.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

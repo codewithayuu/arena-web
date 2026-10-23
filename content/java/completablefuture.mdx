@@ -1,0 +1,740 @@
+---
+title: "CompletableFuture"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "CompletableFuture explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+We covered `Callable` and plain `Future` in `13-callable-future.md`, so we'll only revisit them long enough to motivate why `CompletableFuture` exists. Virtual threads (the modern alternative for "just write blocking code") are the topic of `23-virtual-threads.md` and are out of scope here.
+
+<h1 id="why-plain-future-isnt-enough">Why Plain Future Isn't Enough</h1>
+
+A plain `Future<T>` is the receipt you get back when you submit a `Callable` to an executor. It promises a value will arrive later, and it gives you exactly one way to read that value: `future.get()`. That call blocks the calling thread until the task completes.
+
+```java
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+public class PlainFutureDemo {
+    public static void main(String[] args) throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+
+        Future<String> product = pool.submit(() -> {
+            Thread.sleep(300);
+            return "Notebook $4.99";
+        });
+        Future<String> reviews = pool.submit(() -> {
+            Thread.sleep(500);
+            return "4.5 stars (210 reviews)";
+        });
+
+        String productResult = product.get();
+        String reviewResult = reviews.get();
+
+        System.out.println(productResult);
+        System.out.println(reviewResult);
+
+        pool.shutdown();
+    }
+}
+```
+
+This works, but look at what the main thread did: it blocked on `product.get()` for 300 ms, then blocked on `reviews.get()` for another 200 ms before that call returned. While the main thread was parked, it couldn't do anything else. If the program were a web server, that thread would be unavailable for any other request the whole time.
+
+The deeper problem is composition. If you want to fetch product details, then once those arrive use them to compute a discount, then format the result. With plain `Future`, every step needs another `get()` and another blocked thread. You can't say "when the product future finishes, run this transformation on the result." There's no way to attach a callback. `Future` is a passive receipt, not a building block.
+
+`CompletableFuture` adds two capabilities that change the shape of the API:
+
+1. You can attach callbacks that run when the result is available, without blocking anyone to wait.
+2. You can chain those callbacks into pipelines, so a multi-step async computation reads like a recipe instead of a stack of `get()` calls.
+
+That second capability is the one this lesson spends the most time on.
+
+The diagram shows the contrast. `Future.get()` is a blocking handoff: the caller stops until the result is available. `CompletableFuture` flips that around. The caller registers a callback and moves on. The callback fires on whatever thread completes the future. The caller's thread isn't part of the wait.
+
+<h1 id="creating-a-completablefuture">Creating a CompletableFuture</h1>
+
+There are three common starting points: `supplyAsync` for an async computation that returns a value, `runAsync` for an async computation that returns nothing, and `completedFuture` for a value that's already ready.
+
+`supplyAsync` takes a `Supplier<T>` and starts running it on a background thread immediately. The returned `CompletableFuture<T>` will complete with whatever the supplier returns.
+
+```java
+import java.util.concurrent.CompletableFuture;
+
+public class SupplyAsyncDemo {
+    public static void main(String[] args) throws Exception {
+        CompletableFuture<String> productDetails = CompletableFuture.supplyAsync(() -> {
+            try { Thread.sleep(200); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            return "Notebook | $4.99 | In stock";
+        });
+
+        System.out.println("Submitted, doing other work...");
+        // Imagine other work here
+
+        String result = productDetails.get();
+        System.out.println("Result: " + result);
+    }
+}
+```
+
+The supplier ran on a thread from the common `ForkJoinPool`, not the main thread. The main thread printed "Submitted..." immediately and only blocked at the very end when it called `get()`. In a real pipeline, you wouldn't call `get()` at all; you'd attach callbacks instead.
+
+`runAsync` is the same idea but for a `Runnable`. It returns `CompletableFuture<Void>` because there's no result.
+
+```java
+import java.util.concurrent.CompletableFuture;
+
+public class RunAsyncDemo {
+    public static void main(String[] args) throws Exception {
+        CompletableFuture<Void> notify = CompletableFuture.runAsync(() -> {
+            System.out.println("Sending order confirmation email...");
+        });
+
+        notify.get();
+        System.out.println("Email task finished.");
+    }
+}
+```
+
+Use `runAsync` for fire-and-forget work where you care that it finished but not what it produced. Sending a notification, writing to a log, updating a cache without using the result.
+
+`completedFuture` is the cheap one. It returns a future that is already done, with the value you handed in. No thread is involved, no work is scheduled. It's useful when a method has to return a `CompletableFuture` but in some branch the answer is already known (a cache hit, for example).
+
+```java
+import java.util.concurrent.CompletableFuture;
+
+public class CompletedFutureDemo {
+    public static void main(String[] args) {
+        CompletableFuture<String> cached = CompletableFuture.completedFuture("Cached: Notebook $4.99");
+        System.out.println("Is done? " + cached.isDone());
+        System.out.println("Value: " + cached.join());
+    }
+}
+```
+
+`join()` is like `get()` but throws an unchecked exception instead of a checked one, which makes it more convenient inside lambdas and pipelines where checked exceptions are awkward.
+
+<h1 id="transforming-results-thenapply-thenaccept-thenrun">
+  Transforming Results: thenApply, thenAccept, thenRun
+</h1>
+
+Once you have a future, the most common thing you'll do is transform its result. `CompletableFuture` gives you three flavors of transformation, distinguished by what kind of function you pass in.
+
+`thenApply` takes a `Function<T, R>`. It transforms the result and returns a new future that holds the transformed value.
+
+```java
+import java.util.concurrent.CompletableFuture;
+
+public class ThenApplyDemo {
+    public static void main(String[] args) throws Exception {
+        CompletableFuture<String> productName = CompletableFuture.supplyAsync(() -> "notebook");
+
+        CompletableFuture<String> displayName = productName
+            .thenApply(name -> name.toUpperCase())
+            .thenApply(name -> "Product: " + name);
+
+        System.out.println(displayName.get());
+    }
+}
+```
+
+Each `thenApply` creates a new stage in the pipeline. The output of one stage feeds the next stage's input. The whole chain is set up before the first stage even finishes; the callbacks just fire in order as values become available.
+
+`thenAccept` takes a `Consumer<T>`. It uses the result but doesn't transform it. The returned future is `CompletableFuture<Void>`.
+
+```java
+import java.util.concurrent.CompletableFuture;
+
+public class ThenAcceptDemo {
+    public static void main(String[] args) throws Exception {
+        CompletableFuture<Double> cartTotal = CompletableFuture.supplyAsync(() -> 49.99);
+
+        CompletableFuture<Void> done = cartTotal.thenAccept(total -> {
+            System.out.println("Cart total: $" + total);
+        });
+
+        done.get();
+    }
+}
+```
+
+Use `thenAccept` when the next step is a side effect: logging, sending a notification, updating a UI field. There's no value to pass to a further stage, but you still want the stage to participate in the pipeline so error handling and ordering work correctly.
+
+`thenRun` takes a `Runnable`. It doesn't even look at the result. It just runs after the previous stage finishes.
+
+```java
+import java.util.concurrent.CompletableFuture;
+
+public class ThenRunDemo {
+    public static void main(String[] args) throws Exception {
+        CompletableFuture<String> placeOrder = CompletableFuture.supplyAsync(() -> "Order #1001 placed");
+
+        CompletableFuture<Void> cleanup = placeOrder.thenRun(() -> {
+            System.out.println("Closing checkout session...");
+        });
+
+        cleanup.get();
+    }
+}
+```
+
+`thenRun` is appropriate for "I don't care what the result was, just do this after." Closing a session, releasing a lock, refreshing a stale counter.
+
+| Method       | Function shape   | Returns                   | Has access to result? |
+| ------------ | ---------------- | ------------------------- | --------------------- |
+| `thenApply`  | `Function<T, R>` | `CompletableFuture<R>`    | Yes, transforms it    |
+| `thenAccept` | `Consumer<T>`    | `CompletableFuture<Void>` | Yes, uses it          |
+| `thenRun`    | `Runnable`       | `CompletableFuture<Void>` | No                    |
+
+The three are the building blocks of any pipeline. Pick the one whose function shape matches what you actually want to do at that step.
+
+<h1 id="composing-pipelines-thencompose-vs-thencombine">
+  Composing Pipelines: thenCompose vs thenCombine
+</h1>
+
+Real pipelines do more than transform a value. They chain async calls and combine results from independent calls. Two methods cover the two shapes that come up over and over.
+
+`thenCompose` is for when the next step is itself async. The function you hand it returns a `CompletableFuture`, and `thenCompose` flattens it so you don't end up with `CompletableFuture<CompletableFuture<T>>`. If you've seen `flatMap` in streams, this is the same idea.
+
+A common example is an order placement pipeline: validate the cart, then charge the customer, then ship the order. Each step is its own async call, and each step needs the result of the previous step.
+
+```java
+import java.util.concurrent.CompletableFuture;
+
+public class OrderPipelineDemo {
+    public static void main(String[] args) throws Exception {
+        CompletableFuture<String> orderResult =
+            validateCart("cart-42")
+                .thenCompose(validatedCart -> chargeCustomer(validatedCart))
+                .thenCompose(payment -> shipOrder(payment));
+
+        System.out.println(orderResult.get());
+    }
+
+    static CompletableFuture<String> validateCart(String cartId) {
+        return CompletableFuture.supplyAsync(() -> {
+            sleep(100);
+            return "validated:" + cartId;
+        });
+    }
+
+    static CompletableFuture<String> chargeCustomer(String validatedCart) {
+        return CompletableFuture.supplyAsync(() -> {
+            sleep(150);
+            return "charged:" + validatedCart + ":txn-9001";
+        });
+    }
+
+    static CompletableFuture<String> shipOrder(String payment) {
+        return CompletableFuture.supplyAsync(() -> {
+            sleep(120);
+            return "shipped:" + payment + ":tracking-AB42";
+        });
+    }
+
+    static void sleep(int ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+}
+```
+
+Each step takes the result of the previous one and starts its own async work. `thenCompose` is what lets you write this as a flat chain. If you used `thenApply` instead, each lambda would return a `CompletableFuture` and the type would become `CompletableFuture<CompletableFuture<CompletableFuture<String>>>`, which is unusable. `thenCompose` peels off the outer wrapper at every step.
+
+The contrast with `thenApply`:
+
+| Method        | Function returns       | Result type            | Use when                          |
+| ------------- | ---------------------- | ---------------------- | --------------------------------- |
+| `thenApply`   | Plain value `R`        | `CompletableFuture<R>` | The transformation is synchronous |
+| `thenCompose` | `CompletableFuture<R>` | `CompletableFuture<R>` | The next step is itself async     |
+
+`thenCombine` is for when two independent futures both need to finish before you can produce a result. A common case is a product detail page that needs the product, its reviews, and a recommendations slot, where each comes from a separate service.
+
+```java
+import java.util.concurrent.CompletableFuture;
+
+public class ProductPageDemo {
+    public static void main(String[] args) throws Exception {
+        CompletableFuture<String> product = CompletableFuture.supplyAsync(() -> {
+            sleep(200);
+            return "Notebook $4.99";
+        });
+        CompletableFuture<String> reviews = CompletableFuture.supplyAsync(() -> {
+            sleep(300);
+            return "4.5 stars (210 reviews)";
+        });
+
+        CompletableFuture<String> page = product.thenCombine(reviews, (p, r) -> {
+            return "PAGE >> " + p + " | " + r;
+        });
+
+        System.out.println(page.get());
+    }
+
+    static void sleep(int ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+}
+```
+
+Both `product` and `reviews` start running on the common pool at roughly the same time. They run in parallel, so the total wall time is around 300 ms (the longer of the two), not 500 ms. `thenCombine` waits for both, then applies the combining function once with both results in hand. The function you pass to `thenCombine` is a `BiFunction<T, U, R>` because it takes two inputs.
+
+If you need to combine three futures, you chain `thenCombine` calls or use `allOf`. For three:
+
+```java
+import java.util.concurrent.CompletableFuture;
+
+public class ProductPageThreeDemo {
+    public static void main(String[] args) throws Exception {
+        CompletableFuture<String> product = CompletableFuture.supplyAsync(() -> "Notebook $4.99");
+        CompletableFuture<String> reviews = CompletableFuture.supplyAsync(() -> "4.5 stars");
+        CompletableFuture<String> recs = CompletableFuture.supplyAsync(() -> "Pen, Eraser, Stapler");
+
+        CompletableFuture<String> page = product
+            .thenCombine(reviews, (p, r) -> p + " | " + r)
+            .thenCombine(recs, (pr, rec) -> pr + " | recs: " + rec);
+
+        System.out.println(page.get());
+    }
+}
+```
+
+Two `thenCombine` calls fuse three independent futures into one. The first call produces an intermediate string from `product` and `reviews`. The second call combines that with `recs`. The chain still runs all three suppliers in parallel; only the combining is sequential.
+
+The diagram lines up the three independent fetches at the start of the pipeline. They run in parallel. The combiners run only when their inputs are ready. Wall-time-wise, the pipeline finishes as soon as the slowest of the three fetches finishes, plus the (tiny) combining cost.
+
+<h1 id="async-variants-and-which-executor-runs-the-callback">
+  Async Variants and Which Executor Runs the Callback
+</h1>
+
+So far, every `thenApply`, `thenCombine`, and friends call has run its callback on whatever thread happens to complete the source future. That sounds fine, but it leads to a subtle gotcha.
+
+The rule is: a callback registered with the non-`Async` variant (`thenApply`, `thenCombine`, etc.) runs on:
+
+- The thread that completed the source future, if the future wasn't done yet when the callback was registered.
+- The calling thread, if the future was already done when the callback was registered.
+
+For most cases that's fine. But if you register a `thenApply` whose callback does heavy work, and the source future completes on a small pool, the heavy work hijacks that pool. Or if the future is already done, your "async" callback runs synchronously on the thread that called `thenApply`, which can defeat the purpose.
+
+The `Async` variants give you control. `thenApplyAsync` runs the callback on the common `ForkJoinPool` (the default), or on an executor you pass in. Same for `thenAcceptAsync`, `thenComposeAsync`, `thenCombineAsync`, and so on.
+
+```java
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+public class AsyncVariantDemo {
+    public static void main(String[] args) throws Exception {
+        ExecutorService cpuPool = Executors.newFixedThreadPool(4);
+
+        CompletableFuture<String> result = CompletableFuture
+            .supplyAsync(() -> "raw-data")
+            .thenApplyAsync(s -> {
+                System.out.println("Stage 1 on: " + Thread.currentThread().getName());
+                return s.toUpperCase();
+            }, cpuPool)
+            .thenApplyAsync(s -> {
+                System.out.println("Stage 2 on: " + Thread.currentThread().getName());
+                return "[" + s + "]";
+            }, cpuPool);
+
+        System.out.println("Final: " + result.get());
+        cpuPool.shutdown();
+    }
+}
+```
+
+The exact thread numbers vary, but each `Async` stage ran on a thread from `cpuPool`. If you'd left off the executor argument, stages would have run on the common `ForkJoinPool`. If you'd used non-`Async` variants (`thenApply`), the second stage might have run on whatever thread completed the first stage, which could be a common-pool thread, a custom-pool thread, or the main thread, depending on timing.
+
+| Method                         | Where it runs                                                   |
+| ------------------------------ | --------------------------------------------------------------- |
+| `thenApply(fn)`                | Thread that completed the source, or the caller if already done |
+| `thenApplyAsync(fn)`           | A thread from the common `ForkJoinPool`                         |
+| `thenApplyAsync(fn, executor)` | A thread from `executor`                                        |
+
+The same three-row pattern repeats for every transformation method. The rule of thumb: when the callback does meaningful work (blocking calls, expensive computation, IO), use the `Async` variant with an explicit executor so you control where it runs.
+
+Every callback added via the non-`Async` variant is one fewer guarantee about which thread runs it. For pipelines on shared pools, that's enough reason to default to `Async` with a named executor in production code.
+
+<h1 id="the-common-forkjoinpool-gotcha">The Common ForkJoinPool Gotcha</h1>
+
+`supplyAsync(() -> ...)` without an explicit executor uses the **common ForkJoinPool**. That's a shared, JVM-wide pool sized to roughly the number of available CPU cores minus one. It's tuned for short, non-blocking, CPU-bound work. Streams' parallel operations use it. So does any other library that uses `ForkJoinPool.commonPool()` directly.
+
+The problem is that nothing stops you from running a blocking task on it. If you write `supplyAsync(() -> blockingHttpCall(...))`, the call goes onto the common pool, and that pool's thread sits parked until the response arrives. With four cores, you have maybe three usable threads. A handful of blocking calls saturates the pool. Now every other component that depends on the common pool (parallel streams, other libraries) is stalled too.
+
+```java
+import java.util.concurrent.CompletableFuture;
+import java.util.stream.IntStream;
+
+public class CommonPoolBlockingDemo {
+    public static void main(String[] args) throws Exception {
+        long start = System.currentTimeMillis();
+
+        CompletableFuture<?>[] futures = IntStream.range(0, 8)
+            .mapToObj(i -> CompletableFuture.supplyAsync(() -> {
+                try { Thread.sleep(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                return "task-" + i;
+            }))
+            .toArray(CompletableFuture[]::new);
+
+        CompletableFuture.allOf(futures).get();
+        long elapsed = System.currentTimeMillis() - start;
+        System.out.println("8 blocking tasks took: " + elapsed + " ms");
+    }
+}
+```
+
+The actual number depends on how many cores you have. On a 4-core machine the common pool has 3 worker threads, so 8 tasks of 500 ms run in roughly 3 batches: about 1500 ms. On 8 cores, the time is closer to 500 ms. The parallelism is bounded by your core count, not by what your blocking workload actually wants.
+
+The fix is to pass your own executor. For IO-heavy work, size it for IO concurrency, not CPU.
+
+```java
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.stream.IntStream;
+
+public class CustomPoolBlockingDemo {
+    public static void main(String[] args) throws Exception {
+        ExecutorService ioPool = Executors.newFixedThreadPool(32);
+        long start = System.currentTimeMillis();
+
+        CompletableFuture<?>[] futures = IntStream.range(0, 8)
+            .mapToObj(i -> CompletableFuture.supplyAsync(() -> {
+                try { Thread.sleep(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                return "task-" + i;
+            }, ioPool))
+            .toArray(CompletableFuture[]::new);
+
+        CompletableFuture.allOf(futures).get();
+        long elapsed = System.currentTimeMillis() - start;
+        System.out.println("8 IO tasks on dedicated pool: " + elapsed + " ms");
+        ioPool.shutdown();
+    }
+}
+```
+
+All 8 ran in parallel on the dedicated pool because the pool had 32 slots. Total wall time is just over 500 ms, the length of one task. The common pool isn't touched, so other components that depend on it aren't affected.
+
+The common ForkJoinPool's worker count defaults to `Runtime.getRuntime().availableProcessors() - 1`. On a small instance, that can be 1 or 2 threads. Putting blocking work there is a frequent production bug with `CompletableFuture`.
+
+<h1 id="error-handling-exceptionally-handle-whencomplete">
+  Error Handling: exceptionally, handle, whenComplete
+</h1>
+
+Errors in a pipeline don't disappear. If any stage throws, the resulting future completes exceptionally, and downstream stages skip their normal logic and propagate the same exception. Calling `get()` on an exceptionally-completed future throws an `ExecutionException` wrapping the original.
+
+The three error-handling combinators differ in what they return and whether they can recover.
+
+`exceptionally` runs only when the upstream stage failed. It takes a `Function<Throwable, T>` and produces a fallback value of the same type as the pipeline.
+
+```java
+import java.util.concurrent.CompletableFuture;
+
+public class ExceptionallyDemo {
+    public static void main(String[] args) throws Exception {
+        CompletableFuture<Double> price = CompletableFuture
+            .<Double>supplyAsync(() -> {
+                throw new RuntimeException("price service down");
+            })
+            .exceptionally(ex -> {
+                System.out.println("Falling back: " + ex.getMessage());
+                return 0.0;
+            });
+
+        System.out.println("Final price: $" + price.get());
+    }
+}
+```
+
+The supplier threw, so the future completed exceptionally. `exceptionally` caught the failure and supplied `0.0` as the fallback. The pipeline continues with a normal result. If the supplier had succeeded, `exceptionally` would have done nothing and the success value would have flowed through unchanged.
+
+`handle` runs on both success and failure. It takes a `BiFunction<T, Throwable, R>` where exactly one of the two inputs is non-null. It can transform a success, recover from a failure, or change the result type entirely.
+
+```java
+import java.util.concurrent.CompletableFuture;
+
+public class HandleDemo {
+    public static void main(String[] args) throws Exception {
+        CompletableFuture<String> message = CompletableFuture
+            .<Double>supplyAsync(() -> 49.99)
+            .handle((value, ex) -> {
+                if (ex != null) return "ERROR: " + ex.getMessage();
+                return "PRICE: $" + value;
+            });
+
+        System.out.println(message.get());
+
+        CompletableFuture<String> failing = CompletableFuture
+            .<Double>supplyAsync(() -> { throw new RuntimeException("boom"); })
+            .handle((value, ex) -> {
+                if (ex != null) return "ERROR: " + ex.getMessage();
+                return "PRICE: $" + value;
+            });
+
+        System.out.println(failing.get());
+    }
+}
+```
+
+`handle` is the most flexible of the three. It always runs, and it can change the result type (from `Double` to `String` in this example). Use it when you want one place that funnels both success and failure into the next stage.
+
+`whenComplete` is for side effects: log the outcome, record a metric, decrement a counter. It takes a `BiConsumer<T, Throwable>`, can't change the value, and re-emits the same result (success or failure) downstream.
+
+```java
+import java.util.concurrent.CompletableFuture;
+
+public class WhenCompleteDemo {
+    public static void main(String[] args) throws Exception {
+        CompletableFuture<Double> price = CompletableFuture
+            .supplyAsync(() -> 49.99)
+            .whenComplete((value, ex) -> {
+                if (ex != null) System.out.println("[metric] failure: " + ex);
+                else System.out.println("[metric] success: $" + value);
+            });
+
+        System.out.println("Final: $" + price.get());
+    }
+}
+```
+
+The `whenComplete` callback fired, logged the success, and the pipeline kept the original `49.99`. If the upstream stage had failed, `whenComplete` would have run with `ex != null`, logged the failure, and then re-thrown the same exception downstream. It's not a recovery tool, it's a tap into the result stream.
+
+| Combinator      | Runs on success? | Runs on failure? | Can recover? | Can change type?      |
+| --------------- | ---------------- | ---------------- | ------------ | --------------------- |
+| `exceptionally` | No               | Yes              | Yes          | No (same `T`)         |
+| `handle`        | Yes              | Yes              | Yes          | Yes (returns `R`)     |
+| `whenComplete`  | Yes              | Yes              | No           | No (returns same `T`) |
+
+Pick based on what you actually need to do. If you want to log and move on, `whenComplete`. If you want to recover from failure with a same-typed fallback, `exceptionally`. If you want one funnel that produces the next stage's value regardless of whether the upstream succeeded or failed, `handle`.
+
+The diagram lays out the typical "log then recover" idiom. `whenComplete` taps the source for metrics without changing what flows through. `exceptionally` then catches any failure and provides a fallback. By the time control reaches `Final`, the pipeline has either the original value or the fallback.
+
+<h1 id="combinators-for-many-futures-allof-and-anyof">
+  Combinators for Many Futures: allOf and anyOf
+</h1>
+
+`thenCombine` works for two futures. When you have a list of futures, you need a fan-in combinator. The two static methods that handle this are `allOf` and `anyOf`.
+
+`allOf(futures...)` returns a `CompletableFuture<Void>` that completes when every input future has completed (successfully or exceptionally). It doesn't carry the results itself; you have to read them from the original futures after `allOf` finishes.
+
+A natural example is a fan-out of notifications: send an order confirmation email, push a mobile notification, post to a marketing webhook. You don't care about return values, you just need to know they all finished before moving on.
+
+```java
+import java.util.concurrent.CompletableFuture;
+
+public class AllOfDemo {
+    public static void main(String[] args) throws Exception {
+        CompletableFuture<Void> email = CompletableFuture.runAsync(() -> {
+            sleep(200);
+            System.out.println("Sent confirmation email");
+        });
+        CompletableFuture<Void> push = CompletableFuture.runAsync(() -> {
+            sleep(150);
+            System.out.println("Pushed mobile notification");
+        });
+        CompletableFuture<Void> marketing = CompletableFuture.runAsync(() -> {
+            sleep(300);
+            System.out.println("Posted to marketing pipeline");
+        });
+
+        CompletableFuture<Void> allDone = CompletableFuture.allOf(email, push, marketing);
+        allDone.get();
+        System.out.println("All notifications complete");
+    }
+
+    static void sleep(int ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+}
+```
+
+The three notifications fired in parallel. Their relative finish order depends on their sleeps (push was fastest). `allOf` completed only after the slowest one (marketing at 300 ms) finished. You'd see the same total wall time (~300 ms) no matter how many parallel notifications were in the batch, as long as the pool had enough threads.
+
+When you do want the results, the pattern is to call `allOf` and then read each future's value with `join`:
+
+```java
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.stream.Collectors;
+
+public class AllOfWithResultsDemo {
+    public static void main(String[] args) throws Exception {
+        List<CompletableFuture<String>> futures = List.of(
+            CompletableFuture.supplyAsync(() -> "Notebook $4.99"),
+            CompletableFuture.supplyAsync(() -> "Pen $1.49"),
+            CompletableFuture.supplyAsync(() -> "Eraser $0.79")
+        );
+
+        CompletableFuture<Void> all = CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
+
+        CompletableFuture<List<String>> combined = all.thenApply(v ->
+            futures.stream().map(CompletableFuture::join).collect(Collectors.toList())
+        );
+
+        System.out.println(combined.get());
+    }
+}
+```
+
+`all` finishes when every future in the list is done. The `thenApply` then walks the list, calling `join()` on each. Because all of them are already done at that point, none of the `join` calls block.
+
+`anyOf(futures...)` returns a `CompletableFuture<Object>` that completes when the first input future completes. The result is the result of whichever one finished first. Use it for race-style scenarios: "fetch from the primary and the replica, take whichever responds first."
+
+```java
+import java.util.concurrent.CompletableFuture;
+
+public class AnyOfDemo {
+    public static void main(String[] args) throws Exception {
+        CompletableFuture<Object> winner = CompletableFuture.anyOf(
+            CompletableFuture.supplyAsync(() -> {
+                sleep(300);
+                return "primary:Notebook";
+            }),
+            CompletableFuture.supplyAsync(() -> {
+                sleep(120);
+                return "replica:Notebook";
+            })
+        );
+
+        System.out.println("Fastest: " + winner.get());
+    }
+
+    static void sleep(int ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+}
+```
+
+The replica finished first, so `anyOf` resolved with its value. The primary continued running in the background, its result discarded. If both had thrown, `anyOf` would complete exceptionally with the first exception.
+
+The return type is `CompletableFuture<Object>` because the input futures could have different result types. In a uniform-typed scenario you usually cast or use `thenApply` to narrow.
+
+<h1 id="timeouts-ortimeout-and-completeontimeout">
+  Timeouts: orTimeout and completeOnTimeout
+</h1>
+
+Java 9 added two methods that handle the "I don't want to wait forever" case directly on the future, without needing a separate scheduled task.
+
+`orTimeout(duration, unit)` causes the future to complete exceptionally with a `TimeoutException` if it hasn't completed by the time the duration elapses.
+
+```java
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+
+public class OrTimeoutDemo {
+    public static void main(String[] args) throws Exception {
+        CompletableFuture<String> recs = CompletableFuture
+            .supplyAsync(() -> {
+                try { Thread.sleep(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                return "Pen, Eraser";
+            })
+            .orTimeout(200, TimeUnit.MILLISECONDS)
+            .exceptionally(ex -> "[recommendations unavailable]");
+
+        System.out.println("Page: Notebook $4.99 | recs: " + recs.get());
+    }
+}
+```
+
+The recommendations call needed 500 ms, but the timeout was 200 ms. The future completed exceptionally with a `TimeoutException`. The `exceptionally` stage caught it and substituted a fallback string, so the page rendered with degraded but valid content.
+
+`completeOnTimeout(value, duration, unit)` is similar, but instead of failing, it completes the future with the given fallback value if the timeout fires first.
+
+```java
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+
+public class CompleteOnTimeoutDemo {
+    public static void main(String[] args) throws Exception {
+        CompletableFuture<String> recs = CompletableFuture
+            .supplyAsync(() -> {
+                try { Thread.sleep(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                return "Pen, Eraser";
+            })
+            .completeOnTimeout("[recommendations unavailable]", 200, TimeUnit.MILLISECONDS);
+
+        System.out.println("Page: Notebook $4.99 | recs: " + recs.get());
+    }
+}
+```
+
+Same outcome, less plumbing. No exception travels the pipeline because the future completed normally with the fallback. Pick `completeOnTimeout` when you have a sensible default value. Pick `orTimeout` + `exceptionally` when you want the failure to be visible (for logging, metrics, or different fallback logic based on the cause).
+
+Timeouts schedule a one-shot task on a hidden scheduler. The original work doesn't get cancelled when the timeout fires; it just keeps running until it finishes or the JVM exits. If the underlying call holds a resource (a connection, a lock), make sure that resource can survive being abandoned.
+
+<h1 id="a-pipeline-diagram">A Pipeline Diagram</h1>
+
+The pipeline below ties everything together into one shape: parallel fetches with `thenCombine`, a sequential transformation with `thenCompose`, an error path with `exceptionally`, a timeout, and a fan-in finish with `allOf` for notifications.
+
+The top row is parallel fetches that fan into a single `thenCombine`. The middle column is a sequential `thenCompose` chain that turns the assembled data into a placed order. The error path peels off the charge step (which is the one most likely to fail) and routes to a fallback. The bottom row is a fan-out of notifications joined by `allOf`. The diagram is what reading the source code feels like once you're fluent: a graph of stages, not a stack of nested callbacks.
+
+<h1 id="putting-it-all-together-an-e-commerce-page-load">
+  Putting It All Together: An E-Commerce Page Load
+</h1>
+
+A small program that exercises most of what this lesson covered. It fetches a product page in parallel, falls back when recommendations are slow, and fans out notifications when the page render is recorded.
+
+```java
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+public class ProductPagePipeline {
+    public static void main(String[] args) throws Exception {
+        ExecutorService ioPool = Executors.newFixedThreadPool(8);
+
+        CompletableFuture<String> product = CompletableFuture.supplyAsync(() -> {
+            sleep(150);
+            return "Notebook $4.99";
+        }, ioPool);
+
+        CompletableFuture<String> reviews = CompletableFuture.supplyAsync(() -> {
+            sleep(220);
+            return "4.5 stars (210)";
+        }, ioPool);
+
+        CompletableFuture<String> recs = CompletableFuture
+            .supplyAsync(() -> {
+                sleep(900);
+                return "Pen, Eraser, Stapler";
+            }, ioPool)
+            .completeOnTimeout("[no recs]", 250, TimeUnit.MILLISECONDS);
+
+        CompletableFuture<String> page = product
+            .thenCombine(reviews, (p, r) -> p + " | " + r)
+            .thenCombine(recs, (pr, rc) -> pr + " | recs: " + rc)
+            .exceptionally(ex -> "page render failed: " + ex.getMessage());
+
+        page.thenAccept(rendered -> System.out.println("Render: " + rendered));
+
+        CompletableFuture<Void> emailSent = CompletableFuture.runAsync(
+            () -> System.out.println("[notify] email sent"), ioPool);
+        CompletableFuture<Void> pushSent = CompletableFuture.runAsync(
+            () -> System.out.println("[notify] push sent"), ioPool);
+        CompletableFuture<Void> marketingSent = CompletableFuture.runAsync(
+            () -> System.out.println("[notify] marketing logged"), ioPool);
+
+        CompletableFuture.allOf(page, emailSent, pushSent, marketingSent).get();
+
+        System.out.println("Done.");
+        ioPool.shutdown();
+    }
+
+    static void sleep(int ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+}
+```
+
+The exact ordering of the notification lines depends on thread scheduling. The page rendered in roughly 250 ms (the recommendation timeout, which dominated since both product and reviews finished sooner). The recs fell back to `[no recs]` because the real call would have taken 900 ms. The whole pipeline ran on `ioPool`, not the common ForkJoinPool, so other components in the JVM were unaffected. One `allOf` at the end kept the main thread parked until both the render and the three notifications had completed.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,543 @@
+---
+title: "Decorators"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Decorators explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="what-a-decorator-does">What a Decorator Does</h1>
+
+A decorator is a function that takes a function as input and returns a function as output. That sentence is the whole idea. Everything else is mechanics.
+
+Consider timing an order-pricing function. Placing `time.perf_counter()` calls around every call site is noisy and easy to forget. A decorator allows the timing logic to be written once and applied to any function with one line.
+
+```python
+import time
+
+def time_it(func):
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        elapsed = time.perf_counter() - start
+        print(f"{func.__name__} took {elapsed:.6f}s")
+        return result
+    return wrapper
+
+def price_order(quantity, unit_price, discount):
+    return quantity * unit_price * (1 - discount)
+
+price_order = time_it(price_order)
+print(price_order(3, 29.99, 0.10))
+```
+
+Three things happened. `time_it(price_order)` took the original function as input. It defined a new function `wrapper` that does the timing around a call to the original. It returned `wrapper`. The name `price_order` was then rebound to point at the wrapper instead of the original.
+
+The next call, `price_order(3, 29.99, 0.10)`, runs the wrapper. The wrapper records the start time, calls the real pricing function (which it captured as `func`), records the end time, prints the elapsed time, and returns the result. From the caller's point of view, `price_order` still computes an order price. From the inside, every call now also reports its timing.
+
+The pattern is common enough that Python has dedicated syntax for it.
+
+<h1 id="the-decorator-syntax">The @decorator Syntax</h1>
+
+Writing `price_order = time_it(price_order)` after every definition is repetitive. Python provides the `@` syntax to do the same rebinding inline:
+
+```python
+import time
+
+def time_it(func):
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        elapsed = time.perf_counter() - start
+        print(f"{func.__name__} took {elapsed:.6f}s")
+        return result
+    return wrapper
+
+@time_it
+def price_order(quantity, unit_price, discount):
+    return quantity * unit_price * (1 - discount)
+
+print(price_order(3, 29.99, 0.10))
+```
+
+The `@time_it` line above the `def` is syntactic sugar. It means the same thing as writing `price_order = time_it(price_order)` after the definition. Python sees the `@`, runs the decorator on the function it precedes, and rebinds the name.
+
+The decorator runs **once**, at the time the function is defined. The wrapper it returns runs **every time** the decorated function is called. That distinction matters: any setup the decorator does (parsing config, opening a connection, allocating a cache) happens once at definition time, while the wrapper logic happens on every call.
+
+What is `func` bound to inside the wrapper after `time_it` has returned? The original, undecorated function. The wrapper captured it as a free variable (a closure cell). When the wrapper runs, it can still call `func` and get the original behavior, even though the name `price_order` now points at the wrapper.
+
+<h1 id="a-logging-decorator">A Logging Decorator</h1>
+
+A second example shows the same shape applied to a different problem. Logging is a common reason to write a decorator: every call to a particular function should record its arguments and result somewhere.
+
+```python
+def log_calls(func):
+    def wrapper(*args, **kwargs):
+        print(f"calling {func.__name__}({args}, {kwargs})")
+        result = func(*args, **kwargs)
+        print(f"  -> {result!r}")
+        return result
+    return wrapper
+
+@log_calls
+def add_to_cart(customer, product, quantity=1):
+    return f"{quantity}x {product} added to {customer}'s cart"
+
+add_to_cart("alice", "Wireless Mouse")
+add_to_cart("bob", "USB Cable", quantity=3)
+```
+
+The decorator has the same shape as the timing one: take a function, define a wrapper that runs extra code around a call to the original, return the wrapper. The wrapper signature is always `(*args, **kwargs)` because the decorated function's signature isn't known in advance, and the wrapper must forward whatever the caller passes.
+
+The `*args` and `**kwargs` pattern makes decorators reusable. The same `log_calls` decorator can wrap a function that takes one argument, three arguments, or any other shape, because the wrapper accepts everything and forwards everything.
+
+The output shows that the wrapper's `print` calls happen before and after the original function runs. The wrapped function's behavior is unchanged; the decorator sandwiches extra code around it.
+
+Each call through a decorator adds one extra function call (the wrapper) and the overhead of building `args` and `kwargs`. For most code this is nanoseconds and invisible. For a function called millions of times in a tight loop, decorators can become a measurable cost; profile before assuming so.
+
+<h1 id="preserving-metadata-with-functoolswraps">
+  Preserving Metadata with functools.wraps
+</h1>
+
+The decorators above have a problem: the wrapper takes over the original function's identity. The name and docstring change accordingly:
+
+```python
+def time_it(func):
+    def wrapper(*args, **kwargs):
+        return func(*args, **kwargs)
+    return wrapper
+
+@time_it
+def price_order(quantity, unit_price, discount):
+    """Compute the price of an order."""
+    return quantity * unit_price * (1 - discount)
+
+print(price_order.__name__)
+print(price_order.__doc__)
+```
+
+The name `price_order.__name__` is now `"wrapper"`, because `price_order` is bound to the wrapper function and the wrapper was named `wrapper`. The docstring is gone for the same reason: the wrapper has no docstring of its own. Tools that read `__name__` (debuggers, logging, traceback printers) and tools that read `__doc__` (help systems, doc generators) get the wrong information.
+
+The fix is `functools.wraps`, a decorator-for-decorators that copies the original function's metadata onto the wrapper. Apply it inside the decorator, to the wrapper:
+
+```python
+from functools import wraps
+import time
+
+def time_it(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        elapsed = time.perf_counter() - start
+        print(f"{func.__name__} took {elapsed:.6f}s")
+        return result
+    return wrapper
+
+@time_it
+def price_order(quantity, unit_price, discount):
+    """Compute the price of an order."""
+    return quantity * unit_price * (1 - discount)
+
+print(price_order.__name__)
+print(price_order.__doc__)
+```
+
+`@wraps(func)` copies `func.__name__`, `func.__doc__`, `func.__module__`, `func.__qualname__`, `func.__annotations__`, and a few other attributes onto the wrapper. From the outside, the wrapper now looks like the original. Tools and humans both see the right name and docstring.
+
+The rule: **always use `@wraps(func)` on the wrapper inside a decorator**. There's no reason not to, and forgetting it produces subtle bugs that show up only when something inspects the function's metadata.
+
+```python
+from functools import wraps
+
+def log_calls(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        print(f"calling {func.__name__}")
+        return func(*args, **kwargs)
+    return wrapper
+
+@log_calls
+def cart_total(prices):
+    """Sum the prices in the cart."""
+    return sum(prices)
+
+help(cart_total)
+```
+
+`help` reads `__name__` and `__doc__`, and because of `@wraps`, it sees the right function. Without `@wraps`, `help(cart_total)` would show `Help on function wrapper`, which is wrong and confusing.
+
+<h1 id="decorators-with-arguments">Decorators with Arguments</h1>
+
+The decorators so far take only the function. Some decorators need configuration: a retry decorator that takes a count, a cache decorator that takes a maximum size, a timing decorator that takes a label. The way to do this is to write a **decorator factory**: a function that takes the configuration and returns a real decorator.
+
+```python
+from functools import wraps
+
+def retry(times):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(1, times + 1):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as exc:
+                    print(f"attempt {attempt} failed: {exc}")
+            raise RuntimeError(f"{func.__name__} failed after {times} attempts")
+        return wrapper
+    return decorator
+
+@retry(times=3)
+def charge_card(amount):
+    raise ConnectionError("payment gateway timeout")
+
+try:
+    charge_card(50.00)
+except RuntimeError as exc:
+    print(exc)
+```
+
+Three layers of functions. `retry(times=3)` is the outermost call; it captures `times` and returns the real decorator. That decorator takes `charge_card` and returns the wrapper. The wrapper does the retry loop, calling the original function up to `times` times.
+
+The shape `@retry(times=3)` is now a function call, not a bare name. Python evaluates `retry(times=3)` first, which produces a decorator. Then it applies that decorator to `charge_card` like any other decorator. The difference from a plain `@time_it` (no parentheses) is that this one has parentheses with arguments inside.
+
+The pattern is "factory returns a decorator, decorator returns a wrapper". Every decorator with arguments follows this shape.
+
+A more realistic version uses a real delay between retries:
+
+```python
+import time
+from functools import wraps
+
+def retry(times=3, delay=1.0):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(1, times + 1):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as exc:
+                    print(f"attempt {attempt}/{times} failed: {exc}")
+                    if attempt < times:
+                        time.sleep(delay)
+            raise RuntimeError(f"{func.__name__} failed after {times} attempts")
+        return wrapper
+    return decorator
+
+@retry(times=2, delay=0.01)
+def fetch_inventory(product_id):
+    raise ConnectionError("inventory service unavailable")
+
+try:
+    fetch_inventory("SKU-42")
+except RuntimeError as exc:
+    print(exc)
+```
+
+The factory takes two arguments with defaults; the decorator captures both and uses them inside the wrapper. The shape is the same; the wrapper has more to do.
+
+One technique sometimes used: making the parentheses optional, so `@retry` and `@retry(times=3)` both work. It's occasionally useful, but it makes the decorator harder to read. The straightforward approach (always require parentheses for configurable decorators) is more common.
+
+<h1 id="stacking-decorators">Stacking Decorators</h1>
+
+More than one decorator can be applied to the same function. The order matters, and the rule is: decorators apply **from bottom up**, meaning the one closest to the `def` runs first, then the one above it, and so on.
+
+```python
+from functools import wraps
+
+def log_calls(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        print(f"[log] calling {func.__name__}")
+        return func(*args, **kwargs)
+    return wrapper
+
+def add_exclamation(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        return func(*args, **kwargs) + "!"
+    return wrapper
+
+@log_calls
+@add_exclamation
+def greet(name):
+    return f"Hello, {name}"
+
+print(greet("alice"))
+```
+
+Read the stack from bottom to top. `@add_exclamation` is closest to the `def`, so Python applies it first: `greet = add_exclamation(greet)`. Then `@log_calls` applies to the result: `greet = log_calls(greet)`. The final `greet` is `log_calls`'s wrapper, which wraps `add_exclamation`'s wrapper, which wraps the real `greet`.
+
+Calling `greet("alice")` flows control through the layers from outside in. First the `log_calls` wrapper runs and prints `[log] calling greet`. Then it calls the next layer, the `add_exclamation` wrapper. That wrapper calls the real `greet`, which returns `"Hello, alice"`, then appends `"!"`, returning `"Hello, alice!"`. Control returns to `log_calls`, which returns the same value to the caller.
+
+Swap the order and the behavior changes:
+
+```python
+@add_exclamation
+@log_calls
+def greet(name):
+    return f"Hello, {name}"
+
+print(greet("alice"))
+```
+
+Same output in this case, but the call order is different. Now `log_calls` is the inner wrapper and `add_exclamation` is the outer one. When `greet("alice")` runs, `add_exclamation`'s wrapper calls `log_calls`'s wrapper, which prints the log line and then calls the real function. The `[log] calling greet` happens **after** entering `add_exclamation` but **before** entering the real function.
+
+The order matters more when the decorators do non-commutative things. A `@cache` outside a `@log_calls` means cached results don't get logged; a `@log_calls` outside a `@cache` means every call gets logged, even cached ones. Choose the order based on the desired behavior.
+
+The diagram shows the call cycle for the first stack (`@log_calls` on top). Each wrapper passes through to the next layer, the innermost function runs, and the result bubbles back out, picking up modifications on the way.
+
+<h1 id="common-decorator-patterns">Common Decorator Patterns</h1>
+
+Some decorators appear frequently enough that recognizing them is part of reading Python. The most common shapes follow, in compact form.
+
+<h3 id="caching-with-functoolslru_cache">Caching with functools.lru_cache</h3>
+
+A cache decorator stores the results of a function so repeat calls with the same arguments don't recompute. Python's `functools.lru_cache` is the standard implementation:
+
+```python
+from functools import lru_cache
+
+@lru_cache(maxsize=128)
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+print(fibonacci(30))
+print(fibonacci.cache_info())
+```
+
+Without the cache, `fibonacci(30)` would make millions of recursive calls. With it, each unique argument is computed once and reused. `cache_info()` shows the hit and miss counts. One of the most useful real-world decorators (`lru_cache`) ships in the standard library.
+
+<h3 id="authorization-checks">Authorization Checks</h3>
+
+Web frameworks and APIs often use a decorator to check that the current user is allowed to call a function. The wrapper checks a permission and either calls the wrapped function or raises an error.
+
+```python
+from functools import wraps
+
+def admin_only(func):
+    @wraps(func)
+    def wrapper(user, *args, **kwargs):
+        if user.get("role") != "admin":
+            raise PermissionError(f"{user['name']} is not an admin")
+        return func(user, *args, **kwargs)
+    return wrapper
+
+@admin_only
+def delete_product(user, product_id):
+    return f"{user['name']} deleted {product_id}"
+
+alice = {"name": "alice", "role": "admin"}
+bob = {"name": "bob", "role": "customer"}
+
+print(delete_product(alice, "SKU-42"))
+
+try:
+    delete_product(bob, "SKU-42")
+except PermissionError as exc:
+    print(exc)
+```
+
+The wrapper checks the user's role before calling the real function. If the check fails, the original function never runs. This is the shape underlying most web framework `@login_required` and `@requires_permission` decorators.
+
+<h3 id="input-validation">Input Validation</h3>
+
+A decorator can validate arguments before they reach the function, raising a clear error if something is wrong.
+
+```python
+from functools import wraps
+
+def validate_positive(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        for value in list(args) + list(kwargs.values()):
+            if isinstance(value, (int, float)) and value < 0:
+                raise ValueError(f"{func.__name__} received negative value: {value}")
+        return func(*args, **kwargs)
+    return wrapper
+
+@validate_positive
+def apply_discount(price, percent):
+    return price * (1 - percent / 100)
+
+print(apply_discount(100, 10))
+
+try:
+    apply_discount(100, -10)
+except ValueError as exc:
+    print(exc)
+```
+
+The validation logic lives in one place and applies to any function that needs it. The wrapped function doesn't need to know that validation happens; it runs with the assurance that its arguments are sane.
+
+<h3 id="registering-functions">Registering Functions</h3>
+
+A decorator can have a side effect: registering the decorated function in a list, dict, or other registry. The function is still returned unchanged, so it works normally, but the registry now knows about it.
+
+```python
+handlers = {}
+
+def handler(event_type):
+    def decorator(func):
+        handlers[event_type] = func
+        return func
+    return decorator
+
+@handler("order_placed")
+def on_order_placed(order):
+    return f"sending confirmation for {order['id']}"
+
+@handler("order_shipped")
+def on_order_shipped(order):
+    return f"sending shipping notice for {order['id']}"
+
+print(handlers)
+print(handlers["order_placed"]({"id": "ORD-42"}))
+```
+
+The decorator doesn't wrap the function in this case; it stores a reference and returns the original. Frameworks like Flask use this pattern for route registration: `@app.route("/cart")` doesn't change the function; it tells the framework "when a request comes for `/cart`, call this function".
+
+The exact memory address in the function repr varies between runs; the shape is what matters.
+
+<h1 id="class-based-decorators-brief">Class-Based Decorators (Brief)</h1>
+
+A decorator doesn't have to be a function. Any callable will do, and the most common alternative is a class with a `__call__` method. The class version is useful when the decorator has state that should persist across calls, or when methods on the decorator itself are needed.
+
+```python
+from functools import wraps
+
+class CountCalls:
+    def __init__(self, func):
+        wraps(func)(self)
+        self.func = func
+        self.count = 0
+
+    def __call__(self, *args, **kwargs):
+        self.count += 1
+        return self.func(*args, **kwargs)
+
+@CountCalls
+def cart_total(prices):
+    return sum(prices)
+
+cart_total([29.99, 14.99])
+cart_total([9.99])
+cart_total([19.99, 4.99, 14.99])
+
+print(f"cart_total was called {cart_total.count} times")
+```
+
+`@CountCalls` rebinds `cart_total` to an instance of the `CountCalls` class. Each call goes through `__call__`, which increments the counter and forwards to the real function. The `count` attribute is accessible from outside, which would be awkward with a closure-based decorator.
+
+For now, the takeaway is that a decorator is anything callable that takes and returns a function, and a class with `__call__` is one shape that fits.
+
+<h1 id="performance-considerations">Performance Considerations</h1>
+
+Decorators have a real but usually negligible runtime cost. Three sources contribute:
+
+The first is the **extra function call per invocation**. The wrapper is itself a function, so every call to the decorated function does at least two function calls instead of one. On modern Python, that's tens to hundreds of nanoseconds. For most code this is invisible.
+
+The second is **building `args` and `kwargs`**. The standard `def wrapper(*args, **kwargs)` pattern builds a new tuple and a new dict for every call, then unpacks them when calling the underlying function. Usually invisible, but in a tight loop calling a decorated function millions of times, this can dominate.
+
+The third is **whatever the wrapper itself does**. A logging decorator that does I/O on every call is slow because logging is slow, not because decorators are slow. A caching decorator that hashes complex arguments to look them up is slow because hashing complex arguments is slow.
+
+```python
+import time
+from functools import wraps
+
+def pass_through(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        return func(*args, **kwargs)
+    return wrapper
+
+def add(a, b):
+    return a + b
+
+@pass_through
+def add_decorated(a, b):
+    return a + b
+
+# Time both.
+n = 1_000_000
+
+start = time.perf_counter()
+for _ in range(n):
+    add(1, 2)
+plain = time.perf_counter() - start
+
+start = time.perf_counter()
+for _ in range(n):
+    add_decorated(1, 2)
+decorated = time.perf_counter() - start
+
+print(f"plain: {plain:.3f}s")
+print(f"decorated: {decorated:.3f}s")
+print(f"overhead per call: {(decorated - plain) / n * 1e9:.0f} ns")
+```
+
+The exact numbers depend on the machine and Python version; the shape is what matters. Per-call overhead is in the tens of nanoseconds for a pass-through wrapper. That's roughly the time it takes a modern CPU to execute a few hundred instructions, far below the threshold where any normal program would notice.
+
+A pass-through decorator typically adds 50 to 150 ns per call on modern Python. If the decorated function does any real work (a database query, an HTTP request, a hash, a list iteration over more than a handful of elements), the decorator overhead is rounding error. Optimize away from decorators only when measurement says the wrapper is a bottleneck.
+
+<h1 id="real-built-in-decorators">Real Built-In Decorators</h1>
+
+Three decorators appear in everyday Python code, all from the standard library or built-ins. Knowing what they do makes a lot of real code easier to read.
+
+**`@property`** turns a method into a read-only attribute. `obj.some_property` runs the method and returns the result, as if reading an attribute.
+
+```python
+class Cart:
+    def __init__(self, items):
+        self.items = items
+
+    @property
+    def total(self):
+        return sum(item["price"] for item in self.items)
+
+cart = Cart([{"name": "Mouse", "price": 29.99}, {"name": "Cable", "price": 4.99}])
+print(cart.total)
+```
+
+`cart.total` is written like an attribute access (no parentheses) but actually runs the method. `@property` is a decorator like any other.
+
+**`@staticmethod`** marks a method that doesn't depend on the instance or the class. It's used inside class bodies and doesn't receive `self`.
+
+```python
+class Pricing:
+    @staticmethod
+    def with_tax(price, rate):
+        return price * (1 + rate)
+
+print(Pricing.with_tax(100, 0.08))
+```
+
+No `self` parameter, no instance needed. The decorator changes how Python treats the function inside the class.
+
+**`@cache`** (Python 3.9+) and **`@lru_cache`** memoize a function's results. The functools lesson covers them in detail.
+
+```python
+from functools import cache
+
+@cache
+def slow_lookup(product_id):
+    print(f"computing for {product_id}")
+    return product_id.upper()
+
+print(slow_lookup("sku-1"))
+print(slow_lookup("sku-1"))
+print(slow_lookup("sku-2"))
+```
+
+The second call to `slow_lookup("sku-1")` doesn't print "computing"; the cache returned the previous result. The function only runs once per unique argument.
+
+These three decorators (and a few others like `@classmethod` and `@dataclass`) cover most of the decorator usage in real code. Once the mechanism is clear, recognizing them is a matter of knowing what each one does.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

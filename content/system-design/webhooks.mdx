@@ -1,0 +1,270 @@
+---
+title: "Webhooks"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Webhooks explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+<h1 id="1-what-is-a-webhook">1. What Is a Webhook?</h1>
+
+The sending system is usually called the **provider**. The receiving system exposes the endpoint and is called the **consumer** or **receiver**.
+
+In the payment example, Stripe is the provider and your backend is the consumer. Instead of your system asking for updates, the provider tells you when something happens.
+
+<h1 id="2-basic-webhook-flow">2. Basic Webhook Flow</h1>
+
+A webhook request usually contains:
+
+- The **event type**, such as `payment_intent.succeeded`
+- An **event ID** that uniquely identifies the event
+- A **timestamp**
+- The **payload**, with details about the object involved
+
+A typical body looks like this:
+
+```json
+{
+  "id": "evt_01HYZ8R7J8K2Z5Q9N4J3P2A1BC",
+  "type": "payment_intent.succeeded",
+  "created_at": "2026-05-24T12:03:41Z",
+  "data": {
+    "payment_id": "pi_3PqR8sT2uV",
+    "order_id": "order_1042",
+    "amount": 4999,
+    "currency": "usd",
+    "status": "succeeded"
+  }
+}
+```
+
+Delivery details and security information usually travel in headers. The exact names vary by provider:
+
+| Header            | Purpose                                                          |
+| ----------------- | ---------------------------------------------------------------- |
+| `Content-Type`    | Usually `application/json`                                       |
+| Event type header | Event name, such as `pull_request` or `payment_intent.succeeded` |
+| Delivery ID       | Unique ID for this delivery attempt or event                     |
+| Signature         | HMAC or similar signature used to verify who sent the request    |
+| Timestamp         | Helps detect replayed requests when used with a signature        |
+| User agent        | Identifies the sender, such as GitHub or Stripe                  |
+
+Your server receives the request, verifies it, processes the event, and returns a successful HTTP response.
+
+In production systems, sending the request is the easy part. The hard part is making delivery reliable. A webhook is still an HTTP request crossing the internet. It can fail, be sent more than once, or arrive out of order. The rest of this chapter deals with those problems.
+
+<h1 id="3-retries">3. Retries</h1>
+
+Suppose a provider sends an event, but your server is temporarily unavailable. The provider should not discard the event. Instead, it stores it and retries later, usually with **exponential backoff**. For example, it might retry after 1 minute, then 2, 4, and 8 minutes.
+
+Providers also add **jitter**, a small random offset on each delay, so thousands of failed deliveries do not all retry at the same moment.
+
+Eventually, retries must stop. Most systems define a maximum number of attempts or a retry window, such as 3 days. After that, the event moves to a failed-delivery queue, where someone can inspect it or replay it manually.
+
+<h1 id="4-why-duplicate-webhooks-happen">4. Why Duplicate Webhooks Happen</h1>
+
+Retries introduce another problem: duplicate delivery.
+
+Suppose your server processes a webhook successfully, but the network fails before the provider receives the HTTP response. Your server knows the event succeeded. The provider does not. From its side, the safest option is to retry, so your application receives the same event again.
+
+That is why most webhook systems provide **at-least-once delivery**, not exactly-once delivery. Your consumer must handle duplicate events safely.
+
+<h1 id="5-idempotency">5. Idempotency</h1>
+
+The standard solution to duplicate delivery is idempotency: processing the same event twice has the same effect as processing it once.
+
+Every webhook event should have a unique event ID. When your application receives an event:
+
+1. Check whether that event ID has already been processed.
+2. If not, process the event and record the ID.
+3. If it has, recognize the duplicate and ignore it.
+
+Store processed IDs in reliable storage with a unique constraint, so two concurrent deliveries of the same event cannot both slip through:
+
+```sql
+CREATE TABLE webhook_events (
+  provider TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  status TEXT NOT NULL,
+  received_at TIMESTAMP NOT NULL DEFAULT now(),
+  processed_at TIMESTAMP,
+  payload JSONB NOT NULL,
+  PRIMARY KEY (provider, event_id)
+);
+```
+
+When a duplicate arrives, return success, because the original was already accepted:
+
+```java
+if (eventAlreadyAccepted(provider, eventId)) {
+    return "200 OK";
+}
+```
+
+This does not create true exactly-once delivery. It makes repeated deliveries safe, which is the practical goal.
+
+<h1 id="6-return-quickly-process-asynchronously">
+  6. Return Quickly, Process Asynchronously
+</h1>
+
+Another common mistake is doing too much work inside the webhook request itself.
+
+Imagine your server receives a payment webhook. The handler updates the database, sends an email, generates an invoice, updates analytics, and calls another service, all before responding. If that takes too long, the provider hits its timeout and assumes delivery failed. Then it retries, and you might process the event again while the first request is still running.
+
+A more reliable pattern keeps the webhook endpoint lightweight:
+
+1. Validate the request.
+2. Store the event durably, usually in a database or queue.
+3. Return a success response as quickly as possible.
+
+Background workers then handle the expensive processing asynchronously. This separates webhook delivery from business logic, so slow downstream systems cannot delay the acknowledgment.
+
+The order matters. Do not return `200 OK` before the event is safely stored. If your process crashes after returning success but before saving, the provider has no reason to retry, and the event is lost.
+
+<h1 id="7-queue-based-architecture">7. Queue-Based Architecture</h1>
+
+At scale, a common webhook consumer architecture looks like this. The endpoint receives the request, validates it, writes the event to a durable queue, and immediately returns success. A pool of workers consumes events from the queue and performs the actual business logic.
+
+This gives three advantages:
+
+- **Webhook traffic and processing are decoupled.** If a provider suddenly sends 100,000 events, the queue absorbs the spike.
+- **Workers can retry failed processing** without asking the provider to resend the event.
+- **The worker fleet scales independently**, based on the queue backlog.
+
+The endpoint stays fast, while the queue acts as a buffer between external traffic and internal processing.
+
+One detail to get right: if the endpoint saves the event to a database and then sends it to a separate queue as two independent writes, a crash between them can drop the event. Either commit both together, often with an `outbox` table that a relay forwards to the queue, or let workers read directly from the events table.
+
+<h1 id="8-webhook-ordering">8. Webhook Ordering</h1>
+
+Another subtle problem is event ordering.
+
+Suppose a system sends two events. The first says an order was created. The second says the order was cancelled. You might assume they arrive in that order, but distributed systems rarely give you that guarantee. The first webhook could fail and be retried later, while the second succeeds immediately. Your application receives the cancellation before the creation.
+
+There are two common solutions:
+
+- **Sequence or version numbers.** Each event carries the version of the resource it describes. If the system has already processed version 5 and later receives version 4, it ignores the stale event.
+- **Fetch the latest state.** Treat the webhook as a notification that something changed, then fetch the current state of the resource from the source system. The order of notifications no longer matters.
+
+For payments, the second approach is common: before fulfilling an order, confirm its status through the provider's API.
+
+<h1 id="9-security-and-webhook-signatures">
+  9. Security and Webhook Signatures
+</h1>
+
+Webhook endpoints are publicly accessible. Without verification, anyone who finds your endpoint could send a fake `payment_succeeded` event and get free access.
+
+So your server needs a way to verify that a request actually came from the trusted provider. The common approach is **request signing**:
+
+1. The provider uses a shared secret to compute a cryptographic signature (usually an HMAC) over the webhook payload.
+2. It sends that signature with the request, in a header.
+3. Your server computes the expected signature with the same secret and compares the two.
+
+```java
+// Stripe-style: sign timestamp + "." + rawBody, header carries "t=..,v1=.."
+String signedPayload = timestamp + "." + rawRequestBody;
+String expected = hmacSha256(secret, signedPayload);
+
+// GitHub uses a "sha256=" prefix on X-Hub-Signature-256
+String providedSignature = stripPrefix(signatureFromHeader, "sha256=");
+
+if (!constantTimeEquals(expected, providedSignature)) {
+    return "401 Unauthorized";
+}
+
+if (Math.abs(now() - timestamp) > FIVE_MINUTES) {
+    return "401 Unauthorized";  // stale, reject to prevent replay
+}
+```
+
+Two details matter:
+
+- **Verify the raw request body.** Parsing the JSON and serializing it again can change the bytes, and then the signature will not match.
+- **Check the signed timestamp.** Many providers sign a timestamp along with the body. Reject requests that are too old, such as more than 5 minutes. That protects against replay attacks, where an attacker captures a valid webhook and sends it again later.
+
+In real code, use the provider's official library when one exists, because signature formats differ between providers.
+
+<h1 id="10-webhook-endpoint-design">10. Webhook Endpoint Design</h1>
+
+A webhook endpoint should stay simple. Verify the request, validate the event, store it durably, and return a response quickly. Avoid running complex business logic directly inside the request.
+
+**HTTP status codes matter.** A success response tells the sender the event was accepted. A server error usually signals that it should retry. A permanent client error may indicate that retrying will not help.
+
+| Response                             | Meaning                                                                  |
+| ------------------------------------ | ------------------------------------------------------------------------ |
+| `200 OK` or `204 No Content`         | Event was accepted or already handled                                    |
+| `400 Bad Request`                    | Request body is malformed or unsupported                                 |
+| `401 Unauthorized` / `403 Forbidden` | Signature or authorization check failed                                  |
+| `404 Not Found`                      | Endpoint is wrong or no longer exists                                    |
+| `429 Too Many Requests`              | Receiver is overloaded; treated as a retryable failure by most providers |
+| `500` / `503`                        | Temporary receiver failure; provider should retry                        |
+
+The exact behavior depends on the provider, so retry semantics should be clearly defined on both sides.
+
+**Observability is just as important.** Webhook failures are easy to miss: the provider retries quietly, and users notice only the symptom, such as an order stuck in `PENDING`. Track:
+
+- Delivery volume
+- Failures and retries
+- Processing latency
+- Queue backlog
+
+Without that visibility, webhook issues are hard to detect and debug.
+
+<h1 id="11-designing-a-webhook-provider">11. Designing a Webhook Provider</h1>
+
+So far, the focus has been on consuming webhooks. Now look at the other side: sending them.
+
+Suppose your platform delivers webhooks to thousands of customers. When an event occurs, the service that created it should usually not send the webhook directly. Instead:
+
+1. Write the event to a durable queue or event stream.
+2. A **webhook delivery service** reads it, finds the subscribed endpoints, and sends the requests.
+3. The delivery service tracks each attempt: the response, the retry count, and the next retry time.
+4. After repeated failures, the event moves to a dead-letter queue.
+
+Separating event generation from webhook delivery makes the system more reliable and easier to scale. The service that created the event never waits on a customer's server.
+
+<h1 id="12-handling-slow-or-broken-consumers">
+  12. Handling Slow or Broken Consumers
+</h1>
+
+If you operate a webhook provider, some customer endpoints will be slow, unreliable, or completely down.
+
+One broken destination should not affect everyone else. So isolate deliveries per endpoint, each with its own:
+
+- Retry state
+- Rate limits
+- Timeouts
+
+You may also need **concurrency limits**, so you do not overwhelm a customer with too many requests at once. This matters most when replaying a large backlog after an outage: a customer that was down for an hour should receive the backlog at a pace it can handle, not all at once.
+
+<h1 id="13-when-to-use-webhooks">13. When to Use Webhooks</h1>
+
+Webhooks are a strong choice when one system needs to notify another that an event occurred. Common examples:
+
+- Payments
+- Source control events
+- Order updates
+- Email delivery
+- Identity systems
+- CI pipelines
+- Third-party integrations
+
+They work especially well for discrete events, where a permanent connection is unnecessary.
+
+<h1 id="summary">Summary</h1>
+
+A webhook is an HTTP callback: when an event occurs, the provider sends an HTTP request to an endpoint you registered, instead of you polling for it.
+
+Sending the request is easy. Reliable delivery is the hard part. Providers retry with exponential backoff and jitter, then move failed events to a failed-delivery queue. Retries mean duplicates, so consumers use event IDs for idempotency. Events can arrive out of order, so use version numbers or fetch the latest state.
+
+A good endpoint verifies the signature over the raw body, stores the event durably, returns quickly, and leaves the real work to queue-backed workers. A good provider separates event generation from delivery and isolates each customer endpoint.
+
+Reliable webhooks need more than an HTTP request: durable event storage, retries, idempotency, authentication, monitoring, and a strategy for failed deliveries.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,672 @@
+---
+title: "Built-in Annotations"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Built-in Annotations explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="the-built-in-set-at-a-glance">The Built-in Set at a Glance</h1>
+
+The JDK includes six annotations in `java.lang` that appear in everyday code. They split into two groups: the ones the compiler enforces (`@Override`, `@FunctionalInterface`, `@SafeVarargs`) and the ones that change how tooling and other readers treat the code (`@Deprecated`, `@SuppressWarnings`, `@Native`).
+
+| Annotation             | Applies To                 | Effect                                                                  |
+| ---------------------- | -------------------------- | ----------------------------------------------------------------------- |
+| `@Override`            | Method                     | Compiler checks the method actually overrides a supertype method        |
+| `@Deprecated`          | Most declarations          | Marks the element as discouraged; tools warn callers                    |
+| `@SuppressWarnings`    | Most declarations          | Silences specific compiler warnings inside the scope                    |
+| `@SafeVarargs`         | Varargs method/constructor | Asserts the body doesn't pollute the heap; suppresses unchecked warning |
+| `@FunctionalInterface` | Interface                  | Compiler checks the interface has exactly one abstract method           |
+| `@Native`              | Field                      | Marks a constant as visible to native (JNI) code                        |
+
+The diagram shows the three roles. The enforced annotations turn ambiguous code into compile errors. The diagnostic annotations change which warnings the compiler emits. `@Native` is a marker for external tools (the JNI header generator) and the compiler mostly ignores it.
+
+Everything below works through these six in order, from the one written daily to the one rarely seen.
+
+<h1 id="override">@Override</h1>
+
+`@Override` tells the compiler: "I believe this method overrides a method from a parent class or interface. If it doesn't, fail the build." The compiler checks the signature against the supertype and, if there's no matching method to override, prints an error.
+
+The annotation itself doesn't change runtime behavior. The override would happen with or without it, as long as the signature actually matches. `@Override` catches the case where the signature is intended as an override but doesn't actually match.
+
+```java
+public class CartTotal {
+
+    public static void main(String[] args) {
+        Cart standardCart = new StandardCart();
+        Cart discountCart = new DiscountCart();
+
+        System.out.println("Standard total: $" + standardCart.total(100.0));
+        System.out.println("Discount total: $" + discountCart.total(100.0));
+    }
+}
+
+class Cart {
+    public double total(double subtotal) {
+        return subtotal;
+    }
+}
+
+class StandardCart extends Cart {
+    @Override
+    public double total(double subtotal) {
+        return subtotal;
+    }
+}
+
+class DiscountCart extends Cart {
+    @Override
+    public double total(double subtotal) {
+        return subtotal * 0.9;
+    }
+}
+```
+
+Both subclasses override `total`. The `@Override` markers serve as a contract: if someone later renames `total` in the parent class or changes its parameter list, every child class with `@Override` becomes a compile error immediately, surfacing every site that needs updating.
+
+<h3 id="where-override-saves-you">Where @Override Saves You</h3>
+
+The real value of `@Override` shows up with method signatures that look right but aren't. Consider an attempt to override `equals` on a product class.
+
+**What's wrong with this code?**
+
+```java
+public class Product {
+
+    private final String sku;
+    private final double price;
+
+    public Product(String sku, double price) {
+        this.sku = sku;
+        this.price = price;
+    }
+
+    // Intended to override Object.equals(Object)
+    public boolean equals(Product other) {
+        return sku.equals(other.sku);
+    }
+}
+```
+
+`Object.equals` takes an `Object` parameter, not a `Product`. The method above is a brand-new overload, not an override. When the collections framework calls `equals(Object)` on a `Product` it'll hit the inherited `Object.equals`, which uses reference equality, and your "custom" equality logic gets skipped silently. A `HashSet<Product>` will store the same product twice. A `contains` call will return `false` for an object you just inserted.
+
+**Fix:**
+
+```java
+public class ProductFixed {
+
+    private final String sku;
+    private final double price;
+
+    public ProductFixed(String sku, double price) {
+        this.sku = sku;
+        this.price = price;
+    }
+
+    @Override
+    public boolean equals(Object other) {
+        if (!(other instanceof ProductFixed p)) {
+            return false;
+        }
+        return sku.equals(p.sku);
+    }
+
+    @Override
+    public int hashCode() {
+        return sku.hashCode();
+    }
+}
+```
+
+Add `@Override` to the original broken version and the compiler fails immediately with "method does not override or implement a method from a supertype." That single annotation turns a silent runtime bug into a build error fixed in seconds. The same thing happens with `hashCode()` vs `hashcode()`, `toString()` vs `toString(int)`, or `compareTo(Order)` on an interface that actually requires `compareTo(Object)`.
+
+`@Override` has zero runtime cost. It's a compile-time marker only.
+
+<h3 id="override-and-interfaces">@Override and Interfaces</h3>
+
+Since Java 6, `@Override` works on interface implementations too. It's just as useful there: if the interface method gets renamed or its parameters change, every implementor with `@Override` becomes a compile error.
+
+```java
+interface PriceCalculator {
+    double calculate(double subtotal);
+}
+
+class FlatDiscountCalculator implements PriceCalculator {
+    private final double discountRate;
+
+    FlatDiscountCalculator(double discountRate) {
+        this.discountRate = discountRate;
+    }
+
+    @Override
+    public double calculate(double subtotal) {
+        return subtotal * (1 - discountRate);
+    }
+}
+```
+
+The `@Override` on `calculate` says "this exists to satisfy the `PriceCalculator` contract." Drop it, and removing `calculate` from the interface (or renaming it) only breaks calls at the use sites, not at the implementation. With `@Override` in place, the implementation site fails to compile too.
+
+<h1 id="deprecated">@Deprecated</h1>
+
+`@Deprecated` marks a class, method, field, or constructor as "still here, but discouraged." The compiler emits a warning at every call site of a deprecated element, and IDEs draw a strikethrough across the name. The element itself still works; deprecation is a communication tool, not a removal.
+
+```java
+public class LegacyCartDemo {
+
+    public static void main(String[] args) {
+        LegacyCart cart = new LegacyCart();
+        cart.add("BOOK-123", 19.99);
+        System.out.println("Total: $" + cart.total());
+    }
+}
+
+class LegacyCart {
+
+    private double subtotal;
+
+    @Deprecated
+    public void add(String sku, double price) {
+        // Old API: didn't track quantity
+        this.subtotal += price;
+    }
+
+    public void add(String sku, double price, int quantity) {
+        this.subtotal += price * quantity;
+    }
+
+    public double total() {
+        return subtotal;
+    }
+}
+```
+
+The code compiles and runs, but `javac` prints `warning: [deprecation] add(String,double) in LegacyCart has been deprecated`. The single-argument `add` still exists for old callers, and new code is steered toward the three-argument version.
+
+<h3 id="since-and-forremoval-java-9">since and forRemoval (Java 9+)</h3>
+
+Plain `@Deprecated` says "don't use this" but doesn't say when it became unwanted or whether it'll ever be deleted. Java 9 added two elements that fix that:
+
+- `since` is a string describing the version at which the element was deprecated. It shows up in Javadoc and in IDE tooltips.
+- `forRemoval` is a boolean. When `true`, the compiler emits a stronger "removal" warning, signaling that this element is on its way out of the API entirely.
+
+```java
+public class LegacyCartV2Demo {
+
+    public static void main(String[] args) {
+        LegacyCartV2 cart = new LegacyCartV2();
+        cart.addItem("BOOK-123", 19.99);           // soft deprecation
+        cart.legacyApplyDiscount(0.1);             // hard deprecation
+        System.out.println("Total: $" + cart.total());
+    }
+}
+
+class LegacyCartV2 {
+
+    private double subtotal;
+    private double discount;
+
+    @Deprecated(since = "2.0")
+    public void addItem(String sku, double price) {
+        this.subtotal += price;
+    }
+
+    public void addItem(String sku, double price, int quantity) {
+        this.subtotal += price * quantity;
+    }
+
+    @Deprecated(since = "2.0", forRemoval = true)
+    public void legacyApplyDiscount(double rate) {
+        this.discount = rate;
+    }
+
+    public double total() {
+        return subtotal * (1 - discount);
+    }
+}
+```
+
+The `addItem(String, double)` call produces a regular deprecation warning. The `legacyApplyDiscount` call produces a "removal" warning, which is louder and treated separately by tools and IDEs. Most IDEs render `legacyApplyDiscount` with a stronger strikethrough.
+
+`forRemoval = true` is appropriate when an API is committed for deletion in a future release. Soft `@Deprecated(since = "2.0")` is appropriate when the API is discouraged but not scheduled for removal (think `Vector` or `Hashtable`, which have been deprecated for decades and are still in the JDK).
+
+Deprecation is free at runtime. The warnings happen at compile time, so callers of a deprecated API pay nothing beyond the warning in their build output.
+
+<h3 id="suppressing-deprecation-warnings">Suppressing Deprecation Warnings</h3>
+
+Sometimes calling a deprecated API on purpose is necessary (maintaining the legacy path, writing a compatibility shim, the replacement isn't ready). `@SuppressWarnings("deprecation")` exists for exactly that case.
+
+The flow on the right is what `@SuppressWarnings` enables. The warning is gone, but the deprecation itself stays in the called API, so anyone else calling it still gets the warning. Suppression is local.
+
+<h1 id="suppresswarnings">@SuppressWarnings</h1>
+
+`@SuppressWarnings` tells the compiler to skip a specific category of warnings inside the annotated element. It takes one or more string values, each naming a warning kind. The most common values in real code:
+
+| Value           | Suppresses                                                     |
+| --------------- | -------------------------------------------------------------- |
+| `"unchecked"`   | Unchecked generic operations (raw types, unchecked casts)      |
+| `"rawtypes"`    | Use of raw generic types like `List` instead of `List<String>` |
+| `"deprecation"` | Calls to `@Deprecated` APIs                                    |
+| `"serial"`      | Missing `serialVersionUID` on a `Serializable` class           |
+| `"unused"`      | Unused local variables, fields, methods, or imports            |
+
+The values aren't standardized by the language spec; each compiler decides what it understands. The list above is `javac`'s, and most IDEs add a few extras on top.
+
+<h3 id="suppresswarningsunchecked-on-a-cart-cast">
+  @SuppressWarnings("unchecked") on a Cart Cast
+</h3>
+
+The most common use is around unavoidable unchecked casts inside generic code. Consider a `CartUtils` class that reads a serialized cart payload from somewhere untyped (a file, a network call) and has to cast the result into `List<CartItem>`.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class CartUtils {
+
+    public static void main(String[] args) {
+        Object payload = loadCartPayload();
+        List<CartItem> items = readItems(payload);
+        for (CartItem item : items) {
+            System.out.println(item.sku() + " x" + item.quantity());
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    public static List<CartItem> readItems(Object rawPayload) {
+        // The payload's runtime type is List<CartItem>; we just can't prove it to the compiler.
+        return (List<CartItem>) rawPayload;
+    }
+
+    private static Object loadCartPayload() {
+        List<CartItem> items = new ArrayList<>();
+        items.add(new CartItem("BOOK-123", 2));
+        items.add(new CartItem("PEN-001", 5));
+        return items;
+    }
+
+    record CartItem(String sku, int quantity) {}
+}
+```
+
+Without `@SuppressWarnings("unchecked")`, the cast `(List<CartItem>) rawPayload` produces "unchecked cast" because the compiler can't verify at compile time that the runtime list actually holds `CartItem` instances. The annotation acknowledges that risk and asserts the cast is verified elsewhere.
+
+The key rule is **scope**. Put `@SuppressWarnings` on the smallest possible element: the local variable or the single method, not the whole class. The annotation in the example above is on `readItems` only, so a typo in an unrelated method still gets caught.
+
+**What's wrong with this code?**
+
+```java
+@SuppressWarnings("unchecked")
+public class CartUtilsBad {
+
+    public static List<CartItem> readItems(Object rawPayload) {
+        return (List<CartItem>) rawPayload;
+    }
+
+    public List<CartItem> readMore(Object rawPayload) {
+        return (List<CartItem>) rawPayload;
+    }
+
+    public void unrelatedMethod() {
+        List untyped = new ArrayList();  // raw type, would warn
+        untyped.add("oops");
+    }
+}
+```
+
+`@SuppressWarnings("unchecked")` on the class disables the unchecked warning for _every_ method in the class, including `unrelatedMethod`, where the raw `List untyped` is a real bug. The class-level suppression hides legitimate warnings along with the one you intended to silence.
+
+**Fix:**
+
+```java
+public class CartUtilsGood {
+
+    @SuppressWarnings("unchecked")
+    public static List<CartItem> readItems(Object rawPayload) {
+        return (List<CartItem>) rawPayload;
+    }
+
+    @SuppressWarnings("unchecked")
+    public List<CartItem> readMore(Object rawPayload) {
+        return (List<CartItem>) rawPayload;
+    }
+
+    public void unrelatedMethod() {
+        List<String> untyped = new ArrayList<>();
+        untyped.add("oops");
+    }
+}
+```
+
+Each cast that needs the suppression gets its own annotation. The unrelated method now gets its raw-type warning, which surfaces the bug.
+
+<h3 id="multiple-values">Multiple Values</h3>
+
+`@SuppressWarnings` accepts an array of string values to suppress more than one kind:
+
+```java
+@SuppressWarnings({"unchecked", "rawtypes"})
+public List asAnyList(Object o) {
+    return (List) o;
+}
+```
+
+The braces are required when there's more than one value. With a single value the braces are optional; both `@SuppressWarnings("unchecked")` and `@SuppressWarnings({"unchecked"})` work.
+
+<h1 id="safevarargs">@SafeVarargs</h1>
+
+`@SafeVarargs` is the most specialized of the built-in annotations. It applies to methods and constructors that take a varargs parameter of a generic type, and it tells the compiler "I promise the body of this method doesn't pollute the heap." In return, the compiler suppresses the warning that would otherwise appear at every call site.
+
+Understanding why the annotation exists requires understanding heap pollution. With a varargs method like `List<String>...`, Java erases the generic type at runtime, so the actual parameter is an array of `List` (raw, no element type). Arrays in Java are covariant and remember their component type at runtime, but generics are invariant and erased. The mismatch creates a path where a method can silently put the wrong type into an array.
+
+<h3 id="a-safe-use-of-generic-varargs">A Safe Use of Generic Varargs</h3>
+
+A common safe use is a helper that builds a list of orders from any number of orders:
+
+```java
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+public class OrderBatch {
+
+    public static void main(String[] args) {
+        Order o1 = new Order("ORD-001", 49.99);
+        Order o2 = new Order("ORD-002", 19.99);
+        Order o3 = new Order("ORD-003", 9.99);
+
+        List<Order> batch = listOf(o1, o2, o3);
+        for (Order order : batch) {
+            System.out.println(order.id() + ": $" + order.total());
+        }
+    }
+
+    @SafeVarargs
+    public static <T> List<T> listOf(T... items) {
+        return new ArrayList<>(Arrays.asList(items));
+    }
+
+    record Order(String id, double total) {}
+}
+```
+
+Without `@SafeVarargs`, every call to `listOf` would print "unchecked generic array creation for varargs parameter" because the compiler can't verify that the body doesn't do something unsafe with the underlying array. The body, in this case, just copies the elements into an `ArrayList`. It never writes into the varargs array and never exposes it, so heap pollution is impossible. The annotation says exactly that.
+
+<h3 id="where-heap-pollution-actually-happens">
+  Where Heap Pollution Actually Happens
+</h3>
+
+To see why `@SafeVarargs` is a promise the compiler can't verify, consider a method that _would_ pollute the heap:
+
+**What's wrong with this code?**
+
+```java
+import java.util.List;
+
+public class UnsafeMethod {
+
+    @SafeVarargs  // wrong: this method is NOT safe
+    public static <T> T[] toArray(T... items) {
+        return items;  // exposes the varargs array
+    }
+
+    public static void main(String[] args) {
+        List<String> a = List.of("BOOK-1");
+        List<String> b = List.of("BOOK-2");
+
+        // Exposes the underlying array of List (which is raw at runtime)
+        List<String>[] arr = toArray(a, b);
+
+        Object[] objArr = arr;
+        objArr[0] = List.of(42);  // sneaks an Integer-list into a String-list slot
+
+        String first = arr[0].get(0);  // ClassCastException
+    }
+}
+```
+
+The `toArray` method returns the varargs array directly. At runtime that array's component type is just `List`, not `List<String>`, so the next line can assign a `List<Integer>` into a slot the caller's type says holds `List<String>`. The blowup happens at the read site (`arr[0].get(0)` casts to `String`), which is far from the actual bug. That's heap pollution: a variable whose declared type doesn't match the runtime value it holds.
+
+The fix is to **not** annotate this method as safe. The compiler's warning was right; ignoring it created the bug.
+
+**Fix:**
+
+```java
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+public class SafeMethod {
+
+    @SafeVarargs
+    public static <T> List<T> safeListOf(T... items) {
+        // We never expose `items` and never write into it.
+        List<T> copy = new ArrayList<>(items.length);
+        Collections.addAll(copy, items);
+        return copy;
+    }
+}
+```
+
+The safe pattern: read each element, never expose the array, never write into it. That's what `@SafeVarargs` is asking you to promise.
+
+<h3 id="where-safevarargs-can-be-applied">Where @SafeVarargs Can Be Applied</h3>
+
+Before Java 9, `@SafeVarargs` could only go on `static` methods, `final` instance methods, or constructors. The reasoning was simple: an overridable method could be subclassed and its varargs contract changed, so `@SafeVarargs` on it would be a promise the parent class couldn't enforce.
+
+Java 9 widened this slightly: `@SafeVarargs` can now also be applied to `private` instance methods, since private methods can't be overridden either.
+
+| Java version | `@SafeVarargs` allowed on                                |
+| ------------ | -------------------------------------------------------- |
+| 7-8          | `static` methods, `final` instance methods, constructors |
+| 9+           | All of the above, plus `private` instance methods        |
+
+The rule is "methods that can't be overridden." Anywhere else, the compiler rejects the annotation with "Invalid SafeVarargs annotation. Only static, final, or private methods are allowed."
+
+<h1 id="functionalinterface">@FunctionalInterface</h1>
+
+A functional interface is an interface with exactly one abstract method. Lambdas and method references work because the compiler can match them against that single abstract method. `@FunctionalInterface` doesn't make an interface functional (the language rules do that based on the method count), but it asks the compiler to check that the interface stays functional, and complains if a later change breaks it.
+
+```java
+import java.util.List;
+
+public class DiscountStrategyDemo {
+
+    public static void main(String[] args) {
+        DiscountStrategy seasonal = subtotal -> subtotal * 0.85;
+        DiscountStrategy loyalty = subtotal -> subtotal - 10.0;
+
+        List<DiscountStrategy> strategies = List.of(seasonal, loyalty);
+        double cartTotal = 200.0;
+        for (DiscountStrategy s : strategies) {
+            System.out.println("After strategy: $" + s.apply(cartTotal));
+        }
+    }
+}
+
+@FunctionalInterface
+interface DiscountStrategy {
+    double apply(double subtotal);
+}
+```
+
+`DiscountStrategy` has exactly one abstract method (`apply`), so lambdas like `subtotal -> subtotal * 0.85` work. The `@FunctionalInterface` annotation is a guard: if a second abstract method is added later, the build fails on the interface itself, not at every lambda call site.
+
+<h3 id="what-exactly-one-abstract-method-means">
+  What "Exactly One Abstract Method" Means
+</h3>
+
+The rule isn't "exactly one method." It's "exactly one _abstract_ method." `default` methods, `static` methods, and methods that override `public` methods of `Object` (like `equals`, `hashCode`, `toString`) don't count toward the abstract-method tally.
+
+```java
+@FunctionalInterface
+interface PriceCalculator {
+    double calculate(double subtotal);                   // the single abstract method
+
+    default PriceCalculator andThen(PriceCalculator next) {
+        return subtotal -> next.calculate(this.calculate(subtotal));
+    }
+
+    static PriceCalculator identity() {
+        return subtotal -> subtotal;
+    }
+
+    @Override
+    boolean equals(Object obj);                          // re-declared Object method, doesn't count
+}
+```
+
+All four members are fine. The interface stays functional. Lambdas can implement it, and the default and static methods give it the same fluent feel as `java.util.function.Function`.
+
+The Java standard library uses this pattern throughout: `Function`, `Predicate`, `Consumer`, `Supplier`, `Comparator`, and `Runnable` are all `@FunctionalInterface`-annotated, and most of them also have default helper methods.
+
+<h3 id="what-goes-wrong-without-functionalinterface">
+  What Goes Wrong Without @FunctionalInterface
+</h3>
+
+**What's wrong with this code?**
+
+```java
+interface ShippingCostCalculator {
+    double calculate(double weightKg);
+    double calculateInternational(double weightKg);  // accidentally added later
+}
+
+public class ShippingDemo {
+    public static void main(String[] args) {
+        // Compile error: ShippingCostCalculator is not a functional interface
+        ShippingCostCalculator c = weight -> weight * 5.0;
+    }
+}
+```
+
+The interface used to have one method. Someone added `calculateInternational` later, not realizing the interface was used as a target for lambdas. Now every lambda that targeted `ShippingCostCalculator` fails to compile, and the error message points at the lambda, not the interface.
+
+**Fix:**
+
+Add `@FunctionalInterface` so the interface itself fails to compile when someone adds a second abstract method. The error then points at the interface, where the actual change happened.
+
+```java
+@FunctionalInterface
+interface ShippingCostCalculator {
+    double calculate(double weightKg);
+    // Compile error here if anyone adds a second abstract method:
+    // "Multiple non-overriding abstract methods found in interface ShippingCostCalculator"
+}
+```
+
+Use `default` methods for behavior that should be shared across implementations, and `static` factory methods for common cases. Both are fair game inside a `@FunctionalInterface`.
+
+`@FunctionalInterface` has no runtime cost. It's a compile-time check only. Adding it to existing single-method interfaces prevents accidental breakage.
+
+<h1 id="native">@Native</h1>
+
+`@Native` is the least-used of the built-in annotations. It marks a field whose value might be referenced from native code (code written in C or C++ and linked via JNI). The Java side of the toolchain mostly ignores it. The native side, specifically the `javah` tool (or `javac -h` in modern JDKs), uses the marker to emit the constant into a generated C header file.
+
+It appears almost exclusively on `static final` primitive or `String` constants inside platform classes. A typical example from the JDK itself:
+
+```java
+public class Integer {
+    @Native public static final int MIN_VALUE = 0x80000000;
+    @Native public static final int MAX_VALUE = 0x7fffffff;
+    // ... rest of java.lang.Integer ...
+}
+```
+
+When the JDK generates the JNI header for `java.lang.Integer`, the `@Native` markers tell the header generator "emit `#define` lines for these constants so native code can use them." Without `@Native`, the constants would still exist on the Java side, but they wouldn't show up in the generated header.
+
+Application code on an e-commerce backend almost never uses `@Native`. It exists for platform code that bridges Java and native libraries, and for tooling that emits headers. Mentioning it for completeness, because it appears in `java.lang` source.
+
+```java
+public final class ShippingApiConstants {
+
+    // Visible to both Java and any native shipping integration shim.
+    @java.lang.annotation.Native
+    public static final int MAX_PACKAGES_PER_ORDER = 50;
+
+    private ShippingApiConstants() {}
+}
+```
+
+The annotation doesn't change how Java sees the constant. It only affects what the native-header generator does with it. Projects that never generate JNI headers can ignore `@Native` entirely.
+
+<h1 id="putting-them-together">Putting Them Together</h1>
+
+A realistic class often uses several of these annotations at once. A small e-commerce snippet that demonstrates all of them outside of `@Native`:
+
+```java
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+public class CheckoutFlow {
+
+    public static void main(String[] args) {
+        Cart cart = new Cart();
+        cart.addItem(new Item("BOOK-123", 19.99, 2));
+        cart.addItem(new Item("PEN-001", 1.99, 5));
+
+        PriceCalculator standardDiscount = subtotal -> subtotal * 0.95;
+        PriceCalculator promoCoupon = subtotal -> subtotal - 5.0;
+
+        List<PriceCalculator> calculators = listOf(standardDiscount, promoCoupon);
+        double total = cart.subtotal();
+        for (PriceCalculator pc : calculators) {
+            total = pc.apply(total);
+        }
+        System.out.println("Final total: $" + total);
+    }
+
+    @SafeVarargs
+    @SuppressWarnings("varargs")
+    private static <T> List<T> listOf(T... values) {
+        return new ArrayList<>(Arrays.asList(values));
+    }
+}
+
+@FunctionalInterface
+interface PriceCalculator {
+    double apply(double subtotal);
+}
+
+record Item(String sku, double price, int quantity) {}
+
+class Cart {
+
+    private final List<Item> items = new ArrayList<>();
+
+    public void addItem(Item item) {
+        items.add(item);
+    }
+
+    /**
+     * @deprecated as of 2.0, use {@link #subtotal()} which excludes tax.
+     */
+    @Deprecated(since = "2.0", forRemoval = true)
+    public double total() {
+        return subtotal();
+    }
+
+    public double subtotal() {
+        double sum = 0;
+        for (Item item : items) {
+            sum += item.price() * item.quantity();
+        }
+        return sum;
+    }
+
+    @Override
+    public String toString() {
+        return "Cart{items=" + items.size() + ", subtotal=$" + subtotal() + "}";
+    }
+}
+```
+
+The class uses `@SafeVarargs` on a private static varargs helper, `@SuppressWarnings("varargs")` to silence the small extra warning the array creation produces, `@FunctionalInterface` on the strategy interface, `@Deprecated(since="2.0", forRemoval=true)` on a legacy method, and `@Override` on the `toString` method. Every annotation here is doing something useful, and removing any one of them would either lose a compile-time check or hide useful information from future readers.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

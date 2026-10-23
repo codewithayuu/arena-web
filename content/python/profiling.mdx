@@ -1,0 +1,195 @@
+---
+title: "Profiling"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Profiling explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="why-profile-before-optimizing">Why Profile Before Optimizing</h1>
+
+A familiar pattern with performance work: a function feels slow, the inner list comprehension looks like the problem, it gets rewritten with `map` or NumPy, and the program is still slow. The hour spent rewriting did nothing because the bottleneck was somewhere else entirely.
+
+Donald Knuth's old line, "premature optimization is the root of all evil," is half the story. The other half is that even non-premature optimization fails when it targets the wrong code. Profiling is the cheap way to find out which code matters before changing it.
+
+Consider this order-loading script:
+
+```python
+import json
+
+def load_orders():
+    with open("orders.json") as f:
+        return json.load(f)
+
+def normalize(order):
+    order["status"] = order["status"].lower().strip()
+    return order
+
+def total_revenue(orders):
+    return sum(o["total"] for o in orders if o["status"] == "delivered")
+
+def report():
+    orders = load_orders()
+    cleaned = [normalize(o) for o in orders]
+    return total_revenue(cleaned)
+
+print(report())
+```
+
+If `report()` is slow, the suspect functions are `load_orders` (file I/O and JSON parsing), `normalize` (string operations on every record), and `total_revenue` (a generator over the list). Without profiling, picking one is guesswork. On a 500MB JSON file, `load_orders` dominates and the rest is rounding error. On a small file with millions of normalized records, `normalize` could be the hot spot. The right fix depends on the answer, and the answer takes 10 seconds with `cProfile` to find.
+
+The workflow: profile first, identify the hot spot, change one thing, profile again, confirm the change helped. Anything else is hope, not engineering.
+
+<h1 id="cprofile-the-built-in-deterministic-profiler">
+  cProfile, the Built-In Deterministic Profiler
+</h1>
+
+`cProfile` is the profiler that ships with Python. It instruments every function call: when a call starts, `cProfile` records the time; when it returns, it records the time again. The output is a precise table of how often each function ran and how much time it took, in total and per call.
+
+The simplest way to run it is from the command line:
+
+```text
+python -m cProfile script.py
+```
+
+That runs the script normally and prints a profile table at the end. Output looks like this (trimmed to the relevant rows):
+
+```text
+204815 function calls (199712 primitive calls) in 2.143 seconds
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.001    0.001    2.143    2.143 report.py:14(report)
+        1    1.789    1.789    1.789    1.789 report.py:4(load_orders)
+   100000    0.184    0.000    0.302    0.000 report.py:9(normalize)
+        1    0.012    0.012    0.169    0.169 report.py:11(total_revenue)
+   100000    0.118    0.000    0.118    0.000 {method 'lower' of 'str' objects}
+```
+
+Six columns matter:
+
+| Column                      | What it tells you                                                                  |
+| --------------------------- | ---------------------------------------------------------------------------------- |
+| `ncalls`                    | How many times the function was called. Two numbers (e.g., `5/1`) means recursion. |
+| `tottime`                   | Total time spent inside this function, excluding time in callees.                  |
+| `percall`                   | `tottime / ncalls`. Average time per call, not counting callees.                   |
+| `cumtime`                   | Total time spent inside this function, including everything it called.             |
+| `percall`                   | `cumtime / ncalls`. Average wall time per call.                                    |
+| `filename:lineno(function)` | Which function the row is about.                                                   |
+
+The distinction that newcomers miss is `tottime` versus `cumtime`. `cumtime` answers "how long did this whole subtree take?" `tottime` answers "how much time was spent in this function's own code, not its callees?" A function with 5 seconds of `cumtime` but only 0.001 of `tottime` is not the bottleneck. It is calling something else that is. Walk down its callees to find the real hot spot.
+
+In the trace above, `load_orders` has `tottime` 1.789 and `cumtime` 1.789, so essentially all the time is inside its own body (`json.load` is the dominant cost, hidden inside it). `normalize` has 0.184 own time and 0.302 cumulative, so it spends real time on its own work plus some inside its `lower()` call. `report` has nearly zero `tottime` because it mostly delegates to the others.
+
+`cProfile` can also be called programmatically, which is useful for profiling a single section of a long program:
+
+```python
+import cProfile
+
+def slow_section():
+    orders = [{"status": "Delivered "} for _ in range(100_000)]
+    return [o["status"].lower().strip() for o in orders]
+
+cProfile.run("slow_section()")
+```
+
+`cProfile.run` takes a string, evaluates it, and prints the profile. For structured data rather than printed output, use `cProfile.Profile` directly:
+
+```python
+import cProfile, pstats
+
+profiler = cProfile.Profile()
+profiler.enable()
+slow_section()
+profiler.disable()
+
+stats = pstats.Stats(profiler).sort_stats("cumulative")
+stats.print_stats(10)  # top 10 by cumulative time
+```
+
+That pattern (enable, run the code, disable, build a `Stats`) applies whenever a slice of a larger program needs profiling.
+
+`cProfile` adds 5 to 30 percent overhead, sometimes more on call-heavy code, because every function call goes through the C-level profiler hook. The recorded times reflect code running under the profiler, not in normal operation. Relative ranking of hot spots is still accurate, but absolute numbers shift.
+
+<h1 id="reading-and-filtering-with-pstats">
+  Reading and Filtering with pstats
+</h1>
+
+A profile from a real program can have thousands of rows. `pstats` is the standard library module for sorting, filtering, and slicing that data to focus on the relevant parts.
+
+Save a profile to a file first, then explore it:
+
+```text
+python -m cProfile -o report.prof script.py
+```
+
+The `-o` flag writes the profile to a binary file instead of printing. Now open it in Python:
+
+```python
+import pstats
+
+stats = pstats.Stats("report.prof")
+stats.sort_stats("cumulative").print_stats(20)
+```
+
+`sort_stats` accepts the field names shown earlier: `"cumulative"`, `"tottime"`, `"ncalls"`, `"filename"`, and a few more. `print_stats(20)` prints the top 20 rows in that order. `print_stats(0.1)` prints the top 10 percent of rows. `print_stats("orders")` filters rows whose qualified name contains `"orders"`, which is useful for focusing on application code and hiding standard-library noise.
+
+Two methods are worth learning beyond `print_stats`:
+
+```python
+stats.print_callers("normalize")  # who called normalize?
+stats.print_callees("report")     # what did report call?
+```
+
+`print_callers` shows the call sites that reach a function. `print_callees` shows what a function called. Together they support walking up and down the call graph, which is the point of profiling: find the hot spot, then find what is pushing work into it.
+
+A pattern that pays off on every real program: sort by cumulative, find the function with the highest `cumtime` that is not a framework or library, then sort by `tottime` to see which of its descendants is doing the actual work.
+
+```python
+import pstats
+
+stats = pstats.Stats("report.prof")
+stats.sort_stats("cumulative").print_stats(10)  # roots of slow subtrees
+stats.sort_stats("tottime").print_stats(10)     # leaves doing the real work
+```
+
+The first call shows which high-level operations cost the most. The second shows the bottom-of-the-stack functions where time is actually accumulating. The honest bottleneck is usually visible by comparing the two lists.
+
+<h1 id="visualizing-profiles">Visualizing Profiles</h1>
+
+Reading a `pstats` table by hand works, but for any non-trivial program a visual representation is faster. Two free tools are popular.
+
+**SnakeViz** renders a profile as an interactive icicle or sunburst chart in a browser. The visual structure shows the call tree, with each box's width proportional to the time spent in that subtree. Clicking a box zooms into it, and a wide rectangle near the bottom of the tree marks the bottleneck in seconds.
+
+```text
+pip install snakeviz
+python -m cProfile -o report.prof script.py
+snakeviz report.prof
+```
+
+The browser opens automatically with the profile loaded. The default view is an icicle chart with the root at the top and callees stacked below; the sunburst alternative shows the same data as concentric rings.
+
+**flameprof** generates a static flame graph (SVG) from a cProfile file. Flame graphs are the standard format in the broader performance community (popularized by Brendan Gregg for systems profiling), and the visual conventions are the same: each box is a function, width is proportional to time, vertical stacks show call depth.
+
+```text
+pip install flameprof
+flameprof report.prof > report.svg
+```
+
+Open the SVG in a browser to see the chart. Both tools read the same `.prof` file `cProfile` produces, so switching between them does not require re-running.
+
+Visual tools are useful when the profile has hundreds of functions. The table view is fine for ten rows; for a thousand, a view of the program's shape beats scrolling through text.
+
+<h1 id="line-level-profiling">Line-Level Profiling</h1>
+
+`cProfile` measures per-function time. That identifies which function is slow. It does not identify which line inside the function. For most bugs the function is enough, but sometimes a single function has multiple suspects and a line-by-line breakdown is needed.
+
+`line_profiler` is the third-party tool for that. Install it, decorate the function to inspect, and run the script with the `kernprof` wrapper:
+
+```text
+pip install line_profiler
+```
+
+<CommentsSection />
+
+</LessonCard>

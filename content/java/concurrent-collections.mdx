@@ -1,0 +1,461 @@
+---
+title: "Concurrent Collections"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Concurrent Collections explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="why-plain-collections-arent-safe-across-threads">
+  Why Plain Collections Aren't Safe Across Threads
+</h1>
+
+`ArrayList` and `HashMap` are not safe to share across threads. If two threads write to the same `HashMap` at the same time, the internal table can get into a state where a `get` call loops forever, the size counter drifts, or the structure simply corrupts. The Javadoc spells this out: these classes are unsynchronized by design, because most code uses them on a single thread and pays no synchronization cost.
+
+The old escape hatch was `Collections.synchronizedMap(new HashMap<>())`, which wraps every method in a single lock. That works for individual operations but breaks down in two ways. First, every read takes the lock too, so two threads can't even read in parallel. Second, compound operations like "check if a key exists, and if not, add it" still need the caller to lock manually:
+
+```java
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+
+public class SynchronizedMapPitfall {
+    public static void main(String[] args) {
+        Map<String, Integer> stock = Collections.synchronizedMap(new HashMap<>());
+        stock.put("Notebook", 10);
+
+        // Two threads running this same block can both pass the containsKey check
+        // before either one writes. One write overwrites the other.
+        if (!stock.containsKey("Pen")) {
+            stock.put("Pen", 5);
+        }
+
+        System.out.println(stock);
+    }
+}
+```
+
+The output looks fine because only one thread ran. The hidden problem is the two-step check-then-act. On a synchronized map, each call is atomic on its own, but a pair of calls is not. To make the pair atomic, the caller has to wrap the whole block in `synchronized (stock)`, which puts the burden back on the developer. The concurrent collections fix both problems: parallel reads where possible, and atomic compound operations as first-class methods.
+
+<h1 id="concurrenthashmap">ConcurrentHashMap</h1>
+
+`ConcurrentHashMap` is the most-used class in the concurrent collections. It behaves like `HashMap` from the outside: same `put`, `get`, `remove`, `containsKey` methods, same iteration shape. Inside, it's built so multiple threads can read and write without blocking each other except where they actually touch the same data.
+
+The mental model is that the internal table is divided into independent slots, called bins. A write to one bin doesn't block a read or a write in a different bin. Modern versions (Java 8 and later) lock at the level of individual bins using the first node of each bin as the lock object, so the effective lock granularity is per-bucket, not per-segment or per-table. The diagram below shows the layout for a small map with three threads working on three different keys.
+
+Three threads, three bins, no contention. Reads are even cheaper than writes: most `get` calls don't take any lock at all. They walk the bin chain using volatile reads, which means a reader sees a consistent value but doesn't block any writer.
+
+The basic shape with one thread, to anchor the API:
+
+```java
+import java.util.concurrent.ConcurrentHashMap;
+
+public class StockMap {
+    public static void main(String[] args) {
+        ConcurrentHashMap<String, Integer> stock = new ConcurrentHashMap<>();
+        stock.put("Notebook", 10);
+        stock.put("Pen", 5);
+        stock.put("Eraser", 8);
+
+        System.out.println("Pens in stock: " + stock.get("Pen"));
+        System.out.println("Total entries: " + stock.size());
+    }
+}
+```
+
+Same calls you'd make on `HashMap`. The difference shows up once multiple threads share the map.
+
+<h3 id="no-null-keys-no-null-values">No null keys, no null values</h3>
+
+`ConcurrentHashMap` does not allow `null` as a key or as a value, unlike `HashMap`. A `null` value would be ambiguous under concurrent reads, because a reader couldn't tell whether `get(key)` returning `null` means "the key isn't there" or "the key is mapped to null and someone is about to update it". The designers chose to forbid `null` outright.
+
+```java
+import java.util.concurrent.ConcurrentHashMap;
+
+public class NullsForbidden {
+    public static void main(String[] args) {
+        ConcurrentHashMap<String, Integer> stock = new ConcurrentHashMap<>();
+
+        try {
+            stock.put("Pen", null);
+        } catch (NullPointerException e) {
+            System.out.println("Null value rejected: " + e.getClass().getSimpleName());
+        }
+
+        try {
+            stock.put(null, 5);
+        } catch (NullPointerException e) {
+            System.out.println("Null key rejected: " + e.getClass().getSimpleName());
+        }
+    }
+}
+```
+
+If you need to represent "absent" in a `ConcurrentHashMap`, use a sentinel object or `Optional`, or just remove the key.
+
+<h3 id="atomic-compound-operations">Atomic compound operations</h3>
+
+The interesting part of `ConcurrentHashMap` is the methods that make read-modify-write atomic. The three you'll use most are `putIfAbsent`, `compute`, and `merge`.
+
+`putIfAbsent(key, value)` adds the mapping only if the key isn't already present, and returns the existing value if there was one. The check and the put happen together, so two threads racing to add the same key won't both succeed.
+
+```java
+import java.util.concurrent.ConcurrentHashMap;
+
+public class FirstWriteWins {
+    public static void main(String[] args) {
+        ConcurrentHashMap<String, Integer> stock = new ConcurrentHashMap<>();
+
+        Integer previous = stock.putIfAbsent("Pen", 5);
+        System.out.println("First call returned: " + previous);
+
+        previous = stock.putIfAbsent("Pen", 99);
+        System.out.println("Second call returned: " + previous);
+        System.out.println("Final value: " + stock.get("Pen"));
+    }
+}
+```
+
+The first call put `5` and returned `null` to indicate there was no previous value. The second call saw `Pen` already mapped, did not overwrite it, and returned the existing `5`. The map still holds `5`. This is exactly the operation the synchronized-map example earlier needed two lines (and a manual lock) to achieve.
+
+`compute(key, remappingFunction)` runs your function with the current value (or `null` if absent) and stores whatever the function returns. The whole call is atomic on that key. A common use case is a thread-safe counter for an online store tracking how many times each product has been viewed.
+
+```java
+import java.util.concurrent.ConcurrentHashMap;
+
+public class ViewCounter {
+    public static void main(String[] args) {
+        ConcurrentHashMap<String, Integer> views = new ConcurrentHashMap<>();
+
+        // Each call atomically reads the current count and writes count + 1.
+        views.compute("Notebook", (key, count) -> count == null ? 1 : count + 1);
+        views.compute("Notebook", (key, count) -> count == null ? 1 : count + 1);
+        views.compute("Pen", (key, count) -> count == null ? 1 : count + 1);
+
+        System.out.println("Notebook views: " + views.get("Notebook"));
+        System.out.println("Pen views: " + views.get("Pen"));
+    }
+}
+```
+
+The "null becomes 1, otherwise add one" pattern shows up often enough that there's a shorter form: `merge`. `merge(key, value, mergeFunction)` puts the value if the key is absent, otherwise calls your function on the existing and new values to produce a combined result.
+
+```java
+import java.util.concurrent.ConcurrentHashMap;
+
+public class CartCounter {
+    public static void main(String[] args) {
+        ConcurrentHashMap<String, Integer> cart = new ConcurrentHashMap<>();
+
+        // First call puts 1. Each later call adds 1 to the existing value.
+        cart.merge("Notebook", 1, Integer::sum);
+        cart.merge("Notebook", 1, Integer::sum);
+        cart.merge("Notebook", 1, Integer::sum);
+        cart.merge("Pen", 1, Integer::sum);
+
+        System.out.println("Cart: " + cart);
+    }
+}
+```
+
+`merge` and `compute` both lock only the bin for that key for the duration of the call. Other keys in other bins keep moving. That's the property that makes `ConcurrentHashMap` scale: contention is bounded by how often two threads touch the same key, not by how many threads use the map.
+
+The function you pass to `compute` or `merge` runs while the bin is locked. Keep it short. Don't make a database call or sleep inside it, or you'll serialize every other thread that needs the same bin.
+
+<h1 id="copyonwritearraylist">CopyOnWriteArrayList</h1>
+
+`CopyOnWriteArrayList` solves a different problem. Consider an inventory system where one background thread occasionally adjusts the list of registered price listeners, and many threads constantly read that list to notify the listeners of price changes. Reads dominate, writes are rare, and iteration must never throw `ConcurrentModificationException` even if a write happens mid-iteration.
+
+The mechanism is in the name. Every mutation (add, set, remove) creates a fresh copy of the internal array with the change applied, then atomically swaps the reference. Readers always see a consistent snapshot, because the array they're iterating is the array as it existed when iteration started. A write that happens later swaps in a new array but leaves the older one intact for any reader still walking it.
+
+```java
+import java.util.concurrent.CopyOnWriteArrayList;
+
+public class PriceListeners {
+    public static void main(String[] args) {
+        CopyOnWriteArrayList<String> listeners = new CopyOnWriteArrayList<>();
+        listeners.add("EmailNotifier");
+        listeners.add("DashboardWidget");
+        listeners.add("AnalyticsLogger");
+
+        // Iterate. Concurrent modification during this loop would not throw.
+        for (String listener : listeners) {
+            System.out.println("Notifying " + listener);
+            // A write here would leave this iteration unaffected.
+            if (listener.equals("DashboardWidget")) {
+                listeners.add("LateArrival");
+            }
+        }
+
+        System.out.println("Final size: " + listeners.size());
+    }
+}
+```
+
+The loop printed three listeners, not four, even though a fourth was added during iteration. The iterator was working off the snapshot taken when the loop began, and that snapshot didn't change when `add("LateArrival")` swapped in a new internal array. After the loop ends, a fresh check of `size()` sees the new value.
+
+When the listener set is shared across threads, this property is the whole point. A reader can iterate without worrying about a writer pulling the rug out, and a writer can add or remove without waiting for readers to finish.
+
+The cost is on the write side. Each mutation copies the entire backing array. For a 10-element listener list, that's nothing. For a 100,000-element list, every write allocates a 100,000-element array and copies the contents. This is why the class is for read-heavy, mutation-rare workloads. Use it for observer lists, event listener registries, configuration entries that change at startup or on a manual reload, and similar shapes. Don't use it as a general-purpose list.
+
+Every mutation on `CopyOnWriteArrayList` is O(n) because it copies the whole array. If writes happen more than occasionally, a different structure (with synchronized access or a `ConcurrentLinkedQueue`) will scale far better.
+
+A second consequence of the snapshot model is that the iterator does not support `remove`, `set`, or `add`. Those calls throw `UnsupportedOperationException`. The iterator is purely a view into the snapshot. To remove from the list, call `list.remove(...)` directly.
+
+```java
+import java.util.Iterator;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+public class IteratorRemoveFails {
+    public static void main(String[] args) {
+        CopyOnWriteArrayList<String> listeners = new CopyOnWriteArrayList<>();
+        listeners.add("EmailNotifier");
+
+        Iterator<String> it = listeners.iterator();
+        it.next();
+        try {
+            it.remove();
+        } catch (UnsupportedOperationException e) {
+            System.out.println("Iterator remove not supported on CopyOnWriteArrayList.");
+        }
+    }
+}
+```
+
+<h1 id="copyonwritearrayset">CopyOnWriteArraySet</h1>
+
+`CopyOnWriteArraySet` is a `Set` built on top of `CopyOnWriteArrayList`. It uses the same copy-on-write strategy and has the same shape of trade-offs: cheap reads, expensive writes, snapshot iteration. The only difference is that adds are deduplicated by `equals`, so the set never holds two equal elements.
+
+```java
+import java.util.concurrent.CopyOnWriteArraySet;
+
+public class WatchedProducts {
+    public static void main(String[] args) {
+        CopyOnWriteArraySet<String> watched = new CopyOnWriteArraySet<>();
+        watched.add("Notebook");
+        watched.add("Pen");
+        watched.add("Notebook"); // duplicate, ignored
+
+        for (String product : watched) {
+            System.out.println("Watching: " + product);
+        }
+        System.out.println("Size: " + watched.size());
+    }
+}
+```
+
+Because the underlying structure is an array, every `add` and `contains` is O(n). For a small set of distinct items where reads dominate, that's fine. For anything that grows, `ConcurrentHashMap.newKeySet()` is the better default: it gives you a `Set` backed by a `ConcurrentHashMap`, with O(1) operations and bin-level locking.
+
+<h1 id="concurrentlinkedqueue-and-concurrentlinkeddeque">
+  ConcurrentLinkedQueue and ConcurrentLinkedDeque
+</h1>
+
+When threads need to hand items off to one another without blocking, the lock-free queues are the tool. `ConcurrentLinkedQueue` is an unbounded FIFO queue based on a linked-node algorithm by Michael and Scott that uses atomic compare-and-set operations (no locks) to update the head and tail pointers. `ConcurrentLinkedDeque` is the double-ended version.
+
+"Non-blocking" here means a thread that wants to enqueue or dequeue never waits for a lock. If two threads try to enqueue at the same moment, both attempt the compare-and-set on the tail pointer; one succeeds, the other retries with the new tail. There's no kernel-level blocking, no thread suspension. Under contention, threads keep working, just doing a little extra retry work.
+
+```java
+import java.util.concurrent.ConcurrentLinkedQueue;
+
+public class EventBuffer {
+    public static void main(String[] args) {
+        ConcurrentLinkedQueue<String> events = new ConcurrentLinkedQueue<>();
+
+        events.offer("order-placed");
+        events.offer("order-shipped");
+        events.offer("order-delivered");
+
+        String next;
+        while ((next = events.poll()) != null) {
+            System.out.println("Processing: " + next);
+        }
+        System.out.println("Queue size: " + events.size());
+    }
+}
+```
+
+`offer` adds to the tail. `poll` removes from the head and returns `null` if the queue is empty. `peek` looks at the head without removing.
+
+The catch with `ConcurrentLinkedQueue` is `size()`. Because the queue is unbounded and modifications happen lock-free across all of memory, `size` has to walk the chain to count. It's O(n), not O(1). Documentation calls this out plainly. If you're using a concurrent queue in a tight loop and reaching for `size` to decide what to do next, you're paying more than you think. Use `isEmpty()` (which is O(1)) when that's the question you actually have.
+
+`ConcurrentLinkedQueue.size()` is O(n) and the result may already be stale by the time you read it. Prefer `isEmpty()` for liveness checks.
+
+When do you use `ConcurrentLinkedQueue` over a blocking queue? When the consumer side has its own logic for "no work right now" and shouldn't wait for the producer. A non-blocking queue fits when the consumer can move on to other work if the queue happens to be empty. When the consumer's job is to wait for work, blocking queues do more of the lifting.
+
+<h1 id="blockingqueue-family">BlockingQueue Family</h1>
+
+A `BlockingQueue` is a queue with two extra operations: a producer that finds the queue full can wait until space becomes available, and a consumer that finds the queue empty can wait until something arrives. This is the foundation of every producer-consumer pipeline in Java. The shape looks like this:
+
+Producers call `put` to add an order. If the queue is full, they wait. Consumers call `take` to pull an order off. If the queue is empty, they wait. Java handles the waking up. You don't write any `wait`/`notify` code.
+
+The four implementations cover different needs:
+
+| Implementation          | Capacity                                        | Ordering                                     | When to use it                                                                |
+| ----------------------- | ----------------------------------------------- | -------------------------------------------- | ----------------------------------------------------------------------------- |
+| `ArrayBlockingQueue`    | Bounded, fixed at construction                  | FIFO                                         | Producer-consumer with a hard cap, predictable memory use                     |
+| `LinkedBlockingQueue`   | Optionally bounded, default `Integer.MAX_VALUE` | FIFO                                         | High-throughput producer-consumer, decoupled head and tail locks              |
+| `PriorityBlockingQueue` | Unbounded                                       | By priority via `Comparable` or `Comparator` | When some items must be processed before others                               |
+| `SynchronousQueue`      | Zero capacity                                   | Direct handoff                               | A producer hands an item directly to a consumer, neither side stores anything |
+
+<h3 id="arrayblockingqueue-example">ArrayBlockingQueue example</h3>
+
+A fulfillment service backed by a bounded queue. The web layer accepts orders and pushes them onto the queue. A worker pulls them off, one at a time. The bounded capacity acts as backpressure: if the worker can't keep up, producers block instead of letting the queue grow without limit.
+
+```java
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+
+public class OrderPipeline {
+    public static void main(String[] args) throws InterruptedException {
+        BlockingQueue<String> orders = new ArrayBlockingQueue<>(3);
+
+        // Producer thread.
+        Thread producer = new Thread(() -> {
+            try {
+                for (int i = 1; i <= 5; i++) {
+                    String order = "order-" + i;
+                    orders.put(order);
+                    System.out.println("Enqueued " + order);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+
+        // Consumer thread.
+        Thread consumer = new Thread(() -> {
+            try {
+                for (int i = 1; i <= 5; i++) {
+                    String order = orders.take();
+                    System.out.println("Processed " + order);
+                    Thread.sleep(50);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+
+        producer.start();
+        consumer.start();
+        producer.join();
+        consumer.join();
+    }
+}
+```
+
+The exact interleaving will vary between runs because the threads race. What's stable is the count and the relative order. The producer enqueues all five orders in FIFO order. The consumer processes them in the same order. When the queue holds three items (its capacity), the next `put` blocks until the consumer's `take` makes room. This is why the enqueue and process lines interleave in the middle.
+
+`put` and `take` block. Two other pairs exist for code that doesn't want to wait forever. `offer(item, timeout, TimeUnit)` returns `false` if the timeout expires before space opens up. `poll(timeout, TimeUnit)` returns `null` if no item arrives in time. And `offer(item)` and `poll()` without arguments don't block at all: they succeed or fail immediately. The four shapes (block, time-out, fail-fast, throw) give the caller exactly the failure mode they want.
+
+<h3 id="linkedblockingqueue-and-synchronousqueue">
+  LinkedBlockingQueue and SynchronousQueue
+</h3>
+
+`LinkedBlockingQueue` is the most common pick for general producer-consumer work. By default it's effectively unbounded (`Integer.MAX_VALUE`), which is a hazard: a slow consumer leaves a runaway producer free to exhaust memory. In production, give it a sensible cap.
+
+```java
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+
+public class CappedQueue {
+    public static void main(String[] args) {
+        BlockingQueue<String> queue = new LinkedBlockingQueue<>(100);
+        queue.offer("first");
+        queue.offer("second");
+        System.out.println("Size: " + queue.size());
+        System.out.println("Peek: " + queue.peek());
+    }
+}
+```
+
+Internally, `LinkedBlockingQueue` uses two locks (one for the head, one for the tail), so producers and consumers don't fight over the same lock. This is why it tends to throw more items per second than `ArrayBlockingQueue` under heavy load, at the cost of a slightly larger memory footprint per item.
+
+`SynchronousQueue` is the unusual one. It has zero capacity. A `put` doesn't store the item; it waits for a matching `take` to arrive, and the item is handed directly from one thread to the other. There's no internal buffer. This is the queue inside `Executors.newCachedThreadPool()`, where every submitted task either lands on a thread that's already waiting, or causes a new thread to be created. It fits when buffering is the wrong answer and a strict handoff is needed.
+
+<h3 id="priorityblockingqueue">PriorityBlockingQueue</h3>
+
+When some items must be processed before others (express orders before standard, alerts before metrics), `PriorityBlockingQueue` orders elements by `Comparable` or a provided `Comparator`. The lowest-priority element (smallest by the comparator) comes out first.
+
+```java
+import java.util.concurrent.PriorityBlockingQueue;
+
+public class ExpressOrders {
+    static record Order(String id, int priority) implements Comparable<Order> {
+        public int compareTo(Order other) {
+            return Integer.compare(this.priority, other.priority);
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        PriorityBlockingQueue<Order> queue = new PriorityBlockingQueue<>();
+        queue.put(new Order("order-A", 5));
+        queue.put(new Order("order-B", 1));
+        queue.put(new Order("order-C", 3));
+
+        while (!queue.isEmpty()) {
+            System.out.println("Next: " + queue.take());
+        }
+    }
+}
+```
+
+`order-B` came out first because its priority was the smallest. The queue isn't FIFO; it's a priority heap with concurrent locking. `put` never blocks (the queue is unbounded), so be careful: if items can arrive faster than they're processed, memory will grow without limit. Bound the producer somewhere upstream.
+
+<h1 id="when-not-to-use-the-synchronized-wrappers">
+  When Not to Use the Synchronized Wrappers
+</h1>
+
+`Collections.synchronizedList`, `synchronizedMap`, and `synchronizedSet` still exist, and they show up in older codebases. They wrap every method in a single lock on the wrapper object. Two problems make them a poor default for any code written today:
+
+First, performance. Every read takes the same lock as every write, so concurrent reads serialize. `ConcurrentHashMap` lets many readers go in parallel and only locks bins on writes. For any real read workload, the concurrent collection is faster, often by an order of magnitude.
+
+Second, compound operations. A check-then-act on a synchronized collection requires the caller to lock manually, the same way it did on `Hashtable`. The atomic operations on `ConcurrentHashMap` and `CopyOnWriteArrayList` (`putIfAbsent`, `compute`, `merge`, `addIfAbsent`) make those patterns one method call, with the atomicity baked in. The synchronized wrappers give you neither parallelism nor atomic compound operations, which leaves no situation where they're the best choice for new code.
+
+The one place you'll still see synchronized wrappers is when a legacy API requires a `List` or a `Map` and the calling code already happens to do all its access from one thread. There the wrapping is defensive, not load-bearing, and it doesn't matter much either way. For genuine concurrent use, use the `java.util.concurrent` collection that fits the access pattern.
+
+<h1 id="putting-the-pieces-together">Putting the Pieces Together</h1>
+
+A small picture of how these classes fit. An e-commerce backend has three kinds of concurrent state. Stock levels for every product, read constantly and updated when orders ship: that's a `ConcurrentHashMap<String, Integer>`, with `merge(productId, -1, Integer::sum)` to decrement atomically. A list of inventory-change listeners, mostly stable, occasionally updated when an integration is added or removed: that's a `CopyOnWriteArrayList<InventoryListener>`. An order queue between the web layer and the fulfillment worker: that's an `ArrayBlockingQueue<Order>` with a bounded capacity, so a backed-up worker creates backpressure on the web layer instead of letting the queue grow. Three different access patterns, three different concurrent collections, no manual synchronization.
+
+```java
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+public class StorefrontState {
+    public static void main(String[] args) {
+        ConcurrentHashMap<String, Integer> stock = new ConcurrentHashMap<>();
+        stock.put("Notebook", 10);
+        stock.put("Pen", 25);
+
+        CopyOnWriteArrayList<String> listeners = new CopyOnWriteArrayList<>();
+        listeners.add("EmailNotifier");
+        listeners.add("AnalyticsLogger");
+
+        BlockingQueue<String> orderQueue = new ArrayBlockingQueue<>(100);
+        orderQueue.offer("order-1");
+        orderQueue.offer("order-2");
+
+        // Ship one Notebook: decrement stock atomically.
+        stock.merge("Notebook", -1, Integer::sum);
+
+        // Notify all listeners.
+        for (String listener : listeners) {
+            System.out.println(listener + " saw inventory update for Notebook");
+        }
+
+        System.out.println("Notebooks in stock: " + stock.get("Notebook"));
+        System.out.println("Orders waiting: " + orderQueue.size());
+    }
+}
+```
+
+Each collection is doing its own job. The map handles concurrent reads and atomic writes for stock. The copy-on-write list lets the notification loop iterate safely even if another thread reconfigures listeners mid-loop. The blocking queue connects producers to consumers with built-in backpressure.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,341 @@
+---
+title: "Batch vs Stream Processing"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Batch vs Stream Processing explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+For example, a nightly job might read all orders placed during the previous day, group them by category, calculate total revenue, and write the results to a reporting table. Once processing is complete, the job finishes. The next night, it runs again with the next day's orders.
+
+Technologies like Hadoop MapReduce and Apache Spark are commonly used for batch processing. The basic idea is simple: collect the data first, then process it together.
+
+<h3 id="how-a-batch-job-runs">How a Batch Job Runs</h3>
+
+Let's walk through how a typical batch job works.
+
+1. **Collect.** Throughout the day, the application writes order events to storage, such as files in object storage or tables in a data warehouse.
+2. **Start.** At a scheduled time, say 2:00 AM, a scheduler starts the job.
+3. **Read and split.** The job reads the input data. Since the dataset could contain millions of records, the work is usually distributed across multiple machines. Each machine processes a portion of the data in parallel.
+4. **Combine.** The partial results are combined to produce the final output.
+5. **Write.** The results are written to a reporting table or another destination, and the job ends.
+
+Because the job has access to the complete dataset for that period, it can perform operations like sorting records, joining large tables, scanning the data more than once, and calculating exact totals. It can also check the output before publishing it.
+
+<h3 id="why-batch-works-well">Why Batch Works Well</h3>
+
+Batch processing has several important advantages.
+
+**High throughput.** By processing large amounts of data together, batch jobs can use sequential reads and distributed computing to use resources efficiently. The cost of starting a job is spread across millions of records.
+
+**Simplicity.** Since the input is fixed, the processing logic is generally easier to write, test, and reason about. You can compare the input and output after the job completes.
+
+**Easy recovery.** If a batch job fails, you can usually fix the problem and run it again using the same input. As long as the processing is deterministic and the output is written safely, rerunning the job should produce the same result without duplicates. A common way to write safely is to replace a whole output partition, such as one day of results, instead of appending rows to it.
+
+This also makes batch processing useful for reprocessing historical data. If you discover a bug in last month's revenue calculations, you can fix the code, rerun the job on last month's data, and regenerate the reports.
+
+| Characteristic     | Practical Meaning                                                                      |
+| ------------------ | -------------------------------------------------------------------------------------- |
+| **Input**          | Bounded. A known slice of data, such as one day of orders or one table snapshot.       |
+| **Latency**        | Usually minutes to hours. Results are available after the job finishes.                |
+| **Throughput**     | High. The setup cost is spread across many records.                                    |
+| **Recovery**       | Straightforward. A failed job can be fixed and rerun on the same input.                |
+| **Correctness**    | Easier to validate because inputs and outputs can be compared after the job completes. |
+| **Resource usage** | Bursty. Clusters can start for a scheduled job and shut down afterward.                |
+
+Common batch workloads include daily reports, ETL and ELT pipelines, billing and settlement, machine learning training on historical data, backfills, and large data migrations.
+
+Apache Spark is the usual choice for large ETL jobs, joins, and backfills. Hadoop MapReduce is important historically and still appears in older Hadoop systems, but most new systems start with Spark, SQL engines like Hive, Trino, and Presto, tools like dbt, or managed cloud data warehouses.
+
+<h3 id="the-limitation-latency">The Limitation: Latency</h3>
+
+The biggest limitation of batch processing is latency. Results are only as fresh as the last completed job. If a batch job runs once a day, its results could be nearly 24 hours behind the latest data.
+
+For financial reports, that might be acceptable. But applications like fraud detection, server monitoring, live leaderboards, and location tracking need to react to new information within seconds.
+
+One option is to run batch jobs more frequently. Instead of once a day, you could run them every hour, then every five minutes, or even every few seconds. But each run has some overhead: scheduling the job, starting workers, reading the input, and writing the output. Repeatedly starting jobs to process small batches becomes inefficient. As the required latency decreases, traditional batch processing becomes less practical.
+
+This is where stream processing comes in.
+
+<h1 id="2-what-is-stream-processing">2. What is Stream Processing?</h1>
+
+Stream processing handles data continuously, as new events arrive. Instead of waiting for a large collection of events, the system processes them shortly after they're produced.
+
+Unlike batch processing, stream processing works with **unbounded** data. There is no final record. New orders, clicks, transactions, and sensor readings can keep arriving indefinitely. As a result, a stream processing job typically runs continuously rather than finishing after processing a fixed dataset.
+
+Going back to our e-commerce example, every new order can be analyzed for fraud as soon as the event reaches the processing system. If an order looks suspicious, it can be flagged within milliseconds or seconds, rather than waiting for the next batch job.
+
+<h3 id="the-streaming-pipeline">The Streaming Pipeline</h3>
+
+A typical streaming pipeline has three main components.
+
+1. **Event producers**, such as application servers, mobile apps, or IoT devices, create the events.
+2. **An event streaming platform or message broker**, such as Apache Kafka, receives them. Kafka stores events durably within partitions and allows consumers to read them at their own pace. If a consumer restarts or falls behind, the events are still there.
+3. **A stream processor** continuously reads events from the broker and applies the processing logic. Common technologies include Apache Flink, Kafka Streams, and Spark Structured Streaming.
+
+The processor might filter events, enrich them with additional information, calculate running totals, or detect conditions that trigger alerts. Results can then be written to another Kafka topic, a database, a cache, or a notification service.
+
+Choosing between the processors is mostly a question of fit. Flink is strong for low-latency, stateful pipelines that depend on event time. Kafka Streams suits services that already sit close to Kafka, especially Kafka-to-Kafka transformations. Spark Structured Streaming works well for teams that already use Spark and want to share logic between batch and streaming jobs.
+
+| Characteristic   | Practical Meaning                                                                                  |
+| ---------------- | -------------------------------------------------------------------------------------------------- |
+| **Input**        | Unbounded. The system sees a continuous stream of events, not a complete table.                    |
+| **Latency**      | Usually milliseconds to seconds.                                                                   |
+| **Job lifetime** | Runs continuously, often for months.                                                               |
+| **State**        | Often required for counts, windows, joins, deduplication, and pattern detection.                   |
+| **Recovery**     | Harder than batch. The system must restore state and resume from the right position in the stream. |
+| **Correctness**  | Depends on event time, watermarks, late events, and how duplicates are handled.                    |
+
+Common stream workloads include fraud detection, monitoring and alerting, real-time recommendations, live dashboards, live tracking, and Change Data Capture (CDC). These workloads lose value if they wait for the next scheduled batch job.
+
+Reading one event is easy. Producing correct results from a stream that never ends is harder. The next three sections cover the main problems: calculating totals over an endless stream, placing events that arrive late, and keeping state safe when machines fail.
+
+<h1 id="3-windowing">3. Windowing</h1>
+
+Stream processing introduces an interesting problem. If the stream never ends, how do we calculate something like a total or an average?
+
+In batch processing, we can simply sum all records in the input. But with an unbounded stream, there's no point at which we've received every event.
+
+To solve this, streaming systems use **windowing**. A window groups events into finite sets, usually based on time. There are three common types.
+
+**Tumbling windows** divide time into fixed, non-overlapping intervals. For example, counting orders during each one-minute interval. Each event belongs to exactly one window.
+
+**Sliding windows** use overlapping intervals. For example, every 10 seconds, calculating the number of orders placed during the previous five minutes. Because the windows overlap, one event can be counted in many of them.
+
+**Session windows** group events based on activity. For example, a user's session might remain active while they're interacting with the application and end after a period of inactivity, such as 30 minutes without any events. Session windows have no fixed length.
+
+```plaintext
+Tumbling (1 minute, no overlap)
+  [12:00 - 12:01)  [12:01 - 12:02)  [12:02 - 12:03)
+
+Sliding (5 minutes long, moves every 10 seconds)
+  [11:55:00 - 12:00:00)
+     [11:55:10 - 12:00:10)
+        [11:55:20 - 12:00:20)
+
+Session (closes after 30 minutes of inactivity)
+  [12:00 ... 12:14]  -- 30+ min idle --  [12:52 ... 13:05]
+```
+
+Windows allow streaming systems to continuously calculate totals and averages, even though the overall stream never ends.
+
+In code, the window is part of the query itself. Here is a batch job that counts errors per service for one day. It can assume the input has an end:
+
+```python
+data = read_all_from("s3://logs/date=2026-05-24/")
+
+result = (
+    data
+    .filter(lambda log: log.level == "ERROR")
+    .group_by(lambda log: log.service)
+    .count()
+)
+
+result.write_to("warehouse.error_counts_daily")
+```
+
+The streaming version must say how to split the never-ending input into finite pieces. Here it uses a one-minute tumbling window:
+
+```python
+stream = consume_from("kafka://logs")
+
+(
+    stream
+    .filter(lambda log: log.level == "ERROR")
+    .window(size="1 minute", time="event_time")
+    .group_by(lambda log: log.service)
+    .count()
+    .emit_to("ops.error_counts_live")
+)
+```
+
+The window choice also changes what the result means. A "five-minute error rate" and an "hourly error count" answer different questions, so the window should come from the requirement, not from what is convenient to build.
+
+<h1 id="4-event-time-late-data-and-watermarks">
+  4. Event Time, Late Data, and Watermarks
+</h1>
+
+Windowing introduces another challenge. How do we decide which window an event belongs to?
+
+There are two important concepts:
+
+- **Event time** is when something actually happened.
+- **Processing time** is when the stream processor handles the event.
+
+Some systems also track **ingestion time**, which is when the event entered the streaming platform.
+
+Usually, event time and processing time are close. But network delays can create a significant difference.
+
+Suppose a user places an order on their phone while traveling through a tunnel. The event occurs at 12:01, but due to a network delay, it doesn't reach the processor until 12:06.
+
+If we use processing time, the order gets counted in the 12:06 window. But if we use event time, it belongs in the 12:01 window.
+
+For analytics and billing, event time is usually the right choice, because each event is counted in the period when it actually happened. For operational alerts, processing time may be good enough, because freshness matters more than exact placement.
+
+The problem with event time is that the 12:01 window might have already produced its result. This is called **late-arriving data**.
+
+<h3 id="watermarks">Watermarks</h3>
+
+Stream processing systems handle this using **watermarks**. A watermark estimates how far event time has progressed. It indicates that most events before a certain timestamp are expected to have arrived. When the watermark passes the end of a window, the processor can produce that window's result.
+
+A watermark is an estimate, not a guarantee. Aggressive watermarks give faster results but leave more events arriving late. Conservative watermarks wait longer and usually produce more complete results.
+
+<h3 id="handling-late-events">Handling Late Events</h3>
+
+Depending on the configuration, late events may still be allowed to update a result. Events arriving too late might be discarded or handled separately. Here is a concrete case:
+
+```plaintext
+Window: 10:00 - 10:05
+Watermark passes 10:05, result emitted at 10:06: total = $500
+
+Late arrival at 10:07:
+  event_time = 10:03
+  user_id = 42
+  amount = 79.00
+```
+
+The late event belongs to a window that has already published `$$500`. The system has a few options:
+
+- **Drop it.** The window state has been discarded, so the engine ignores the event. The published `$$500` stays as is. It is wrong by `$$79`, but simple and cheap.
+- **Update the result.** If the engine keeps the window state for a grace period (often called allowed lateness), it publishes a correction: `$$579` instead of `$$500`. Downstream systems must be able to handle a changed value.
+- **Wait longer before publishing.** A more conservative watermark would have waited past `10:07`, so the `$$79` would be included the first time. The cost is slower results for every window.
+- **Send it to a separate path.** The late event goes to a side output and is handled later, for example by a batch correction job. This keeps the main pipeline simpler.
+
+Each option trades off simplicity, completeness, and latency. This is one reason stream processing is more complicated than simply processing a batch of events.
+
+<h1 id="5-state-and-checkpoints">5. State and Checkpoints</h1>
+
+Some computations process each event independently. Filtering out test orders, for example, only needs the current event. But other computations need information from previous events.
+
+For example, suppose our fraud detection system wants to identify credit cards used in three different countries within ten minutes. To detect this, the processor needs to remember recent transactions for each card. That information is called **state**.
+
+Running counters, active windows, and recent transaction histories are all examples of state.
+
+The challenge is that streaming applications may run continuously for months. What happens if the machine maintaining this state crashes? We can't simply lose everything and start counting from zero.
+
+To prevent this, stream processing engines periodically save their state to durable storage. These saved snapshots are called **checkpoints**. Each checkpoint also records the position in the stream that the state matches. With Kafka, that position is the offset in each partition.
+
+After a failure, the processor restores its state from the latest successful checkpoint and resumes reading events from the corresponding position in the stream.
+
+The state and the offset must be saved together. If the processor restored state from one moment but resumed reading from a different position, it would either skip events or count some of them twice.
+
+State needs care in other ways too. It has to be split across machines so the job can scale, and old entries have to expire so it does not grow forever. A ten-minute fraud check only needs ten minutes of history per card.
+
+<h3 id="processing-guarantees">Processing Guarantees</h3>
+
+Checkpoints lead to a follow-up question. Events that were read after the last checkpoint will be read again after recovery. What does that mean for the output?
+
+Processing guarantees describe the answer:
+
+- **At-most-once:** each event is processed zero or one time. Events can be lost.
+- **At-least-once:** no events are lost, but some may be processed more than once, creating duplicates.
+- **Exactly-once:** each event affects the result once, for a defined set of inputs and outputs. This needs careful coordination between the processor and the destination.
+
+The phrase "exactly-once" is easy to misuse. A streaming engine can usually provide exactly-once state updates inside the engine, and sometimes exactly-once writes to supported destinations. It cannot make every external API exactly-once.
+
+If your stream job calls a payment gateway, sends an email, or invokes any service with side effects, you still need practical safeguards: idempotency keys, deduplication, transactional writes, or compensation logic. A useful question to ask is: if this job crashes after processing an event but before or during the output, what can a downstream system see?
+
+<h1 id="6-micro-batching">6. Micro-Batching</h1>
+
+There's also an approach between traditional batch processing and continuous event-by-event processing. It's called **micro-batching**.
+
+Instead of processing every event individually, the system collects events over short intervals and processes each group as a small batch. For example, it might collect events for one second, process them together, and then move to the next batch.
+
+Spark Structured Streaming uses this approach by default. Micro-batching can reuse batch-style execution and recovery mechanisms, which makes the system simpler to implement and operate. Many transformations look the same as their batch versions.
+
+The trade-off is additional latency, because each event must wait for its batch to be processed. Other engines, like Apache Flink, support continuous event-by-event processing, which can achieve lower latency.
+
+But not every application needs millisecond-level responses. A dashboard that refreshes every few seconds or a table that updates every minute can work well with micro-batching. For many workloads, a delay of around a second is acceptable, which makes micro-batching a practical option.
+
+<h1 id="7-comparing-batch-and-stream-processing">
+  7. Comparing Batch and Stream Processing
+</h1>
+
+Now, let's compare both approaches directly.
+
+Batch processing works with bounded datasets. Jobs typically run on a schedule, process a defined amount of data, and finish. It's optimized for high throughput, with results often available after minutes or hours. Because the input is fixed, batch jobs are generally easier to develop, test, and rerun.
+
+Stream processing works with unbounded data. Jobs run continuously, processing new events as they arrive and producing results within milliseconds or seconds. The main advantage is low latency. But it introduces additional complexity, including handling windows, late events, state, and failures without losing or duplicating results.
+
+There are also differences in resource usage. A batch cluster can start when needed, finish its work, and shut down. A streaming application typically runs continuously, so it needs resources available throughout its lifetime.
+
+|                     | Batch                                | Stream                                          |
+| ------------------- | ------------------------------------ | ----------------------------------------------- |
+| **Data**            | Bounded                              | Unbounded                                       |
+| **Job lifetime**    | Runs on a schedule and finishes      | Runs continuously                               |
+| **Latency**         | Minutes to hours                     | Milliseconds to seconds                         |
+| **Optimized for**   | High throughput                      | Low latency                                     |
+| **Resources**       | Start, run, shut down                | Always running                                  |
+| **Reprocessing**    | Rerun the job on the same input      | Replay events from the log, harder to do safely |
+| **Debugging**       | Easier to reproduce from fixed input | Harder because time, state, and ordering matter |
+| **Main difficulty** | Stale results                        | Windows, late events, state, and failures       |
+
+Newer tools blur the line at the API level. Spark Structured Streaming uses the same DataFrame model as Spark batch jobs, and Flink can process both bounded and unbounded data. This helps teams reuse code, but the design questions stay the same. A streaming job still needs decisions about windows, watermarks, state, and duplicate output. A batch job still needs decisions about scheduling, partitioning, and backfills.
+
+Neither approach is universally better. They serve different requirements.
+
+<h1 id="8-using-both-lambda-and-kappa-architectures">
+  8. Using Both: Lambda and Kappa Architectures
+</h1>
+
+In practice, many large systems use both approaches.
+
+Let's return to our e-commerce platform. A streaming pipeline could analyze orders for fraud and maintain a live dashboard showing orders per minute. Meanwhile, a batch pipeline could run every night to calculate accurate revenue reports for the finance team.
+
+There are also architectural patterns for combining these workloads.
+
+<h3 id="lambda-architecture">Lambda Architecture</h3>
+
+The **Lambda architecture** maintains two processing paths: a batch layer for historical data and a speed layer for low-latency results. A serving layer combines their outputs.
+
+The batch layer produces accurate results, but they are hours old. The speed layer fills the gap with fresh results for recent data. When the next batch run completes, its results replace what the speed layer computed for that period.
+
+The main drawback is complexity. Similar processing logic often needs to be maintained in two separate systems, and the two versions have to produce matching results.
+
+<h3 id="kappa-architecture">Kappa Architecture</h3>
+
+The **Kappa architecture** takes a different approach. Instead of separate batch and streaming pipelines, Kappa uses a streaming model for both real-time and historical processing.
+
+When historical data needs reprocessing, the system replays stored events through the streaming pipeline. For this to work, the event log must keep events long enough to cover the history you may need to rebuild.
+
+This avoids maintaining two implementations, although replaying large datasets can still be expensive.
+
+Both architectures address the same requirement: systems often need fast updates alongside accurate historical results.
+
+<h1 id="9-how-to-choose">9. How to Choose</h1>
+
+So, how do you decide which approach to use?
+
+**How quickly does the system need the result?** If the answer is hours or a day, batch processing is usually simpler. Examples include daily reports, billing calculations, machine learning training on historical data, and large data migrations. If results are needed within seconds, stream processing is likely a better fit. Examples include fraud detection, monitoring and alerting, real-time recommendations, and live tracking.
+
+**What kind of computation is it?** Processing large historical datasets and performing complex joins is often easier in batch. Continuously aggregating events, detecting patterns, or reacting to changes is better suited to streaming.
+
+**How much operational complexity can you take on?** Streaming systems need additional mechanisms for state management, recovery, and handling late or duplicate events. So if your application can tolerate results that are a few minutes old, frequent batch jobs or micro-batching may provide what you need with less complexity.
+
+| Requirement                               | Good starting point                               |
+| ----------------------------------------- | ------------------------------------------------- |
+| Results needed in hours or a day          | Batch                                             |
+| Results needed within seconds             | Stream processing                                 |
+| A few seconds to a few minutes is fine    | Micro-batching or frequent batch jobs             |
+| Fast updates and exact historical results | Both (streaming plus batch, or Kappa with replay) |
+
+The goal is to choose the simplest approach that meets your requirements.
+
+<h1 id="summary">Summary</h1>
+
+Batch processing collects data and processes it together in a defined job. It works on bounded data and provides high throughput, simpler processing logic, and easy reprocessing, but results are delayed until the next job finishes.
+
+Stream processing handles events continuously as they arrive and provides much lower latency. However, it introduces challenges around windowing, late events, state management, and processing guarantees.
+
+Micro-batching sits between them. It processes events in small groups every second or so, reusing batch-style execution for workloads that can tolerate a short delay.
+
+Many large systems use both: streaming for fast reactions and batch for accurate historical results, either as separate pipelines (Lambda) or through one streaming pipeline with replay (Kappa).
+
+The right choice depends on how quickly your application needs to process data and how much complexity that requirement justifies.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

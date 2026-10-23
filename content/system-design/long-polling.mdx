@@ -1,0 +1,634 @@
+---
+title: "Long Polling"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Long Polling explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+With regular polling, also called short polling, the client sends an HTTP request every few seconds and asks, "Do I have anything new?"
+
+The server checks. If there is a notification, it returns it. If not, it returns an empty response. The client waits a few seconds and asks again.
+
+This is easy to build, but it has two problems.
+
+**Most requests may be useless.** If notifications are rare but the client polls every second, the server processes a huge number of requests that return nothing. For example, 100,000 clients polling every 5 seconds creates about 20,000 requests per second even when there are no notifications at all.
+
+**There is always some delay.** If the client polls every 10 seconds, a notification may sit on the server for almost 10 seconds before the client learns about it.
+
+Polling forces a choice between lower latency and fewer requests. Poll faster and you waste more requests. Poll slower and users wait longer. Long polling tries to improve that trade-off.
+
+<h1 id="2-what-is-long-polling">2. What Is Long Polling?</h1>
+
+With long polling, the client still sends a normal HTTP request, such as:
+
+```text
+GET /api/notifications?after=42 HTTP/1.1
+Host: api.example.com
+Accept: application/json
+```
+
+The `after` value tells the server the last event the client has already processed.
+
+If newer events already exist, the server responds immediately. If not, it does not respond right away. It keeps the request open and waits until either new data becomes available or a timeout is reached.
+
+When new data arrives, the server sends the response immediately. The client processes it and then opens another long polling request with the latest event ID it has seen.
+
+Long polling is not one permanent connection. It is a chain of normal HTTP requests, where each request may wait before returning.
+
+A single request goes through three phases:
+
+1. **Check existing data.** Look in reliable storage for events newer than the client's cursor.
+2. **Wait for new data.** If nothing is there, pause the request. Do not spin in a loop checking over and over. Resume the request when an event arrives from an event bus, database notification, queue, or in-process signal.
+3. **Respond and reconnect.** Return the new events, or an empty response on timeout. The client updates its cursor and sends the next request.
+
+Compared with regular polling:
+
+| Metric          | Short Polling              | Long Polling                                 |
+| --------------- | -------------------------- | -------------------------------------------- |
+| Request pattern | Request every N seconds    | Keep one pending request                     |
+| Empty responses | Common                     | Still possible on timeout, but less frequent |
+| Update delay    | Up to the polling interval | Usually soon after data is available         |
+| Server work     | Constant even when idle    | Mostly tied to active clients and events     |
+| Complexity      | Low                        | Moderate                                     |
+
+<h1 id="3-the-timeout">3. The Timeout</h1>
+
+A server should not keep a long polling request open forever. Proxies, load balancers, servers, and clients all have timeout limits, so the server usually holds the request for a fixed period, such as 30 seconds. When that period ends with no data, it returns an empty response and the client immediately asks again.
+
+Picking the value is a trade-off:
+
+- **Too short**, and clients reconnect too often. You are back to creating many unnecessary requests.
+- **Too long**, and the connection may hit infrastructure limits. Failures also take longer to detect, because a dead connection looks the same as a quiet one until the timeout ends.
+
+A hold timeout of 20 to 60 seconds is common, but the right value depends on the infrastructure around your server. Section 7 covers how to line it up with every layer in the path.
+
+<h1 id="4-server-side-architecture">4. Server-Side Architecture</h1>
+
+Start with a single application server. If 10,000 clients are long polling, the server may have close to 10,000 open requests waiting for events.
+
+When an event arrives, the server finds the matching request, returns the response, and the client immediately reconnects. So the server must manage many waiting connections efficiently.
+
+Older thread-per-request servers struggle with this. Each open request occupies a dedicated thread, even while it is doing nothing but waiting. With many clients, that model wastes memory and can hit thread limits.
+
+Modern asynchronous, event-driven servers handle this much better. They use event loops that wait for network events, so a waiting request does not tie up an operating system thread. Good fits include Node.js with async handlers, Go with goroutines, async Python frameworks, Java or Kotlin reactive servers, JVM virtual threads, and Nginx/OpenResty-style servers.
+
+Still, every open request consumes resources: memory, a socket, a file descriptor, and connection-management overhead. Long polling can be more efficient than frequent short polling, but it is not free. It replaces many empty requests with many open requests.
+
+At a high level, the handler does this:
+
+1. Authenticate and authorize the request.
+2. Read events after the client's cursor.
+3. If events exist, return them immediately.
+4. If not, register the request as waiting for that user or topic.
+5. Complete the request when an event arrives or the timeout fires.
+6. Remove the waiter when the client disconnects.
+
+<h1 id="5-scaling-across-multiple-servers">
+  5. Scaling Across Multiple Servers
+</h1>
+
+When one server is no longer enough, place multiple application servers behind a load balancer.
+
+Now there is a new problem. Say a client's pending request is waiting on server 3. Another backend service generates an event for that client. How does the event reach server 3? The service that produced it has no idea which server holds the request.
+
+This is a distributed routing problem. A common solution is shared messaging infrastructure such as Redis Pub/Sub, Kafka, or another message broker:
+
+- Backend services publish events to the broker.
+- Every application server subscribes.
+- The server holding the client's pending request receives the event and returns it.
+
+This separates event production from HTTP delivery. Producers do not need to know which server holds which client, and you can add application servers without changing them.
+
+The event store and the broker serve different purposes. The event store is the source of truth that prevents missed events. The broker wakes up waiting requests quickly. Do not rely only on the broker for correctness. Pub/sub messages can be missed. If a server misses one, the client's next request must still be able to recover from storage.
+
+<h1 id="6-avoiding-missed-events">6. Avoiding Missed Events</h1>
+
+Long polling has one subtle problem: the client is not continuously connected. There is always a small gap between receiving one response and sending the next request.
+
+If an event arrives during that gap, it could be lost if the server only delivers events to currently open requests.
+
+The fix is a cursor. Each event gets a sequence number, event ID, or timestamp. The client includes the last one it processed in every request: "Give me everything after event 43." The server checks reliable storage before waiting, so even if newer events arrived while the client was reconnecting, it can still return them.
+
+The same cursor lets the client recover after a temporary network failure. It reconnects, sends its last event ID, and picks up where it left off.
+
+For most systems, an increasing event ID is better than a timestamp. Timestamps can collide, move backward across machines, or create confusing edge cases.
+
+<h1 id="7-load-balancers-and-timeouts">7. Load Balancers and Timeouts</h1>
+
+Infrastructure timeouts matter more with long polling than with normal requests, because a long poll is supposed to sit idle.
+
+Say the client expects the server to hold a request for 30 seconds, but the load balancer has a 20-second idle timeout. The load balancer closes the connection at 20 seconds, and the client sees a failure even though the application is working fine.
+
+The same issue can happen with reverse proxies, API gateways, CDNs, and client HTTP libraries. Every layer in the path must use a timeout compatible with the long polling duration.
+
+A common approach is to set the application's hold timeout slightly shorter than every infrastructure timeout. Then the server closes the request intentionally, with a clean empty response, before any intermediary cuts it off.
+
+For example, to support a 30-second hold behind Nginx, configure the proxy to outlast the server:
+
+```text
+# Example Nginx settings for a 30 second long poll
+location /api/notifications {
+    proxy_pass http://backend;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+
+    proxy_read_timeout 40s;
+    send_timeout 40s;
+}
+```
+
+The client's own request timeout should also be longer than the server's hold. If the client gives up first, it cancels healthy requests before the server has a chance to respond.
+
+<h1 id="8-failure-and-reconnection">8. Failure and Reconnection</h1>
+
+Because long polling uses standard HTTP requests, failures are relatively easy to handle. If a request fails, the client can simply retry.
+
+But retries should be controlled. If a large cluster fails and hundreds of thousands of clients reconnect at the same moment, they can overload the system while it is trying to recover. This is a reconnect storm.
+
+Clients should spread out reconnection attempts:
+
+- **Retry delays.** Do not retry instantly after an error.
+- **Exponential backoff.** Double the delay after each consecutive failure, up to a cap.
+- **Jitter.** Randomize each delay so clients that failed together do not retry together.
+
+Normal empty timeout responses are not failures. After one of those, the client should reconnect immediately.
+
+Important state should also not live only on one application server. The client's position in the event stream belongs in reliable storage, keyed by its cursor. That way a client can reconnect to any server, not just the one that failed, and resume from its last known event.
+
+A basic client needs to handle four things: data, empty timeouts, errors with backoff, and cancellation.
+
+```java
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+
+class LongPollingClient {
+    private final String endpoint;
+    private final HttpClient http = HttpClient.newHttpClient();
+    private long lastEventId = 0;
+    private int failures = 0;
+    private volatile boolean running = false;
+
+    LongPollingClient(String endpoint) {
+        this.endpoint = endpoint;
+    }
+
+    void start() throws InterruptedException {
+        running = true;
+
+        while (running) {
+            try {
+                PollResponse response = poll();
+
+                for (Event event : response.events) {
+                    handleEvent(event);
+                    lastEventId = event.id;
+                }
+                failures = 0;
+            } catch (Exception error) {
+                System.out.println("poll failed: " + error.getMessage());
+                backoffWithJitter();
+            }
+        }
+    }
+
+    PollResponse poll() throws Exception {
+        String url = endpoint + "?after=" + lastEventId;
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .timeout(Duration.ofSeconds(35))
+                .header("Accept", "application/json")
+                .GET()
+                .build();
+
+        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() != 200) {
+            throw new RuntimeException("HTTP " + response.statusCode());
+        }
+
+        return parseJson(response.body());
+    }
+
+    void handleEvent(Event event) {
+        System.out.println("received: " + event);
+    }
+
+    void backoffWithJitter() throws InterruptedException {
+        failures++;
+        long cap = Math.min(30_000, 1000L << Math.min(failures - 1, 5));
+        long delay = (long) (Math.random() * cap);
+        Thread.sleep(delay);
+    }
+
+    void stop() {
+        running = false;
+    }
+}
+```
+
+```python
+import random
+import time
+
+import requests  # ambient HTTP client
+
+
+class LongPollingClient:
+    def __init__(self, endpoint):
+        self.endpoint = endpoint
+        self.last_event_id = 0
+        self.failures = 0
+        self.running = False
+
+    def start(self):
+        self.running = True
+
+        while self.running:
+            try:
+                response = self.poll()
+
+                for event in response["events"]:
+                    self.handle_event(event)
+                    self.last_event_id = event["id"]
+                self.failures = 0
+            except Exception as error:
+                print("poll failed:", error)
+                self.backoff_with_jitter()
+
+    def poll(self):
+        url = f"{self.endpoint}?after={self.last_event_id}"
+
+        response = requests.get(
+            url,
+            headers={"Accept": "application/json"},
+            timeout=35,
+        )
+
+        if not response.ok:
+            raise RuntimeError(f"HTTP {response.status_code}")
+
+        return response.json()
+
+    def handle_event(self, event):
+        print("received:", event)
+
+    def backoff_with_jitter(self):
+        self.failures += 1
+        cap = min(30.0, 1.0 * 2 ** (self.failures - 1))
+        delay = random.uniform(0, cap)
+        time.sleep(delay)
+
+    def stop(self):
+        self.running = False
+```
+
+```cpp
+#include <algorithm>
+#include <chrono>
+#include <iostream>
+#include <random>
+#include <string>
+#include <thread>
+
+// Assumes an ambient HTTP client library (no HTTP client in the C++ standard library).
+extern HttpClient httpClient;
+
+class LongPollingClient {
+public:
+    explicit LongPollingClient(std::string endpoint)
+        : endpoint_(std::move(endpoint)) {}
+
+    void start() {
+        running_ = true;
+
+        while (running_) {
+            try {
+                PollResponse response = poll();
+
+                for (const Event& event : response.events) {
+                    handleEvent(event);
+                    lastEventId_ = event.id;
+                }
+                failures_ = 0;
+            } catch (const std::exception& error) {
+                std::cout << "poll failed: " << error.what() << "\n";
+                backoffWithJitter();
+            }
+        }
+    }
+
+    PollResponse poll() {
+        std::string url = endpoint_ + "?after=" + std::to_string(lastEventId_);
+
+        // 35s request timeout, illustrative ambient client.
+        HttpResponse response = httpClient.get(url, /*timeoutMs=*/35000);
+
+        if (response.status != 200) {
+            throw std::runtime_error("HTTP " + std::to_string(response.status));
+        }
+
+        return parseJson(response.body);
+    }
+
+    void handleEvent(const Event& event) {
+        std::cout << "received: " << event << "\n";
+    }
+
+    void backoffWithJitter() {
+        failures_++;
+        int cap = std::min(30000, 1000 << std::min(failures_ - 1, 5));
+        static std::mt19937 rng{std::random_device{}()};
+        std::uniform_int_distribution<int> dist(0, cap);
+        std::this_thread::sleep_for(std::chrono::milliseconds(dist(rng)));
+    }
+
+    void stop() {
+        running_ = false;
+    }
+
+private:
+    std::string endpoint_;
+    long lastEventId_ = 0;
+    int failures_ = 0;
+    bool running_ = false;
+};
+```
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"math/rand"
+	"net/http"
+	"time"
+)
+
+type LongPollingClient struct {
+	endpoint    string
+	http        *http.Client
+	lastEventID int64
+	failures    int
+	running     bool
+}
+
+func NewLongPollingClient(endpoint string) *LongPollingClient {
+	return &LongPollingClient{endpoint: endpoint, http: &http.Client{}}
+}
+
+func (c *LongPollingClient) Start() {
+	c.running = true
+
+	for c.running {
+		response, err := c.Poll()
+		if err != nil {
+			fmt.Println("poll failed:", err)
+			c.BackoffWithJitter()
+			continue
+		}
+		c.failures = 0
+
+		for _, event := range response.Events {
+			c.HandleEvent(event)
+			c.lastEventID = event.ID
+		}
+	}
+}
+
+func (c *LongPollingClient) Poll() (*PollResponse, error) {
+	url := fmt.Sprintf("%s?after=%d", c.endpoint, c.lastEventID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	return parseJSON(resp.Body)
+}
+
+func (c *LongPollingClient) HandleEvent(event Event) {
+	fmt.Println("received:", event)
+}
+
+func (c *LongPollingClient) BackoffWithJitter() {
+	c.failures++
+	capMs := min(30000, 1000<<min(c.failures-1, 5))
+	delay := time.Duration(rand.Intn(capMs+1)) * time.Millisecond
+	time.Sleep(delay)
+}
+
+func (c *LongPollingClient) Stop() {
+	c.running = false
+}
+```
+
+```csharp
+using System;
+using System.Net.Http;
+using System.Threading;
+using System.Threading.Tasks;
+
+class LongPollingClient
+{
+    private readonly string _endpoint;
+    private readonly HttpClient _http = new HttpClient();
+    private readonly Random _random = new Random();
+    private long _lastEventId = 0;
+    private int _failures = 0;
+    private bool _running = false;
+
+    public LongPollingClient(string endpoint)
+    {
+        _endpoint = endpoint;
+    }
+
+    public async Task Start()
+    {
+        _running = true;
+
+        while (_running)
+        {
+            try
+            {
+                var response = await Poll();
+
+                foreach (var ev in response.Events)
+                {
+                    HandleEvent(ev);
+                    _lastEventId = ev.Id;
+                }
+                _failures = 0;
+            }
+            catch (Exception error)
+            {
+                Console.WriteLine("poll failed: " + error.Message);
+                await BackoffWithJitter();
+            }
+        }
+    }
+
+    public async Task<PollResponse> Poll()
+    {
+        var url = $"{_endpoint}?after={_lastEventId}";
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(35));
+
+        var request = new HttpRequestMessage(HttpMethod.Get, url);
+        request.Headers.Add("Accept", "application/json");
+
+        var response = await _http.SendAsync(request, cts.Token);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new Exception($"HTTP {(int)response.StatusCode}");
+        }
+
+        return ParseJson(await response.Content.ReadAsStringAsync());
+    }
+
+    public void HandleEvent(Event ev)
+    {
+        Console.WriteLine("received: " + ev);
+    }
+
+    public async Task BackoffWithJitter()
+    {
+        _failures++;
+        var cap = Math.Min(30000, 1000 << Math.Min(_failures - 1, 5));
+        var delay = _random.Next(cap + 1);
+        await Task.Delay(delay);
+    }
+
+    public void Stop()
+    {
+        _running = false;
+    }
+}
+```
+
+```typescript
+interface Event {
+  id: number;
+}
+
+interface PollResponse {
+  events: Event[];
+}
+
+class LongPollingClient {
+  private endpoint: string;
+  private lastEventId: number = 0;
+  private failures: number = 0;
+  private running: boolean = false;
+
+  constructor(endpoint: string) {
+    this.endpoint = endpoint;
+  }
+
+  async start(): Promise<void> {
+    this.running = true;
+
+    while (this.running) {
+      try {
+        const response = await this.poll();
+
+        for (const event of response.events) {
+          this.handleEvent(event);
+          this.lastEventId = event.id;
+        }
+        this.failures = 0;
+      } catch (error) {
+        console.log("poll failed:", (error as Error).message);
+        await this.backoffWithJitter();
+      }
+    }
+  }
+
+  async poll(): Promise<PollResponse> {
+    const url = `${this.endpoint}?after=${this.lastEventId}`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 35000);
+
+    try {
+      const response = await fetch(url, {
+        signal: controller.signal,
+        headers: { Accept: "application/json" },
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      return response.json() as Promise<PollResponse>;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  handleEvent(event: Event): void {
+    console.log("received:", event);
+  }
+
+  async backoffWithJitter(): Promise<void> {
+    this.failures++;
+    const cap = Math.min(30000, 1000 * 2 ** Math.min(this.failures - 1, 5));
+    const delay = Math.random() * cap;
+    return new Promise((resolve) => setTimeout(resolve, delay));
+  }
+
+  stop(): void {
+    this.running = false;
+  }
+}
+```
+
+The client timeout here is 35 seconds, slightly longer than a 30-second server hold. Backoff starts at 1 second, doubles on each consecutive failure up to 30 seconds, and resets after any successful response.
+
+<h1 id="9-when-to-use-long-polling">9. When to Use Long Polling</h1>
+
+Long polling works well when you need near-real-time updates but want to stay within the standard HTTP request-response model. Good examples:
+
+- Notifications
+- Job status updates
+- Results of asynchronous processing, such as a report or video that finishes rendering
+
+Compared with regular polling, it gives lower latency and avoids many unnecessary requests, without needing a fully persistent streaming connection.
+
+<h1 id="summary">Summary</h1>
+
+Regular polling forces a choice between latency and wasted requests. Long polling improves that trade-off: the server holds each request until data arrives or a timeout fires, and the client immediately reconnects.
+
+The hold timeout should be long enough to avoid needless reconnects and slightly shorter than every proxy, load balancer, and client timeout in the path.
+
+Async, event-driven servers handle many waiting requests without one thread per connection, but open requests still cost memory and sockets. Across multiple servers, a message broker such as Redis or Kafka routes each event to the server holding the client's request.
+
+Cursors close the gap between requests, so the server should always check reliable storage before waiting. When failures happen, clients retry with exponential backoff and jitter, and can resume on any server from their last event ID.
+
+Long polling fits notifications, job status, and async results: near-real-time updates that stay inside plain HTTP.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

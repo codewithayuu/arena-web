@@ -1,0 +1,243 @@
+---
+title: "multiprocessing Module"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "multiprocessing Module explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="why-a-separate-module-exists">Why a Separate Module Exists</h1>
+
+The constraint is the GIL: inside one interpreter, only one thread executes Python bytecode at a time. That's fine when threads spend most of their time waiting on I/O, but useless when threads are doing pure computation. Two threads computing image hashes don't run twice as fast as one. They run at roughly the same speed, because the GIL forces them to take turns.
+
+Processes don't share an interpreter. Each process gets its own Python runtime, its own memory, and its own GIL. Four processes hashing four images run on four CPU cores at the same time, no taking turns.
+
+The price is isolation. A list in one process is invisible to another. You can't just hand a Python object across the boundary; the data has to be serialized, sent over a pipe, and deserialized on the other side. That's slower than passing a reference between threads, and it places restrictions on what you can pass at all.
+
+The mental model for the rest of this lesson:
+
+Threads share one heap. They communicate by mutating the same objects (with locks for safety). Processes don't share anything by default. They communicate only through explicit channels (pipes, queues, shared memory regions).
+
+<h1 id="your-first-process">Your First Process</h1>
+
+`multiprocessing.Process` is the basic building block. You give it a target function and arguments, call `start()` to launch it, and call `join()` to wait for it to finish. The shape mirrors `threading.Thread` deliberately, so the API feels familiar if you've used threads.
+
+Here's a worker that simulates resizing a product image. We'll use a fake "resize" that just sleeps for a moment, because the point right now is the process lifecycle, not the work itself.
+
+The two `pid` numbers are different. `os.getpid()` returns the operating system's process ID, and the parent and child each have their own. That's the whole point: they're two separate processes the OS scheduled independently.
+
+A few details worth pinning down:
+
+- `target` is the function the child process will run.
+- `args` is a tuple of positional arguments passed to `target`. The trailing comma in `(101,)` matters; `(101)` is just the number 101, not a tuple.
+- `kwargs` (not shown) passes keyword arguments as a dict.
+- `start()` actually launches the new process. The function does not run until you call this.
+- `join()` blocks the calling process until the child finishes.
+
+The `if __name__ == "__main__":` guard is doing real work here, not decoration. We'll come back to why in a moment.
+
+To launch several workers in parallel, build a list of `Process` objects, start them all, then join them all:
+
+Four images, one second each, but the wall-clock time is about one second total. That's true parallelism. With four threads doing the same sleep-based work, you'd also get about a second (because `time.sleep` releases the GIL), but if the work were a tight CPU loop, threads would take roughly four seconds and processes would still take one.
+
+> **Cost:** Starting a process is not free. On Linux it takes a few milliseconds; on Windows and macOS with the `spawn` start method, it can be 50-200ms because Python boots a fresh interpreter. If your work unit takes less time than the startup cost, you'll spend more time launching processes than doing the actual work.
+
+<h1 id="inspecting-a-process-pid-is_alive-exitcode">
+  Inspecting a Process: pid, is_alive, exitcode
+</h1>
+
+A `Process` object exposes a few useful attributes you can read from the parent:
+
+Here's a worker that succeeds for some inputs and crashes for others, so we can see the different exit codes:
+
+The good worker exits with `0` (success). The bad worker raises an exception, which `multiprocessing` catches, prints to stderr, and translates into a non-zero exit code. Negative exit codes (`-9`, `-15`, etc.) mean the OS killed the process with a signal; `-9` is `SIGKILL`, `-15` is `SIGTERM`.
+
+One thing to know: an exception in a child process does **not** raise in the parent. The parent only sees the non-zero `exitcode`. If you want the actual exception object, you have to send it back through a queue, or use `concurrent.futures`, which wraps this for you.
+
+<h1 id="the-if-__name__-__main__-guard">
+  The if __name__ == "__main__": Guard
+</h1>
+
+This guard isn't a style preference for `multiprocessing` code; on Windows and modern macOS it's mandatory. Without it, you get an infinite recursion of processes spawning more processes until your machine falls over.
+
+To understand why, you need to know what happens when a child process starts. The default start method on Windows and (since Python 3.8) macOS is `spawn`. When you call `start()`, Python:
+
+1. Boots a brand-new interpreter for the child.
+2. Re-imports your script module from scratch in that interpreter.
+3. Looks up the `target` function by name.
+4. Calls it with the `args` you passed.
+
+Step 2 is the trap. Re-importing your script means re-running every top-level statement in it. If your top-level code includes `multiprocessing.Process(...).start()`, the child runs that too, which spawns another child, which spawns another, and so on.
+
+The `if __name__ == "__main__":` block is only true when the script is run directly, not when it's imported. So when the child re-imports your script, the guard is `False`, and the launch code is skipped. Only the function definitions and the import statements run, which is what the child needs.
+
+On Linux, the default start method has historically been `fork`, which clones the parent process directly without re-importing anything. With `fork`, the guard wasn't strictly necessary. But Python 3.14 changes the default to `spawn` on every platform (because `fork` has known issues with threads, file descriptors, and macOS internals), so going forward you should always use the guard, even on Linux.
+
+> **Cost:** Forgetting the guard on Windows or macOS produces a runaway fork bomb on import. You'll see hundreds of Python processes spawn in seconds. The fix is always the same: wrap launch code in `if __name__ == "__main__":`.
+
+The rule is simple: any code that calls `multiprocessing.Process(...).start()` or `Pool(...)` belongs inside the guard. Function definitions, class definitions, and imports stay at the top level so the child can find them.
+
+<h1 id="start-methods-spawn-fork-forkserver">
+  Start Methods: spawn, fork, forkserver
+</h1>
+
+`multiprocessing` supports three start methods, and they differ in how the child process is created and what it inherits.
+
+**`spawn`** is the safest and slowest. The child starts from nothing and rebuilds its state by importing your script. Anything you want available in the child has to be either defined at module level or passed explicitly through `args`/`kwargs`. This is the default on Windows for the obvious reason that Windows has no `fork` system call, and the default on macOS since Python 3.8 because `fork` interacts badly with macOS's frameworks. Starting from Python 3.14, it's the default on Linux too.
+
+**`fork`** is fast because it clones the parent process. The child inherits everything: open file descriptors, threads, module globals, even objects allocated by the parent. The OS uses copy-on-write, so memory pages are shared until either side writes to them. The catch: if your parent process has running threads, file handles, or holds locks at the moment of forking, the child inherits all of that and weird things happen. A child with a copy of a locked mutex and no thread to release it is a classic deadlock.
+
+**`forkserver`** is a middle ground. A small "server" process is started early, before the parent does anything risky. When you spawn a worker, the parent asks the server to fork a child. The server is clean (no app threads, no file handles), so the resulting child is also clean.
+
+You pick a start method explicitly with `set_start_method()`:
+
+A few rules:
+
+- Call `set_start_method` at most once per program, inside the `__main__` guard.
+- If you want to inspect the active method, use `multiprocessing.get_start_method()`.
+- If you want to use a non-default method only for one specific launch (without changing the global default), use `ctx = multiprocessing.get_context("forkserver")` and then `ctx.Process(...)`.
+
+For most production code, prefer `spawn` (or `forkserver` on Linux when startup cost matters). It's slower per process but predictable. Reserve `fork` for short scripts on Linux with no threads.
+
+**What gets pickled.** Under `spawn` and `forkserver`, every argument you pass to `Process(target=..., args=...)` is serialized with `pickle` on the parent side, written to a pipe, and deserialized on the child side. The target function itself is also looked up by its fully qualified name in the child's freshly-imported module. Anything that can't be pickled can't be passed.
+
+Under `fork`, none of this happens. The child is a clone, so it already has the args and the target function in its memory. That's why `fork` doesn't enforce picklability the way `spawn` does, and why code that worked on Linux can break when you move it to macOS or Windows.
+
+<h1 id="picklability-what-you-can-and-cant-pass">
+  Picklability: What You Can and Can't Pass
+</h1>
+
+Because `spawn` and `forkserver` send arguments through `pickle`, anything you pass to `Process(args=...)` must be picklable. Most ordinary Python data is fine: ints, floats, strings, bytes, tuples, lists, dicts, sets, and instances of regular classes defined at module level.
+
+The things that **don't** pickle are the ones that usually catch people:
+
+Here's a concrete example of what fails. A team writes a parallel image resizer and tries to pass a lambda for the size formula:
+
+The fix is to use a module-level function instead:
+
+Module-level functions have a stable qualified name (`__main__.halve_size`), so `pickle` records the name and `unpickle` re-imports the module and looks the function up. The actual function body is never serialized; it's loaded fresh from the source.
+
+For arguments, the same rule applies. Don't pass an open file handle to a child; pass the path and let the child open the file:
+
+The general principle: pass **data**, not **handles**. Anything that's "just bytes and primitives" travels fine. Anything that represents a live resource needs to be re-created on the other side.
+
+<h1 id="a-practical-speedup-example">A Practical Speedup Example</h1>
+
+Time to make this concrete with a CPU-bound workload that actually shows the parallel speedup. We'll compute a SHA-256 hash of a synthetic "product image" (a chunk of bytes) several times in a row, which is heavy enough to keep one core busy for a noticeable fraction of a second.
+
+We'll run three versions and time each:
+
+1. Sequential (one process, one core).
+2. Threaded (four threads in one process).
+3. Multiprocessing (four processes, ideally on four cores).
+
+The expectation: threads and sequential are about the same (because hashing is CPU-bound and the GIL serializes them), while multiprocessing is roughly 4x faster on a 4-core machine.
+
+A few things to read out of this:
+
+- **Threads got no speedup.** Four CPU-bound threads contend for the GIL, so they run serially in practice. The slight slowdown vs sequential comes from lock-handoff overhead.
+- **Multiprocessing got roughly 4x.** Each process runs on its own core with its own GIL. You don't hit exactly 4x because of process startup cost, serialization overhead, and OS scheduling.
+- **The 5 MB image isn't being copied via pickle in this version.** It's defined as a module-level constant, and under `fork` it would be inherited; under `spawn` (the default on Windows/macOS, and on Linux from 3.14), the constant is re-created in each child by re-importing the module. Either way, it's not being shipped through a pipe per call.
+
+If you'd written `hash_image` to take the image bytes as an argument, every call would have pickled 5 MB of bytes, written them to a pipe, and unpickled them in the child. That copying time can easily dwarf the actual work, which is why "pass data, not handles" generalizes to "pass small data, share large data through a different channel".
+
+> **Cost:** Pickling 5 MB of bytes and shipping them through a pipe costs roughly 20-50ms per call, depending on hardware. If your worker function does only a few ms of real work, that overhead eats your speedup. Keep argument payloads small.
+
+<h1 id="handling-child-failures">Handling Child Failures</h1>
+
+A child that raises an exception sets a non-zero `exitcode` and prints the traceback to stderr, but the parent's `join()` returns normally. If you care whether the work actually succeeded, you have to check `exitcode` yourself.
+
+Exit codes you'll see in practice:
+
+If you need the actual exception (not just "something went wrong"), put a `try/except` inside the target and send the error back through a queue or pipe. For most real applications, the cleaner pattern is `concurrent.futures.ProcessPoolExecutor`, which surfaces exceptions in the parent automatically when you call `.result()`.
+
+<h1 id="terminating-and-daemons">Terminating and Daemons</h1>
+
+Most of the time you should let processes finish on their own. Two cases where you need more control:
+
+**Terminating a runaway process.** `process.terminate()` sends `SIGTERM` (a polite "please exit"), and `process.kill()` sends `SIGKILL` (a non-polite "exit immediately"). After either, you still need to call `join()` to release the OS-level process slot. Use this sparingly; killing a process mid-work can corrupt files it had open.
+
+**Daemon processes.** Setting `process.daemon = True` before `start()` marks the process as a daemon, which means: when the parent process exits, the daemon child is killed automatically. This is useful for background helpers (a metrics emitter, a log shipper) that should die with the application. Daemon processes can't have their own children.
+
+Without `daemon=True`, the parent would hang forever in `emit_metrics`'s infinite loop, because Python won't exit while non-daemon child processes are alive.
+
+<h1 id="a-slightly-bigger-example-parallel-csv-processing">
+  A Slightly Bigger Example: Parallel CSV Processing
+</h1>
+
+To tie everything together, here's a more realistic worker that processes a CSV of orders. Each worker handles a slice of the file and writes its results to a separate output file. The parent splits the work, launches one process per slice, waits for all to finish, and reports timings and exit codes.
+
+Notice what's being passed across the boundary: strings (paths) and integers (row indices). No open file handles, no pickled DataFrames, no live database connections. Each child opens its own input file and writes its own output file. That's a deliberately simple, picklable interface.
+
+The output files come out separate, which is fine if a downstream step concatenates them. If you wanted a single combined output, the workers would need to communicate, either by writing to a shared queue or by having the parent merge the per-worker files at the end. Letting workers append to the same file from multiple processes is a recipe for interleaved garbage; don't do it.
+
+This whole pattern, "split work into independent slices, run each in its own process, combine the results in the parent," is the bread-and-butter use of multiprocessing for batch jobs.
+
+<h1 id="quiz">Quiz</h1>
+
+<h1 id="quiz-questions">Quiz Questions</h1>
+
+**Question 1: Why can multiprocessing speed up CPU-bound Python work when threading usually cannot?**
+
+- [x] It creates separate interpreters, so each worker has its own GIL.
+- [ ] It disables the GIL while each child process runs Python bytecode.
+- [ ] It shares one heap but schedules threads more fairly across CPU cores.
+- [ ] It converts Python bytecode into native machine code before running it.
+
+**Question 2: What is the main purpose of using if **name** == "**main**": around multiprocessing startup code?**
+
+- [ ] It makes child processes inherit local variables by reference.
+- [x] It prevents spawned children from rerunning process-creation code on import.
+- [ ] It forces join() to wait for every process started by the program.
+- [ ] It lets Process objects reuse the parent process identifier safely.
+
+**Question 3: When creating multiprocessing.Process(target=resize_image, args=(101,)), why does the comma matter?**
+
+- [ ] It marks 101 as immutable, so the child can serialize it safely.
+- [ ] It turns the argument into bytes before crossing the process boundary.
+- [x] It makes args a one-item tuple instead of the integer 101.
+- [ ] It delays evaluating 101 until start() is called by the parent.
+
+**Question 4: A child process appends to a normal list passed through args. What should the parent expect after join()?**
+
+- [ ] The parent sees the append because lists are mutable references.
+- [ ] The parent sees the append only if the list was created at module scope.
+- [x] The parent list is unchanged; use an explicit channel to send data back.
+- [ ] The append is replayed in the parent when the process exitcode is read.
+
+**Question 5: Which target function is safest to use with multiprocessing across Windows, macOS, and Linux spawn-style starts?**
+
+- [ ] A lambda assigned to a variable inside the main guard.
+- [ ] A nested function that closes over the parent's local variables.
+- [x] A top-level function with arguments that can be pickled.
+- [ ] A bound method of any object currently alive in the parent.
+
+**Question 6: What is the exact stdout of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 7: What is the exact stdout of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 8: What is the exact stdout of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+<QuizCard />
+
+<CommentsSection />
+
+</LessonCard>

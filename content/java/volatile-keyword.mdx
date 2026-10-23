@@ -1,0 +1,452 @@
+---
+title: "volatile Keyword"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "volatile Keyword explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+`volatile` is the lighter-weight tool for the cases where visibility is needed but not mutual exclusion.
+
+<h1 id="the-visibility-problem">The Visibility Problem</h1>
+
+Java threads run on CPUs, and modern CPUs are aggressive about caching. When a thread reads a field, the value can end up in a CPU register, in an L1 cache, in an L2 cache, or in main memory. When the thread writes, the new value can sit in a write buffer for a while before it flushes to memory. The JVM and the just-in-time compiler are equally aggressive: they're allowed to hoist a field read out of a loop, cache it in a register, and never look at memory again until the loop exits.
+
+That's great for performance in single-threaded code. It's a disaster across threads. If one thread updates a field and another thread is spinning on a cached copy in a register, the second thread can spin forever and never notice the update.
+
+A canonical broken program, written for an e-commerce store. A worker thread keeps accepting orders until a flag is flipped. The main thread waits a beat and flips the flag.
+
+```java
+public class OrderWorkerBroken {
+
+    static boolean acceptingOrders = true;
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread worker = new Thread(() -> {
+            int processed = 0;
+            while (acceptingOrders) {
+                processed++;
+            }
+            System.out.println("Worker stopped after " + processed + " orders");
+        });
+
+        worker.start();
+        Thread.sleep(100);
+        acceptingOrders = false;
+        System.out.println("Main thread flipped the flag");
+
+        worker.join(2000);
+        if (worker.isAlive()) {
+            System.out.println("Worker is STILL running");
+        }
+    }
+}
+```
+
+The main thread flips `acceptingOrders` to `false`. The worker thread is sitting in a tight loop reading the same field. The expected outcome is that the worker sees the change and stops. Instead, on most JVMs with a server-class JIT, the worker keeps running indefinitely, because the JIT noticed that nothing inside the loop body changes `acceptingOrders` and decided it's safe to cache the value in a register. From the worker's point of view, the field is still `true`, forever.
+
+This is not a bug in the JVM. It's the JVM doing exactly what the Java Memory Model permits when there are no synchronization actions between threads. Two threads with no coordination are allowed to disagree about what's in memory. The fix is to introduce a coordination point, which is what `volatile` is for.
+
+The diagram shows the situation. The main thread updates its local view of the field, that view may or may not flush to memory at some point, and the worker thread is reading a copy it pulled into a register before the main thread ever touched it. There's no traffic between the worker's register and main memory once the JIT decides to hoist the read, so the worker is disconnected from the rest of the program.
+
+<h1 id="what-volatile-guarantees">What volatile Guarantees</h1>
+
+Declaring a field `volatile` tells the JVM two things. First, every read of the field must come from main memory, not a register or a cached copy. Second, every write must go all the way to main memory before the writing thread moves on. Between threads, that turns a field into a synchronization point: when thread A writes a `volatile` field and thread B subsequently reads it, B is guaranteed to see A's write, plus everything else A did before that write.
+
+Here's the same shutdown program with one keyword changed.
+
+```java
+public class OrderWorkerFixed {
+
+    static volatile boolean acceptingOrders = true;
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread worker = new Thread(() -> {
+            int processed = 0;
+            while (acceptingOrders) {
+                processed++;
+            }
+            System.out.println("Worker stopped after " + processed + " orders");
+        });
+
+        worker.start();
+        Thread.sleep(100);
+        acceptingOrders = false;
+        System.out.println("Main thread flipped the flag");
+
+        worker.join(2000);
+        if (worker.isAlive()) {
+            System.out.println("Worker is STILL running");
+        } else {
+            System.out.println("Worker exited cleanly");
+        }
+    }
+}
+```
+
+The processed count varies wildly between runs because it depends on how long the worker spun before the main thread woke up and flipped the flag, but the important part is the last line. The worker actually exits. The single word `volatile` changed the field from "private to whatever cache the thread happens to have" to "shared, with every read going to memory."
+
+`volatile` does not change what the field is. It's still a `boolean`. What changed is the visibility contract: reads can't be hoisted out of loops, writes can't sit in buffers across thread boundaries, and the JIT has to respect the field as a memory-fence-bearing access on every touch.
+
+A volatile read costs roughly the same as a normal read on most architectures, because reads from cache are already cheap. A volatile write is more expensive than a normal write because it has to drain the CPU's store buffer to main memory and may emit a memory barrier instruction. In a hot loop, a non-volatile field is faster, but only if the thread is the sole reader and writer.
+
+A second e-commerce example: a configuration object that can be hot-reloaded at runtime. One thread (say a config watcher) builds a new `Configuration` object when the admin updates the rules, then publishes it to a volatile reference. Every request thread reads the reference once per request and uses whatever it sees.
+
+```java
+public class ConfigurationDemo {
+
+    static volatile Configuration current = new Configuration(0.10, 50.0);
+
+    public static void main(String[] args) throws InterruptedException {
+        // Request threads read the current configuration on each request.
+        Thread requestHandler = new Thread(() -> {
+            for (int i = 0; i < 4; i++) {
+                Configuration snapshot = current;
+                System.out.println("Request " + i +
+                    " sees discount=" + snapshot.discountPercent() +
+                    " free shipping over $" + snapshot.freeShippingThreshold());
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        });
+
+        requestHandler.start();
+        Thread.sleep(150);
+
+        // Admin updates the rules. One write to the volatile reference.
+        current = new Configuration(0.20, 35.0);
+        System.out.println("Admin published new configuration");
+
+        requestHandler.join();
+    }
+
+    record Configuration(double discountPercent, double freeShippingThreshold) {}
+}
+```
+
+The key here is that `Configuration` itself is immutable (it's a `record` with two `double` fields). The volatile reference points at one of two snapshot objects. Updating the configuration means building a new snapshot and assigning it to the reference. Because the reference is volatile, every request thread that reads after the publish is guaranteed to see the new snapshot, not a half-updated mix of old and new fields.
+
+What makes this safe: the fields inside `Configuration` are never mutated. The only mutation is the assignment of the reference, which is a single write to a single field. That's the kind of mutation `volatile` handles correctly. If we'd instead tried to mutate the fields of the existing `Configuration`, we'd be back in the broken world, because mutating two fields takes two writes, and `volatile` only protects one field at a time.
+
+<h1 id="the-happens-before-rule">The Happens-Before Rule</h1>
+
+The Java Memory Model defines a relation called **happens-before** between actions in a program. If action A happens-before action B, then everything A did, including writes to ordinary (non-volatile) fields, is visible to B. For volatile fields, the rule is:
+
+> A write to a volatile field happens-before every subsequent read of that same field.
+
+"Subsequent" here means in the program order across all threads, not just within one thread. If thread A writes `acceptingOrders = false`, and thread B later reads `acceptingOrders` and observes `false`, then everything thread A did before the write is also visible to thread B. That includes writes to other fields, even non-volatile ones.
+
+This is what makes the configuration pattern work. The config watcher builds the new `Configuration` object, sets its fields, and then assigns it to the volatile reference. The two field writes happen before the reference write. When a request thread reads the reference and gets the new object, the happens-before rule guarantees the field writes are visible too. Without that piggyback, the request thread might see the new reference but stale fields, which would be the worst kind of bug.
+
+The diagram traces the relationship. The field writes in thread A happen-before the volatile write in thread A (same thread, program order). The volatile write happens-before the volatile read in thread B (the rule). The volatile read in thread B happens-before the field accesses in thread B (same thread, program order). By transitivity, the field writes in thread A are visible to the field accesses in thread B. That chain is the reason `volatile` is useful for publishing immutable objects.
+
+Without the volatile reference, thread B might see the new pointer (or might not), and even if it does, it has no guarantee about the state of the fields inside the new object. With the volatile, the publish is safe.
+
+<h1 id="the-critical-limitation-no-atomicity-for-compound-operations">
+  The Critical Limitation: No Atomicity for Compound Operations
+</h1>
+
+`volatile` guarantees that reads and writes of the field itself are visible across threads. It does not make compound operations atomic. A compound operation is anything that reads the field, computes a new value, and writes it back. The classic example is `i++`, which is really three steps: read `i`, add 1, write `i`. Between the read and the write, another thread can sneak in and update `i` too, and one of the two increments gets lost.
+
+Here's that bug, dressed up as an order counter for the store:
+
+```java
+public class OrderCounterBroken {
+
+    static volatile int orderCount = 0;
+
+    public static void main(String[] args) throws InterruptedException {
+        Runnable incrementTask = () -> {
+            for (int i = 0; i < 100_000; i++) {
+                orderCount++;
+            }
+        };
+
+        Thread t1 = new Thread(incrementTask);
+        Thread t2 = new Thread(incrementTask);
+        Thread t3 = new Thread(incrementTask);
+        Thread t4 = new Thread(incrementTask);
+
+        t1.start();
+        t2.start();
+        t3.start();
+        t4.start();
+
+        t1.join();
+        t2.join();
+        t3.join();
+        t4.join();
+
+        System.out.println("Expected: 400000");
+        System.out.println("Got:      " + orderCount);
+    }
+}
+```
+
+The exact number changes from run to run, but it's almost never 400,000. Four threads, 100,000 increments each, and the answer comes out short. Each increment is three operations: read `orderCount`, add 1, write `orderCount`. When two threads read the same value (say, 50), they both compute 51, and they both write 51. Two increments collapsed into one. The volatile keyword makes every read and every write visible, but it can't glue the three steps together into a single atomic operation. Nothing prevents another thread from interleaving between the read and the write.
+
+**What's wrong with this code?**
+
+```java
+static volatile int orderCount = 0;
+
+void recordOrder() {
+    orderCount++;
+}
+```
+
+**Why it fails:**
+
+`orderCount++` is `read, add, write`, not one indivisible step. Two threads can both read the same value, both add one, and both write the same incremented value, losing one increment. `volatile` makes reads and writes visible across threads but doesn't make the three steps run as a unit.
+
+**Fix (synchronized):**
+
+```java
+static int orderCount = 0;
+
+synchronized void recordOrder() {
+    orderCount++;
+}
+```
+
+**Fix (AtomicInteger, preferred for counters):**
+
+```java
+static final java.util.concurrent.atomic.AtomicInteger orderCount =
+    new java.util.concurrent.atomic.AtomicInteger(0);
+
+void recordOrder() {
+    orderCount.incrementAndGet();
+}
+```
+
+`synchronized` works but forces threads to serialize, which is wasteful for a simple counter. `AtomicInteger` is appropriate here: it uses a CPU-level compare-and-set instruction to make the read-modify-write happen as one atomic step, with no locking.
+
+The diagram shows a single interleaving where two increments are lost down to one. Multiply this across a few hundred thousand increments and a handful of threads, and you get the off-by-tens-of-thousands result above. `volatile` did its job: every read saw a real value from memory, every write went to memory. The problem is that the read-modify-write pattern is not protected by volatile alone.
+
+The same issue affects any compound operation: `count = count + delta`, `if (price < minimum) price = minimum;`, `if (!stopped) doWork();`. Anywhere you read a field, decide what to do, and write it back, you have a race. `volatile` is not enough.
+
+<h1 id="when-volatile-is-enough">When volatile Is Enough</h1>
+
+Given the limitation, the question becomes when `volatile` is appropriate at all. The answer is fairly crisp. `volatile` is enough when:
+
+1. The field is updated by a **single writer** (or when concurrent writes don't need to coordinate with each other).
+2. The update is a **single write** of a value that doesn't depend on the current value.
+3. **Multiple readers** need to see the latest value.
+
+The shutdown flag fits perfectly. One thread writes `acceptingOrders = false` once. Many worker threads read it in their loops. The value of `false` doesn't depend on the current value; it's a constant the writer wants to publish.
+
+The configuration reference fits too. One thread (the admin) builds a new immutable snapshot and assigns it to the reference. Many threads read the reference. The new reference doesn't depend on the current reference; it's a freshly built object.
+
+A "current minimum price" tracker would not fit, even with a single writer, because the writer would do `if (newPrice < minPrice) minPrice = newPrice;`. That's a read-modify-write, and even though only one thread writes, the writer's own logic still reads the field once and writes a value derived from it. Volatile would protect each operation in isolation but not the combination.
+
+Here's a table of common patterns and what they need:
+
+| Pattern                                   | Tool                                                                    | Why                                                              |
+| ----------------------------------------- | ----------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| One-shot shutdown flag                    | `volatile boolean`                                                      | Single write of `true` or `false`, many readers                  |
+| Hot-reloadable config reference           | `volatile Configuration`                                                | Single write of a new immutable object, many readers             |
+| Cached value with one publisher           | `volatile T`                                                            | One thread writes the cache, others read                         |
+| Counter incremented by many threads       | `AtomicInteger`                                                         | Compound operation; volatile alone loses updates                 |
+| Lazy initialization with multiple readers | `volatile T` + double-checked locking, or `Holder` idiom                | Reference write needs visibility, but assignment needs care      |
+| Multi-step update of two related fields   | `synchronized` block                                                    | Volatile can't atomically update two fields                      |
+| Read-modify-write of a single int         | `AtomicInteger`                                                         | Same reason as the counter                                       |
+| Producer/consumer queue                   | A real concurrent collection (`ConcurrentLinkedQueue`, `BlockingQueue`) | Volatile alone can't coordinate multiple producers and consumers |
+
+The rule: `volatile` is for **publishing**: one thread writes a value (or a reference to an immutable object), other threads read it. If the writers need to see what other writers did before deciding what to write, you need a stronger tool.
+
+<h1 id="a-larger-working-example">A Larger Working Example</h1>
+
+Tying the patterns together, here's an order processor that uses both volatile patterns from this chapter: a shutdown flag and a hot-reloadable configuration. The worker keeps running until shutdown, and on each pass it reads the current pricing config to decide whether to apply a discount.
+
+```java
+public class OrderProcessor {
+
+    static volatile boolean acceptingOrders = true;
+    static volatile PricingConfig pricing = new PricingConfig(0.0, 999.0);
+
+    record PricingConfig(double discountPercent, double freeShippingThreshold) {}
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread worker = new Thread(() -> {
+            int handled = 0;
+            while (acceptingOrders) {
+                PricingConfig snapshot = pricing;
+                double cartTotal = 60.0;
+                double discounted = cartTotal * (1 - snapshot.discountPercent());
+                boolean freeShipping = discounted >= snapshot.freeShippingThreshold();
+
+                if (handled % 1_000_000 == 0) {
+                    System.out.println("Handled " + handled +
+                        " | total=$" + discounted +
+                        " | free shipping=" + freeShipping);
+                }
+                handled++;
+            }
+            System.out.println("Worker exited after " + handled + " iterations");
+        });
+
+        worker.start();
+
+        Thread.sleep(50);
+        pricing = new PricingConfig(0.10, 50.0);
+        System.out.println("Admin: pricing updated (10% off, free shipping over $50)");
+
+        Thread.sleep(50);
+        pricing = new PricingConfig(0.20, 40.0);
+        System.out.println("Admin: pricing updated (20% off, free shipping over $40)");
+
+        Thread.sleep(50);
+        acceptingOrders = false;
+        System.out.println("Admin: shutting down");
+
+        worker.join();
+    }
+}
+```
+
+**Output (the iteration counts will vary by machine):**
+
+```text
+Handled 0 | total=$60.0 | free shipping=false
+Handled 1000000 | total=$60.0 | free shipping=false
+Admin: pricing updated (10% off, free shipping over $50)
+Handled 2000000 | total=$54.0 | free shipping=true
+Admin: pricing updated (20% off, free shipping over $40)
+Handled 3000000 | total=$48.0 | free shipping=true
+Admin: shutting down
+Worker exited after 3247891 iterations
+```
+
+The worker reads `acceptingOrders` once per loop iteration and reads `pricing` once per iteration too. Both reads are forced to go to memory because the fields are volatile. When the admin publishes a new `PricingConfig`, the worker picks it up on its next iteration. When the admin sets `acceptingOrders = false`, the worker sees it on its next check and exits.
+
+What's not happening here matters too. We're not synchronizing the loop. The worker spins on its own without ever blocking, which is roughly free in CPU terms (a volatile read is cheap on modern hardware) and avoids the overhead of acquiring and releasing a lock per iteration. The cost is that the worker burns a core; in real code you'd usually use a blocking queue or `ExecutorService`. This example shows the volatile pattern in isolation.
+
+If you tried to add a "total orders processed" counter that all worker threads incremented, you'd be back in the broken counter territory from the last section. Volatile is right for the flag and the reference, not for the counter. Each piece of state needs the tool that fits its update pattern.
+
+Spinning on a volatile flag burns the worker thread's CPU at 100%. For a real shutdown, prefer `Thread.interrupt()` and check `Thread.currentThread().isInterrupted()`, or use a `BlockingQueue` so the worker blocks when there's nothing to do. Volatile is the visibility part of the solution, not a substitute for proper waiting primitives.
+
+<h1 id="reference-assignment-is-atomic-even-without-volatile">
+  Reference Assignment Is Atomic, Even Without volatile
+</h1>
+
+One last bit of memory-model fine print. The Java Language Specification guarantees that the assignment of a reference (and of `int`, `byte`, `short`, `char`, `float`, and `boolean`) is atomic on the bytecode level. A reader will never see a half-written reference, even without `volatile`. What `volatile` adds is the **visibility** guarantee: that the reader will actually see the write at all, and in a timely manner.
+
+So without `volatile`, a reference write is atomic but may not be visible. The reader might never observe the new value, or might observe it after an arbitrary delay. With `volatile`, the write is atomic **and** visible. That distinction is why `volatile` is well-suited to publishing an immutable object reference: you get atomic publication of the reference plus the happens-before piggyback that brings the object's fields along.
+
+The two cases where assignment is not atomic without extra help are `long` and `double` on 32-bit JVMs. The JLS says a 64-bit non-volatile write can be split into two 32-bit writes, so a reader could potentially see the high half of an old value and the low half of a new one. Declaring the field `volatile` makes the write atomic in this case too. On 64-bit JVMs this is moot in practice, but the rule is part of the language spec, so writing `volatile long` on a counter you intend to publish is the safe move regardless of platform.
+
+```java
+public class LongPublish {
+
+    static volatile long totalRevenue = 0L;
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread publisher = new Thread(() -> {
+            totalRevenue = 1_234_567_890_123L;
+        });
+
+        Thread reader = new Thread(() -> {
+            long seen = totalRevenue;
+            System.out.println("Reader saw: " + seen);
+        });
+
+        publisher.start();
+        publisher.join();
+        reader.start();
+        reader.join();
+    }
+}
+```
+
+In this tiny program the publisher finishes before the reader starts, so the read is bound to see the new value, but the `volatile` is what guarantees the 64-bit write isn't observed as two halves on the rare 32-bit JVM. Treat `volatile long` and `volatile double` as the default when a field crosses thread boundaries, even if you're on a 64-bit machine, because the cost is negligible and the future portability is real.
+
+<h1 id="how-volatile-compares-to-synchronized">
+  How volatile Compares to synchronized
+</h1>
+
+Both keywords give you visibility, but they're solving different problems.
+
+| Aspect                                    | `volatile`                                | `synchronized`                        |
+| ----------------------------------------- | ----------------------------------------- | ------------------------------------- |
+| Visibility                                | Yes, on every read and write of the field | Yes, on entry and exit of the block   |
+| Atomicity for single read or single write | Yes                                       | Yes                                   |
+| Atomicity for compound operations (`i++`) | No                                        | Yes                                   |
+| Mutual exclusion                          | No                                        | Yes                                   |
+| Blocking                                  | Never (a volatile access is non-blocking) | Yes (waiting threads block)           |
+| Reordering protection                     | Around the volatile access only           | Across the entire synchronized block  |
+| Performance cost                          | Low (memory barrier on write)             | Higher (lock acquisition and release) |
+| Use case                                  | Publishing a flag or immutable reference  | Coordinating multi-step state changes |
+
+The way to read the table: if you need mutual exclusion, you need `synchronized` (or a `Lock`). If you only need visibility of a single field, `volatile` is lighter and often enough. If you need to update one field as part of a multi-step operation involving other fields, `volatile` is not enough. If you need to atomically update one numeric field under contention, neither is appropriate on its own; use an atomic class.
+
+<h1 id="brief-look-at-atomicinteger">Brief Look at AtomicInteger</h1>
+
+Since the counter example came up, here's a one-screen tour of `AtomicInteger` (and its siblings, `AtomicLong`, `AtomicBoolean`, `AtomicReference`).
+
+```java
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class OrderCounterFixed {
+
+    static final AtomicInteger orderCount = new AtomicInteger(0);
+
+    public static void main(String[] args) throws InterruptedException {
+        Runnable incrementTask = () -> {
+            for (int i = 0; i < 100_000; i++) {
+                orderCount.incrementAndGet();
+            }
+        };
+
+        Thread t1 = new Thread(incrementTask);
+        Thread t2 = new Thread(incrementTask);
+        Thread t3 = new Thread(incrementTask);
+        Thread t4 = new Thread(incrementTask);
+
+        t1.start(); t2.start(); t3.start(); t4.start();
+        t1.join(); t2.join(); t3.join(); t4.join();
+
+        System.out.println("Expected: 400000");
+        System.out.println("Got:      " + orderCount.get());
+    }
+}
+```
+
+Every run produces 400,000. `incrementAndGet` uses a hardware compare-and-set internally: read the current value, attempt to write `current + 1`, and retry if another thread beat you to it. The retry loop is invisible to your code, but it's what makes the increment behave as a single atomic step. No locking, no thread blocking, just CPU-level coordination. `AtomicInteger` is the right answer for the counter pattern, and `volatile int` is the wrong one.
+
+The same shape applies to `AtomicLong` for 64-bit counters, `AtomicBoolean` for atomic flag flips where the writer needs to know whether it succeeded, and `AtomicReference<T>` for atomic reference swaps.
+
+<h1 id="common-misuses">Common Misuses</h1>
+
+A few patterns to watch for that look correct but aren't.
+
+**Volatile-checked, not volatile-updated.** A field is declared `volatile`, but the update logic still treats it as a normal field. The visibility on the read side doesn't fix the lost-update problem.
+
+```java
+static volatile int stockCount = 100;
+
+void recordSale() {
+    if (stockCount > 0) {
+        stockCount--; // race: read and write are separate steps
+    }
+}
+```
+
+Two threads can both see `stockCount > 0`, both decrement, and the stock can dip below the floor. Use a lock or an atomic.
+
+**Volatile collection.** Declaring `volatile List<String> items = new ArrayList<>()` makes the reference volatile, not the contents. The list itself is still not thread-safe. Reading `items` from another thread sees the latest reference, but if two threads call `items.add(...)` concurrently, the `ArrayList` will corrupt its internal state. Use `CopyOnWriteArrayList`, `Collections.synchronizedList`, or guard accesses with a lock.
+
+**Volatile only on one side.** Both reader and writer need to use the volatile field directly, not a copy. If one side reads through a non-volatile alias or caches the value in a local variable for the lifetime of a method, the volatile contract is lost for that side.
+
+**Compound-but-looks-simple.** Anything with `+=`, `-=`, `*=`, `++`, `--`, or a conditional update is compound, not simple. Even `flag = !flag` is a read-modify-write. Short syntax does not mean a single operation.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

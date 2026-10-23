@@ -1,0 +1,1090 @@
+---
+title: "Red-Black Tree"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Red Black Tree explained with clear examples, visuals, and practice questions in Mindflare's Data Structures and Algorithms course."
+---
+
+<LessonCard>
+
+Red-black trees take a different approach. They relax the balance requirement just enough that any insertion or deletion can be repaired with **at most 2 or 3 rotations and some color flips**, regardless of tree size. The height is no longer the tightest possible, but every operation has bounded rebalancing work. That predictability is why almost every production sorted map, Java's `TreeMap`, C++'s `std::map`, the Linux kernel's process scheduler and `epoll`, ships a red-black tree internally.
+
+In this chapter, we'll cover:
+
+- The five properties that define a red-black tree
+- Why those properties bound the height at `2 · log2(n + 1)`
+- Insertion: insert red, then fix three cases
+- Deletion: replace as in a BST, then resolve double-black with four cases
+- Visual walkthroughs of every case
+- A complete, working implementation
+- How red-black trees compare to AVL in real systems
+
+The rotations used here are the same left and right rotations introduced in the AVL Tree chapter, applied with a different rebalancing rule.
+
+<h1 id="the-five-properties">The Five Properties</h1>
+
+A red-black tree is a BST where every node carries one extra bit, its **color**, either red or black. The colors are chosen so the tree satisfies these five rules at all times:
+
+1. **Every node is red or black.**
+2. **The root is black.**
+3. **Every leaf (the conceptual **`**null**`** node, often called NIL) is black.**
+4. **A red node's children are both black.** Equivalently, no two reds appear in a row on any path.
+5. **Every path from a given node to any descendant **`**null**`** contains the same number of black nodes.** This count is the node's **black-height**.
+
+Property 4 prevents long red-red chains. Property 5 forces every root-to-leaf path to have the same black structure. Together they guarantee that the longest path is at most twice the shortest one, which is exactly what bounds the height.
+
+Here is a small valid red-black tree:
+
+Every property checks out:
+
+- The root (13) is black.
+- No red node has a red parent or red child.
+- Every root-to-`null` path passes through exactly two black non-null nodes.
+
+<h1 id="why-the-height-is-bounded">Why the Height Is Bounded</h1>
+
+Let `bh(x)` denote the black-height of node `x`: the number of black nodes on any path from `x` to a `null` descendant (excluding `x` itself, by convention).
+
+A subtree rooted at `x` contains at least `2^bh(x) - 1` internal nodes. The argument is by induction. The base case is a node whose children are both `null`: its black-height is 0, and `2^0 - 1 = 0` internal descendants. For the inductive step, each child has black-height `bh(x)` or `bh(x) - 1` depending on its own color, so by induction each child's subtree holds at least `2^(bh(x) - 1) - 1` internal nodes, and the two subtrees plus `x` itself give `2 · (2^(bh(x) - 1) - 1) + 1 = 2^bh(x) - 1`.
+
+Property 4 says at least half the nodes on any root-to-leaf path are black, so for a tree of height `h`, `bh(root) ≥ h / 2`. Combine the two:
+
+`n ≥ 2^(h/2) - 1`, which gives `h ≤ 2 · log2(n + 1)`.
+
+The height is at most twice that of a perfectly balanced tree. Tighter than that is what AVL gives you. Looser than that is what red-black gives up to keep rebalancing cheap.
+
+<h1 id="why-red-black-not-avl">Why Red-Black, Not AVL?</h1>
+
+Both structures end up at O(log n) for every operation. The choice between them comes down to rebalancing cost.
+
+| Operation                 | AVL              | Red-Black     |
+| ------------------------- | ---------------- | ------------- |
+| Insert: maximum rotations | 1                | 2             |
+| Delete: maximum rotations | O(log n)         | 3             |
+| Color/height bookkeeping  | 4-byte height    | 1-bit color   |
+| Worst-case height         | `1.44 · log2(n)` | `2 · log2(n)` |
+
+The delete row is the one that matters in practice. An AVL delete may cascade rotations all the way to the root. A red-black delete never does more than three. For a workload with frequent inserts and deletes, that bounded cost is more valuable than the slightly shorter tree.
+
+This is also why nearly every system standard library picks red-black:
+
+- **Java**: `java.util.TreeMap`, `java.util.TreeSet`
+- **C++**: `std::map`, `std::set`, `std::multimap`, `std::multiset`
+- **C# (.NET)**: `SortedDictionary`, `SortedSet`
+- **Linux kernel**: process scheduler's Completely Fair Scheduler (CFS), `epoll`'s registered file-descriptor index, virtual memory area lookups
+- **PostgreSQL**: some internal indexes
+
+You almost never need to write one from scratch. You should still understand how it works because the underlying ideas (insert as red, fix only what is broken, push violations up the tree) show up in many balanced data structures.
+
+<h1 id="insertion">Insertion</h1>
+
+A new key is always inserted as a **red** leaf with two `null` (black) children. Why red? A red insert can only violate property 4 (no two reds in a row) and only at the new node's parent. It cannot violate property 5 (equal black-heights), because adding a red leaf does not change any black-height. Fixing one property is easier than fixing several.
+
+If the parent of the new node is black, you are done immediately. If the parent is red, you have a red-red violation to fix. The fix-up routine walks up the tree from the new node, handling one of three cases at each step.
+
+<h3 id="case-1-uncle-is-red">Case 1: Uncle is Red</h3>
+
+The new node's parent `P` is red and the grandparent's other child (the "uncle" `U`) is also red.
+
+Before:
+
+Fix:
+
+- Recolor parent and uncle to black.
+- Recolor grandparent to red.
+- Set the "current node" to grandparent and continue the loop.
+
+After:
+
+The red-red conflict between `P` and `Z` is gone. The grandparent has turned red, which can create a new red-red conflict with **its** parent further up the tree. So the loop continues.
+
+This case is the only one that pushes the problem upward instead of resolving it on the spot, which is why fix-up may walk O(log n) levels even though each level is O(1).
+
+<h3 id="case-2-uncle-is-black-new-node-is-zigzag-child">
+  Case 2: Uncle is Black, New Node is "Zigzag" Child
+</h3>
+
+`P` is red, `U` is black, and `Z` is on the opposite side of `P` from `P`'s position relative to `G` (left-right or right-left).
+
+Fix:
+
+- Rotate around `P` to straighten the zigzag.
+- This reduces to Case 3.
+
+After the left rotation around `P` (in this left-right example), `Z` and `P` swap roles: `Z` becomes the child of `G` and `P` becomes the left child of `Z`. The result is a "straight" red-red chain, ready for Case 3.
+
+<h3 id="case-3-uncle-is-black-new-node-is-straight-child">
+  Case 3: Uncle is Black, New Node is "Straight" Child
+</h3>
+
+`P` is red, `U` is black, and `Z` is on the same side of `P` as `P` is of `G` (left-left or right-right).
+
+Fix:
+
+- Recolor `P` to black, `G` to red.
+- Rotate right around `G` (right rotation; in the mirror right-right case, rotate left around `G`).
+
+After:
+
+No more red-red violation. The rotation does not change any black-height, so property 5 still holds. The loop terminates.
+
+The last step of insert-fixup, regardless of which case ran, is to force the root color back to black. This handles the corner case where the loop bubbled all the way up.
+
+<h3 id="walkthrough-insert-10-20-30">Walkthrough: Insert 10, 20, 30</h3>
+
+The same sequence that broke a plain BST.
+
+After inserting `10` (forced black as root) and `20` (red):
+
+(Note: BST order places 20 to the right of 10. The diagram above shows it as `A`'s child, where `B = 20` sits on the right.)
+
+Insert `30` as red, child of `20`:
+
+Red-red violation between `20` and `30`. Uncle of `30` is `null` (black). The configuration is right-right (straight), so this is Case 3:
+
+- Recolor `20` to black, `10` to red.
+- Left rotate around `10`.
+
+Result:
+
+The root color is forced back to black if needed (here `20` is already black). Inserting `40` next would hit Case 1 (uncle `10` is red), recolor `10` and `30` to black and `20` to red, then force the root back to black.
+
+<h1 id="deletion">Deletion</h1>
+
+Deletion is the harder operation. The BST deletion step itself is standard, replace the deleted node with its in-order successor when it has two children. The interesting work happens when the node actually removed from the tree is **black**, because that removal shortens every path through that node by one black, which violates property 5.
+
+The standard trick is to assign the "extra black" to the child that takes the deleted node's place, treating it as if it carried a phantom extra black token. This temporary state is called **double-black**. The fix-up loop pushes the double-black token up the tree, resolving it through one of four cases at each step.
+
+If the deleted node was red, no fix-up is needed: black-heights are unchanged.
+
+<h3 id="case-1-sibling-is-red">Case 1: Sibling is Red</h3>
+
+The double-black node's sibling `S` is red. Recolor `S` black and the parent red, then rotate the parent toward the double-black side. This transforms the problem into one of cases 2 through 4, where the sibling is black.
+
+<h3 id="case-2-sibling-is-black-with-two-black-children">
+  Case 2: Sibling is Black with Two Black Children
+</h3>
+
+Recolor `S` red and move the double-black token up to the parent. The subtree's overall black-height drops by one, and the parent now carries the double-black. Continue the loop one level higher.
+
+<h3 id="case-3-sibling-is-black-its-near-child-is-red-far-child-is-black">
+  Case 3: Sibling is Black, Its Near Child is Red, Far Child is Black
+</h3>
+
+Rotate `S` away from the double-black, swap colors between `S` and its (formerly) near red child. This transforms the configuration into Case 4.
+
+<h3 id="case-4-sibling-is-black-its-far-child-is-red">
+  Case 4: Sibling is Black, Its Far Child is Red
+</h3>
+
+Color the sibling with the parent's color, color the parent black, color the far child black. Rotate the parent toward the double-black. The token is consumed and the loop terminates.
+
+The two takeaways from delete-fixup: the deepest cases (3 and 4) terminate the loop, and Case 2 is the only one that propagates the violation. So the total number of rotations is bounded by 3, regardless of how many recoloring steps happen.
+
+<h1 id="full-implementation">Full Implementation</h1>
+
+This implementation uses a sentinel `NIL` node for all nulls, which is the trick from CLRS that keeps the case analysis clean: `NIL.color = BLACK` and every leaf points at the same `NIL`, so you can dereference `NIL.parent` and `NIL.color` without null checks.
+
+```java
+class RedBlackTree {
+    static final boolean RED = false;
+    static final boolean BLACK = true;
+
+    static class Node {
+        int val;
+        boolean color;
+        Node left, right, parent;
+        Node(int val, boolean color) { this.val = val; this.color = color; }
+    }
+
+    final Node NIL = new Node(0, BLACK);
+    Node root = NIL;
+
+    private void rotateLeft(Node x) {
+        Node y = x.right;
+        x.right = y.left;
+        if (y.left != NIL) y.left.parent = x;
+        y.parent = x.parent;
+        if (x.parent == NIL)        root = y;
+        else if (x == x.parent.left) x.parent.left = y;
+        else                         x.parent.right = y;
+        y.left = x;
+        x.parent = y;
+    }
+
+    private void rotateRight(Node x) {
+        Node y = x.left;
+        x.left = y.right;
+        if (y.right != NIL) y.right.parent = x;
+        y.parent = x.parent;
+        if (x.parent == NIL)         root = y;
+        else if (x == x.parent.right) x.parent.right = y;
+        else                          x.parent.left = y;
+        y.right = x;
+        x.parent = y;
+    }
+
+    public void insert(int val) {
+        Node z = new Node(val, RED);
+        z.left = z.right = NIL;
+
+        Node y = NIL, x = root;
+        while (x != NIL) {
+            y = x;
+            x = val < x.val ? x.left : x.right;
+        }
+        z.parent = y;
+        if (y == NIL)            root = z;
+        else if (val < y.val)    y.left = z;
+        else                     y.right = z;
+
+        insertFixup(z);
+    }
+
+    private void insertFixup(Node z) {
+        while (z.parent.color == RED) {
+            if (z.parent == z.parent.parent.left) {
+                Node u = z.parent.parent.right;        // uncle
+                if (u.color == RED) {                  // Case 1
+                    z.parent.color = BLACK;
+                    u.color = BLACK;
+                    z.parent.parent.color = RED;
+                    z = z.parent.parent;
+                } else {
+                    if (z == z.parent.right) {         // Case 2
+                        z = z.parent;
+                        rotateLeft(z);
+                    }
+                    z.parent.color = BLACK;            // Case 3
+                    z.parent.parent.color = RED;
+                    rotateRight(z.parent.parent);
+                }
+            } else {
+                Node u = z.parent.parent.left;
+                if (u.color == RED) {
+                    z.parent.color = BLACK;
+                    u.color = BLACK;
+                    z.parent.parent.color = RED;
+                    z = z.parent.parent;
+                } else {
+                    if (z == z.parent.left) {
+                        z = z.parent;
+                        rotateRight(z);
+                    }
+                    z.parent.color = BLACK;
+                    z.parent.parent.color = RED;
+                    rotateLeft(z.parent.parent);
+                }
+            }
+        }
+        root.color = BLACK;
+    }
+
+    public boolean search(int val) {
+        Node n = root;
+        while (n != NIL) {
+            if (val == n.val) return true;
+            n = val < n.val ? n.left : n.right;
+        }
+        return false;
+    }
+}
+```
+
+```python
+RED, BLACK = False, True
+
+class _Node:
+    __slots__ = ("val", "color", "left", "right", "parent")
+    def __init__(self, val, color):
+        self.val = val
+        self.color = color
+        self.left = self.right = self.parent = None
+
+class RedBlackTree:
+    def __init__(self):
+        self.NIL = _Node(0, BLACK)
+        self.NIL.left = self.NIL.right = self.NIL.parent = self.NIL
+        self.root = self.NIL
+
+    def _rotate_left(self, x):
+        y = x.right
+        x.right = y.left
+        if y.left is not self.NIL: y.left.parent = x
+        y.parent = x.parent
+        if x.parent is self.NIL:        self.root = y
+        elif x is x.parent.left:        x.parent.left = y
+        else:                           x.parent.right = y
+        y.left = x
+        x.parent = y
+
+    def _rotate_right(self, x):
+        y = x.left
+        x.left = y.right
+        if y.right is not self.NIL: y.right.parent = x
+        y.parent = x.parent
+        if x.parent is self.NIL:        self.root = y
+        elif x is x.parent.right:       x.parent.right = y
+        else:                           x.parent.left = y
+        y.right = x
+        x.parent = y
+
+    def insert(self, val):
+        z = _Node(val, RED)
+        z.left = z.right = self.NIL
+        y, x = self.NIL, self.root
+        while x is not self.NIL:
+            y = x
+            x = x.left if val < x.val else x.right
+        z.parent = y
+        if y is self.NIL:        self.root = z
+        elif val < y.val:        y.left = z
+        else:                    y.right = z
+        self._insert_fixup(z)
+
+    def _insert_fixup(self, z):
+        while z.parent.color == RED:
+            if z.parent is z.parent.parent.left:
+                u = z.parent.parent.right
+                if u.color == RED:
+                    z.parent.color = BLACK
+                    u.color = BLACK
+                    z.parent.parent.color = RED
+                    z = z.parent.parent
+                else:
+                    if z is z.parent.right:
+                        z = z.parent
+                        self._rotate_left(z)
+                    z.parent.color = BLACK
+                    z.parent.parent.color = RED
+                    self._rotate_right(z.parent.parent)
+            else:
+                u = z.parent.parent.left
+                if u.color == RED:
+                    z.parent.color = BLACK
+                    u.color = BLACK
+                    z.parent.parent.color = RED
+                    z = z.parent.parent
+                else:
+                    if z is z.parent.left:
+                        z = z.parent
+                        self._rotate_right(z)
+                    z.parent.color = BLACK
+                    z.parent.parent.color = RED
+                    self._rotate_left(z.parent.parent)
+        self.root.color = BLACK
+
+    def search(self, val):
+        n = self.root
+        while n is not self.NIL:
+            if val == n.val:
+                return True
+            n = n.left if val < n.val else n.right
+        return False
+```
+
+```cpp
+class RedBlackTree {
+    enum Color { RED, BLACK };
+
+    struct Node {
+        int val;
+        Color color;
+        Node *left, *right, *parent;
+    };
+
+    Node* NIL;
+    Node* root;
+
+    Node* makeNode(int val, Color c) {
+        Node* n = new Node{val, c, NIL, NIL, NIL};
+        return n;
+    }
+
+    void rotateLeft(Node* x) {
+        Node* y = x->right;
+        x->right = y->left;
+        if (y->left != NIL) y->left->parent = x;
+        y->parent = x->parent;
+        if (x->parent == NIL)        root = y;
+        else if (x == x->parent->left) x->parent->left = y;
+        else                          x->parent->right = y;
+        y->left = x;
+        x->parent = y;
+    }
+
+    void rotateRight(Node* x) {
+        Node* y = x->left;
+        x->left = y->right;
+        if (y->right != NIL) y->right->parent = x;
+        y->parent = x->parent;
+        if (x->parent == NIL)         root = y;
+        else if (x == x->parent->right) x->parent->right = y;
+        else                           x->parent->left = y;
+        y->right = x;
+        x->parent = y;
+    }
+
+    void insertFixup(Node* z) {
+        while (z->parent->color == RED) {
+            if (z->parent == z->parent->parent->left) {
+                Node* u = z->parent->parent->right;
+                if (u->color == RED) {
+                    z->parent->color = BLACK;
+                    u->color = BLACK;
+                    z->parent->parent->color = RED;
+                    z = z->parent->parent;
+                } else {
+                    if (z == z->parent->right) {
+                        z = z->parent;
+                        rotateLeft(z);
+                    }
+                    z->parent->color = BLACK;
+                    z->parent->parent->color = RED;
+                    rotateRight(z->parent->parent);
+                }
+            } else {
+                Node* u = z->parent->parent->left;
+                if (u->color == RED) {
+                    z->parent->color = BLACK;
+                    u->color = BLACK;
+                    z->parent->parent->color = RED;
+                    z = z->parent->parent;
+                } else {
+                    if (z == z->parent->left) {
+                        z = z->parent;
+                        rotateRight(z);
+                    }
+                    z->parent->color = BLACK;
+                    z->parent->parent->color = RED;
+                    rotateLeft(z->parent->parent);
+                }
+            }
+        }
+        root->color = BLACK;
+    }
+
+public:
+    RedBlackTree() {
+        NIL = new Node{0, BLACK, nullptr, nullptr, nullptr};
+        NIL->left = NIL->right = NIL->parent = NIL;
+        root = NIL;
+    }
+
+    void insert(int val) {
+        Node* z = makeNode(val, RED);
+        Node *y = NIL, *x = root;
+        while (x != NIL) {
+            y = x;
+            x = val < x->val ? x->left : x->right;
+        }
+        z->parent = y;
+        if (y == NIL)         root = z;
+        else if (val < y->val) y->left = z;
+        else                   y->right = z;
+        insertFixup(z);
+    }
+
+    bool search(int val) {
+        Node* n = root;
+        while (n != NIL) {
+            if (val == n->val) return true;
+            n = val < n->val ? n->left : n->right;
+        }
+        return false;
+    }
+};
+```
+
+```csharp
+public class RedBlackTree {
+    private const bool RED = false;
+    private const bool BLACK = true;
+
+    private class Node {
+        public int val;
+        public bool color;
+        public Node left, right, parent;
+        public Node(int val, bool color) { this.val = val; this.color = color; }
+    }
+
+    private readonly Node NIL = new Node(0, BLACK);
+    private Node root;
+
+    public RedBlackTree() { root = NIL; }
+
+    private void RotateLeft(Node x) {
+        Node y = x.right;
+        x.right = y.left;
+        if (y.left != NIL) y.left.parent = x;
+        y.parent = x.parent;
+        if (x.parent == NIL)         root = y;
+        else if (x == x.parent.left) x.parent.left = y;
+        else                          x.parent.right = y;
+        y.left = x;
+        x.parent = y;
+    }
+
+    private void RotateRight(Node x) {
+        Node y = x.left;
+        x.left = y.right;
+        if (y.right != NIL) y.right.parent = x;
+        y.parent = x.parent;
+        if (x.parent == NIL)          root = y;
+        else if (x == x.parent.right) x.parent.right = y;
+        else                          x.parent.left = y;
+        y.right = x;
+        x.parent = y;
+    }
+
+    public void Insert(int val) {
+        Node z = new Node(val, RED) { left = NIL, right = NIL };
+        Node y = NIL, x = root;
+        while (x != NIL) {
+            y = x;
+            x = val < x.val ? x.left : x.right;
+        }
+        z.parent = y;
+        if (y == NIL)         root = z;
+        else if (val < y.val) y.left = z;
+        else                  y.right = z;
+        InsertFixup(z);
+    }
+
+    private void InsertFixup(Node z) {
+        while (z.parent.color == RED) {
+            if (z.parent == z.parent.parent.left) {
+                Node u = z.parent.parent.right;
+                if (u.color == RED) {
+                    z.parent.color = BLACK;
+                    u.color = BLACK;
+                    z.parent.parent.color = RED;
+                    z = z.parent.parent;
+                } else {
+                    if (z == z.parent.right) {
+                        z = z.parent;
+                        RotateLeft(z);
+                    }
+                    z.parent.color = BLACK;
+                    z.parent.parent.color = RED;
+                    RotateRight(z.parent.parent);
+                }
+            } else {
+                Node u = z.parent.parent.left;
+                if (u.color == RED) {
+                    z.parent.color = BLACK;
+                    u.color = BLACK;
+                    z.parent.parent.color = RED;
+                    z = z.parent.parent;
+                } else {
+                    if (z == z.parent.left) {
+                        z = z.parent;
+                        RotateRight(z);
+                    }
+                    z.parent.color = BLACK;
+                    z.parent.parent.color = RED;
+                    RotateLeft(z.parent.parent);
+                }
+            }
+        }
+        root.color = BLACK;
+    }
+
+    public bool Search(int val) {
+        Node n = root;
+        while (n != NIL) {
+            if (val == n.val) return true;
+            n = val < n.val ? n.left : n.right;
+        }
+        return false;
+    }
+}
+```
+
+```go
+const (
+    rbRed   = false
+    rbBlack = true
+)
+
+type rbNode struct {
+    val                 int
+    color               bool
+    left, right, parent *rbNode
+}
+
+type RedBlackTree struct {
+    nil_ *rbNode
+    root *rbNode
+}
+
+func NewRedBlackTree() *RedBlackTree {
+    sentinel := &rbNode{color: rbBlack}
+    sentinel.left = sentinel
+    sentinel.right = sentinel
+    sentinel.parent = sentinel
+    return &RedBlackTree{nil_: sentinel, root: sentinel}
+}
+
+func (t *RedBlackTree) rotateLeft(x *rbNode) {
+    y := x.right
+    x.right = y.left
+    if y.left != t.nil_ {
+        y.left.parent = x
+    }
+    y.parent = x.parent
+    switch {
+    case x.parent == t.nil_:
+        t.root = y
+    case x == x.parent.left:
+        x.parent.left = y
+    default:
+        x.parent.right = y
+    }
+    y.left = x
+    x.parent = y
+}
+
+func (t *RedBlackTree) rotateRight(x *rbNode) {
+    y := x.left
+    x.left = y.right
+    if y.right != t.nil_ {
+        y.right.parent = x
+    }
+    y.parent = x.parent
+    switch {
+    case x.parent == t.nil_:
+        t.root = y
+    case x == x.parent.right:
+        x.parent.right = y
+    default:
+        x.parent.left = y
+    }
+    y.right = x
+    x.parent = y
+}
+
+func (t *RedBlackTree) Insert(val int) {
+    z := &rbNode{val: val, color: rbRed, left: t.nil_, right: t.nil_, parent: t.nil_}
+    y, x := t.nil_, t.root
+    for x != t.nil_ {
+        y = x
+        if val < x.val {
+            x = x.left
+        } else {
+            x = x.right
+        }
+    }
+    z.parent = y
+    switch {
+    case y == t.nil_:
+        t.root = z
+    case val < y.val:
+        y.left = z
+    default:
+        y.right = z
+    }
+    t.insertFixup(z)
+}
+
+func (t *RedBlackTree) insertFixup(z *rbNode) {
+    for z.parent.color == rbRed {
+        if z.parent == z.parent.parent.left {
+            u := z.parent.parent.right
+            if u.color == rbRed {
+                z.parent.color = rbBlack
+                u.color = rbBlack
+                z.parent.parent.color = rbRed
+                z = z.parent.parent
+            } else {
+                if z == z.parent.right {
+                    z = z.parent
+                    t.rotateLeft(z)
+                }
+                z.parent.color = rbBlack
+                z.parent.parent.color = rbRed
+                t.rotateRight(z.parent.parent)
+            }
+        } else {
+            u := z.parent.parent.left
+            if u.color == rbRed {
+                z.parent.color = rbBlack
+                u.color = rbBlack
+                z.parent.parent.color = rbRed
+                z = z.parent.parent
+            } else {
+                if z == z.parent.left {
+                    z = z.parent
+                    t.rotateRight(z)
+                }
+                z.parent.color = rbBlack
+                z.parent.parent.color = rbRed
+                t.rotateLeft(z.parent.parent)
+            }
+        }
+    }
+    t.root.color = rbBlack
+}
+
+func (t *RedBlackTree) Search(val int) bool {
+    n := t.root
+    for n != t.nil_ {
+        if val == n.val {
+            return true
+        }
+        if val < n.val {
+            n = n.left
+        } else {
+            n = n.right
+        }
+    }
+    return false
+}
+```
+
+```rust
+// A pointer-heavy data structure like a red-black tree fights the borrow checker.
+// Production Rust crates (e.g., the std BTreeMap) avoid Box-of-RefCell by using
+// unsafe pointers. The version below uses Rc<RefCell<Node>> for clarity at the
+// cost of some runtime overhead.
+
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
+
+#[derive(Clone, Copy, PartialEq)]
+enum Color { Red, Black }
+
+type Link = Option<Rc<RefCell<Node>>>;
+type WeakLink = Option<Weak<RefCell<Node>>>;
+
+struct Node {
+    val: i32,
+    color: Color,
+    left: Link,
+    right: Link,
+    parent: WeakLink,
+}
+
+pub struct RedBlackTree {
+    root: Link,
+}
+
+impl RedBlackTree {
+    pub fn new() -> Self { RedBlackTree { root: None } }
+
+    fn color(link: &Link) -> Color {
+        match link {
+            None => Color::Black,
+            Some(n) => n.borrow().color,
+        }
+    }
+
+    pub fn insert(&mut self, val: i32) {
+        let new_node = Rc::new(RefCell::new(Node {
+            val, color: Color::Red, left: None, right: None, parent: None,
+        }));
+
+        // Standard BST insertion
+        let mut parent: Link = None;
+        let mut cur = self.root.clone();
+        while let Some(n) = cur.clone() {
+            parent = Some(n.clone());
+            cur = if val < n.borrow().val { n.borrow().left.clone() }
+                  else                    { n.borrow().right.clone() };
+        }
+
+        new_node.borrow_mut().parent = parent.as_ref().map(|p| Rc::downgrade(p));
+
+        match parent {
+            None => self.root = Some(new_node.clone()),
+            Some(p) => {
+                let mut pb = p.borrow_mut();
+                if val < pb.val { pb.left  = Some(new_node.clone()); }
+                else            { pb.right = Some(new_node.clone()); }
+            }
+        }
+
+        // Fix-up omitted for brevity; production code reproduces the case logic
+        // from the Java/Python/C++ versions above using upgrade() on the parent
+        // weak link to access grandparent and uncle.
+        if let Some(ref root) = self.root {
+            root.borrow_mut().color = Color::Black;
+        }
+    }
+
+    pub fn search(&self, val: i32) -> bool {
+        let mut cur = self.root.clone();
+        while let Some(n) = cur.clone() {
+            let nb = n.borrow();
+            if val == nb.val { return true; }
+            cur = if val < nb.val { nb.left.clone() } else { nb.right.clone() };
+        }
+        false
+    }
+}
+```
+
+```javascript
+const RED = false;
+const BLACK = true;
+
+class RedBlackTree {
+  constructor() {
+    this.NIL = { val: 0, color: BLACK, left: null, right: null, parent: null };
+    this.NIL.left = this.NIL;
+    this.NIL.right = this.NIL;
+    this.NIL.parent = this.NIL;
+    this.root = this.NIL;
+  }
+
+  _rotateLeft(x) {
+    const y = x.right;
+    x.right = y.left;
+    if (y.left !== this.NIL) y.left.parent = x;
+    y.parent = x.parent;
+    if (x.parent === this.NIL) this.root = y;
+    else if (x === x.parent.left) x.parent.left = y;
+    else x.parent.right = y;
+    y.left = x;
+    x.parent = y;
+  }
+
+  _rotateRight(x) {
+    const y = x.left;
+    x.left = y.right;
+    if (y.right !== this.NIL) y.right.parent = x;
+    y.parent = x.parent;
+    if (x.parent === this.NIL) this.root = y;
+    else if (x === x.parent.right) x.parent.right = y;
+    else x.parent.left = y;
+    y.right = x;
+    x.parent = y;
+  }
+
+  insert(val) {
+    const z = {
+      val,
+      color: RED,
+      left: this.NIL,
+      right: this.NIL,
+      parent: this.NIL,
+    };
+    let y = this.NIL,
+      x = this.root;
+    while (x !== this.NIL) {
+      y = x;
+      x = val < x.val ? x.left : x.right;
+    }
+    z.parent = y;
+    if (y === this.NIL) this.root = z;
+    else if (val < y.val) y.left = z;
+    else y.right = z;
+    this._insertFixup(z);
+  }
+
+  _insertFixup(z) {
+    while (z.parent.color === RED) {
+      if (z.parent === z.parent.parent.left) {
+        const u = z.parent.parent.right;
+        if (u.color === RED) {
+          z.parent.color = BLACK;
+          u.color = BLACK;
+          z.parent.parent.color = RED;
+          z = z.parent.parent;
+        } else {
+          if (z === z.parent.right) {
+            z = z.parent;
+            this._rotateLeft(z);
+          }
+          z.parent.color = BLACK;
+          z.parent.parent.color = RED;
+          this._rotateRight(z.parent.parent);
+        }
+      } else {
+        const u = z.parent.parent.left;
+        if (u.color === RED) {
+          z.parent.color = BLACK;
+          u.color = BLACK;
+          z.parent.parent.color = RED;
+          z = z.parent.parent;
+        } else {
+          if (z === z.parent.left) {
+            z = z.parent;
+            this._rotateRight(z);
+          }
+          z.parent.color = BLACK;
+          z.parent.parent.color = RED;
+          this._rotateLeft(z.parent.parent);
+        }
+      }
+    }
+    this.root.color = BLACK;
+  }
+
+  search(val) {
+    let n = this.root;
+    while (n !== this.NIL) {
+      if (val === n.val) return true;
+      n = val < n.val ? n.left : n.right;
+    }
+    return false;
+  }
+}
+```
+
+```typescript
+const RED = false;
+const BLACK = true;
+
+interface RBNode {
+  val: number;
+  color: boolean;
+  left: RBNode;
+  right: RBNode;
+  parent: RBNode;
+}
+
+class RedBlackTree {
+  private NIL: RBNode;
+  private root: RBNode;
+
+  constructor() {
+    const nil = { val: 0, color: BLACK } as RBNode;
+    nil.left = nil;
+    nil.right = nil;
+    nil.parent = nil;
+    this.NIL = nil;
+    this.root = nil;
+  }
+
+  private _rotateLeft(x: RBNode): void {
+    const y = x.right;
+    x.right = y.left;
+    if (y.left !== this.NIL) y.left.parent = x;
+    y.parent = x.parent;
+    if (x.parent === this.NIL) this.root = y;
+    else if (x === x.parent.left) x.parent.left = y;
+    else x.parent.right = y;
+    y.left = x;
+    x.parent = y;
+  }
+
+  private _rotateRight(x: RBNode): void {
+    const y = x.left;
+    x.left = y.right;
+    if (y.right !== this.NIL) y.right.parent = x;
+    y.parent = x.parent;
+    if (x.parent === this.NIL) this.root = y;
+    else if (x === x.parent.right) x.parent.right = y;
+    else x.parent.left = y;
+    y.right = x;
+    x.parent = y;
+  }
+
+  insert(val: number): void {
+    const z: RBNode = {
+      val,
+      color: RED,
+      left: this.NIL,
+      right: this.NIL,
+      parent: this.NIL,
+    };
+    let y: RBNode = this.NIL;
+    let x: RBNode = this.root;
+    while (x !== this.NIL) {
+      y = x;
+      x = val < x.val ? x.left : x.right;
+    }
+    z.parent = y;
+    if (y === this.NIL) this.root = z;
+    else if (val < y.val) y.left = z;
+    else y.right = z;
+    this._insertFixup(z);
+  }
+
+  private _insertFixup(z: RBNode): void {
+    while (z.parent.color === RED) {
+      if (z.parent === z.parent.parent.left) {
+        const u = z.parent.parent.right;
+        if (u.color === RED) {
+          z.parent.color = BLACK;
+          u.color = BLACK;
+          z.parent.parent.color = RED;
+          z = z.parent.parent;
+        } else {
+          if (z === z.parent.right) {
+            z = z.parent;
+            this._rotateLeft(z);
+          }
+          z.parent.color = BLACK;
+          z.parent.parent.color = RED;
+          this._rotateRight(z.parent.parent);
+        }
+      } else {
+        const u = z.parent.parent.left;
+        if (u.color === RED) {
+          z.parent.color = BLACK;
+          u.color = BLACK;
+          z.parent.parent.color = RED;
+          z = z.parent.parent;
+        } else {
+          if (z === z.parent.left) {
+            z = z.parent;
+            this._rotateRight(z);
+          }
+          z.parent.color = BLACK;
+          z.parent.parent.color = RED;
+          this._rotateLeft(z.parent.parent);
+        }
+      }
+    }
+    this.root.color = BLACK;
+  }
+
+  search(val: number): boolean {
+    let n = this.root;
+    while (n !== this.NIL) {
+      if (val === n.val) return true;
+      n = val < n.val ? n.left : n.right;
+    }
+    return false;
+  }
+}
+```
+
+A few notes on the implementation:
+
+- The `NIL` sentinel is the single trick that makes red-black code readable. Without it, every line of fix-up needs `if (parent != null)` guards, and the code grows to twice the length.
+- The fix-up loop has two symmetric branches: parent is the grandparent's left child, or parent is the grandparent's right child. Some textbooks factor these into helper functions to halve the code. Most production implementations inline them for clarity and speed.
+- Real production implementations (Java's `TreeMap`, the Linux kernel's `rbtree.h`) carry the parent pointer on every node, just like the code above. The alternative of recomputing parents from a recursive descent is slower and rarely worth it.
+
+<h1 id="where-red-black-trees-show-up">Where Red-Black Trees Show Up</h1>
+
+The same algorithm sits behind a surprising amount of infrastructure:
+
+- `**java.util.TreeMap**`** and **`**java.util.TreeSet**` are red-black trees. Every navigation method (`floorKey`, `ceilingKey`, `higherKey`, `subMap`) is an O(log n) walk on the same structure.
+- **C++ **`**std::map**`**, **`**std::set**`**, **`**std::multimap**`**, **`**std::multiset**` are typically red-black trees in every major implementation (libstdc++, libc++, MSVC STL).
+- **C# **`**SortedDictionary**`** and **`**SortedSet**` are red-black trees.
+- **Linux kernel** uses red-black trees in many subsystems: the Completely Fair Scheduler picks the next process by extracting the minimum from a red-black tree keyed by virtual runtime. `epoll` uses one to index registered file descriptors. Each task's virtual memory areas (VMAs) are stored in a red-black tree for fast range lookups.
+- $Lb8
+
+The reason for this dominance is the deletion bound. A system that runs for months under sustained insert/delete load cannot afford an O(log n) worst-case rotation on every delete. Red-black trees keep that at 3, regardless of tree size.
+
+<h1 id="built-in-library">Built-in Library</h1>
+
+The point of writing a red-black tree from scratch is to understand how it works, not to use it in production. If you need a sorted map in real code, use the library:
+
+- Java: `new TreeMap<>()`
+- C++: `std::map<K, V>`
+- C#: `new SortedDictionary<TKey, TValue>()`
+- Rust: `BTreeMap` (a B-tree, but offers the same ordered API)
+- Python: `from sortedcontainers import SortedDict` (third party; the standard library has no sorted map)
+- Go: no standard sorted map; use `github.com/google/btree` or maintain a sorted slice
+
+These are tuned and tested far better than anything you can reasonably write under interview time pressure. The mental model from this chapter is what carries over: insert is `O(log n)` with at most 2 rotations, and delete is bounded at 3.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

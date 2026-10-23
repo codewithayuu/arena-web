@@ -1,0 +1,312 @@
+---
+title: "Idempotency"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Idempotency explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+Idempotency is about **effect**, not identical responses.
+
+For example, the first `DELETE /sessions/sess_123` might return `204 No Content`. A retry on a resource that is already gone often returns `404 Not Found`, though some APIs choose to return `204` again to keep retries simple. The responses differ, but the final state is the same: the session no longer exists.
+
+For a better client experience, many APIs return the original response for a duplicate retry. That way the caller does not have to treat a successful duplicate as an error.
+
+<h1 id="2-natural-idempotency-vs-engineered-idempotency">
+  2. Natural Idempotency vs Engineered Idempotency
+</h1>
+
+Some operations are naturally idempotent because they set a final state.
+
+```sql
+UPDATE users
+SET status = 'ACTIVE'
+WHERE id = 123;
+```
+
+Running this statement several times leaves the user in the same state.
+
+Other operations are not naturally idempotent because they change the value again or create something new each time.
+
+```sql
+UPDATE inventory
+SET stock = stock + 10
+WHERE item_id = 1;
+```
+
+Each retry adds 10 more units. To make this safe, attach a stable operation ID:
+
+```sql
+INSERT INTO inventory_changes (operation_id, item_id, delta)
+VALUES ('shipment_789', 1, 10)
+ON CONFLICT (operation_id) DO NOTHING;
+```
+
+The operation ID turns "add 10 units" into "apply shipment `shipment_789` once."
+
+This distinction matters:
+
+- **Natural idempotency:** The operation itself sets a final state.
+- **Engineered idempotency:** The system records a stable operation ID and uses it to detect duplicates.
+
+Payments, order creation, email delivery, webhook processing, and job submission usually need engineered idempotency.
+
+<h1 id="3-idempotency-keys">3. Idempotency Keys</h1>
+
+An **idempotency key** is a stable ID for one logical operation.
+
+```plaintext
+POST /v1/payments HTTP/1.1
+Host: api.example.com
+Authorization: Bearer <token>
+Content-Type: application/json
+Idempotency-Key: payment:order_123:attempt_1
+```
+
+The payment details travel in the body below those headers:
+
+```json
+{
+  "order_id": "order_123",
+  "amount_cents": 4999,
+  "currency": "USD"
+}
+```
+
+The same logical operation must reuse the same key on every retry. A new key means a new operation.
+
+Good keys are:
+
+- **Client-generated:** The key exists before the first request is sent.
+- **Stable across retries:** The same operation always uses the same key.
+- **Unique for different operations:** Two different payment attempts do not share a key.
+- **Scoped:** The server checks the key within a user, account, tenant, endpoint, or operation type.
+- **Bound to the request:** The server rejects the same key if the request body changes.
+- **Stored durably:** The key survives restarts and failover.
+
+Do not generate the idempotency key only after the server receives the request. If the response is lost, the client will not know which key to use on retry.
+
+<h1 id="4-server-side-implementation">4. Server-Side Implementation</h1>
+
+A production system usually stores idempotency records in durable storage, such as a database.
+
+```sql
+CREATE TABLE idempotency_keys (
+  scope TEXT NOT NULL,
+  key TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  status TEXT NOT NULL,
+  response_status INTEGER,
+  response_body JSONB,
+  resource_id TEXT,
+  locked_until TIMESTAMP,
+  created_at TIMESTAMP NOT NULL DEFAULT now(),
+  completed_at TIMESTAMP,
+  PRIMARY KEY (scope, key)
+);
+```
+
+The `scope` prevents accidental collisions across tenants or endpoints. The `request_hash` catches client bugs where the same key is reused with a different request body. The `status` tells the server whether this is the first request, a completed retry, or a request that is still running.
+
+<h3 id="request-flow">Request Flow</h3>
+
+Every incoming request follows the same basic path: check the key, reserve it if it is new, then decide what to do based on what the server found.
+
+The reserve step must be atomic, meaning two requests cannot both claim the same key at the same time. This pattern is unsafe:
+
+```plaintext
+1. Check whether the idempotency key exists.
+2. See that it does not exist.
+3. Process the payment.
+4. Insert the idempotency key.
+```
+
+Two retries running at the same time can both pass step 2 and both process the payment. Use a unique constraint, transaction, lock, compare-and-set operation, or a business table keyed by the operation ID.
+
+<h3 id="reserving-a-key">Reserving a Key</h3>
+
+A single atomic insert makes the reservation safe when retries arrive at the same time. The query below tries to claim the key and does nothing if another request already holds it.
+
+```sql
+INSERT INTO idempotency_keys (scope, key, request_hash, status)
+VALUES ('tenant_123:/v1/payments', 'payment:order_123:attempt_1', 'hash_abc', 'IN_PROGRESS')
+ON CONFLICT (scope, key) DO NOTHING;
+```
+
+If the insert succeeds, this request owns the operation. If it does not, the server loads the existing record and decides whether to return a stored response, reject a changed request body, or ask the client to retry later.
+
+<h3 id="status-and-lock-lifecycle">Status and Lock Lifecycle</h3>
+
+The `status` and `locked_until` columns keep the record safe while the operation is running, even if the server crashes. A record moves through a small set of states:
+
+1. **Reserved as **`**IN_PROGRESS**`**.** The successful insert sets `status = IN_PROGRESS` and `locked_until = now() + timeout`. This claims the operation for this request. The `locked_until` value is a lease, which means "this request owns the work until this time."
+2. **Completed.** When the operation finishes, the owner updates the row to `status = COMPLETED`, stores `response_status` and `response_body`, and sets `completed_at`. A later duplicate that sees `COMPLETED` returns the stored response without running the operation again.
+
+The tricky case is when the owner crashes after reserving the key but before finishing the operation. Without a lease, the row would stay at `IN_PROGRESS` forever, and every retry would be told "still in progress." `locked_until` fixes this. When a duplicate finds an `IN_PROGRESS` record, it checks the lease:
+
+- If `locked_until` is still in the future, the original request is probably still running, so the server returns a retry-later response.
+- If `locked_until` has passed, the original owner is probably gone, so the duplicate claims the lease by extending `locked_until` and runs the operation.
+
+This is why the work behind an idempotency key must also be safe to retry. If the first owner crashes, another request may take over the same key. The lease should be long enough for a normal slow operation, but short enough that a real crash does not block retries for too long.
+
+<h1 id="5-handling-in-progress-requests">5. Handling In-Progress Requests</h1>
+
+Retries can arrive at the same time. A user double-clicks, a mobile client retries aggressively, or two workers process the same job.
+
+When a duplicate request arrives while the first request is still running, the server has a few options:
+
+| Strategy                    | Behavior                                     | Tradeoff                                     |
+| --------------------------- | -------------------------------------------- | -------------------------------------------- |
+| Return `409 Conflict`       | Tell the client the operation is in progress | Simple, client must retry                    |
+| Return `202 Accepted`       | Expose an operation resource to poll         | Good for long-running work                   |
+| Wait briefly                | Block until the first request completes      | Easier for clients, ties up server resources |
+| Return stored partial state | Useful for workflows with clear states       | Requires careful state modeling              |
+
+For long-running operations, returning an operation resource is often cleaner than holding the connection open:
+
+```json
+{
+  "id": "payment_attempt_123",
+  "status": "processing",
+  "retry_after_seconds": 2
+}
+```
+
+The idempotency key identifies the operation. The operation resource describes its current state.
+
+<h1 id="6-external-side-effects">6. External Side Effects</h1>
+
+The hardest idempotency bugs happen when the operation calls another system.
+
+Example payment flow:
+
+1. Reserve idempotency key.
+2. Create local payment attempt.
+3. Call payment provider.
+4. Provider charges the card.
+5. Local service crashes before saving the provider result.
+
+On retry, the service must not charge again. Better designs reduce this risk:
+
+- Pass an idempotency key to the external provider when the provider supports it.
+- Store a local payment attempt before calling the provider.
+- Store the provider's charge ID as soon as it is known.
+- Recover by querying the provider using its request ID or saved call details.
+- Use a workflow engine for long-running, multi-step operations when appropriate.
+- Keep side effects behind database uniqueness checks where possible.
+
+No database transaction can include every external API. The design needs a recovery path for this case: "the external action happened, but our local state did not finish updating."
+
+<h1 id="7-idempotency-in-messaging">7. Idempotency in Messaging</h1>
+
+Message systems often provide at-least-once delivery, which means a consumer may receive the same message more than once. This can happen after a crash, rebalance, visibility timeout, or manual replay.
+
+Consumers should treat duplicate delivery as normal.
+
+Durable duplicate detection can take several shapes: a processed-message table with a unique message ID, a business table keyed by operation ID, a state machine that ignores old transitions, or a durable key-value store.
+
+The business write is often the best place to detect duplicates. A `shipments` table with a unique `shipment_id` is stronger than an in-memory set that says a message was processed.
+
+Commit broker offsets or acknowledge messages only after the business operation is stored durably. If the process crashes after the write but before the ack, the broker may deliver the message again. Idempotency makes that safe.
+
+<h1 id="8-http-method-behavior">8. HTTP Method Behavior</h1>
+
+HTTP defines idempotency at the method level. The important part is the intended effect of the request.
+
+| Method   | Idempotent by HTTP Meaning? | Practical Meaning                                               |
+| -------- | --------------------------- | --------------------------------------------------------------- |
+| `GET`    | Yes                         | Reads data. Logging and metrics may still happen.               |
+| `HEAD`   | Yes                         | Same idea as GET, but without a response body.                  |
+| `PUT`    | Yes                         | Replaces or creates a resource at a known URI.                  |
+| `DELETE` | Yes                         | Leaves the resource deleted after the first successful delete.  |
+| `POST`   | No by default               | Often creates a new child resource or starts processing.        |
+| `PATCH`  | Depends                     | Setting a field can be idempotent. Incrementing a field is not. |
+
+Examples:
+
+- `PUT /users/123/status` with `{ "status": "ACTIVE" }` is idempotent.
+- `PATCH /users/123` with `{ "status": "ACTIVE" }` can be idempotent if defined as a set operation.
+- `PATCH /inventory/1` with `{ "increment_by": 10 }` is not idempotent.
+- `POST /payments` without an idempotency key is not idempotent.
+- `POST /payments` with an idempotency key can be engineered to be idempotent.
+
+Idempotent does not mean "nothing else happens." Logging, metrics, and audit records may still happen. It means repeated identical requests have the same intended effect on the resource.
+
+<h1 id="9-retention-and-scope">9. Retention and Scope</h1>
+
+Idempotency records cannot be kept forever in every system. They contain request hashes, response bodies, resource IDs, timestamps, and sometimes tenant-specific details.
+
+Keep records long enough to cover realistic retry windows. That includes client retries after network failures, mobile apps coming back online, broker redelivery windows, provider retry schedules for webhooks, operator replay windows, and audit needs.
+
+If a key expires, the server may treat a late retry as a new operation. Document the retention window as part of the API contract.
+
+Scope matters too. The same key string may appear in different tenants or endpoints. Store keys under a scope such as:
+
+```plaintext
+tenant_id + endpoint + idempotency_key
+```
+
+This prevents one tenant or operation type from colliding with another.
+
+<h1 id="10-common-pitfalls">10. Common Pitfalls</h1>
+
+Idempotency designs usually break in a few predictable ways, often around key handling or storage.
+
+<h3 id="new-key-on-every-retry">New Key on Every Retry</h3>
+
+If each retry gets a new key, the server sees each attempt as a new operation. The key must represent the logical operation, not the individual HTTP attempt.
+
+<h3 id="payload-mismatch">Payload Mismatch</h3>
+
+The same key with a different request body should be rejected. Returning the old result for a different request can hide client bugs and break workflows.
+
+<h3 id="non-atomic-reservation">Non-Atomic Reservation</h3>
+
+Check-then-insert logic can race. Reserve the key atomically, or let a unique constraint protect the business operation.
+
+<h3 id="dedupe-in-memory">Dedupe in Memory</h3>
+
+An in-memory set disappears on restart and is not shared across replicas. Use durable storage in production.
+
+<h3 id="side-effects-before-reservation">Side Effects Before Reservation</h3>
+
+Calling an external provider before reserving the key leaves no durable record for retries to find.
+
+<h3 id="confusing-idempotency-with-exactly-once">
+  Confusing Idempotency with Exactly-Once
+</h3>
+
+Idempotency does not prove that the code ran once. It makes repeated attempts end with one intended effect.
+
+Exactly-once promises, where available, are usually limited to one system boundary. A broker may provide exactly-once processing for topic-to-topic workflows, but that does not automatically make calls to an external payment provider exactly once.
+
+<h1 id="11-best-practices">11. Best Practices</h1>
+
+Use this checklist when building retry-safe endpoints, consumers, and calls to other services.
+
+- Use stable operation IDs for operations with side effects.
+- Require idempotency keys for retryable endpoints that can create side effects, such as payment creation and job submission.
+- Scope keys by tenant, caller, endpoint, or operation type.
+- Store request hashes and reject mismatches.
+- Reserve keys atomically.
+- Store the original response when client consistency matters.
+- Keep business state and duplicate-detection state in the same transaction when possible.
+- Pass idempotency keys to providers that support them.
+- Treat message consumers as duplicate-tolerant by default.
+- Document key retention windows.
+- Test concurrent retries, timeouts, process crashes, provider failures, and broker redelivery.
+
+<h1 id="summary">Summary</h1>
+
+Idempotency makes retries safe by letting a system receive the same logical operation more than once without creating duplicate side effects. Natural idempotency comes from setting a final state. Engineered idempotency comes from stable operation IDs, durable records, request hashes, atomic reservation, and unique constraints.
+
+HTTP method behavior helps, but it is not enough for payment creation, order submission, webhook processing, background jobs, and message consumers. Those workflows need explicit idempotency design.
+
+The practical goal is simple: clients, brokers, and operators should be able to retry after uncertainty without charging twice, creating duplicate orders, sending duplicate irreversible actions, or corrupting state.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

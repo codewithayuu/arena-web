@@ -1,0 +1,534 @@
+---
+title: "FileInputStream & FileOutputStream"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "FileInputStream & FileOutputStream explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+The orange boxes are the file-backed streams this lesson focuses on. The teal boxes are in-memory streams used for testing or for buffering data you've already collected. The green boxes are wrappers that add buffering on top of any underlying stream; they appear briefly later.
+
+The model: a `FileInputStream` is a one-way pipe from a file on disk into the program. A `FileOutputStream` is a one-way pipe from the program to a file on disk. Open the pipe, push bytes through it, and close it. Bytes are bytes; interpreting them as a JPEG, a PDF, an encrypted payload, or a plain text file is entirely the application's job.
+
+<h1 id="when-to-use-byte-streams-vs-character-streams">
+  When to Use Byte Streams (vs Character Streams)
+</h1>
+
+Use byte streams when the file's contents are not text: images (`.jpg`, `.png`), PDFs, compressed archives (`.zip`, `.gz`), executable binaries, encrypted blobs, audio, video, or any custom binary format. Use character streams (`FileReader`, `FileWriter`) when the file holds text and correct charset handling is required.
+
+The key distinction is encoding. A text file is not a sequence of bytes that happen to look like letters; it is a sequence of characters encoded into bytes using some charset (UTF-8, UTF-16, ISO-8859-1, etc.). A character `é` is one byte in ISO-8859-1, two bytes in UTF-8, and two or four bytes in UTF-16. Reading a UTF-8 text file with a byte stream and treating each byte as a character causes multi-byte characters to break apart and produces garbage.
+
+The rule of thumb:
+
+| File type               | Stream family    | Why                                            |
+| ----------------------- | ---------------- | ---------------------------------------------- |
+| `.jpg`, `.png`, `.pdf`  | Byte stream      | Binary data, no charset involved               |
+| `.zip`, `.gz`, `.tar`   | Byte stream      | Compressed binary                              |
+| `.mp3`, `.mp4`, `.wav`  | Byte stream      | Binary media                                   |
+| Custom binary blobs     | Byte stream      | The byte layout is application-defined         |
+| `.txt`, `.csv`, `.json` | Character stream | Charset matters, strings are needed, not bytes |
+| Source code files       | Character stream | Text with a specific encoding                  |
+
+That said, a text file can be read as bytes when only its size, a verbatim copy, or a hash matters. The bytes don't change; only the interpretation does. The character-stream classes are conveniences for working with `String` and `char` instead of `byte`.
+
+<h1 id="opening-a-fileinputstream">Opening a FileInputStream</h1>
+
+`FileInputStream` has three commonly used constructors. All three throw `FileNotFoundException` (a checked exception) if the file doesn't exist or can't be opened for reading.
+
+```java
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+
+public class OpenInputStream {
+    public static void main(String[] args) throws IOException {
+        // 1. From a path string
+        try (FileInputStream a = new FileInputStream("orders.bin")) {
+            System.out.println("Opened by path string, available bytes: " + a.available());
+        }
+
+        // 2. From a File object
+        File file = new File("orders.bin");
+        try (FileInputStream b = new FileInputStream(file)) {
+            System.out.println("Opened by File, available bytes: " + b.available());
+        }
+    }
+}
+```
+
+The example assumes `orders.bin` exists in the current directory with 12 bytes in it. Both constructors do the same thing; the `File` overload is convenient when a `File` object already exists from earlier code. There's also a third constructor that takes a `FileDescriptor`, which mostly shows up when interoperating with other low-level APIs.
+
+`try-with-resources` is how every stream should be opened. `FileInputStream` implements `AutoCloseable`, so the stream is closed automatically when the block exits, even if an exception is thrown. The exception-handling section covered the mechanics; in file I/O, this matters because every open stream holds an operating-system file handle, and leaking handles eventually crashes the JVM with "too many open files".
+
+Opening a `FileInputStream` is not free. The constructor makes a system call to ask the operating system for a file descriptor. Open it once for a read session, not once per byte.
+
+Passing a path to a file that doesn't exist causes the constructor to throw immediately:
+
+**What's wrong with this code?**
+
+```java
+FileInputStream input = new FileInputStream("does-not-exist.bin");
+// FileNotFoundException: does-not-exist.bin (No such file or directory)
+```
+
+**Fix:**
+
+```java
+File file = new File("does-not-exist.bin");
+if (file.exists() && file.isFile()) {
+    try (FileInputStream input = new FileInputStream(file)) {
+        // ... read
+    }
+} else {
+    System.out.println("File not found: " + file.getAbsolutePath());
+}
+```
+
+Checking `exists()` before opening doesn't eliminate the exception (the file could be deleted between the check and the open) but it provides a useful error message in the common case.
+
+<h1 id="reading-bytes-read-readbyte-readbyte-off-len">
+  Reading Bytes: read(), read(byte[]), read(byte[], off, len)
+</h1>
+
+`FileInputStream` exposes three read methods, in increasing order of usefulness.
+
+**`int read()`** reads exactly one byte and returns it as an `int` in the range `0` to `255`. The return type is `int`, not `byte`, for a specific reason: it has to be able to return `-1` to signal end-of-stream, and `byte` already uses negative values for half its range. Returning a `byte` of `-1` would be ambiguous between "the byte `0xFF` was read" and "the file is over". Using `int` resolves that ambiguity.
+
+```java
+import java.io.FileInputStream;
+import java.io.IOException;
+
+public class ReadOneByte {
+    public static void main(String[] args) throws IOException {
+        try (FileInputStream input = new FileInputStream("orders.bin")) {
+            int firstByte = input.read();
+            System.out.println("First byte (unsigned): " + firstByte);
+            System.out.println("As hex: " + Integer.toHexString(firstByte));
+        }
+    }
+}
+```
+
+The value `79` is the unsigned decimal of `0x4F`, which is the ASCII code for `O`. If `orders.bin` started with the letter `O`, the output would match.
+
+Calling `read()` once per byte is the slowest possible way to read a file. Each call is a method invocation, and underneath, the JDK often goes back to the OS for more data. Reading a 10 MB file one byte at a time can take tens of seconds when reading it in chunks takes milliseconds.
+
+**`int read(byte[] buffer)`** reads up to `buffer.length` bytes into the array and returns how many bytes were actually read. The return is `-1` when end-of-stream is reached before any bytes could be read. This is the workhorse method.
+
+```java
+import java.io.FileInputStream;
+import java.io.IOException;
+
+public class ReadIntoBuffer {
+    public static void main(String[] args) throws IOException {
+        try (FileInputStream input = new FileInputStream("orders.bin")) {
+            byte[] buffer = new byte[8];
+            int bytesRead = input.read(buffer);
+            System.out.println("Bytes read: " + bytesRead);
+            System.out.print("Values: ");
+            for (int i = 0; i < bytesRead; i++) {
+                System.out.print((buffer[i] & 0xFF) + " ");
+            }
+            System.out.println();
+        }
+    }
+}
+```
+
+`read(buffer)` is allowed to return fewer bytes than the buffer holds. For a file, it usually fills the buffer until the last read, when fewer bytes remain. For network streams or pipes, partial reads are common even in the middle of the stream. Always use the returned count, never assume the buffer is full.
+
+The `& 0xFF` trick when printing matters here. `buffer[i]` is a `byte`, which in Java is signed (-128 to 127). Concatenating it into a string or converting to `int` causes sign extension to turn a byte like `0xFF` into the `int` `-1`. Masking with `0xFF` keeps only the low 8 bits, producing the unsigned value (0 to 255).
+
+**`int read(byte[] buffer, int offset, int length)`** is the most flexible form. It reads up to `length` bytes into `buffer`, starting at index `offset` inside the buffer. This is useful when filling a slice of a larger buffer or leaving headroom at the start of the buffer (for example, for a length prefix).
+
+```java
+import java.io.FileInputStream;
+import java.io.IOException;
+
+public class ReadIntoSlice {
+    public static void main(String[] args) throws IOException {
+        try (FileInputStream input = new FileInputStream("orders.bin")) {
+            byte[] buffer = new byte[16];
+            // Leave the first 4 bytes empty, fill bytes 4..15
+            int bytesRead = input.read(buffer, 4, 12);
+            System.out.println("Bytes read into slice: " + bytesRead);
+            System.out.println("buffer[0..3] is still zeros: "
+                + buffer[0] + " " + buffer[1] + " " + buffer[2] + " " + buffer[3]);
+        }
+    }
+}
+```
+
+The bytes are placed into positions 4 through 15 of the buffer. The first four positions stay at their default `0`. Invalid offsets or lengths cause `IndexOutOfBoundsException`.
+
+<h1 id="end-of-stream-and-available">End-of-Stream and available()</h1>
+
+Two methods on `FileInputStream` report how much data is left. They're easy to confuse, and they answer different questions.
+
+`read(...)` returns `-1` once there's nothing left to read. This is the only reliable end-of-stream signal. Every read loop in idiomatic Java looks like:
+
+```java
+int bytesRead;
+while ((bytesRead = input.read(buffer)) != -1) {
+    // process buffer[0 .. bytesRead - 1]
+}
+```
+
+The assignment-inside-the-condition pattern is common in I/O code. Read into the buffer, get the actual count, and exit when the count is `-1`.
+
+`available()` returns the number of bytes that can be read without blocking. For a `FileInputStream`, this is usually the file size minus how many bytes have already been read, but the JDK explicitly says "do not assume this is the total remaining". On other streams (sockets, pipes), it can return `0` even when more bytes are on the way; the caller just hasn't received them yet.
+
+```java
+import java.io.FileInputStream;
+import java.io.IOException;
+
+public class AvailableDemo {
+    public static void main(String[] args) throws IOException {
+        try (FileInputStream input = new FileInputStream("orders.bin")) {
+            System.out.println("Available at start: " + input.available());
+            input.read();
+            System.out.println("Available after one read: " + input.available());
+            input.read(new byte[5]);
+            System.out.println("Available after reading 5 more: " + input.available());
+        }
+    }
+}
+```
+
+`available()` is useful for sizing a one-shot read when the source is known to be a file ("a buffer just big enough for the rest of this file"), but it should never be used to detect end-of-stream. Always use the `-1` return from `read`.
+
+`available()` is not the file size. It's "bytes ready right now". On a file it usually matches the remainder; on a network stream it's often `0` while you wait for the next packet. Treat it as a hint, not a guarantee.
+
+<h1 id="writing-bytes-with-fileoutputstream">
+  Writing Bytes with FileOutputStream
+</h1>
+
+`FileOutputStream` mirrors `FileInputStream`. The two most common constructors take either a path or a `File`:
+
+```java
+new FileOutputStream("inventory-snapshot.bin");
+new FileOutputStream(new File("inventory-snapshot.bin"));
+```
+
+Both default to **overwrite mode**: if the file exists, its contents are truncated to zero length the moment the stream is opened. The very first call to the constructor wipes the old file. There's a second pair of constructors that take a boolean `append` flag.
+
+The write methods parallel the read methods, with one extra: `flush()`.
+
+| Method                                | What it does                                               |
+| ------------------------------------- | ---------------------------------------------------------- |
+| `void write(int b)`                   | Writes one byte (low 8 bits of `b`)                        |
+| `void write(byte[] buffer)`           | Writes the whole buffer                                    |
+| `void write(byte[] buffer, off, len)` | Writes `len` bytes from `buffer` starting at `off`         |
+| `void flush()`                        | Forces buffered output (no-op on plain `FileOutputStream`) |
+| `void close()`                        | Closes the stream and releases the OS file handle          |
+
+A simple end-to-end example: save a short binary snapshot of inventory counts to a file, one byte per count.
+
+```java
+import java.io.FileOutputStream;
+import java.io.IOException;
+
+public class WriteInventory {
+    public static void main(String[] args) throws IOException {
+        int[] stockCounts = { 12, 7, 25, 4, 99, 0, 13 };
+
+        try (FileOutputStream output = new FileOutputStream("inventory-snapshot.bin")) {
+            for (int count : stockCounts) {
+                output.write(count);
+            }
+        }
+
+        System.out.println("Wrote " + stockCounts.length + " stock counts to disk.");
+    }
+}
+```
+
+The file `inventory-snapshot.bin` now contains 7 bytes: `0x0C 0x07 0x19 0x04 0x63 0x00 0x0D`. Each byte is the stock count for one product. Because each value fits in a byte (0 to 255), `write(int)` works directly. If any count exceeded 255, the low 8 bits would truncate without warning and data would be lost, which is a real risk.
+
+Writing a whole array at once is faster and more idiomatic when the bytes are already in a buffer:
+
+```java
+import java.io.FileOutputStream;
+import java.io.IOException;
+
+public class WriteOrdersBuffer {
+    public static void main(String[] args) throws IOException {
+        // Pretend this is an order header: "ORDER-101"
+        byte[] orderHeader = { 'O', 'R', 'D', 'E', 'R', '-', '1', '0', '1' };
+
+        try (FileOutputStream output = new FileOutputStream("orders.bin")) {
+            output.write(orderHeader);
+        }
+
+        System.out.println("Wrote order header (" + orderHeader.length + " bytes).");
+    }
+}
+```
+
+`write(byte[])` is the choice with a pre-built buffer. It's one method call and one underlying syscall (or close to it), instead of nine of each.
+
+`output.write(b)` in a loop is slow for the same reason `input.read()` is slow: method-call overhead plus possible per-byte trips to the OS. Build a buffer and call `write(byte[])` once, or wrap the stream in `BufferedOutputStream`.
+
+The `flush()` method matters more for buffered streams than for raw `FileOutputStream`. On a plain `FileOutputStream`, every `write` already pushes data to the OS, so `flush()` is essentially a no-op. Wrap that same stream in a `BufferedOutputStream` and `flush()` becomes important: it forces the wrapper to send any in-memory data downstream.
+
+<h1 id="overwrite-vs-append-mode">Overwrite vs Append Mode</h1>
+
+The overwrite default is a common source of surprise. Opening the file appears to be a preamble to writing bytes, but the existing contents are gone before any `write` call. This is by design: most binary file outputs replace the file wholesale (think snapshots), so overwriting is the right default. To actually add bytes to the end, pass `true` as the second constructor argument.
+
+The diagram captures the choice made at construction time. Once the stream is open, every `write` goes to the current position (the end of the file, or the beginning of the freshly-truncated file). Modes don't switch mid-stream; the decision is committed at the constructor.
+
+A concrete example shows the difference. Consider a small audit log of order IDs in a binary file. Running the program twice shows what happens with each mode.
+
+```java
+import java.io.FileOutputStream;
+import java.io.IOException;
+
+public class AppendVsOverwrite {
+    public static void main(String[] args) throws IOException {
+        byte[] order1 = { 'A', 1, 0, 1 };  // marker + order 101 in 2 bytes
+        byte[] order2 = { 'A', 1, 0, 2 };  // marker + order 102
+
+        // Overwrite (default)
+        try (FileOutputStream out = new FileOutputStream("orders-overwrite.bin")) {
+            out.write(order1);
+        }
+        try (FileOutputStream out = new FileOutputStream("orders-overwrite.bin")) {
+            out.write(order2);
+        }
+
+        // Append
+        try (FileOutputStream out = new FileOutputStream("orders-append.bin", true)) {
+            out.write(order1);
+        }
+        try (FileOutputStream out = new FileOutputStream("orders-append.bin", true)) {
+            out.write(order2);
+        }
+
+        System.out.println("orders-overwrite.bin size: "
+            + new java.io.File("orders-overwrite.bin").length());
+        System.out.println("orders-append.bin size: "
+            + new java.io.File("orders-append.bin").length());
+    }
+}
+```
+
+The overwrite file holds only the second write (4 bytes), because the second open wiped the first one. The append file holds both writes (8 bytes), because each open positions the write cursor at the end of whatever's already there. Deleting the append file and running the program again starts it at 0 bytes and grows it to 8.
+
+Append mode fits log files, audit trails, or any "add to the end" workflow. Overwrite fits snapshots, exports, and atomic replacements.
+
+There's a subtle gotcha with append mode and concurrent writers. Two processes opening the same file in append mode can each get correct end-of-file positioning on every write, because most operating systems make append-mode writes atomic at the syscall level. But this is an OS-level guarantee, not a Java one. For application-level concurrency (multiple threads in the same JVM), synchronization or a higher-level abstraction is still required; raw `FileOutputStream` is not thread-safe.
+
+<h1 id="copying-a-file-one-byte-at-a-time-vs-chunks">
+  Copying a File: One Byte at a Time vs Chunks
+</h1>
+
+The clearest way to feel the cost of unbuffered byte-by-byte I/O is to copy a file two ways and time it. The pattern is the same for both: open an input stream, open an output stream, pull from input, push to output.
+
+The buffer in the middle is the whole story. Without it, each byte makes its own round trip: read one byte from disk, write one byte to disk, repeat. With a buffer, each round trip moves thousands of bytes, and the dominant cost (the system call) is amortized over all of them.
+
+Byte-by-byte copy (slow, but a useful baseline):
+
+```java
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+
+public class CopyByteByByte {
+    public static void main(String[] args) throws IOException {
+        long start = System.currentTimeMillis();
+
+        try (FileInputStream in = new FileInputStream("product-photo.jpg");
+             FileOutputStream out = new FileOutputStream("product-photo-copy.jpg")) {
+
+            int b;
+            while ((b = in.read()) != -1) {
+                out.write(b);
+            }
+        }
+
+        long elapsed = System.currentTimeMillis() - start;
+        System.out.println("Byte-by-byte copy took " + elapsed + " ms.");
+    }
+}
+```
+
+(Actual numbers depend on file size and disk speed. On a 5 MB JPEG, expect several seconds.)
+
+Chunked copy (correct and fast):
+
+```java
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+
+public class CopyInChunks {
+    public static void main(String[] args) throws IOException {
+        long start = System.currentTimeMillis();
+
+        try (FileInputStream in = new FileInputStream("product-photo.jpg");
+             FileOutputStream out = new FileOutputStream("product-photo-copy.jpg")) {
+
+            byte[] buffer = new byte[8192];
+            int bytesRead;
+            while ((bytesRead = in.read(buffer)) != -1) {
+                out.write(buffer, 0, bytesRead);
+            }
+        }
+
+        long elapsed = System.currentTimeMillis() - start;
+        System.out.println("Chunked copy took " + elapsed + " ms.");
+    }
+}
+```
+
+Two changes deliver the speedup. First, `read(buffer)` fills up to 8192 bytes per call, so the number of method calls drops by roughly 8000x. Second, `write(buffer, 0, bytesRead)` writes those bytes in one call. The OS still does its work, but the work is batched.
+
+The `0, bytesRead` parameters on `write` matter. Write exactly the bytes that were read, not the entire buffer. On the final iteration, `read` typically returns fewer bytes than the buffer's length (it reads whatever remains in the file). Writing the whole buffer appends garbage from the previous iteration to the end of the output file. That bug corrupts every binary file copy that gets it wrong, and it's invisible until the destination file fails to open.
+
+**What's wrong with this code?**
+
+```java
+byte[] buffer = new byte[8192];
+int bytesRead;
+while ((bytesRead = in.read(buffer)) != -1) {
+    out.write(buffer); // BUG
+}
+```
+
+**Fix:**
+
+```java
+byte[] buffer = new byte[8192];
+int bytesRead;
+while ((bytesRead = in.read(buffer)) != -1) {
+    out.write(buffer, 0, bytesRead);
+}
+```
+
+`write(buffer)` always writes all 8192 bytes, regardless of how many were actually read. On the last iteration, the tail of the buffer holds stale data from the previous read, so the destination file ends up larger than the source and the trailing bytes are wrong. Always pass `(buffer, 0, bytesRead)` when copying.
+
+8192 bytes is the conventional buffer size and it's what `BufferedInputStream`/`BufferedOutputStream` use by default. Smaller buffers waste syscalls; much larger buffers waste memory without measurable speedup, because the OS already prefetches around your reads.
+
+<h1 id="a-realistic-example-saving-an-uploaded-product-image">
+  A Realistic Example: Saving an Uploaded Product Image
+</h1>
+
+A common task in an e-commerce backend is taking the bytes of an uploaded image and persisting them to disk. The bytes might arrive as a `byte[]` from a multipart form, from a `ByteArrayInputStream` built earlier, or from a network socket. The destination is the local filesystem. `FileOutputStream` is what does the actual writing.
+
+```java
+import java.io.FileOutputStream;
+import java.io.IOException;
+
+public class SaveProductImage {
+    public static void main(String[] args) throws IOException {
+        // Pretend these bytes came from a file upload over HTTP.
+        // In real code, they'd be the body of a multipart upload.
+        byte[] productImageBytes = {
+            (byte) 0xFF, (byte) 0xD8, (byte) 0xFF, (byte) 0xE0, // JPEG header
+            // ... thousands more bytes in real code
+            (byte) 0xFF, (byte) 0xD9  // JPEG end marker
+        };
+
+        String savedPath = "uploads/product-1042.jpg";
+        try (FileOutputStream output = new FileOutputStream(savedPath)) {
+            output.write(productImageBytes);
+        }
+
+        System.out.println("Saved " + productImageBytes.length + " bytes to " + savedPath);
+    }
+}
+```
+
+For this snippet to work, the `uploads/` directory must already exist; `FileOutputStream` won't create missing parent directories. A real upload handler would call `new File(savedPath).getParentFile().mkdirs()` first to ensure the directory tree is there.
+
+Reading the image back out is symmetric:
+
+```java
+import java.io.ByteArrayOutputStream;
+import java.io.FileInputStream;
+import java.io.IOException;
+
+public class LoadProductImage {
+    public static void main(String[] args) throws IOException {
+        ByteArrayOutputStream collected = new ByteArrayOutputStream();
+
+        try (FileInputStream input = new FileInputStream("uploads/product-1042.jpg")) {
+            byte[] buffer = new byte[8192];
+            int bytesRead;
+            while ((bytesRead = input.read(buffer)) != -1) {
+                collected.write(buffer, 0, bytesRead);
+            }
+        }
+
+        byte[] productImageBytes = collected.toByteArray();
+        System.out.println("Loaded " + productImageBytes.length + " bytes from disk.");
+        System.out.println("First byte: 0x" + Integer.toHexString(productImageBytes[0] & 0xFF));
+        System.out.println("Last byte:  0x" + Integer.toHexString(
+            productImageBytes[productImageBytes.length - 1] & 0xFF));
+    }
+}
+```
+
+The pattern: open a `FileInputStream`, read into an 8 KB buffer in a loop, append each chunk into a `ByteArrayOutputStream`, and call `toByteArray()` when done. This works for any size of file as long as the contents fit in memory. For multi-gigabyte files, stream chunks straight to their destination instead of collecting them in memory.
+
+<h1 id="common-pitfalls">Common Pitfalls</h1>
+
+A few mistakes show up repeatedly in code reviews. Recognizing these avoids most byte-stream bugs.
+
+**Forgetting to close.** Pre-Java 7 code is full of bare `new FileInputStream(...)` with no `try-finally` and no `close()`. Each leaked handle stays open until garbage collection runs, which might be never. Always use `try-with-resources`. The JDK closes the stream when the block exits, even on exception.
+
+**Treating bytes as characters.** Reading a UTF-8 text file with `FileInputStream` and casting each `byte` to `char` works only for pure ASCII. Anything outside `0..127` either breaks (multi-byte UTF-8 sequences split across characters) or shows up as garbage. Use `FileReader` for text.
+
+**Sign extension of bytes.** A `byte` in Java is signed. Arithmetic on a byte or conversion to a wider type without masking causes sign extension to turn `0xFF` into `-1`, not `255`. For the unsigned value of a byte, write `b & 0xFF`.
+
+**Writing the whole buffer instead of the bytes read.** The `out.write(buffer)` vs `out.write(buffer, 0, bytesRead)` mistake from earlier. Always use the three-argument form when copying.
+
+**Assuming `available()` is the file size.** It's "bytes ready to read without blocking", which is usually the remaining file size for a `FileInputStream`, but never the right thing to use for end-of-stream detection. The JDK explicitly says do not rely on `available()` for that. Use the `-1` return from `read`.
+
+**Single-byte reads in a loop.** `while ((b = in.read()) != -1)` works, but it's slow. Use `read(byte[])` for any non-trivial file, or wrap with `BufferedInputStream` to keep the single-byte API.
+
+**Not creating parent directories.** `new FileOutputStream("uploads/orders/2026/02/order.bin")` fails with `FileNotFoundException` if any directory in the path doesn't exist. The stream creates the file itself but not the directories above it. Call `parent.mkdirs()` first.
+
+<h1 id="a-brief-note-on-wrapping-with-buffered-streams">
+  A Brief Note on Wrapping with Buffered Streams
+</h1>
+
+`BufferedInputStream` and `BufferedOutputStream` are wrappers that sit on top of any byte stream and add an internal buffer. Hand them a `FileInputStream` (or any `InputStream`), and they batch the underlying reads. From the calling code's perspective, `read()` and `write()` are called exactly as before; the wrapper hides the buffering.
+
+The shape of the code:
+
+```java
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+
+public class BufferedCopy {
+    public static void main(String[] args) throws IOException {
+        try (BufferedInputStream in =
+                new BufferedInputStream(new FileInputStream("orders.bin"));
+             BufferedOutputStream out =
+                new BufferedOutputStream(new FileOutputStream("orders-copy.bin"))) {
+
+            int b;
+            while ((b = in.read()) != -1) {
+                out.write(b);
+            }
+        }
+
+        System.out.println("Copied orders.bin via buffered streams.");
+    }
+}
+```
+
+With buffering, single-byte `read()` and `write(int)` calls are fast again, because the wrappers turn them into batched syscalls internally. That doesn't make single-byte I/O the right design (chunked reads are still faster and more direct), but buffered wrappers fix the performance cliff when the calling code is stuck with a stream-of-bytes API.
+
+The byte-stream wrappers (`BufferedInputStream`, `BufferedOutputStream`) work the same way as their character-stream siblings: same constructor pattern, same default buffer size (8192 bytes), same effect on performance.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

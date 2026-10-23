@@ -1,0 +1,347 @@
+---
+title: "Currying"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Currying explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="what-currying-is">What Currying Is</h1>
+
+A curried function expects exactly one argument per call. If the original function needs three arguments, the curried version is a function that returns a function that returns a function that returns the result.
+
+The shape is easier to read than describe. The simplest example side by side:
+
+```python
+# Regular function: takes three arguments at once.
+def add(a, b, c):
+    return a + b + c
+
+# Curried version: takes one argument at a time.
+def add_curried(a):
+    def step_b(b):
+        def step_c(c):
+            return a + b + c
+        return step_c
+    return step_b
+
+print(add(1, 2, 3))
+print(add_curried(1)(2)(3))
+```
+
+Both produce `6`. The curried version splits the single three-argument call into three single-argument calls. Each call returns a function that's ready for the next argument, until the last call returns the actual result.
+
+This works because of closures. Each nested `def` captures the arguments that came before it. By the time `step_c` runs with `c=3`, the `a=1` and `b=2` from the earlier calls are still in scope, held alive by the closure cells.
+
+You can also stop partway through and save the intermediate result:
+
+```python
+def add_curried(a):
+    def step_b(b):
+        def step_c(c):
+            return a + b + c
+        return step_c
+    return step_b
+
+add_one = add_curried(1)
+add_one_two = add_one(2)
+
+print(add_one_two(3))
+print(add_one_two(10))
+print(add_one(5)(5))
+```
+
+`add_one` is a callable that still needs two arguments. `add_one_two` is one that still needs one. Each saved step is a usable function on its own. That's the practical appeal of currying: every prefix of the argument list gives a new specialized function.
+
+A curried function does N function calls instead of one, plus N closure cells per fully-applied call. For arithmetic in a tight loop, the overhead is real (a few times slower than the direct call). For higher-level operations where the work inside the function dominates, the overhead is negligible.
+
+<h1 id="why-currying-exists">Why Currying Exists</h1>
+
+If currying just splits one call into many, why does any language bother with it? The answer is **function composition**. In a language where every function takes one argument, every function is a black box with one input and one output, so any two functions can be chained together as long as the output type of the first matches the input type of the second.
+
+In Haskell, OCaml, and similar languages, every function is curried by default. There's no `f(a, b)` form; there's only `f a b`, which parses as `(f a) b`, which is currying. Once that's the default, pipelines like `map (double . increment) numbers` work without any special syntax: `double . increment` is a one-input, one-output function, and `map` accepts it directly.
+
+Python isn't built that way. The language has multi-argument functions as a first-class concept, and Python idioms don't favor heavy function composition. So while currying is a clean idea on paper, in Python it tends to show up only in code that's deliberately written in a functional style or in libraries that bring the FP toolkit with them.
+
+The technique is still useful in three situations:
+
+1. **Building pipelines** where each step is a small transformation, composed with `compose(f, g, h)` or a pipe operator.
+2. **Specializing the same function many times** with one argument at a time, where the "one at a time" shape matches how the arguments become available.
+3. **Reading FP-heavy code** in libraries like `toolz`, `fnc`, or `returns`, where curried APIs are common and the pattern needs to be familiar.
+
+The sections below cover each of these in Python, starting with hand-rolled curried functions and moving to library tools.
+
+<h1 id="hand-rolled-currying-with-nested-closures">
+  Hand-Rolled Currying with Nested Closures
+</h1>
+
+For a function whose argument count is known in advance, hand-rolling a curried version is straightforward. Each level is one `def` that captures the prior arguments.
+
+A discount calculator with three knobs (base price, percent off, loyalty bonus) is a realistic e-commerce shape:
+
+```python
+def discounted_price(price):
+    def with_percent(percent):
+        def with_loyalty(loyalty):
+            total_discount = (percent + loyalty) / 100
+            return round(price * (1 - total_discount), 2)
+        return with_loyalty
+    return with_percent
+
+print(discounted_price(100)(10)(5))
+
+# Partially applied at each step.
+member_price = discounted_price(100)
+member_at_10_off = member_price(10)
+print(member_at_10_off(5))
+print(member_at_10_off(0))
+```
+
+The three-level nest mirrors the three arguments. `discounted_price(100)` returns a function waiting for the percent. That returns a function waiting for the loyalty bonus. That final function does the math and returns the price. The intermediate `member_at_10_off` is a specialized function in its own right.
+
+The diagram below shows the chain:
+
+Each box is the result of one call. The first call returns the second function, which returns the third function, which returns the number. The caller stops at whatever step makes sense; the curried function never refuses to be paused partway.
+
+Hand-rolling like this works fine for two or three arguments. Beyond that, the nesting becomes ugly and error-prone. For wider functions, a small helper that turns any regular function into a curried one is more practical.
+
+<h1 id="a-generic-curry-helper">A Generic curry Helper</h1>
+
+A `curry` function takes a regular function and returns a curried version that collects its arguments one at a time. The trick is to keep returning a new wrapper until enough arguments have been gathered, then call the underlying function.
+
+```python
+import inspect
+
+def curry(func):
+    """Turn a regular function into a curried one."""
+    arity = len(inspect.signature(func).parameters)
+
+    def curried(*args):
+        if len(args) >= arity:
+            return func(*args[:arity])
+        return lambda *more: curried(*(args + more))
+
+    return curried
+
+def total_price(quantity, unit_price, tax_rate):
+    return quantity * unit_price * (1 + tax_rate)
+
+curried_total = curry(total_price)
+
+print(curried_total(2)(10)(0.08))
+print(curried_total(2, 10)(0.08))
+print(curried_total(2)(10, 0.08))
+```
+
+The helper inspects the function's signature to find out how many arguments it expects (`arity`). The inner `curried` collects arguments as they arrive. When the count reaches the arity, it calls the underlying function with whatever it has. Otherwise it returns another callable that will collect more.
+
+This `curry` is a little friendlier than the strict definition: it accepts arguments one at a time, but it also accepts groups. `curried_total(2, 10)(0.08)` works the same way as `curried_total(2)(10)(0.08)`. That's a practical compromise; strict currying would require exactly one argument per call. Most Python libraries that offer currying take this looser approach.
+
+The same helper works for any positional-only function. Functions with `**kwargs` or `*args` need more careful handling because their arity isn't fixed; libraries handle those cases with extra logic.
+
+```python
+def total_price(quantity, unit_price, tax_rate):
+    return quantity * unit_price * (1 + tax_rate)
+
+curried_total = curry(total_price)
+
+# Save each prefix as a named, reusable function.
+two_units = curried_total(2)
+two_units_at_10 = two_units(10)
+
+print(two_units_at_10(0.08))
+print(two_units_at_10(0.0))
+print(two_units(20)(0.08))
+```
+
+Each prefix is callable. `two_units` is "the total for two of anything". `two_units_at_10` is "the total for two at $10 each, ready for whichever tax rate". The chain doesn't have to be unwound all at once; whichever prefix is useful is a valid stopping point.
+
+The generic helper builds a closure on every partial application. For deeply curried calls in a hot loop, this is more overhead than the hand-rolled version. For most code, the cost is invisible.
+
+<h1 id="currying-vs-partial">Currying vs partial</h1>
+
+`functools.partial` and currying both let you supply arguments later, so it's natural to ask when each one fits.
+
+| Feature                     | `partial`           | Currying                |
+| --------------------------- | ------------------- | ----------------------- |
+| Bind any subset in one step | Yes                 | No (one at a time)      |
+| Bind by keyword             | Yes                 | No (positional only)    |
+| Bind out-of-order arguments | Yes (with keywords) | No (left to right)      |
+| Compose into pipelines      | Awkward             | Natural                 |
+| Picklable                   | Yes                 | Usually yes             |
+| Built into stdlib           | Yes (`functools`)   | No (DIY or third-party) |
+| Common in Python code       | Very                | Rare                    |
+
+The practical rule: to **specialize** a function (lock in one or two arguments and reuse the result repeatedly), `partial` is the cleaner choice. To **compose** functions in a pipeline where each stage takes one input, currying lines up better.
+
+```python
+from functools import partial
+
+def total_price(quantity, unit_price, tax_rate):
+    return quantity * unit_price * (1 + tax_rate)
+
+# Partial: bind whatever you want, in any order.
+two_units_taxed = partial(total_price, 2, tax_rate=0.08)
+print(two_units_taxed(unit_price=10))
+
+# Curry: positional only, one at a time.
+curried = curry(total_price)
+print(curried(2)(10)(0.08))
+```
+
+The same answer, two different APIs. The `partial` version skips `unit_price` and binds `tax_rate` while leaving `unit_price` for later. The curried version goes strictly left to right. Neither is wrong; they match different design preferences.
+
+A useful framing: `partial` is the Python-native answer, and currying fits when consciously writing in a functional style or working with a library that expects curried inputs.
+
+<h1 id="currying-in-toolz-and-fnc">Currying in toolz and fnc</h1>
+
+Two popular libraries make currying easy without writing your own helper. `toolz.curry` and `fnc.curry` both decorate a function to make it accept arguments one at a time (or in groups), the same loose definition the helper above uses.
+
+`toolz` is widely used in data-science code and is the more mature option. After `pip install toolz`:
+
+```python
+# pip install toolz
+from toolz import curry
+
+@curry
+def total_price(quantity, unit_price, tax_rate):
+    return quantity * unit_price * (1 + tax_rate)
+
+print(total_price(2, 10, 0.08))
+print(total_price(2)(10)(0.08))
+print(total_price(2, 10)(0.08))
+
+# Partial application also works.
+two_units = total_price(2)
+print(two_units(10, 0.08))
+```
+
+`@curry` turns `total_price` into a callable that accepts arguments in any chunking. Once it has all three, it runs. Until then, each call returns a new curried callable. The library also handles keyword arguments and default values, which the hand-rolled helper above does not.
+
+`toolz` pairs well with its other tools, especially `compose` and `pipe`:
+
+```python
+from toolz import curry, compose
+
+@curry
+def multiply(factor, value):
+    return factor * value
+
+@curry
+def add(addend, value):
+    return value + addend
+
+# compose runs right-to-left: add first, then multiply.
+pipeline = compose(multiply(2), add(10))
+
+print(pipeline(5))
+print(pipeline(0))
+```
+
+`multiply(2)` is a curried function with one argument left. `add(10)` is too. `compose(multiply(2), add(10))` chains them: it adds 10 to the input first, then multiplies the result by 2. Without currying, the same chain would need lambdas to read clearly; with currying, the names of the functions are enough.
+
+`fnc` is a smaller, newer library with a similar API. The choice between them is mostly taste.
+
+<h1 id="when-currying-is-worth-it-in-python">
+  When Currying Is Worth It in Python
+</h1>
+
+After all that, the direct answer is that **currying is rare in idiomatic Python**. Most Python code doesn't compose functions in pipelines, and where it does, `partial` plus comprehensions or generator expressions usually reads more clearly than a chain of curried calls.
+
+The cases where currying fits:
+
+**Data transformation pipelines.** A series of small, named transformations that flow into each other reads cleanly as curried functions plus `compose` or `pipe`. This is the style of `toolz` and `fnc`.
+
+**Configurable predicates and transforms.** To write `keep(matching("price", 29.99))` and have each piece be a function ready for the next call, currying makes that chain work without extra syntax.
+
+**Working with libraries that expect curried inputs.** Some FP-flavored libraries (Returns, Effect, parts of toolz) expect curried callables. Knowing how to produce one is useful even when not writing in that style.
+
+**Teaching.** Currying connects closures, higher-order functions, and function composition into one picture. Walking through a curried function shows what's actually happening when functions return functions.
+
+For everything else, `partial` is more likely to fit. The Python community has settled on it as the standard tool for specializing functions, and `functools` ships with the language.
+
+```python
+# A small data pipeline where currying reads naturally.
+from toolz import curry, pipe
+
+@curry
+def add_tax(rate, price):
+    return round(price * (1 + rate), 2)
+
+@curry
+def apply_discount(percent, price):
+    return round(price * (1 - percent / 100), 2)
+
+@curry
+def round_to(decimals, price):
+    return round(price, decimals)
+
+prices = [29.99, 14.99, 9.99]
+
+result = [pipe(p, apply_discount(10), add_tax(0.08), round_to(2)) for p in prices]
+print(result)
+```
+
+`pipe` passes a value through a chain of functions. Each curried function is partially applied to its configuration (10% off, 8% tax, 2 decimals), leaving one argument for `pipe` to fill with the price. The result is one tidy expression per price. Without currying, the chain would require lambdas and be harder to read.
+
+The same code without currying:
+
+```python
+prices = [29.99, 14.99, 9.99]
+
+def apply_discount(price, percent):
+    return round(price * (1 - percent / 100), 2)
+
+def add_tax(price, rate):
+    return round(price * (1 + rate), 2)
+
+result = [round(add_tax(apply_discount(p, 10), 0.08), 2) for p in prices]
+print(result)
+```
+
+Same answer. The non-curried version reads inside out: innermost call first, then outer. The curried version reads left-to-right because `pipe` reverses the nesting. For three steps it's a wash. For five or six, the pipe version is noticeably clearer. Whether that's worth a third-party dependency is a judgment call.
+
+The pipe-and-curry style adds two layers of indirection per stage. For pipelines that process millions of values per second, this overhead adds up; pure list comprehensions are faster. For pipelines that process thousands of records and care about readability, the overhead is invisible.
+
+<h1 id="limits-and-caveats">Limits and Caveats</h1>
+
+A few things about currying are worth knowing before writing a lot of it.
+
+**Keyword arguments break the chain.** Strict currying only handles positional arguments. The moment you want to pass `tax_rate=0.08` by name, the simple "one arg per call" shape doesn't work. Both `toolz.curry` and `fnc.curry` handle this by being lenient (they accept either), but a hand-rolled curry usually doesn't. Be aware of which version is in use.
+
+**Default arguments interact awkwardly.** A function with default values has a flexible arity: it can be called with fewer arguments than declared. Strict currying based on `len(signature.parameters)` doesn't know whether to wait for the defaults to be filled or to call early. Libraries solve this with a small protocol (call after all required arguments are supplied), but the corner cases surface early.
+
+**Tools that introspect functions may get confused.** A curried function is wrapped in layers of closures, so tools that read `__name__`, signature, or source code may see the wrapper rather than the original. `functools.wraps` helps for hand-rolled cases; library curry decorators usually copy the metadata.
+
+**Performance has a price.** Each partial application allocates a new closure. For tight inner loops, this is measurable. For most application code, it isn't. Profile before optimizing.
+
+**Readers may be confused.** Currying is unusual enough in Python that a curried API in a codebase will surprise readers unfamiliar with the pattern. A brief comment or doc string saying "this is curried" helps. If most of the team would have to look it up, that's a sign to use `partial` and a regular function instead.
+
+A small example that puts the keyword problem in concrete terms:
+
+```python
+def curry3(func):
+    return lambda a: lambda b: lambda c: func(a, b, c)
+
+@curry3
+def discount(price, percent, loyalty):
+    return price * (1 - (percent + loyalty) / 100)
+
+# This works.
+print(discount(100)(10)(5))
+
+# This does not.
+try:
+    print(discount(100)(percent=10)(5))
+except TypeError as exc:
+    print(f"TypeError: {exc}")
+```
+
+The inner lambdas accept one positional argument each. Passing `percent=10` by name doesn't match. Library curry decorators handle this case; hand-rolled lambdas usually don't.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

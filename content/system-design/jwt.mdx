@@ -1,0 +1,366 @@
+---
+title: "JSON Web Tokens (JWT)"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "JWT explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+This works well and is still one of the simplest options for many applications.
+
+It becomes harder in a distributed system. A single request might pass through an API gateway, a user service, an order service, and a payment service. If authentication depends on a central session store, these services may need to repeatedly fetch session data or rely on another service to identify the user.
+
+<h1 id="2-why-jwts-are-useful">2. Why JWTs Are Useful</h1>
+
+JWTs offer another approach. Instead of sending an opaque session ID, the server issues a token containing **claims** about the user.
+
+Because the token is cryptographically signed, other services can verify that it came from a trusted issuer and has not been modified. This lets services verify the user's identity from the token itself, without a session lookup on every request. That is one of the main reasons JWTs are useful in distributed systems.
+
+One important distinction is that **JWT itself is not an authentication protocol**. It is simply a token format. Protocols such as OAuth 2.0 and OpenID Connect can use JWTs, and they decide when tokens are issued, who receives them, and how refresh works. But JWTs can also be used independently.
+
+<h1 id="3-the-structure-of-a-jwt">3. The Structure of a JWT</h1>
+
+At a high level, a JWT is a compact token that lets one system send a set of claims to another system in a way that can be verified. A claim is simply a piece of information, such as a user ID, a role, or the token's expiration time.
+
+A typical JWT looks like a long string with three sections separated by dots:
+
+```plaintext
+header.payload.signature
+
+eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NSIsInJvbGUiOiJ1c2VyIn0.kX9z...
+```
+
+- The **header** describes how the token is signed.
+- The **payload** contains the claims.
+- The **signature** lets the receiving system verify that the token has not been modified.
+
+Let's look at each of these parts in more detail.
+
+<h1 id="4-the-header">4. The Header</h1>
+
+The first part of a JWT is the header. A typical header looks like this:
+
+```json
+{
+  "alg": "RS256",
+  "typ": "JWT",
+  "kid": "key-2026-10"
+}
+```
+
+| Field | Meaning                                                                       |
+| ----- | ----------------------------------------------------------------------------- |
+| `alg` | The algorithm used to sign the token. `RS256` means RSA with SHA-256.         |
+| `typ` | The token type, which is `JWT`                                                |
+| `kid` | The key ID, which tells the receiver which key to use to verify the signature |
+
+This JSON object is then Base64URL encoded to create the first part of the token.
+
+The `kid` becomes especially useful when the authentication system rotates its signing keys over time. Old tokens may still be signed with last month's key while new tokens use the current one, and the `kid` tells the receiver which one to pick.
+
+So the header does not contain information about the user. It describes how the token was signed and how its signature should be verified.
+
+One caution: the API should not trust the header blindly. The header can help pick a key, but the server must decide which algorithms and keys it accepts. We come back to this in the security checklist.
+
+<h1 id="5-the-payload">5. The Payload</h1>
+
+The second part of a JWT is the payload. The payload contains claims, which are pieces of information about the token and the subject it represents. A payload might look like this:
+
+```json
+{
+  "sub": "12345",
+  "iss": "https://auth.example.com",
+  "aud": "orders-api",
+  "iat": 1760000000,
+  "exp": 1760000900,
+  "role": "user",
+  "perms": ["orders:read"],
+  "tenant": "acme"
+}
+```
+
+The first five are standard, registered claims. The table below also includes two optional ones you will often see:
+
+| Claim | Meaning                                                          |
+| ----- | ---------------------------------------------------------------- |
+| `sub` | Subject: the user or entity the token belongs to                 |
+| `iss` | Issuer: who created the token                                    |
+| `aud` | Audience: which service or application the token is intended for |
+| `iat` | Issued at: when the token was created                            |
+| `exp` | Expiration: when the token stops being valid                     |
+| `nbf` | Not before: the token is not valid before this time (optional)   |
+| `jti` | JWT ID: a unique ID for the token (optional)                     |
+
+You can also add **custom claims**, such as a user's role, permissions, or tenant ID.
+
+The JWT payload is **not encrypted** by default. It is only Base64URL encoded, which means anyone who has the token can decode it and read the contents. So you should never put passwords, API keys, or other sensitive secrets inside a normal JWT payload.
+
+Also be careful with claims that change often. If a user's role changes from `admin` to `user`, an old token that still says `admin` may stay valid until it expires.
+
+The payload carries the information. The signature is what allows us to trust that information.
+
+<h1 id="6-the-signature">6. The Signature</h1>
+
+The third part of a JWT is the signature. This is what allows the receiving server to verify that the token was created by a trusted issuer and that its contents have not been changed.
+
+The signature is created from the encoded header and payload. It is computed like this:
+
+```plaintext
+signature = sign(
+  base64url(header) + "." + base64url(payload),
+  key
+)
+```
+
+The exact signing key depends on the algorithm being used:
+
+| Model      | Example algorithms | How it works                                                                            | Good fit                                        |
+| ---------- | ------------------ | --------------------------------------------------------------------------------------- | ----------------------------------------------- |
+| Symmetric  | `HS256`            | The same shared secret creates and verifies the signature                               | One issuer and a small set of trusted verifiers |
+| Asymmetric | `RS256`, `ES256`   | The issuer signs with a private key, other services verify with the matching public key | Many services verifying tokens from one issuer  |
+
+Now imagine an attacker changes the role in the payload from `user` to `admin`. The encoded payload changes, so the existing signature no longer matches. When the server verifies the token, the signature check fails and the token is rejected.
+
+```plaintext
+Original payload:  { "sub": "12345", "role": "user" }   signature: kX9z...  -> valid
+Tampered payload:  { "sub": "12345", "role": "admin" }  signature: kX9z...  -> rejected
+```
+
+The attacker cannot produce a new valid signature without the signing key.
+
+This is what JWT security relies on. The signature does not hide the payload. It proves that the signed contents have not been modified and, when the signing key is properly protected and trusted, that they came from the expected issuer.
+
+<h1 id="7-the-authentication-flow">7. The Authentication Flow</h1>
+
+Now let's see how the complete flow works in practice.
+
+Suppose a user logs into an application using their email and password. The client sends those credentials to the authentication server. The server verifies them, and if they are correct, it creates a JWT containing claims about the user, such as their user ID, role, and expiration time. The server then signs the token and sends it back to the client.
+
+In code, issuing the token might look like this:
+
+```javascript
+const accessToken = jwt.sign(
+  {
+    sub: "12345",
+    iss: "https://auth.example.com",
+    aud: "orders-api",
+    role: "user",
+  },
+  privateKey,
+  {
+    algorithm: "RS256",
+    keyid: "key-2026-10",
+    expiresIn: "15m",
+  },
+);
+```
+
+From that point on, the client includes the JWT with requests to protected APIs. A common way to send it is in the `Authorization` header of the HTTP request:
+
+```plaintext
+GET /orders HTTP/1.1
+Host: api.example.com
+Authorization: Bearer <access_token>
+```
+
+When an API receives the request, it extracts the token and verifies its signature. It also checks important claims:
+
+- `**exp**`**:** Has the token expired?
+- `**iss**`**:** Did it come from the expected issuer?
+- `**aud**`**:** Was it intended for this API?
+
+If all of those checks pass, the API can trust the claims inside the token and process the request.
+
+If validation fails, the API returns `401 Unauthorized`. If the token is valid but does not grant enough permission for the operation, it returns `403 Forbidden`.
+
+Note that the token is a **bearer credential**. Whoever holds it can use it until it expires, so it must only be sent over HTTPS.
+
+<h1 id="8-jwts-across-multiple-services">8. JWTs Across Multiple Services</h1>
+
+JWTs are most useful when authentication has to work across many services.
+
+Imagine a system with an API gateway, a user service, an order service, and a payment service. The user logs in once through the authentication service. The authentication service verifies the credentials, creates a JWT, signs it with its private key, and sends it back to the client.
+
+Now the client can include that same access token with requests to different backend services. Each service can verify the JWT using the authentication service's public key.
+
+This reduces the need for a centralized session lookup on every request and avoids making the authentication service part of the critical path for every API call.
+
+<h3 id="publishing-public-keys-with-jwks">Publishing Public Keys with JWKS</h3>
+
+How do the services get the public key? Most authentication servers publish their public keys at a **JWKS endpoint** (JSON Web Key Set), which is simply a URL that returns the current keys:
+
+```plaintext
+GET https://auth.example.com/.well-known/jwks.json
+```
+
+Each service fetches and caches this key set. When a token arrives, the service reads the `kid` from the header and picks the matching public key.
+
+This is also how key rotation works without breaking anything:
+
+1. Publish the new public key in the JWKS.
+2. Start signing new tokens with the new private key.
+3. Keep the old public key available until all tokens signed with it have expired.
+4. Remove the old key.
+
+The JWKS URL and the expected issuer must come from the service's own configuration, never from the token itself.
+
+<h1 id="9-access-tokens-and-refresh-tokens">
+  9. Access Tokens and Refresh Tokens
+</h1>
+
+In practice, authentication systems often use two different tokens: an **access token** and a **refresh token**.
+
+The access token is what the client sends to APIs. It is usually short-lived, often lasting anywhere from a few minutes to around an hour. If the access token is a JWT, the API can verify it and use its claims to process the request.
+
+The refresh token serves a different purpose. It is longer-lived and is used to obtain a new access token after the old one expires.
+
+So the flow looks like this. The user logs in and receives both an access token and a refresh token. The client uses the access token for normal API requests. Eventually, that access token expires. Instead of asking the user to log in again, the client sends the refresh token to the authentication server. If the refresh token is still valid, the server issues a new access token.
+
+This split balances security and convenience. Access tokens can remain short-lived, which limits the damage if one is stolen, while refresh tokens allow the user to stay signed in for much longer.
+
+Refresh tokens are usually stored more securely and often tracked server-side so they can be revoked, rotated, or invalidated. A refresh token also does not have to be a JWT at all. In many systems, it is simply a long, random, opaque value. And it should only ever be sent to the authentication server, never to normal APIs.
+
+If you use OpenID Connect, you will also see an **ID token**. It tells the client application who signed in. It is not meant for APIs, and an API should not accept it as an access token.
+
+| Token           | Sent to                | Lifetime           | Purpose                        |
+| --------------- | ---------------------- | ------------------ | ------------------------------ |
+| Access token    | APIs                   | Minutes to an hour | Grants access to APIs          |
+| Refresh token   | Auth server only       | Days to weeks      | Gets new access tokens         |
+| ID token (OIDC) | Read by the client app | Short              | Tells the client who signed in |
+
+This separation also helps with one of the biggest challenges of JWT-based authentication: revocation, which we cover in section 11.
+
+<h1 id="10-storing-tokens-in-browser-applications">
+  10. Storing Tokens in Browser Applications
+</h1>
+
+For browser applications, one common question is where the JWT should be stored. Two popular options are local storage and cookies.
+
+<h3 id="local-storage">Local Storage</h3>
+
+Local storage is simple. The application can save the token there and attach it to API requests using the `Authorization` header.
+
+But local storage is accessible from JavaScript. So if your application has an **XSS** (cross-site scripting) vulnerability, malicious JavaScript running on the page may be able to read the token and send it to a server the attacker controls.
+
+<h3 id="http-only-cookies">HTTP-Only Cookies</h3>
+
+Another option is an **HTTP-only cookie**. With an HTTP-only cookie, JavaScript cannot directly read the token, which reduces the risk of token theft through XSS. The browser sends that cookie automatically with requests to the matching domain.
+
+```plaintext
+Set-Cookie: access_token=<jwt>; HttpOnly; Secure; SameSite=Lax; Path=/
+```
+
+But cookies introduce another security concern: **CSRF**, or Cross-Site Request Forgery. Because the browser attaches the cookie automatically, another site may be able to trigger a request the user did not intend. That risk can be reduced using `SameSite` cookies, CSRF tokens, and careful cookie configuration.
+
+| Storage          | Main risk                                      | How to reduce it                                                           |
+| ---------------- | ---------------------------------------------- | -------------------------------------------------------------------------- |
+| Local storage    | JavaScript can read the token after an XSS bug | Prevent XSS, use a strict Content Security Policy, keep tokens short-lived |
+| HTTP-only cookie | Sent automatically, so CSRF is possible        | `SameSite` cookies, CSRF tokens, `Secure` flag                             |
+
+So there is no single storage option that is always correct. The right choice depends on your application architecture and threat model.
+
+Regardless of where the token is stored, access tokens should generally be short-lived, transmitted only over HTTPS, and protected from unnecessary exposure.
+
+Outside the browser, use the platform's secure storage. Mobile apps should use the iOS Keychain or Android Keystore, not plain files. Backend services should keep their credentials in a secrets manager rather than hardcoding long-lived tokens.
+
+<h1 id="11-revocation">11. Revocation</h1>
+
+The hardest operational problem with JWTs is **revocation**, which means making a token stop working before its expiration time.
+
+A self-contained JWT can be verified without contacting the issuer. That is good for speed and availability, but it also means the issuer cannot pull the token back once it is out. If a user logs out, changes their password, or loses their phone, the token can stay valid until it expires.
+
+Common ways to handle this:
+
+| Strategy                    | How it works                                                                             | Trade-off                                       |
+| --------------------------- | ---------------------------------------------------------------------------------------- | ----------------------------------------------- |
+| Short access-token lifetime | Tokens expire quickly, such as 5 to 15 minutes                                           | A stolen token still works until it expires     |
+| Refresh token rotation      | Each refresh returns a new refresh token, and the old one stops working                  | The auth server has to track refresh tokens     |
+| Deny list                   | Store the `jti` of revoked tokens and check it on each request                           | Adds a lookup on every request                  |
+| Token version check         | The token carries a version number that the API compares with the user's current version | Adds a lookup, often only for sensitive actions |
+
+Short-lived access tokens plus refresh-token rotation is the most common setup. For high-risk actions, such as changing payout details or creating API keys, many systems also check current server-side state even when the JWT is valid.
+
+<h1 id="12-trade-offs-and-when-to-use-jwts">
+  12. Trade-offs and When to Use JWTs
+</h1>
+
+JWTs are useful, but they are not always the best choice.
+
+For a simple monolithic application, traditional server-side sessions are often easier to implement and reason about. The server stores the session, the client keeps a session ID, and revoking access is as simple as deleting that session.
+
+JWTs can also be a poor fit when you need **immediate revocation**. Because a self-contained JWT can remain valid until it expires, invalidating it early usually requires extra mechanisms such as a deny list, a token version check, or server-side session state. At that point, you lose some of the simplicity of stateless verification.
+
+Another warning sign is using JWTs simply because they sound more modern or scalable. JWTs do not automatically make an application more secure, faster, or more scalable. They are most valuable when you actually need portable tokens that can be verified across multiple systems.
+
+|                                    | Server-side sessions                 | JWTs                                        |
+| ---------------------------------- | ------------------------------------ | ------------------------------------------- |
+| What the client holds              | An opaque session ID                 | A signed token with claims                  |
+| How the server identifies the user | Looks up the session in a store      | Verifies the signature and reads the claims |
+| Revocation                         | Delete the session                   | Wait for expiry, or add extra checks        |
+| Works best for                     | Single apps and first-party web apps | Many services verifying the same token      |
+
+So if a normal server-side session already solves your authentication problem cleanly, adding JWTs may introduce more complexity than value.
+
+<h1 id="13-security-checklist">13. Security Checklist</h1>
+
+JWTs are easy to parse and easy to validate incorrectly. If you do use them, keep these rules in mind.
+
+<h3 id="validate-more-than-the-signature">Validate More Than the Signature</h3>
+
+Check `iss`, `aud`, and `exp` (and `nbf` when present), then enforce the required permissions. A token issued for `billing-api` should not be accepted by `orders-api` just because its signature is valid.
+
+<h3 id="allowlist-algorithms">Allowlist Algorithms</h3>
+
+Never let the token decide which algorithm to use. Configure the accepted algorithms on the server:
+
+```javascript
+jwt.verify(token, publicKey, {
+  algorithms: ["RS256"],
+  issuer: "https://auth.example.com",
+  audience: "orders-api",
+});
+```
+
+Reject `alg: "none"`. A classic attack is RS256-to-HS256 confusion: the attacker signs a forged token with `alg: "HS256"`, using the issuer's public key as the HMAC secret. If the API trusts the header and uses that public key as the secret, the forged token passes. Fixing the allowed algorithms on the server prevents this.
+
+<h3 id="allow-a-little-clock-skew">Allow a Little Clock Skew</h3>
+
+The issuer's and the API's clocks can drift by a few seconds. Most APIs allow a small leeway, around 30 to 60 seconds, when checking `exp` and `nbf`. Do not stretch it into minutes.
+
+<h3 id="keep-claims-small-and-stable">Keep Claims Small and Stable</h3>
+
+JWTs are sent on every request, so large tokens add size to every call and can hit header limits at gateways. Keep claims to what the API needs. Roles in a token are snapshots, so check current server-side state for sensitive decisions.
+
+<h3 id="do-not-log-tokens">Do Not Log Tokens</h3>
+
+Tokens leak through authorization headers in proxy logs, error logs, analytics events, and crash reports. Redact them before logging.
+
+<h3 id="separate-environments">Separate Environments</h3>
+
+Production, staging, and development should use different issuers, audiences, and signing keys, so a staging token can never work against production.
+
+<h3 id="common-mistakes">Common Mistakes</h3>
+
+1. **Treating JWTs as encrypted:** Signed JWTs are readable by anyone holding them.
+2. **Skipping **`**aud**`** validation:** Tokens meant for one API can be replayed to another.
+3. **Trusting the **`**alg**`** header:** The server must enforce allowed algorithms.
+4. **Using long-lived access tokens:** Stolen tokens stay usable for too long.
+5. **Using ID tokens as access tokens:** ID tokens are for the client, not for APIs.
+6. **Assuming JWTs remove all server-side state:** Refresh tokens, revocation, and risk checks often still need it.
+
+<h1 id="summary">Summary</h1>
+
+A JWT is a signed token format, not a complete authentication system. It has three parts: a header that describes how the token was signed, a payload that carries the claims, and a signature that proves the claims were not changed.
+
+Its main strength is that any service with the issuer's public key can verify the token locally, without a session lookup. That makes JWTs a good fit when many services need to identify the same user.
+
+The main costs are revocation and exposure. A token stays valid until it expires, and anyone who holds it can read and use it. So keep access tokens short-lived, pair them with refresh tokens, validate issuer, audience, and expiry, allowlist algorithms, keep secrets out of the payload, and store tokens carefully.
+
+And if a normal server-side session already solves your problem, it is often the simpler choice.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,613 @@
+---
+title: "Semaphore"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Semaphore explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+The previous chapters covered `Lock` and `ReentrantLock` for mutual exclusion, and `ReadWriteLock` for read-heavy scenarios. A semaphore is a different tool. Locks protect a single critical section. Semaphores count resources. If your goal is "only one thread at a time," a `ReentrantLock` is appropriate. If your goal is "no more than ten threads at once" or "I have eight database connections and I want to hand them out," that's a semaphore.
+
+<h1 id="what-a-permit-actually-is">What a Permit Actually Is</h1>
+
+A `Semaphore` is constructed with a number, the **permit count**. That number is the upper limit on how many threads can be inside the protected section at the same time. A new permit isn't an object. It's just a slot in an internal counter. When a thread calls `acquire`, the counter goes down by one. When it calls `release`, the counter goes up by one. When the counter is zero, callers to `acquire` block until somebody else releases.
+
+```java
+import java.util.concurrent.Semaphore;
+
+public class FirstSemaphore {
+    public static void main(String[] args) throws InterruptedException {
+        Semaphore inventoryLock = new Semaphore(3);
+
+        System.out.println("Permits available: " + inventoryLock.availablePermits());
+        inventoryLock.acquire();
+        System.out.println("After one acquire: " + inventoryLock.availablePermits());
+        inventoryLock.acquire();
+        inventoryLock.acquire();
+        System.out.println("After three acquires: " + inventoryLock.availablePermits());
+        inventoryLock.release();
+        System.out.println("After one release: " + inventoryLock.availablePermits());
+    }
+}
+```
+
+The counter starts at three because `new Semaphore(3)` asked for three permits. Each `acquire` knocks one off. After three acquires the counter is zero, so a fourth would block. One `release` puts a permit back, lifting the counter to one and unblocking one waiter if there was one.
+
+The bucket holds the permits. Threads that hold a permit are inside the protected section. Threads that called `acquire` while the bucket was empty are parked in a queue, waiting for somebody to put a permit back. Once `release` runs, one waiting thread gets the permit, wakes up, and continues.
+
+A semaphore doesn't care which thread releases a permit. The same thread that called `acquire` can release, or a completely different thread can. The counter is the only state that matters. That's a deliberate design choice and one of the biggest differences from a `Lock`, which insists that only the owning thread can `unlock`.
+
+`acquire()` throws `InterruptedException` if the thread is interrupted while waiting. To ignore interrupts, use `acquireUninterruptibly()`. Mixing them up means a graceful shutdown can't stop a stuck thread.
+
+<h1 id="acquire-release-and-availablepermits">
+  acquire, release, and availablePermits
+</h1>
+
+The three most-used methods are `acquire`, `release`, and `availablePermits`. Their job titles:
+
+| Method               | What it does                                                          |
+| -------------------- | --------------------------------------------------------------------- |
+| `acquire()`          | Takes one permit. Blocks if none are available. Throws on interrupt.  |
+| `acquire(int n)`     | Takes `n` permits at once. Blocks until all `n` are available.        |
+| `release()`          | Returns one permit. Wakes up a waiter if there is one.                |
+| `release(int n)`     | Returns `n` permits. Useful for symmetry with `acquire(n)`.           |
+| `availablePermits()` | Returns the current counter value. For monitoring, not for decisions. |
+
+`availablePermits()` is tempting to use as a "is it safe to proceed" check, but the value can change between the check and the next call. The reliable way to take a permit is to call `acquire` (which blocks) or `tryAcquire` (which returns immediately with a boolean).
+
+A small program that has three worker threads sharing a two-permit semaphore. Only two workers can be inside the protected block at a time.
+
+```java
+import java.util.concurrent.Semaphore;
+
+public class TwoAtATime {
+    static Semaphore gate = new Semaphore(2);
+
+    public static void main(String[] args) {
+        Runnable worker = () -> {
+            String name = Thread.currentThread().getName();
+            try {
+                gate.acquire();
+                System.out.println(name + " entered");
+                Thread.sleep(200);
+                System.out.println(name + " leaving");
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                gate.release();
+            }
+        };
+
+        new Thread(worker, "W1").start();
+        new Thread(worker, "W2").start();
+        new Thread(worker, "W3").start();
+    }
+}
+```
+
+**Output (order of W1/W2 may vary):**
+
+```text
+W1 entered
+W2 entered
+W1 leaving
+W2 leaving
+W3 entered
+W3 leaving
+```
+
+W1 and W2 acquire the two available permits and start working. W3 calls `acquire` and blocks because the counter is zero. After 200 ms, W1 and W2 each `release`, the counter goes back up, and W3 gets in. The exact order of W1 and W2 isn't fixed; the JVM scheduler picks.
+
+The `try/finally` shape matters. If anything inside the block throws, the `finally` still runs and the permit goes back. Without that, an exception leaves the permit checked out forever, and after a few failures the semaphore is permanently empty.
+
+<h1 id="binary-semaphore-as-a-non-reentrant-mutex">
+  Binary Semaphore as a Non-Reentrant Mutex
+</h1>
+
+A semaphore with one permit acts like a mutual exclusion lock. Only one thread can hold the permit at a time. Take the permit, do the work, return the permit. That's the same pattern as `synchronized` or `ReentrantLock`.
+
+```java
+import java.util.concurrent.Semaphore;
+
+public class BinarySemaphoreCounter {
+    static Semaphore mutex = new Semaphore(1);
+    static int orderCount = 0;
+
+    public static void main(String[] args) throws InterruptedException {
+        Runnable placeOrder = () -> {
+            for (int i = 0; i < 1000; i++) {
+                try {
+                    mutex.acquire();
+                    orderCount++;
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    mutex.release();
+                }
+            }
+        };
+
+        Thread t1 = new Thread(placeOrder);
+        Thread t2 = new Thread(placeOrder);
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+
+        System.out.println("Final order count: " + orderCount);
+    }
+}
+```
+
+Two threads each increment `orderCount` a thousand times, and the final count is exactly 2000 because the binary semaphore serializes the read-modify-write. Without the semaphore, the increment is not atomic, and you'd see a number less than 2000 most of the time.
+
+This works, but it isn't what semaphores are best at. There's an important difference between a binary semaphore and a `ReentrantLock`: **a semaphore is not reentrant**. If the same thread calls `acquire` twice on a one-permit semaphore without an intermediate `release`, it deadlocks itself.
+
+```java
+import java.util.concurrent.Semaphore;
+
+public class ReentranceDeadlock {
+    static Semaphore mutex = new Semaphore(1);
+
+    static void outer() throws InterruptedException {
+        mutex.acquire();
+        try {
+            System.out.println("In outer, about to call inner");
+            inner();
+        } finally {
+            mutex.release();
+        }
+    }
+
+    static void inner() throws InterruptedException {
+        mutex.acquire();
+        try {
+            System.out.println("In inner");
+        } finally {
+            mutex.release();
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        outer();
+    }
+}
+```
+
+`outer` takes the single permit, then calls `inner`, which tries to take it again. The same thread is now waiting for itself to release, which it can't because it's stuck inside `inner`. A `ReentrantLock` (or `synchronized`) would let the same thread re-enter and count the holds. A semaphore doesn't track who holds what; it just counts permits, and the counter is zero.
+
+That's the first reason semaphores aren't usually appropriate for mutual exclusion. The second is that **a semaphore has no owner**. With `ReentrantLock` or `synchronized`, only the owner thread can release. With a semaphore, any thread can call `release` and increment the counter, even if it never called `acquire`. That's flexible, but it makes accidental bugs (a misplaced `release` in code that never acquired) much easier to write.
+
+Use `ReentrantLock` (or `synchronized`) for mutual exclusion. Use `Semaphore` when you actually want to count things.
+
+<h1 id="multi-permit-semaphore-as-a-throttle">
+  Multi-Permit Semaphore as a Throttle
+</h1>
+
+This is where semaphores are well-suited. Consider an e-commerce checkout service that calls a third-party payment service to charge a card. That third-party service has rate limits: it accepts at most ten concurrent requests from your account. If you send eleven at once, the eleventh gets rejected with an error. To make sure you never have more than ten in flight, even if a thousand checkouts hit your server at the same time, use a semaphore.
+
+A semaphore with ten permits does exactly that.
+
+```java
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.ThreadLocalRandom;
+
+public class PaymentThrottle {
+    static Semaphore paymentSlots = new Semaphore(10);
+
+    static void chargeCard(String orderId) {
+        try {
+            paymentSlots.acquire();
+            try {
+                System.out.println(orderId + " charging (in flight: "
+                    + (10 - paymentSlots.availablePermits()) + ")");
+                Thread.sleep(ThreadLocalRandom.current().nextInt(50, 150));
+                System.out.println(orderId + " charge complete");
+            } finally {
+                paymentSlots.release();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread[] orders = new Thread[25];
+        for (int i = 0; i < orders.length; i++) {
+            String orderId = "ORD-" + (1000 + i);
+            orders[i] = new Thread(() -> chargeCard(orderId));
+            orders[i].start();
+        }
+        for (Thread t : orders) {
+            t.join();
+        }
+        System.out.println("All charges done");
+    }
+}
+```
+
+**Output (in-flight count never exceeds 10):**
+
+```text
+ORD-1000 charging (in flight: 1)
+ORD-1001 charging (in flight: 2)
+...
+ORD-1009 charging (in flight: 10)
+ORD-1000 charge complete
+ORD-1010 charging (in flight: 10)
+...
+All charges done
+```
+
+Twenty-five fake charges fly at the service, but the semaphore caps the number running at once at ten. Each call to `chargeCard` blocks on `acquire` if all ten slots are taken, runs when a slot opens up, and releases its slot in the `finally`. The third-party service never sees more than ten concurrent requests, regardless of how many threads call `chargeCard`.
+
+The semaphore sits between your code and the downstream service. It enforces "no more than ten at once" without your callers having to coordinate. Each caller just acquires before the request and releases after.
+
+A second common throttle is **limiting concurrent inventory-sync jobs**. Suppose a job runs every minute that pulls stock counts from a warehouse system into your own database. Each job is heavy: it reads a few thousand rows, compares them to your local copy, and writes any differences. If five jobs are still running when the next minute's job starts, the warehouse system gets overwhelmed and starts timing out. The goal is at most two sync jobs running at the same time.
+
+```java
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
+
+public class InventorySyncThrottle {
+    static Semaphore syncSlots = new Semaphore(2);
+
+    static void runInventorySync(String region) {
+        try {
+            syncSlots.acquire();
+            try {
+                System.out.println("Sync started for " + region);
+                Thread.sleep(300);
+                System.out.println("Sync done for " + region);
+            } finally {
+                syncSlots.release();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    public static void main(String[] args) {
+        ExecutorService pool = Executors.newFixedThreadPool(10);
+        String[] regions = {"US-East", "US-West", "EU-West", "EU-North", "AP-South", "AP-East"};
+        for (String region : regions) {
+            pool.submit(() -> runInventorySync(region));
+        }
+        pool.shutdown();
+    }
+}
+```
+
+**Output (at most two regions run concurrently):**
+
+```text
+Sync started for US-East
+Sync started for US-West
+Sync done for US-East
+Sync started for EU-West
+Sync done for US-West
+Sync started for EU-North
+...
+```
+
+Even though the thread pool has ten threads ready to go, the semaphore lets only two run sync work at a time. Note that the pool is still useful: it's what runs the tasks. The semaphore is what caps concurrency at a smaller number than the pool size. This is a common combo. The pool decides which thread runs the task, and the semaphore decides how many tasks of this kind can be running together.
+
+<h1 id="tryacquire-with-a-timeout">tryAcquire with a Timeout</h1>
+
+Blocking forever on `acquire` is fine in some places and a disaster in others. If a user clicks "Pay Now" and your server is currently holding all ten payment slots for slow calls, you don't want the user's request to sit there for thirty seconds. Better to time out after, say, two seconds and tell the user "We're busy, try again in a moment."
+
+`tryAcquire` is the method for that. It comes in three flavors:
+
+| Call                                          | Behavior                                                                           |
+| --------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `tryAcquire()`                                | Returns `true` if a permit is available right now, `false` otherwise.              |
+| `tryAcquire(long timeout, TimeUnit unit)`     | Waits up to `timeout` for a permit. Returns `true` on success, `false` on timeout. |
+| `tryAcquire(int permits, long t, TimeUnit u)` | Same as above, but asks for `permits` permits at once.                             |
+
+The version with a timeout is the most common. The payment example with a two-second cap:
+
+```java
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+
+public class PaymentWithTimeout {
+    static Semaphore paymentSlots = new Semaphore(2);
+
+    static boolean tryChargeCard(String orderId) {
+        boolean acquired = false;
+        try {
+            acquired = paymentSlots.tryAcquire(2, TimeUnit.SECONDS);
+            if (!acquired) {
+                System.out.println(orderId + " timed out waiting for a slot");
+                return false;
+            }
+            System.out.println(orderId + " charging");
+            Thread.sleep(500);
+            System.out.println(orderId + " charge complete");
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        } finally {
+            if (acquired) {
+                paymentSlots.release();
+            }
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread t1 = new Thread(() -> tryChargeCard("ORD-1"));
+        Thread t2 = new Thread(() -> tryChargeCard("ORD-2"));
+        Thread t3 = new Thread(() -> tryChargeCard("ORD-3"));
+        t1.start();
+        t2.start();
+        Thread.sleep(50);
+        t3.start();
+        t1.join();
+        t2.join();
+        t3.join();
+    }
+}
+```
+
+ORD-1 and ORD-2 grab the two slots. ORD-3 calls `tryAcquire` with a two-second window. It happens to get in within that window (the others finish in 500 ms), so it proceeds normally. If the others had each held their permits for three seconds, ORD-3 would have hit the timeout and printed `ORD-3 timed out waiting for a slot`, returning `false` so the caller can decide what to do next (retry, fail the request, queue for later).
+
+One detail worth noting. The `if (acquired)` check in the `finally` block matters. `release()` always increments the counter, even if you never acquired. If `tryAcquire` returned `false` (timeout) and you call `release` anyway, you've created a permit out of thin air. The next acquirer takes it, and now you have one more concurrent caller than the semaphore promised. The `acquired` boolean keeps `release` paired correctly with `acquire`.
+
+Forgetting to gate the `release` call on a successful acquire is a real bug. It inflates the permit pool and breaks the throttle without any indication. The signal that it happened is downstream errors, not anything the semaphore itself reports.
+
+The other family member, plain `tryAcquire()` with no timeout, is for "take a permit if and only if one is free right now." Use it when there's a fallback that doesn't need a permit, or when missing the slot means doing nothing instead of waiting.
+
+<h1 id="the-permit-leak-bug">The Permit-Leak Bug</h1>
+
+The bug that bites every team that uses semaphores is forgetting `release` on a failure path. The pattern looks innocent.
+
+**What's wrong with this code?**
+
+```java
+import java.util.concurrent.Semaphore;
+
+public class LeakyThrottle {
+    static Semaphore slots = new Semaphore(3);
+
+    static void chargeCard(String orderId) throws InterruptedException {
+        slots.acquire();
+        System.out.println(orderId + " charging");
+        chargeOrThrow(orderId);
+        slots.release();
+    }
+
+    static void chargeOrThrow(String orderId) {
+        throw new RuntimeException("Payment service down");
+    }
+}
+```
+
+If `chargeOrThrow` throws, the line `slots.release()` never runs. The permit is checked out and never comes back. After three failures, the semaphore counter is permanently zero, and every future caller blocks forever on `acquire`. The service looks healthy at startup, but degrades as failures eat the permits one by one.
+
+**Fix:**
+
+```java
+import java.util.concurrent.Semaphore;
+
+public class FixedThrottle {
+    static Semaphore slots = new Semaphore(3);
+
+    static void chargeCard(String orderId) throws InterruptedException {
+        slots.acquire();
+        try {
+            System.out.println(orderId + " charging");
+            chargeOrThrow(orderId);
+        } finally {
+            slots.release();
+        }
+    }
+
+    static void chargeOrThrow(String orderId) {
+        throw new RuntimeException("Payment service down");
+    }
+}
+```
+
+The `try/finally` is the entire fix. `release` runs whether the body succeeded or threw. If the call throws, the exception still propagates to the caller, but the permit goes home first.
+
+The diagram traces what happens without `try/finally`. Each thrown exception subtracts one from the available permit count without warning. The semaphore never reports the leak; the only symptom is that things get slower over time and eventually stop entirely.
+
+A second variation of the leak is calling `release` more than once for one `acquire`. That's the opposite mistake. The counter grows past its starting value, and the throttle stops throttling. Both directions of the bug come from breaking the rule that **every `acquire` is paired with exactly one `release` in the same logical scope**.
+
+A useful habit: write the `release` immediately when you write the `acquire`, in a `try/finally` shape, before writing anything between them.
+
+<h1 id="fairness">Fairness</h1>
+
+By default, a semaphore makes no promises about the order in which waiting threads acquire permits. When `release` adds a permit, the runtime picks one of the parked threads to wake. The choice is "barging-allowed": a thread that calls `acquire` at the exact moment a permit becomes free can grab it before threads that have been waiting longer.
+
+That's usually fine. Sometimes it isn't. When handing out database connections and one thread has been waiting for a slot for a long time, guaranteed FIFO order may be desirable, even if it costs some throughput.
+
+The constructor takes a second argument:
+
+```java
+Semaphore fair = new Semaphore(10, true);
+Semaphore unfair = new Semaphore(10, false); // same as new Semaphore(10)
+```
+
+When `fair` is `true`, threads acquire permits strictly in the order they called `acquire`. New arrivals queue behind any existing waiters, even if there's currently a permit free.
+
+```java
+import java.util.concurrent.Semaphore;
+
+public class FairnessDemo {
+    public static void main(String[] args) throws InterruptedException {
+        Semaphore fair = new Semaphore(1, true);
+
+        Runnable task = () -> {
+            String name = Thread.currentThread().getName();
+            for (int i = 0; i < 3; i++) {
+                try {
+                    fair.acquire();
+                    System.out.println(name + " got permit, round " + i);
+                    Thread.sleep(50);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    fair.release();
+                }
+            }
+        };
+
+        Thread a = new Thread(task, "A");
+        Thread b = new Thread(task, "B");
+        Thread c = new Thread(task, "C");
+        a.start();
+        Thread.sleep(5);
+        b.start();
+        Thread.sleep(5);
+        c.start();
+
+        a.join();
+        b.join();
+        c.join();
+    }
+}
+```
+
+**Output (rough order, with fairness):**
+
+```text
+A got permit, round 0
+B got permit, round 0
+C got permit, round 0
+A got permit, round 1
+B got permit, round 1
+C got permit, round 1
+A got permit, round 2
+B got permit, round 2
+C got permit, round 2
+```
+
+With fairness on, the threads rotate through the permit in roughly the order they joined. With fairness off, you'd see runs of A grabbing it back-to-back because A is already running on a hot CPU and beats B and C to the next `acquire` call.
+
+Fairness has a cost. Maintaining strict order requires extra coordination, which slows down both `acquire` and `release` by a small amount. For most throttle scenarios, the default (unfair) mode is fine, and you save a bit of overhead. Turn on fairness when:
+
+- Some threads are getting starved under load.
+- The work being protected is long-running and waiting fairness matters more than throughput.
+- You're handing out a scarce, expensive resource (like a database connection) where "first come, first served" is part of the contract.
+
+| Mode             | Behavior                                                | Throughput               |
+| ---------------- | ------------------------------------------------------- | ------------------------ |
+| Unfair (default) | Barging allowed. Whoever runs at the right moment wins. | Higher under contention. |
+| Fair (`true`)    | FIFO order across waiting threads. No barging.          | Slightly lower overhead. |
+
+Neither mode prevents the permit leak. Fairness only affects the order in which threads pick up permits, not whether the permits exist to be picked up.
+
+<h1 id="why-semaphores-arent-mutexes">Why Semaphores Aren't Mutexes</h1>
+
+Semaphores are designed for counting resources. They make a poor fit for mutual exclusion in most cases, for three reasons.
+
+**No ownership.** With `synchronized` or `ReentrantLock`, the runtime tracks which thread holds the lock. Calling `unlock` from a thread that doesn't own the lock throws `IllegalMonitorStateException`. With a semaphore, anyone can call `release`. If you release without acquiring, the counter goes up, and now you have a phantom permit floating in the system. The lack of ownership is great for cases like "thread A acquires, thread B releases" (a producer-consumer signal), but it's error-prone for mutual exclusion.
+
+**No reentrance.** A thread that already holds the single permit can't take it again. `ReentrantLock` tracks the hold count and lets the same thread re-enter. A binary semaphore deadlocks itself the moment a method calls another method that also acquires.
+
+**No condition variables.** `ReentrantLock` works with `Condition` objects so you can express "wait until the inventory is restocked" cleanly. A semaphore has no equivalent. You could fake it with extra permits, but the result is usually harder to reason about than `Condition`.
+
+| Feature                             | `ReentrantLock`           | `Semaphore`                                   |
+| ----------------------------------- | ------------------------- | --------------------------------------------- |
+| Owned by acquiring thread           | Yes                       | No (any thread can release)                   |
+| Reentrant (same thread re-acquires) | Yes                       | No (deadlocks)                                |
+| Counts resources                    | No (one holder at a time) | Yes (N holders at a time)                     |
+| Pairs with `Condition`              | Yes                       | No                                            |
+| Designed for mutual exclusion       | Yes                       | Not primarily (single-permit form is awkward) |
+| Designed for resource throttling    | No                        | Yes                                           |
+
+The decision is mostly mechanical. "Only one thread inside the section at a time" is `ReentrantLock` (or `synchronized`). "At most N threads inside, where N is bigger than 1" is `Semaphore`. The edge case is N equals 1 and you really do need a non-reentrant lock that can be released by a different thread, in which case a binary semaphore is the cleaner choice. That edge case shows up in producer-consumer signaling and a few similar patterns, but it's the exception, not the rule.
+
+A related contrast is with `CountDownLatch`. A semaphore can have permits added back via `release`. A latch counts down and never resets. For "wait for three things to finish," use a latch. For "limit to three concurrent things," use a semaphore. Same number, different shape.
+
+<h1 id="putting-it-together">Putting It Together</h1>
+
+A small end-to-end e-commerce throttling example. The setup: an order pipeline that calls a third-party payment service and a separate inventory service. The payment service allows ten concurrent calls; the inventory service allows three. Both are throttled with their own semaphores, and every acquire is paired with a guaranteed release.
+
+```java
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ThreadLocalRandom;
+
+public class OrderPipeline {
+    static Semaphore paymentSlots = new Semaphore(10);
+    static Semaphore inventorySlots = new Semaphore(3);
+
+    static boolean callPayment(String orderId) throws InterruptedException {
+        if (!paymentSlots.tryAcquire(2, TimeUnit.SECONDS)) {
+            System.out.println(orderId + " payment slot timeout");
+            return false;
+        }
+        try {
+            Thread.sleep(ThreadLocalRandom.current().nextInt(50, 150));
+            return true;
+        } finally {
+            paymentSlots.release();
+        }
+    }
+
+    static boolean callInventory(String orderId) throws InterruptedException {
+        if (!inventorySlots.tryAcquire(2, TimeUnit.SECONDS)) {
+            System.out.println(orderId + " inventory slot timeout");
+            return false;
+        }
+        try {
+            Thread.sleep(ThreadLocalRandom.current().nextInt(50, 150));
+            return true;
+        } finally {
+            inventorySlots.release();
+        }
+    }
+
+    static void processOrder(String orderId) {
+        try {
+            if (!callPayment(orderId)) {
+                return;
+            }
+            if (!callInventory(orderId)) {
+                System.out.println(orderId + " refunded (inventory failed)");
+                return;
+            }
+            System.out.println(orderId + " complete");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    public static void main(String[] args) {
+        ExecutorService pool = Executors.newFixedThreadPool(20);
+        for (int i = 0; i < 30; i++) {
+            String orderId = "ORD-" + (1000 + i);
+            pool.submit(() -> processOrder(orderId));
+        }
+        pool.shutdown();
+    }
+}
+```
+
+**Output (order varies, but never more than 10 payments or 3 inventory calls at once):**
+
+```text
+ORD-1000 complete
+ORD-1001 complete
+ORD-1002 complete
+ORD-1003 complete
+...
+ORD-1029 complete
+```
+
+Each order takes a payment slot, then an inventory slot, then finishes. Both throttles use `tryAcquire` with a timeout so a slow downstream doesn't cause requests to hang forever. The `finally` blocks make sure the permits go back on every path, including timeouts and exceptions. The thread pool has twenty workers, but at any moment at most ten are inside payment and at most three are inside inventory; the rest are either between calls or parked on `acquire`.
+
+This is the shape of most semaphore use. The semaphore isn't protecting a critical section; it's limiting how many concurrent calls go to a thing that doesn't like too many at once. The semaphore is a pressure valve.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

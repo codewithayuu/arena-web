@@ -1,0 +1,764 @@
+---
+title: "Performance Optimization"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Performance Optimization explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+Most Java performance work is not about clever code. It's about knowing where the time actually goes, picking the right collection, and avoiding a handful of allocation traps that pile up under load. This lesson walks through the application-level habits that move the needle: measure first, then fix the algorithm, then watch out for the usual culprits. JVM tuning flags, GC algorithms, and concurrency-specific perf are covered elsewhere; this lesson stays in the code you write every day.
+
+<h1 id="measure-first-premature-optimization-is-a-trap">
+  Measure First: Premature Optimization Is a Trap
+</h1>
+
+Donald Knuth's line, "premature optimization is the root of all evil," is often quoted because it remains true. Code that's been hand-tuned without a profile is usually code that's been slowed down in a place that didn't matter and left untouched in the place that did.
+
+A small story makes the point. A cart checkout flow is running slow. A developer guesses the problem is the discount calculation, spends a day micro-optimizing it from `O(n)` to `O(log n)`, and ships the change. Latency moves a tiny bit. A week later, a profiler shows the real cost was a regex pattern being recompiled on every line item. The discount code was 0.1% of the total time. The regex was 70%.
+
+The fix order is almost always the same:
+
+1. Build something that works correctly with clear code.
+2. Measure it under realistic load.
+3. Find the actual hot spots.
+4. Fix the biggest one. Re-measure.
+5. Stop when it's fast enough.
+
+That last step matters. "Fast enough" is a real target. "As fast as possible" is a tar pit.
+
+```java
+public class NaiveVsMeasured {
+    public static void main(String[] args) {
+        // Step 1: clear, correct code first.
+        long totalCents = 0;
+        int[] prices = {2999, 999, 4999, 1999, 3499};
+        int[] quantities = {2, 3, 1, 4, 2};
+
+        for (int i = 0; i < prices.length; i++) {
+            totalCents += (long) prices[i] * quantities[i];
+        }
+
+        System.out.println("Cart total cents: " + totalCents);
+    }
+}
+```
+
+There's nothing to optimize here yet. There may never be. The question "is this fast enough?" beats "can this be faster?" almost every time.
+
+Optimizing without a profile is gambling. You can spend hours making a `for` loop unroll itself and find out the real time was spent in the database call right after it.
+
+<h1 id="profiling-basics-where-did-the-time-go">
+  Profiling Basics: Where Did the Time Go?
+</h1>
+
+A profiler tells you which methods are eating CPU, allocating the most memory, and holding locks the longest. Java has several built-in tools and one fantastic third-party option.
+
+**VisualVM** ships with most JDK distributions or installs as a standalone download. Connect it to a running JVM and you get live CPU sampling, memory histograms, and a thread view. Good for casual investigation when you can attach to a running process.
+
+**Java Flight Recorder (JFR)** is the production-grade tool. It records JVM events (method samples, allocations, GC pauses, lock contention) into a `.jfr` file with very low overhead, typically under 2%. You can run it continuously on a production process and download the recording when something looks off.
+
+**async-profiler** is a third-party sampling profiler that produces flame graphs. Many teams use it because flame graphs make hot paths immediately visible. This lesson doesn't cover its setup.
+
+The workflow stays the same across tools: capture a representative workload, look at the methods that dominate the sample count, and start from the top. A method that shows up in 30% of samples is where you spend your afternoon. A method that shows up in 0.5% can wait.
+
+Starting JFR from the command line is a one-liner:
+
+```java
+public class JfrSnippet {
+    public static void main(String[] args) {
+        // Run with:
+        // java -XX:StartFlightRecording=duration=60s,filename=cart.jfr JfrSnippet
+        long total = 0;
+        for (int productId = 0; productId < 100_000; productId++) {
+            total += productId;
+        }
+        System.out.println("Sum: " + total);
+    }
+}
+```
+
+The recording lands in `cart.jfr` and opens in JDK Mission Control or any JFR-compatible viewer. The habit matters more than the syntax: when something feels slow, capture data before changing code.
+
+JFR's continuous mode is roughly 1-2% overhead at default settings. That's almost always cheaper than debugging blind.
+
+<h1 id="microbenchmarking-jmh-and-why-naive-timing-lies">
+  Microbenchmarking: JMH and Why Naive Timing Lies
+</h1>
+
+A common beginner instinct is to wrap a snippet in `System.nanoTime()` and call it a benchmark. That measurement is almost always wrong, sometimes by an order of magnitude. The reasons sit at the JVM level:
+
+- **JIT warm-up.** The first thousand or so calls run interpreted or with low-tier JIT. Real performance kicks in only after HotSpot decides the method is hot and compiles it aggressively.
+- **Dead-code elimination.** If you compute a value and never use it, the JIT may drop the entire computation. Your benchmark times nothing.
+- **GC noise.** A garbage collection that fires during your timing block adds milliseconds that aren't really about the code you're testing.
+- **Inlining and constant folding.** The JIT might inline a method and pre-compute its result if the inputs are constants in your test harness.
+
+JMH (Java Microbenchmark Harness) is OpenJDK's solution. It runs your code through proper warm-up iterations, prevents dead-code elimination by consuming the result through a `Blackhole`, and reports stable averages across many measured iterations. Use JMH for Java microbenchmarks.
+
+A JMH benchmark looks like this (the harness adds a Maven or Gradle dependency on `org.openjdk.jmh:jmh-core` and an annotation processor):
+
+```java
+import org.openjdk.jmh.annotations.Benchmark;
+import org.openjdk.jmh.annotations.BenchmarkMode;
+import org.openjdk.jmh.annotations.Mode;
+import org.openjdk.jmh.annotations.OutputTimeUnit;
+import org.openjdk.jmh.annotations.Scope;
+import org.openjdk.jmh.annotations.State;
+import java.util.concurrent.TimeUnit;
+
+@State(Scope.Benchmark)
+@BenchmarkMode(Mode.AverageTime)
+@OutputTimeUnit(TimeUnit.NANOSECONDS)
+public class CartTotalBenchmark {
+    private final int[] prices = {2999, 999, 4999, 1999, 3499};
+    private final int[] quantities = {2, 3, 1, 4, 2};
+
+    @Benchmark
+    public long sumCart() {
+        long total = 0;
+        for (int i = 0; i < prices.length; i++) {
+            total += (long) prices[i] * quantities[i];
+        }
+        return total;
+    }
+}
+```
+
+Returning the result is how you tell JMH the work shouldn't be eliminated. The harness consumes the return value. The output is something like `CartTotalBenchmark.sumCart  avgt   10  4.812 ± 0.041  ns/op`, with a clean mean and error bar.
+
+```java
+public class NaiveTimingTrap {
+    public static void main(String[] args) {
+        // Looks like a benchmark. Isn't.
+        long start = System.nanoTime();
+        long total = 0;
+        for (int i = 0; i < 1_000_000; i++) {
+            total += i;
+        }
+        long elapsedNanos = System.nanoTime() - start;
+        System.out.println("Took " + elapsedNanos + " ns, total=" + total);
+    }
+}
+```
+
+**Output (one possible run):**
+
+```text
+Took 1843762 ns, total=499999500000
+```
+
+Running that same `main` ten times produces numbers all over the map: first runs are slow because the JIT hasn't compiled the loop yet; later runs may eliminate the work entirely if the result is unused. JMH solves both problems.
+
+A microbenchmark without warm-up can report a number 100x worse than the real steady-state speed. If you're going to publish a "this is faster" claim, use JMH or don't claim it.
+
+<h1 id="picking-the-right-collection">Picking the Right Collection</h1>
+
+Most Java performance problems trace back to a poorly chosen collection. The differences look small in a documentation page and enormous in a profile. Three pairs come up over and over.
+
+<h3 id="arraylist-vs-linkedlist">ArrayList vs LinkedList</h3>
+
+`ArrayList` is a growable array. `LinkedList` is a doubly linked list of node objects. The names suggest they're roughly equivalent. They aren't.
+
+| Operation            | `ArrayList`                  | `LinkedList`                           |
+| -------------------- | ---------------------------- | -------------------------------------- |
+| `get(i)`             | O(1)                         | O(n), walks from the nearer end        |
+| `add(e)` at end      | Amortized O(1)               | O(1)                                   |
+| `add(0, e)` at front | O(n), shifts everything      | O(1)                                   |
+| Iteration            | Very fast, contiguous memory | Slower, scattered nodes                |
+| Memory per element   | ~4-8 bytes                   | ~40 bytes (two pointers + node header) |
+
+In practice, `ArrayList` wins almost every realistic workload, even ones where `LinkedList` should theoretically be faster, because iteration is faster and modern CPUs love contiguous memory. The rule of thumb: default to `ArrayList`. Use `LinkedList` only if you need fast insertion and removal at both ends, and even then `ArrayDeque` is usually better.
+
+```java
+import java.util.ArrayList;
+import java.util.LinkedList;
+import java.util.List;
+
+public class ListChoice {
+    public static void main(String[] args) {
+        List<String> cart = new ArrayList<>();
+        cart.add("Wireless Mouse");
+        cart.add("USB Cable");
+        cart.add("Headphones");
+
+        // O(1) lookup. Walks the array directly.
+        System.out.println("Second item: " + cart.get(1));
+
+        List<String> rarely = new LinkedList<>();
+        rarely.add("Notebook");
+        // O(n) lookup. Walks the list from head.
+        System.out.println("First item: " + rarely.get(0));
+    }
+}
+```
+
+`LinkedList.get(i)` is O(n). A loop that calls `list.get(i)` inside an index-based `for` becomes O(n^2). Use the iterator, or use `ArrayList`.
+
+<h3 id="hashmap-vs-treemap">HashMap vs TreeMap</h3>
+
+`HashMap` gives O(1) average-case lookup with no ordering guarantee. `TreeMap` gives O(log n) lookup with keys kept in sorted order. Use `HashMap` unless you need the sort order. The constant factor on `HashMap` is also lower because hashing beats tree traversal.
+
+```java
+import java.util.HashMap;
+import java.util.TreeMap;
+
+public class MapChoice {
+    public static void main(String[] args) {
+        HashMap<String, Integer> stockByProduct = new HashMap<>();
+        stockByProduct.put("Wireless Mouse", 12);
+        stockByProduct.put("USB Cable", 200);
+        stockByProduct.put("Headphones", 4);
+        System.out.println("Mouse stock: " + stockByProduct.get("Wireless Mouse"));
+
+        // TreeMap iterates keys in sorted order.
+        TreeMap<String, Integer> sortedStock = new TreeMap<>(stockByProduct);
+        System.out.println("First by name: " + sortedStock.firstKey());
+    }
+}
+```
+
+<h3 id="arraydeque-vs-stack">ArrayDeque vs Stack</h3>
+
+`Stack` is a legacy class from Java 1.0. It extends `Vector`, which means every operation is synchronized. That's slow and unnecessary in single-threaded code. `ArrayDeque` is the modern replacement: faster, not synchronized, and it works as a stack via `push`, `pop`, and `peek`.
+
+```java
+import java.util.ArrayDeque;
+import java.util.Deque;
+
+public class StackReplacement {
+    public static void main(String[] args) {
+        Deque<String> recentlyViewed = new ArrayDeque<>();
+        recentlyViewed.push("Wireless Mouse");
+        recentlyViewed.push("USB Cable");
+        recentlyViewed.push("Headphones");
+
+        System.out.println("Most recent: " + recentlyViewed.pop());
+        System.out.println("Next: " + recentlyViewed.peek());
+    }
+}
+```
+
+`java.util.Stack` is synchronized on every method. For single-threaded use, `ArrayDeque` is faster and gives the same API shape via `push`, `pop`, and `peek`.
+
+<h1 id="string-concatenation-the-in-a-loop-trap">
+  String Concatenation: The + In A Loop Trap
+</h1>
+
+A single `"a" + "b"` is fine. Strings concatenated in a loop are a famous source of accidental quadratic behavior. The reason: `String` is immutable. Every `+` builds a new `String` and copies all the existing characters into it.
+
+```java
+public class StringConcatTrap {
+    public static void main(String[] args) {
+        String[] items = {"Wireless Mouse", "USB Cable", "Headphones", "Notebook", "Pen"};
+
+        // Bad: each += allocates a new String and copies everything.
+        String receipt = "";
+        for (String item : items) {
+            receipt += item + "\n";
+        }
+        System.out.println("Receipt:\n" + receipt);
+    }
+}
+```
+
+That code works. With five items it's invisible. With 50,000 items it allocates roughly 50,000 ever-larger character arrays and copies a growing prefix into each one. Total work climbs as O(n^2).
+
+`StringBuilder` fixes it. The builder keeps a mutable buffer and resizes only when full, giving you linear total work.
+
+```java
+public class StringBuilderFix {
+    public static void main(String[] args) {
+        String[] items = {"Wireless Mouse", "USB Cable", "Headphones", "Notebook", "Pen"};
+
+        StringBuilder receipt = new StringBuilder();
+        for (String item : items) {
+            receipt.append(item).append('\n');
+        }
+        System.out.println("Receipt:\n" + receipt);
+    }
+}
+```
+
+The JIT does optimize a single-statement `a + b + c` chain into a `StringBuilder` automatically, so the trap is specifically `+=` across loop iterations. For non-loop joining, `String.join` reads even better:
+
+```java
+import java.util.List;
+
+public class StringJoin {
+    public static void main(String[] args) {
+        List<String> items = List.of("Wireless Mouse", "USB Cable", "Headphones");
+        String summary = String.join(", ", items);
+        System.out.println("Cart: " + summary);
+    }
+}
+```
+
+One more cost to be aware of: `String.format`. It's convenient and slow compared to concatenation, because it parses the format string and uses reflection internally. Fine for log messages and exception text. Bad inside a hot loop.
+
+`String.format` is roughly 10x slower than `+` or `StringBuilder` for the same output. Use it for human-readable strings, not for hot paths.
+
+<h1 id="autoboxing-and-primitive-streams">Autoboxing and Primitive Streams</h1>
+
+Java has two number worlds: the primitive `int`, `long`, `double`, etc., and their boxed wrappers `Integer`, `Long`, `Double`. The wrappers are real objects with header overhead, allocated on the heap. Converting between the two is called boxing (primitive to object) and unboxing (object back to primitive). The compiler does it silently. That convenience hides a real cost.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class AutoboxingCost {
+    public static void main(String[] args) {
+        List<Integer> stockLevels = new ArrayList<>();
+        for (int i = 0; i < 5; i++) {
+            stockLevels.add(i * 10);  // int -> Integer, boxes each one
+        }
+
+        long total = 0;
+        for (Integer level : stockLevels) {
+            total += level;  // Integer -> int, unboxes each one
+        }
+        System.out.println("Total stock: " + total);
+    }
+}
+```
+
+Each `add` allocates an `Integer` object. Each iteration unboxes it. For a list of five, this is fine. For a list of a million `Integer`s versus an `int[]`, the heap footprint can be 4-5x larger and the loop several times slower.
+
+The fix in the Streams world is to use the primitive stream types. `IntStream`, `LongStream`, and `DoubleStream` carry primitives end-to-end, no boxing in between.
+
+```java
+import java.util.stream.IntStream;
+
+public class IntStreamUse {
+    public static void main(String[] args) {
+        int[] prices = {2999, 999, 4999, 1999, 3499};
+        int[] quantities = {2, 3, 1, 4, 2};
+
+        long totalCents = IntStream.range(0, prices.length)
+            .mapToLong(i -> (long) prices[i] * quantities[i])
+            .sum();
+
+        System.out.println("Cart total cents: " + totalCents);
+    }
+}
+```
+
+`IntStream` and friends also have specialized terminal operations (`sum`, `average`, `min`, `max`) that take a single pass with no boxing. Using `stream.mapToInt(...).sum()` instead of `stream.map(...).reduce(0, Integer::sum)` is a small change that often shows up in profiles.
+
+A `List<Integer>` of one million elements uses roughly 20 MB. An `int[]` of the same size uses about 4 MB. The boxed version also adds GC pressure.
+
+<h1 id="avoiding-unnecessary-object-allocation">
+  Avoiding Unnecessary Object Allocation
+</h1>
+
+Every `new` costs something: a small heap allocation, eventual garbage collection, and a cache miss when the object lives somewhere cold. Individually they're tiny. In a loop running a million times per second, they add up to real CPU time and GC pressure.
+
+The first defense is awareness. Allocations that look free often aren't:
+
+- Wrapping a primitive (`Integer.valueOf(5)`) allocates outside the small cache.
+- Streams (`list.stream().filter(...).map(...)`) allocate stream stages and lambdas.
+- `String.split`, `String.replace`, and similar all return new `String`s.
+- `LocalDate.now()` allocates a new `LocalDate` every call.
+- Iterators allocated by `for-each` are real objects.
+
+For 99% of code, none of this matters. For tight inner loops in performance-critical code, every one of them can be a real cost.
+
+The second defense is reuse. If you allocate the same object shape repeatedly in a loop, hoist it out:
+
+```java
+import java.util.regex.Pattern;
+import java.util.List;
+
+public class PatternReuse {
+    // Compile once. Reuse forever.
+    private static final Pattern COUPON_PATTERN = Pattern.compile("^[A-Z]{3,10}\\d{0,4}$");
+
+    public static void main(String[] args) {
+        List<String> codes = List.of("WELCOME10", "FREE", "save50", "AUTUMN2025");
+        for (String code : codes) {
+            boolean valid = COUPON_PATTERN.matcher(code).matches();
+            System.out.println(code + " valid? " + valid);
+        }
+    }
+}
+```
+
+If you'd written `Pattern.compile(...)` inside the loop, the regex would be parsed and compiled on every iteration. The fix is a `private static final` constant.
+
+The third defense is object pooling, which is mostly the wrong answer. Modern JVMs allocate small objects very fast (a bump-pointer in the young generation) and collect them cheaply if they die young. Hand-rolled pools usually slow things down by keeping objects alive longer than necessary. The pools that pay for themselves are for expensive objects: database connections, thread pools, large buffers. For ordinary domain objects, let the GC do its job.
+
+`Pattern.compile` is slow. The resulting `Pattern` is thread-safe. Compile once into a `static final` field and you pay the cost a single time per process.
+
+<h1 id="stream-api-when-to-use-it-when-to-skip-it">
+  Stream API: When To Use It, When To Skip It
+</h1>
+
+Streams are great for readability. They also have real overhead compared to plain loops, especially for small collections and primitive work. The honest summary:
+
+- Use streams when they make the intent clearer than a loop, the collection is large enough that overhead is noise, and you're not in a profiled hot spot.
+- Skip streams when the loop is in a measured hot path and the equivalent `for` is dramatically simpler, or when you're working with primitives and the boxing version of stream would dominate.
+
+Parallel streams (`list.parallelStream()` or `stream.parallel()`) deserve a stronger warning. They look like a one-keyword speedup. In practice, they're easy to misuse:
+
+- The default `ForkJoinPool.commonPool()` is shared across the whole JVM. A parallel stream in one library can starve unrelated work.
+- The collection must be efficiently splittable. `ArrayList` and arrays are. `LinkedList` is not, and gets shredded by parallel streams.
+- The per-element work has to be large enough to outweigh the coordination cost. Summing integers in parallel is usually slower than serial.
+- The function passed to a stream stage must be thread-safe and side-effect-free. Mutating a shared `ArrayList` from a parallel stream is a race.
+
+```java
+import java.util.List;
+
+public class StreamSensibly {
+    public static void main(String[] args) {
+        List<String> items = List.of("Wireless Mouse", "USB Cable", "Headphones");
+
+        // Fine: clear intent, small collection, no hot path.
+        long lengthSum = items.stream()
+            .mapToInt(String::length)
+            .sum();
+        System.out.println("Total characters: " + lengthSum);
+    }
+}
+```
+
+For comparison, here's what the same logic looks like as a plain loop:
+
+```java
+import java.util.List;
+
+public class LoopVersion {
+    public static void main(String[] args) {
+        List<String> items = List.of("Wireless Mouse", "USB Cable", "Headphones");
+        int lengthSum = 0;
+        for (String item : items) {
+            lengthSum += item.length();
+        }
+        System.out.println("Total characters: " + lengthSum);
+    }
+}
+```
+
+Both versions are correct. The stream version reads better in many codebases. The loop version is marginally faster and produces no allocation overhead. Use whichever one your team prefers and revisit only if the profiler points there.
+
+Parallel streams pay coordination overhead in the tens of microseconds per task. They speed up CPU-bound work on large datasets and slow down small work. Measure before assuming.
+
+<h1 id="lazy-initialization-and-the-double-checked-locking-story">
+  Lazy Initialization and the Double-Checked Locking Story
+</h1>
+
+Sometimes you have an expensive object that may never be needed. A product catalog loader, a connection to a recommendation service, an in-memory tax-rate table. Constructing it eagerly slows startup. Constructing it on demand makes the first access slow, but only once.
+
+The naive single-threaded version:
+
+```java
+public class LazyCatalog {
+    private static Catalog catalog;
+
+    public static Catalog get() {
+        if (catalog == null) {
+            catalog = new Catalog();  // expensive
+        }
+        return catalog;
+    }
+
+    static class Catalog {
+        Catalog() { System.out.println("Loading catalog..."); }
+    }
+
+    public static void main(String[] args) {
+        Catalog c1 = get();
+        Catalog c2 = get();
+        System.out.println("Same instance? " + (c1 == c2));
+    }
+}
+```
+
+That works in one thread. In a multi-threaded program, two threads can both see `catalog == null`, both call `new Catalog()`, and both store a reference. The famous fix is **double-checked locking**, which works correctly only when the field is `volatile`:
+
+```java
+public class DoubleCheckedLazy {
+    private static volatile Catalog catalog;
+
+    public static Catalog get() {
+        Catalog local = catalog;
+        if (local == null) {
+            synchronized (DoubleCheckedLazy.class) {
+                local = catalog;
+                if (local == null) {
+                    local = new Catalog();
+                    catalog = local;
+                }
+            }
+        }
+        return local;
+    }
+
+    static class Catalog {
+        Catalog() { System.out.println("Loading catalog..."); }
+    }
+
+    public static void main(String[] args) {
+        System.out.println(get() == get());
+    }
+}
+```
+
+The `volatile` matters. Without it, a thread can see a partially constructed `Catalog` reference because the JVM is allowed to reorder writes inside `new`. With `volatile`, the publication happens safely after the constructor finishes.
+
+The simplest answer is to side-step the whole problem. The **initialization-on-demand holder idiom** uses the JVM's guaranteed class initialization order:
+
+```java
+public class HolderIdiom {
+    public static Catalog get() {
+        return Holder.INSTANCE;
+    }
+
+    private static class Holder {
+        static final Catalog INSTANCE = new Catalog();
+    }
+
+    static class Catalog {
+        Catalog() { System.out.println("Loading catalog..."); }
+    }
+
+    public static void main(String[] args) {
+        System.out.println(get() == get());
+    }
+}
+```
+
+The JVM only loads `Holder` when something references `Holder.INSTANCE`, and class initialization is thread-safe by spec. No `volatile`, no `synchronized`, no chance of a partially constructed reference. Use this pattern first; use double-checked locking only when you can't.
+
+A missing `volatile` on a double-checked-locked field is a classic bug. The code "works" almost always and fails rarely in surprising ways under load. The holder idiom sidesteps the trap entirely.
+
+<h1 id="in-process-caching-and-lru-eviction">
+  In-Process Caching and LRU Eviction
+</h1>
+
+Some computations are expensive and the same inputs repeat often. Catalog lookups, price-tier calculations, parsed configuration. A small in-process cache turns repeated work into one-time work.
+
+The simplest cache is a `HashMap`. It grows forever, which is fine for a small bounded key space and a problem for anything user-driven. To bound the size, evict the least recently used entry whenever the map fills up. `LinkedHashMap` makes this a one-line override.
+
+```java
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+public class LruCacheDemo {
+    static class LruCache<K, V> extends LinkedHashMap<K, V> {
+        private final int capacity;
+
+        LruCache(int capacity) {
+            super(capacity, 0.75f, true);  // accessOrder=true
+            this.capacity = capacity;
+        }
+
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<K, V> eldest) {
+            return size() > capacity;
+        }
+    }
+
+    public static void main(String[] args) {
+        LruCache<String, Integer> productPrices = new LruCache<>(3);
+        productPrices.put("Wireless Mouse", 2999);
+        productPrices.put("USB Cable", 999);
+        productPrices.put("Headphones", 4999);
+
+        productPrices.get("Wireless Mouse");  // touches it, now most-recently-used
+        productPrices.put("Notebook", 1299);  // evicts USB Cable (the eldest)
+
+        System.out.println(productPrices.keySet());
+    }
+}
+```
+
+The constructor flag `accessOrder=true` tells the map to reorder on every `get` so the most recently used entry moves to the tail. The override `removeEldestEntry` runs on every insert and returns `true` when the size exceeds the cap, which causes the eldest entry (the front of the linked list) to be evicted.
+
+For anything more demanding, look at Caffeine, a third-party library that gives you size-based and time-based eviction, async loaders, and statistics. Caffeine is common in production Java code. The `LinkedHashMap` trick fits small, simple caches inside a single class.
+
+An unbounded `HashMap` used as a cache is a memory leak waiting to happen. Cap it explicitly with `LinkedHashMap` plus `removeEldestEntry`, or hand the job to Caffeine.
+
+<h1 id="io-buffer-everything">I/O: Buffer Everything</h1>
+
+Raw I/O streams in Java are unbuffered by default. Every `read()` and `write()` can mean a system call. For file or network work, that's painfully slow.
+
+Wrapping a stream in a buffer changes the picture entirely. Reads and writes go through an in-memory buffer; the underlying system call happens once per fill, not once per byte.
+
+```java
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.IOException;
+
+public class BufferedReadDemo {
+    public static void main(String[] args) throws IOException {
+        // Wrapping FileReader in BufferedReader turns one syscall per byte into one per ~8 KB.
+        try (BufferedReader reader = new BufferedReader(new FileReader("orders.txt"))) {
+            String line;
+            int total = 0;
+            while ((line = reader.readLine()) != null) {
+                total += line.length();
+            }
+            System.out.println("Total characters: " + total);
+        } catch (IOException e) {
+            System.out.println("Skipped (no file): " + e.getMessage());
+        }
+    }
+}
+```
+
+**Output (if `orders.txt` is missing):**
+
+```text
+Skipped (no file): orders.txt (No such file or directory)
+```
+
+The same idea applies on the write side: `BufferedWriter` around a `FileWriter`, `BufferedOutputStream` around a `FileOutputStream`. The newer NIO APIs (`Files.newBufferedReader`, `Files.newBufferedWriter`) bake the buffer in for you.
+
+Another common pattern is **batching**. If you're sending one HTTP request per cart item, that's N round-trips. Send the whole cart in one request and you pay one round-trip. The same logic applies to database inserts (`addBatch` plus `executeBatch` on a `PreparedStatement`), to message queue sends, and to any I/O where setup cost dominates per-call work. Batching is usually a 10x+ improvement and rarely a code-readability cost.
+
+Unbuffered reads from a file can run at 1 MB/second. Buffered reads of the same file run at 1 GB/second. Always wrap.
+
+<h1 id="how-the-jit-helps-warm-up-and-inlining">
+  How the JIT Helps (Warm-up and Inlining)
+</h1>
+
+Java starts cold. The first time a method runs, it's interpreted. After enough calls, HotSpot's JIT compiler kicks in and produces optimized machine code. After more calls, the C2 compiler (in HotSpot) produces even more aggressive code with full inlining, escape analysis, and dead-code elimination. This is why the first few thousand calls to a method can be 10x slower than the steady-state speed.
+
+A few practical consequences:
+
+- **Benchmark warm-up matters.** This is why JMH exists. The first run is not the real run.
+- **Short-lived programs don't benefit much.** A CLI that runs for 200 ms barely has time for the JIT to kick in. AOT compilation (GraalVM Native Image) is the answer for startup-bound workloads.
+- **Tiny methods get inlined.** The JIT inlines aggressively, which is why writing small, well-named methods doesn't cost performance. Don't manually inline for "speed."
+- **Polymorphic call sites can be deoptimized.** If a virtual method is called with three or more different concrete types, the JIT may fall back to a slower dispatch path. In hot code, prefer designs where one or two implementations are most common.
+
+You can watch the JIT make decisions with the flag `-XX:+PrintCompilation`. It prints a line each time a method is compiled, deoptimized, or recompiled at a higher tier. Useful for understanding warm-up behavior, not for day-to-day tuning.
+
+```text
+124  18    3   java.util.HashMap::hash (20 bytes)
+124  19    3   java.util.HashMap::putVal (300 bytes)
+125  20    4   java.util.HashMap::hash (20 bytes)
+```
+
+The number after the method name is the tier. Tier 3 is C1, tier 4 is C2. Methods that show up over and over are the hot ones.
+
+A method that only ever runs at startup will probably never reach tier 4. A method that runs in a tight loop reaches tier 4 fast. Don't tune startup methods for steady-state speed.
+
+<h1 id="gc-pressure-the-generational-hypothesis">
+  GC Pressure: The Generational Hypothesis
+</h1>
+
+Java's garbage collector splits the heap into a **young generation** for fresh allocations and an **old generation** for objects that survive long enough. The reason is the **generational hypothesis**: most objects die young. A request handler creates a hundred small objects, returns, and all of them become garbage by the next request. Sweeping the young generation can be very cheap because almost everything in it is dead.
+
+The practical implication for application code: short-lived allocations are cheaper than long-lived ones. A handful of temporary objects in a request handler costs almost nothing. A million objects you accumulate over time and then drop costs a lot, because they get promoted to the old generation and the old-generation collection is more expensive.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class GcFriendlyShape {
+    // Bad shape: builds up a giant list, then drops it. Promotes everything to old gen.
+    public static long sumPricesBadShape() {
+        List<Long> prices = new ArrayList<>();
+        for (long i = 0; i < 1_000_000; i++) {
+            prices.add(i * 100L);  // boxes + stores
+        }
+        long total = 0;
+        for (Long p : prices) total += p;
+        return total;
+    }
+
+    // Good shape: never materializes the intermediate list.
+    public static long sumPricesGoodShape() {
+        long total = 0;
+        for (long i = 0; i < 1_000_000; i++) {
+            total += i * 100L;
+        }
+        return total;
+    }
+
+    public static void main(String[] args) {
+        System.out.println("Bad shape result:  " + sumPricesBadShape());
+        System.out.println("Good shape result: " + sumPricesGoodShape());
+    }
+}
+```
+
+The "good shape" version produces the same answer with zero heap allocations. The "bad shape" version allocates a million `Long` objects, grows an `ArrayList` through resize cycles, and then asks the GC to clean it all up. Same result, very different cost.
+
+The point here is the application-side habit: prefer streaming over accumulating, prefer primitives over boxed types, and don't hold references longer than you need them. Every reference that escapes the scope it could have died in becomes a longer-lived object.
+
+Old-generation collections are more expensive than young-generation collections. Code that allocates and discards in the same request stays cheap. Code that builds a giant cache and slowly releases pieces of it pressures the old gen.
+
+<h1 id="algorithm-first-constants-second">Algorithm First, Constants Second</h1>
+
+Big-O notation tells you how runtime grows with input size. Constants tell you the absolute speed at any given size. Both matter, in different orders.
+
+For large `n`, algorithm beats constants every time. A poorly written `O(n log n)` sort in Python still crushes a hand-tuned `O(n^2)` sort in assembly when `n` is a million. The shape of the curve wins.
+
+For small `n`, constants dominate. `Arrays.sort` on a 4-element array uses insertion sort internally because the constants are smaller than quicksort for tiny inputs, even though insertion sort is `O(n^2)`.
+
+The practical rule:
+
+1. **First**, fix the algorithm. If a loop is `O(n^2)` and could be `O(n log n)`, that's the change that matters. Going from a nested-loop scan of carts to a `HashMap` lookup turns 10-second pages into 10-millisecond pages.
+2. **Second**, fix the constants. Once the algorithm is right, look at allocations, collection choice, and micro-pattern tweaks. These shave 10-30% off, which is real but small compared to going from quadratic to linear.
+
+```java
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+public class AlgorithmFirst {
+    public static void main(String[] args) {
+        List<String> cart = List.of("Wireless Mouse", "USB Cable", "Headphones");
+        List<String> wishlist = List.of("Headphones", "Notebook", "Wireless Mouse");
+
+        // Bad: O(n*m). For each cart item, scan the wishlist.
+        long countSlow = 0;
+        for (String item : cart) {
+            for (String wish : wishlist) {
+                if (item.equals(wish)) countSlow++;
+            }
+        }
+
+        // Good: O(n+m). Index the wishlist once, then look up each cart item.
+        Set<String> wishlistSet = new HashSet<>(wishlist);
+        long countFast = 0;
+        for (String item : cart) {
+            if (wishlistSet.contains(item)) countFast++;
+        }
+
+        System.out.println("Items in both (slow): " + countSlow);
+        System.out.println("Items in both (fast): " + countFast);
+    }
+}
+```
+
+Same answer. With three items each, no visible time difference. With 10,000 cart items and 50,000 wishlist items, the slow version does 500 million comparisons and the fast version does 60,000 plus a hash table build. That's the gap algorithm choice creates.
+
+Replacing a nested loop with a `HashSet` lookup turns `O(n*m)` into `O(n+m)`. That's the most common performance fix in Java code.
+
+<h1 id="putting-it-together-a-performance-investigation">
+  Putting It Together: A Performance Investigation
+</h1>
+
+A short closing scenario that touches most of the ideas above. The checkout endpoint is taking 800 ms per request. The team has a hunch it's the discount calculation. Before changing code, they capture a JFR recording in production for two minutes.
+
+The flame graph shows three hot frames:
+
+1. `CouponValidator.validate` (42%)
+2. `Catalog.findById` (28%)
+3. `Order.totalCents` (4%)
+
+The discount math (`Order.totalCents`) is 4%. The hunch was wrong. The real costs:
+
+- `CouponValidator.validate` is doing `Pattern.compile(...)` every call. Fixing it: pull the pattern into a `static final` field. Drops to 0.3%.
+- `Catalog.findById` is doing a linear scan of a `List<Product>`. Fixing it: maintain a `Map<String, Product>` indexed by product id. Drops to 0.5%.
+
+After both changes, total latency drops from 800 ms to roughly 250 ms. Re-capture, see what's hot now, repeat. That loop, profile, fix the biggest thing, re-measure, is the whole job.
+
+What didn't happen: nobody rewrote a loop into a one-line stream, nobody parallelized anything, nobody tuned a GC flag. The fixes were targeted, measured, and small. That's most performance work in Java code.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

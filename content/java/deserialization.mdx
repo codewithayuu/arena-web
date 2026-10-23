@@ -1,0 +1,636 @@
+---
+title: "Deserialization"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Deserialization explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="objectinputstream-and-readobject">ObjectInputStream and readObject</h1>
+
+The class that reverses everything `ObjectOutputStream` did is `java.io.ObjectInputStream`. Wrap it around any `InputStream`, usually a `FileInputStream`, and call `readObject()` to pull the next object out of the byte stream. The method returns `Object`, so the result is almost always cast to the expected type.
+
+The simplest possible round trip looks like this. The `Order` class is the same one written in the previous lesson, repeated here so the example is self-contained.
+
+```java
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.Serializable;
+
+public class ReadOrder {
+    public static void main(String[] args) throws IOException, ClassNotFoundException {
+        try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream("order.bin"))) {
+            Order order = (Order) ois.readObject();
+            System.out.println("Loaded: " + order);
+        }
+    }
+}
+
+class Order implements Serializable {
+    private static final long serialVersionUID = 1L;
+
+    private final int orderId;
+    private final String customerName;
+    private final double total;
+
+    public Order(int orderId, String customerName, double total) {
+        this.orderId = orderId;
+        this.customerName = customerName;
+        this.total = total;
+    }
+
+    @Override
+    public String toString() {
+        return "Order{id=" + orderId + ", customer=" + customerName + ", total=$" + total + "}";
+    }
+}
+```
+
+**Output (assuming `order.bin` was written in the previous lesson):**
+
+```text
+Loaded: Order{id=1001, customer=Asha, total=$59.97}
+```
+
+Three things in that snippet do most of the work. The constructor of `ObjectInputStream` reads the stream header that `ObjectOutputStream` wrote, so it fails fast if the file is not a valid object stream. The call to `readObject()` blocks until the next object has been fully reconstructed, including any objects it references. The cast `(Order)` turns the returned `Object` into a usable type. The cast is where types come back into the picture, because the byte stream itself carries class names but the compiler cannot see them at compile time.
+
+`ObjectInputStream` also has primitive-aware methods that mirror the writer side: `readInt`, `readDouble`, `readLong`, `readBoolean`, `readChar`, `readUTF`, and friends. These read raw values that were written with the matching `writeInt`, `writeDouble`, and so on, not values that happened to be fields of a serialized object. The two paths are separate. Serializing an `Order` with `writeObject` and then calling `readInt` for the `orderId` field does not work. The fields of a serialized object are pulled out of the stream by `readObject` as one unit and reached through the object it returns.
+
+The bytes on disk carry both metadata (class name, `serialVersionUID`, the shape of each field) and the field values. `ObjectInputStream` reads the metadata first to figure out which class to load and how to map bytes to fields, then reads the field values and produces a fresh `Order` instance with those values filled in.
+
+> **Cost:** `readObject` is not cheap. Each call loads the class metadata (once per class per stream), allocates the object, and reads each field. For a deeply nested graph it does this recursively. For tight loops over many objects, JSON or a binary format like protobuf will usually be faster.
+
+<h1 id="exceptions-you-need-to-handle">Exceptions You Need to Handle</h1>
+
+Deserialization is one of the few APIs where reading from a stream throws a checked exception that is not an `IOException`. The full list matters because each one signals a different kind of failure.
+
+| Exception                  | When it fires                                        | Typical cause                                                                   |
+| -------------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `IOException`              | The underlying stream failed                         | Disk error, file truncated, network drop                                        |
+| `EOFException`             | The stream ended unexpectedly                        | You called `readObject` past the last object                                    |
+| `ClassNotFoundException`   | The class named in the bytes is not on the classpath | Reader is missing the JAR that defines the class                                |
+| `InvalidClassException`    | Class is present but doesn't match the bytes         | `serialVersionUID` mismatch, field type changed, class no longer `Serializable` |
+| `StreamCorruptedException` | The bytes are not a valid object stream              | File is the wrong format, header is missing or wrong                            |
+| `ClassCastException`       | Cast after `readObject` doesn't match runtime type   | Expected `Order`, the stream held `Customer`                                    |
+| `OptionalDataException`    | Primitive data appeared where an object was expected | Mixed `writeObject` and `writeInt` reads incorrectly                            |
+
+`readObject` declares two checked exceptions on its signature: `IOException` (the parent of `EOFException`, `InvalidClassException`, `StreamCorruptedException`, and `OptionalDataException`) and `ClassNotFoundException`. `ClassCastException` is unchecked, so the compiler does not require a catch.
+
+A robust reader catches the specific failures it can recover from, lets the rest bubble up, and logs enough detail to debug the byte stream when something goes wrong.
+
+```java
+import java.io.EOFException;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InvalidClassException;
+import java.io.ObjectInputStream;
+import java.io.StreamCorruptedException;
+
+public class ReadOrderSafely {
+    public static void main(String[] args) {
+        try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream("order.bin"))) {
+            Order order = (Order) ois.readObject();
+            System.out.println("Loaded: " + order);
+        } catch (InvalidClassException e) {
+            System.out.println("Class shape changed: " + e.getMessage());
+        } catch (StreamCorruptedException e) {
+            System.out.println("Corrupted file: " + e.getMessage());
+        } catch (EOFException e) {
+            System.out.println("File was empty or truncated");
+        } catch (ClassNotFoundException e) {
+            System.out.println("Order class missing on classpath");
+        } catch (IOException e) {
+            System.out.println("I/O failure: " + e.getMessage());
+        } catch (ClassCastException e) {
+            System.out.println("Stream did not contain an Order");
+        }
+    }
+}
+```
+
+Catching `InvalidClassException` before `IOException` matters because `InvalidClassException` extends `IOException`. Flipping the order would let the broader catch swallow the more specific one, losing the helpful message about which field changed.
+
+<h1 id="reading-multiple-objects-until-eof">
+  Reading Multiple Objects Until EOF
+</h1>
+
+Writers often dump many objects into the same file in a row. The format does not include a count, so the reader keeps calling `readObject` until the stream signals it is empty. The signal is `EOFException`. Java's serialization stream does not have a "more?" method, so the canonical pattern is a loop that catches `EOFException` as the exit condition.
+
+Suppose chapter 7 wrote a list of orders one at a time. The reader looks like this.
+
+```java
+import java.io.EOFException;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.util.ArrayList;
+import java.util.List;
+
+public class ReadAllOrders {
+    public static void main(String[] args) throws IOException, ClassNotFoundException {
+        List<Order> orders = new ArrayList<>();
+        try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream("orders.bin"))) {
+            while (true) {
+                Order order = (Order) ois.readObject();
+                orders.add(order);
+            }
+        } catch (EOFException e) {
+            // Expected: we've consumed every object on the stream
+        }
+
+        System.out.println("Loaded " + orders.size() + " orders");
+        for (Order o : orders) {
+            System.out.println("  " + o);
+        }
+    }
+}
+```
+
+**Output (assuming three orders were written):**
+
+```text
+Loaded 3 orders
+  Order{id=1001, customer=Asha, total=$59.97}
+  Order{id=1002, customer=Ben, total=$12.49}
+  Order{id=1003, customer=Carla, total=$84.20}
+```
+
+Using a checked exception as a loop terminator feels strange, but it is the documented pattern. `readObject` does not return `null` at end of stream; that would conflict with the fact that `null` is a perfectly legal value to have serialized. There is no `hasMoreObjects()` method either, because the stream cannot peek without consuming bytes. So the design picked an exception as the only unambiguous signal.
+
+A common alternative is to write a wrapper object first. Instead of writing three `Order` objects, write one `List<Order>` and read one `List<Order>`. That trades a try-catch for a single allocation and the ability to know the size up front. Either pattern works; the wrapper pattern is cleaner code, the loop pattern handles streams of unknown size.
+
+The decision node tests whether the most recent `readObject` call hit end-of-stream. The catch block around `EOFException` is the implementation of that decision in Java. Any other `IOException` is a real failure and should propagate.
+
+<h1 id="when-the-class-has-changed-serialversionuid">
+  When the Class Has Changed: serialVersionUID
+</h1>
+
+Once a file has been written, the class on disk and the class on the reader's classpath can drift. Someone adds a field. Someone removes one. Someone changes a `double` to a `BigDecimal`. Java's serialization mechanism handles some of these changes gracefully and refuses others outright.
+
+Every serializable class has a `serialVersionUID`, a 64-bit number that acts as a version stamp. When `readObject` rebuilds an instance, it compares the `serialVersionUID` in the bytes against the `serialVersionUID` of the class on the classpath. If they match, the read proceeds. If they don't, `readObject` throws `InvalidClassException` immediately, with a message like `local class incompatible: stream classdesc serialVersionUID = ..., local class serialVersionUID = ...`.
+
+That's why declaring `serialVersionUID` explicitly (covered in the previous lesson) matters so much: letting the compiler generate it means almost any change to the class regenerates it, and old files stop loading.
+
+Even with a matching `serialVersionUID`, some class changes are compatible and some are not. The rules below cover the most common cases.
+
+| Class change                         | Compatible? | Behavior on read                                                                    |
+| ------------------------------------ | ----------- | ----------------------------------------------------------------------------------- |
+| Add a new field                      | Yes         | New field gets its default (0, null, false)                                         |
+| Remove a field                       | Yes         | Old field's bytes are read and discarded                                            |
+| Change a field's type to a wider one | No          | `InvalidClassException`                                                             |
+| Change a field's name                | No          | Treated as remove + add                                                             |
+| Add a no-arg constructor             | Yes         | Not called during deserialization (see below)                                       |
+| Remove `Serializable`                | No          | `InvalidClassException`                                                             |
+| Add a superclass                     | Sometimes   | Compatible only if the new superclass is `Serializable` or has a no-arg constructor |
+
+The "add a new field" rule lets a service evolve without breaking saved data. A `Product` class that gains a `rating` field can still load a file written before that field existed. The `rating` will be `0.0` (the `double` default) in the loaded objects.
+
+```java
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.Serializable;
+
+public class LoadEvolvedProduct {
+    public static void main(String[] args) throws IOException, ClassNotFoundException {
+        try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream("product.bin"))) {
+            Product product = (Product) ois.readObject();
+            System.out.println(product);
+        }
+    }
+}
+
+class Product implements Serializable {
+    private static final long serialVersionUID = 1L;
+
+    private final String name;
+    private final double price;
+    private final double rating; // Added after product.bin was written
+
+    public Product(String name, double price, double rating) {
+        this.name = name;
+        this.price = price;
+        this.rating = rating;
+    }
+
+    @Override
+    public String toString() {
+        return "Product{name=" + name + ", price=$" + price + ", rating=" + rating + "}";
+    }
+}
+```
+
+**Output (assuming the file was written when `Product` had only `name` and `price`):**
+
+```text
+Product{name=Notebook, price=$4.99, rating=0.0}
+```
+
+The `rating` field is `0.0` because the stream had no bytes for it. Java filled in the default for a `double`. The same is true for any new field: `int` becomes `0`, `boolean` becomes `false`, references become `null`.
+
+When the version stamp doesn't match, the failure looks like this.
+
+```text
+java.io.InvalidClassException: Product; local class incompatible:
+    stream classdesc serialVersionUID = 1, local class serialVersionUID = -8235724293437L
+```
+
+The number on the left is what the bytes claim; the number on the right is what the loaded class declares. Forgetting to pin a value, then redeploying, produces exactly this error against every file written under the old build.
+
+The diagram shows the two gates `readObject` runs before it returns an object: the version check first, then the field compatibility check. Either failure throws `InvalidClassException` with a different message; the version mismatch message names two `serialVersionUID` values, the field mismatch message names the offending field.
+
+> **Cost:** A pinned `serialVersionUID` is one line of code and prevents every "we can't read yesterday's orders" outage that follows a redeploy. Forgetting it is the most common cause of an outage with Java serialization.
+
+<h1 id="transient-fields-after-deserialization">
+  Transient Fields After Deserialization
+</h1>
+
+The `transient` keyword (declared in the previous lesson) tells the writer to skip a field. The reader sees the same skip on the way back: the field gets the default value for its type, regardless of whatever the field held when it was written.
+
+Consider a `ShoppingCart` whose `cachedTotal` is marked transient. It's a computed value, recomputable from the items, so it doesn't belong in the file.
+
+```java
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.Serializable;
+import java.util.List;
+
+public class LoadCart {
+    public static void main(String[] args) throws IOException, ClassNotFoundException {
+        try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream("cart.bin"))) {
+            ShoppingCart cart = (ShoppingCart) ois.readObject();
+            System.out.println("Items: " + cart.getItems());
+            System.out.println("cachedTotal after load: " + cart.getCachedTotal());
+        }
+    }
+}
+
+class ShoppingCart implements Serializable {
+    private static final long serialVersionUID = 1L;
+
+    private final List<String> items;
+    private transient double cachedTotal;
+
+    public ShoppingCart(List<String> items, double cachedTotal) {
+        this.items = items;
+        this.cachedTotal = cachedTotal;
+    }
+
+    public List<String> getItems() { return items; }
+    public double getCachedTotal() { return cachedTotal; }
+}
+```
+
+`cachedTotal` was `7.27` when the cart was written, but it's `0.0` after the load because `transient` told the writer to skip it. The reader doesn't have any bytes for that field and fills in the `double` default.
+
+The defaults Java uses for skipped or new fields are the same as the defaults for any uninitialized instance field, summarized below.
+
+| Field type                                            | Default after deserialization   |
+| ----------------------------------------------------- | ------------------------------- |
+| `byte`, `short`, `int`, `long`                        | `0`                             |
+| `float`, `double`                                     | `0.0`                           |
+| `boolean`                                             | `false`                         |
+| `char`                                                | `'\u0000'` (the null character) |
+| Any reference type (`String`, `List`, custom classes) | `null`                          |
+
+If a transient field needs a non-default value after loading (a logger, a database connection, a recomputed cache), rehydrate it manually after `readObject` returns, or run the rehydration inside the custom `readObject` hook described below.
+
+<h1 id="constructors-are-not-called">Constructors Are Not Called</h1>
+
+When `readObject` rebuilds an instance, it does not invoke any of the class's constructors. The object is allocated, the field bytes are stamped into place, and that's it. Any validation, defaults, or initialization in the constructor is bypassed.
+
+That's a deliberate design choice. If constructors ran during deserialization, an object's invariants would depend on the constructor doing exactly what it did when the bytes were written. Skipping construction means the bytes alone determine the field values, which is consistent but also dangerous: an attacker (or a corrupted file) can produce a `ShoppingCart` whose total is `-1000`, even if the constructor would have rejected that value.
+
+```java
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.Serializable;
+
+public class LoadValidatedOrder {
+    public static void main(String[] args) throws IOException, ClassNotFoundException {
+        try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream("bad-order.bin"))) {
+            ValidatedOrder order = (ValidatedOrder) ois.readObject();
+            System.out.println("Loaded with total: $" + order.getTotal());
+            System.out.println("Constructor message ran? " + ValidatedOrder.constructorRan);
+        }
+    }
+}
+
+class ValidatedOrder implements Serializable {
+    private static final long serialVersionUID = 1L;
+    static boolean constructorRan = false;
+
+    private final double total;
+
+    public ValidatedOrder(double total) {
+        if (total < 0) {
+            throw new IllegalArgumentException("Total cannot be negative");
+        }
+        this.total = total;
+        constructorRan = true;
+    }
+
+    public double getTotal() { return total; }
+}
+```
+
+**Output (assuming `bad-order.bin` was crafted to contain a negative total):**
+
+```text
+Loaded with total: $-1000.0
+Constructor message ran? false
+```
+
+The constructor's negative-total check did nothing. The static flag stayed `false` because the constructor was never called. The object exists, it's typed `ValidatedOrder`, but it's in a state the constructor would have refused.
+
+There is one wrinkle: if the class has a non-serializable superclass, that superclass's no-arg constructor _is_ called during deserialization. Java needs some way to initialize the inherited fields. The rule is precise: constructors of serializable classes are not called, but the first non-serializable superclass walked from the bottom must have a public or protected no-arg constructor, or the read fails.
+
+The practical consequence: for invariants that must hold, enforce them in a custom `readObject` method, not in the constructor.
+
+> **Cost:** Skipping the constructor is what makes hostile input cheap to produce. An attacker who can feed bytes to an `ObjectInputStream` can fabricate "objects" that real code paths can never produce. The security section below covers what to do about it.
+
+<h1 id="custom-readobject-for-validation-and-rehydration">
+  Custom readObject for Validation and Rehydration
+</h1>
+
+To enforce invariants or recompute transient fields after a read, implement a private method with this exact signature:
+
+```java
+private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, ClassNotFoundException
+```
+
+Java's serialization machinery looks for this method by name and signature on each class in the hierarchy. If it finds one, it calls that method instead of doing the default field-by-field read. Inside the method, call `in.defaultReadObject()` first (which performs the normal field read), then do extra work as needed: validate state, rebuild caches, reconnect resources.
+
+A `ShoppingCart` that validates the loaded item list and recomputes `cachedTotal` looks like this.
+
+```java
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.Serializable;
+import java.util.List;
+
+public class LoadCartWithRehydration {
+    public static void main(String[] args) throws IOException, ClassNotFoundException {
+        try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream("cart.bin"))) {
+            ValidatedCart cart = (ValidatedCart) ois.readObject();
+            System.out.println("Items: " + cart.getItems());
+            System.out.println("cachedTotal after load: " + cart.getCachedTotal());
+        }
+    }
+}
+
+class ValidatedCart implements Serializable {
+    private static final long serialVersionUID = 1L;
+
+    private final List<String> items;
+    private final double[] prices;
+    private transient double cachedTotal;
+
+    public ValidatedCart(List<String> items, double[] prices) {
+        if (items.size() != prices.length) {
+            throw new IllegalArgumentException("items and prices must align");
+        }
+        this.items = items;
+        this.prices = prices;
+        this.cachedTotal = computeTotal(prices);
+    }
+
+    private static double computeTotal(double[] prices) {
+        double sum = 0;
+        for (double p : prices) {
+            sum += p;
+        }
+        return sum;
+    }
+
+    private void readObject(ObjectInputStream in) throws IOException, ClassNotFoundException {
+        in.defaultReadObject();
+        if (items == null || prices == null) {
+            throw new java.io.InvalidObjectException("Cart fields cannot be null");
+        }
+        if (items.size() != prices.length) {
+            throw new java.io.InvalidObjectException("items and prices must align");
+        }
+        this.cachedTotal = computeTotal(prices);
+    }
+
+    public List<String> getItems() { return items; }
+    public double getCachedTotal() { return cachedTotal; }
+}
+```
+
+Three things happen inside the custom `readObject`. First, `defaultReadObject()` performs the normal field-by-field read, so `items` and `prices` get populated from the stream just like they would without a custom hook. Second, the method validates the post-read state: if the file was corrupted or hostile, `items` and `prices` might be mismatched or null, and the method throws `InvalidObjectException` to abort. Third, it recomputes `cachedTotal` from the now-validated `prices` array, because that transient field would otherwise be `0.0`.
+
+`defaultReadObject` has a sibling, `readFields`, that gives finer-grained control over which fields to pick out of the stream. It's rarely needed in application code; `defaultReadObject` plus validation is the usual pattern.
+
+> **Cost:** A custom `readObject` is the only line of defense against a hostile stream. Without it, any byte sequence that matches the class's shape produces an object that bypasses every constructor invariant.
+
+<h1 id="readresolve-for-singletons-and-enums">
+  readResolve for Singletons and Enums
+</h1>
+
+After `readObject` has built an instance, it calls `readResolve()` if the class defines one, and the value `readResolve` returns replaces the deserialized instance in the result.
+
+This matters for singletons. A class with a single canonical instance, like a registry or a configuration holder, would normally be broken by deserialization: every read would produce a fresh instance, defeating the singleton property. `readResolve` redirects the result back to the canonical instance.
+
+```java
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.Serializable;
+
+public class LoadDiscountPolicy {
+    public static void main(String[] args) throws IOException, ClassNotFoundException {
+        try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream("policy.bin"))) {
+            DiscountPolicy policy = (DiscountPolicy) ois.readObject();
+            System.out.println("Same instance as singleton? " + (policy == DiscountPolicy.INSTANCE));
+        }
+    }
+}
+
+class DiscountPolicy implements Serializable {
+    private static final long serialVersionUID = 1L;
+    public static final DiscountPolicy INSTANCE = new DiscountPolicy();
+
+    private DiscountPolicy() {}
+
+    private Object readResolve() {
+        return INSTANCE;
+    }
+}
+```
+
+Without `readResolve`, that comparison would be `false` because deserialization would build a brand-new `DiscountPolicy` and the singleton reference would be lost. The hook intercepts the fresh instance and substitutes the real one. The freshly built object becomes garbage immediately, which is mildly wasteful but acceptable for the use case.
+
+Enums get this protection automatically. Java's serialization treats enum constants specially: the stream stores only the enum's class and the constant's name, and the reader looks up the existing constant rather than allocating a new one. Serializing enums needs no special handling, and `==` comparisons survive the round trip.
+
+```java
+enum OrderStatus {
+    PLACED, SHIPPED, DELIVERED, CANCELLED
+}
+```
+
+A serialized `OrderStatus.SHIPPED` on disk, read back, is `==` to `OrderStatus.SHIPPED` in memory. The enum machinery handles this without any custom `readResolve`.
+
+<h1 id="the-security-problem-with-readobject">
+  The Security Problem with readObject
+</h1>
+
+This is the part that has reshaped how Java applications handle persisted data. `ObjectInputStream.readObject` is not a parser. It is a general-purpose mechanism that reconstructs whatever the stream tells it to, including unexpected classes, with whatever field values the stream specifies, and it runs each class's `readObject` hook as part of that. An attacker who can feed bytes to an `ObjectInputStream` can choose which classes get constructed and what state those classes start in.
+
+The attack pattern is called a "gadget chain". The attacker doesn't write a new exploit class; they pick classes already on the classpath whose `readObject` hooks do something useful when fed specific inputs. Common Java libraries have classes whose `readObject` invokes methods like `Runtime.exec`, opens database connections, or fetches URLs as a side effect of legitimate setup work. Chain those together with the right field values and the attacker gets remote code execution out of a single `readObject` call.
+
+The dangerous part is that no method call on the deserialized object is needed for the exploit to fire. The damage is done during the read itself, inside `readObject` hooks of classes the application didn't write and probably doesn't know are on the classpath.
+
+The attacker's bytes go in on the left. `readObject` doesn't care that the classes named in the stream are gadgets; it constructs them faithfully. As each one is built, its `readObject` hook does the legitimate work it was designed for, with the field values the attacker chose. The last gadget in the chain reaches a sensitive sink, like `Runtime.exec` or a reflective method invocation, and the attacker has achieved their goal.
+
+Java itself doesn't validate which classes are allowed on the stream by default. Several real-world CVEs over the past decade (Apache Commons Collections, Spring, WebLogic, Jenkins) have hinged on exactly this pattern.
+
+Java 9 introduced `ObjectInputFilter` to defend against this. A filter inspects each class as it appears on the stream and decides whether to allow it or reject it. The recommended posture is to allow-list: enumerate the classes you actually expect, and reject everything else.
+
+```java
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.ObjectInputFilter;
+import java.io.ObjectInputStream;
+
+public class FilteredOrderReader {
+    public static void main(String[] args) throws IOException, ClassNotFoundException {
+        try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream("order.bin"))) {
+
+            ObjectInputFilter filter = ObjectInputFilter.Config.createFilter(
+                "com.shop.model.*;java.lang.String;java.util.ArrayList;!*"
+            );
+            ois.setObjectInputFilter(filter);
+
+            Order order = (Order) ois.readObject();
+            System.out.println("Loaded: " + order);
+        }
+    }
+}
+```
+
+The filter string is a sequence of patterns separated by `;`. A pattern that ends with `.*` allows everything in that package; a bare class name allows that exact class; a leading `!` rejects the matched pattern; and `!*` at the end rejects everything not previously allowed. The filter above allows the application's own model classes, plus the standard library types they need, and rejects everything else. If the attacker tries to inject a `org.apache.commons.collections.functors.InvokerTransformer` into the stream, the filter throws `InvalidClassException` before any `readObject` hook runs.
+
+A JVM-wide filter can be set through the `jdk.serialFilter` system property, or supplied as a more elaborate `Function<FilterInfo, Status>` lambda. The exact API isn't the point. Any `readObject` on untrusted input must have a filter, and the filter must be an allow-list, not a deny-list.
+
+The deeper conclusion most teams have reached: don't use Java serialization for untrusted input at all. JSON parsers don't execute arbitrary code while parsing; they produce strings, numbers, and maps that get deserialized explicitly into application types, with full control over which classes get instantiated. Protobuf is similar: the schema dictates the types, the parser has no general-purpose object reconstruction. Both are also smaller, faster, and language-portable. New code rarely uses `ObjectOutputStream` and `ObjectInputStream` for anything beyond local caches or RMI, where both ends are trusted.
+
+> **Cost:** Without an `ObjectInputFilter`, a single hostile `readObject` call against untrusted bytes can be remote code execution. The performance cost of a filter is negligible compared to that risk.
+
+<h1 id="why-many-teams-migrated-away-from-java-serialization">
+  Why Many Teams Migrated Away from Java Serialization
+</h1>
+
+Putting the pieces together: Java serialization is fragile (any non-trivial class change can break old files), unsafe by default (`readObject` is a remote code execution sink without a filter), opaque (the byte format is Java-specific and impossible to read from another language), and slow compared to modern alternatives. The combination is why most new persistence and inter-service communication uses JSON, protobuf, or a similar schema-driven format.
+
+A short comparison sketches the trade-offs.
+
+| Concern          | Java serialization                  | JSON                                 | Protobuf                       |
+| ---------------- | ----------------------------------- | ------------------------------------ | ------------------------------ |
+| Cross-language   | No                                  | Yes                                  | Yes                            |
+| Schema evolution | Brittle, ties to `serialVersionUID` | Lenient, unknown fields ignored      | Designed for it, field numbers |
+| Size on the wire | Medium                              | Largest (text)                       | Smallest (binary)              |
+| Speed            | Slow                                | Slow to moderate                     | Fastest                        |
+| Security risk    | High without a filter               | Low (parser produces data, not code) | Low                            |
+| Setup cost       | None, built in                      | None for basic use                   | Schema definition needed       |
+
+Java serialization still has a niche. RMI uses it. Some local-cache and session-state stores still depend on it. JVM-only systems where both ends are trusted and deploy together can use it without much pain. But for any persisted file that outlives a deploy, or any byte stream that crosses a trust boundary, the modern default is JSON for general use and protobuf for performance-sensitive systems.
+
+For a system that already uses Java serialization, the practical migration path is to keep the existing format for legacy data and add a JSON or protobuf writer alongside it. New writes go to the new format; reads check both, preferring the new one. Over time, the old files age out and the serialization code gets deleted.
+
+<h1 id="putting-it-together">Putting It Together</h1>
+
+A reader that handles a list of orders, validates the version, applies an `ObjectInputFilter`, and uses a custom `readObject` for invariant checks pulls everything together.
+
+```java
+import java.io.EOFException;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InvalidObjectException;
+import java.io.ObjectInputFilter;
+import java.io.ObjectInputStream;
+import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.List;
+
+public class FullReader {
+    public static void main(String[] args) {
+        List<SafeOrder> orders = new ArrayList<>();
+
+        try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream("orders.bin"))) {
+            ObjectInputFilter filter = ObjectInputFilter.Config.createFilter(
+                "FullReader$SafeOrder;java.lang.String;!*"
+            );
+            ois.setObjectInputFilter(filter);
+
+            while (true) {
+                SafeOrder order = (SafeOrder) ois.readObject();
+                orders.add(order);
+            }
+        } catch (EOFException e) {
+            // Done reading
+        } catch (IOException | ClassNotFoundException e) {
+            System.out.println("Load failed: " + e.getMessage());
+            return;
+        }
+
+        System.out.println("Loaded " + orders.size() + " orders:");
+        for (SafeOrder order : orders) {
+            System.out.println("  " + order);
+        }
+    }
+
+    static class SafeOrder implements Serializable {
+        private static final long serialVersionUID = 1L;
+        private final int orderId;
+        private final String customer;
+        private final double total;
+
+        public SafeOrder(int orderId, String customer, double total) {
+            if (total < 0) throw new IllegalArgumentException("Negative total");
+            this.orderId = orderId;
+            this.customer = customer;
+            this.total = total;
+        }
+
+        private void readObject(ObjectInputStream in) throws IOException, ClassNotFoundException {
+            in.defaultReadObject();
+            if (customer == null) {
+                throw new InvalidObjectException("customer is required");
+            }
+            if (total < 0) {
+                throw new InvalidObjectException("total cannot be negative");
+            }
+        }
+
+        @Override
+        public String toString() {
+            return "SafeOrder{id=" + orderId + ", customer=" + customer + ", total=$" + total + "}";
+        }
+    }
+}
+```
+
+Four layers of safety are stacked here. The `ObjectInputFilter` rejects any class outside the expected set before construction starts. The `serialVersionUID` pin keeps old files loadable across deploys. The custom `readObject` validates invariants the constructor can no longer enforce. The try-with-resources guarantees the stream is closed even when reads fail. None of these alone is enough; together they make Java serialization usable for the narrow cases where it still makes sense.
+
+<h1 id="summary">Summary</h1>
+
+- `ObjectInputStream.readObject()` reverses `writeObject`: it consumes a byte stream and returns a freshly allocated object. The static return type is `Object`, so the result gets cast to the expected type.
+- The canonical multi-object pattern is a `while (true)` loop with a catch on `EOFException`, because the format has no `hasNext` method and `null` is a legal value.
+- Constructors of serializable classes are not called during deserialization. Field values come straight from the bytes, which means class invariants must be enforced inside a private `readObject` hook, not in the constructor.
+- `transient` fields come back as the default for their type: `0`, `0.0`, `false`, `'\u0000'`, or `null`. Recompute them in `readObject` if they need a real value.
+- `serialVersionUID` is the version gate. A mismatch throws `InvalidClassException`$Lca
+
+In the next lesson, we'll move on to the NIO package, which provides a different model for I/O built around channels, buffers, and non-blocking operations.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,247 @@
+---
+title: "Anti-Patterns"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Anti-Patterns explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="mutable-default-arguments">Mutable Default Arguments</h1>
+
+The default value for a function parameter is evaluated **once**, when the function is defined, not each time the function is called. For an immutable default like `0` or `"unknown"`, this is fine. For a mutable default like `[]` or `{}`, every call that doesn't pass an explicit value shares the same list.
+
+Consider this code:
+
+```python
+def add_to_cart(item, cart=[]):
+    cart.append(item)
+    return cart
+
+print(add_to_cart("headphones"))
+print(add_to_cart("cable"))
+print(add_to_cart("case"))
+```
+
+Three different calls were supposed to produce three different carts. Instead, they all share the same list, because the `[]` default was created once at definition time and reused on every call.
+
+**Fix:** use `None` as a sentinel and create a fresh list inside the function.
+
+```python
+def add_to_cart(item, cart=None):
+    if cart is None:
+        cart = []
+    cart.append(item)
+    return cart
+
+print(add_to_cart("headphones"))
+print(add_to_cart("cable"))
+```
+
+The pattern is the same for `dict`, `set`, and any other mutable default. The rule: a default argument should be immutable, or it should be `None` and the function creates the value on entry.
+
+The bug doesn't show up in single-call tests. It only appears when the same function is called more than once. Linters (`ruff`, `pylint`) catch this; turn the rule on.
+
+<h1 id="using-is-to-compare-values">Using is to Compare Values</h1>
+
+`is` checks **identity** (whether two names point to the same object). `==` checks **equality** (whether two objects have the same value). For most types they look like the same thing on small examples, because Python caches small integers and interned strings, but once the values get bigger, `is` starts returning `False` on equal values.
+
+```python
+x = 1000
+y = 1000
+print(x == y)
+print(x is y)
+```
+
+Both `x` and `y` hold the value `1000`, but they're separate `int` objects in memory. `x == y` compares the values, returns `True`. `x is y` checks whether they're literally the same object, which they aren't.
+
+The same issue hits strings beyond a certain length, lists, tuples, and any object that isn't a singleton.
+
+**Use `is` only for:** `None`, `True`, `False`, and other genuine singletons (like sentinel objects you define yourself). Use `==` for everything else.
+
+```python
+if customer_email is None:    # right: None is a singleton
+    ...
+
+if status == "shipped":       # right: comparing values
+    ...
+
+if status is "shipped":       # wrong: works by accident due to string interning
+    ...
+```
+
+The string version sometimes works because CPython interns short identifier-like strings, but once the string comes from input, a file, or concatenation, the identity check fails. The rule is mechanical: `is` for singletons, `==` for value equality.
+
+<h1 id="catching-bare-except">Catching Bare except:</h1>
+
+A bare `except:` catches every exception that inherits from `BaseException`, including `KeyboardInterrupt` (Ctrl-C) and `SystemExit` (which `sys.exit()` raises). That makes it nearly impossible to stop the program cleanly, and it hides real bugs by discarding them.
+
+```python
+# Anti-pattern
+try:
+    process_order(order)
+except:
+    pass
+```
+
+The `pass` here turns every error into silence: a `KeyError` from a missing field, a `ZeroDivisionError` from a bad calculation, a `KeyboardInterrupt` from the user trying to quit. The program limps on, the bug stays, and nobody notices until something downstream breaks.
+
+**Fix 1:** catch what you expect.
+
+```python
+try:
+    process_order(order)
+except ValueError as exc:
+    log.warning("Bad order payload: %s", exc)
+except OSError as exc:
+    log.error("IO failed: %s", exc)
+```
+
+**Fix 2:** if you need a catch-all (for example, in a top-level supervisor that logs unexpected errors and keeps the service up), use `except Exception:`. That excludes `KeyboardInterrupt` and `SystemExit`, which is usually the desired behavior.
+
+```python
+try:
+    process_order(order)
+except Exception as exc:
+    log.exception("Order processing failed")
+    metrics.increment("orders.failed")
+```
+
+**Fix 3:** if you do want to catch absolutely everything (rare, only justified in a final crash-handler), use `except BaseException:` explicitly so the reader can see the intent.
+
+The hierarchy that makes this work:
+
+`KeyboardInterrupt` and `SystemExit` sit beside `Exception`, not under it. This is why `except Exception:` lets Ctrl-C through.
+
+<h1 id="modifying-a-list-during-iteration">
+  Modifying a List During Iteration
+</h1>
+
+A `for` loop over a list keeps an internal index. When you remove items inside the loop, the index keeps advancing while the list gets shorter, so some items get skipped.
+
+Consider this code:
+
+```python
+prices = [29.99, 14.99, 9.99, 4.99, 19.99]
+for price in prices:
+    if price < 15:
+        prices.remove(price)
+print(prices)
+```
+
+`14.99` was removed correctly, but `9.99` and `4.99` should have been removed too. After removing `14.99`, the list shifts down, but the loop's index moves to the next slot, skipping the new occupant.
+
+**Fix:** build a new list instead of mutating during iteration.
+
+```python
+prices = [29.99, 14.99, 9.99, 4.99, 19.99]
+prices = [price for price in prices if price >= 15]
+print(prices)
+```
+
+If other code holds a reference to the original list and needs to see the change, use slice assignment to mutate in place while still iterating over a copy:
+
+```python
+prices[:] = [price for price in prices if price >= 15]
+```
+
+The slice on the left rebinds the contents of the existing list object, so any other reference to `prices` sees the new contents too.
+
+The same issue appears with dicts. `for key in some_dict:` iterates over a live view; deleting keys inside the loop raises `RuntimeError: dictionary changed size during iteration`. Iterate over `list(some_dict)` if you need to delete entries.
+
+<h1 id="eval-and-exec-on-untrusted-input">eval and exec on Untrusted Input</h1>
+
+`eval` runs a string as a Python expression. `exec` runs a string as a Python statement. On untrusted input, they're a remote code execution hole; on trusted input, they're almost always overkill.
+
+```python
+# Anti-pattern: lets the caller run anything
+user_expression = input("Enter a price calculation: ")
+price = eval(user_expression)
+```
+
+A user typing `__import__('os').system('rm -rf /')` runs that immediately. There's no sandboxing in `eval`. The rule for general code is: don't `eval` user input. Most legitimate uses of `eval` have a safer alternative.
+
+**Fix:** parse the input with a real parser.
+
+```python
+# Numbers? Use float / int.
+price = float(input("Enter a price: "))
+
+# Structured data? Use json.
+import json
+config = json.loads(payload)
+
+# Limited math? Use ast.literal_eval (safe for Python literals only).
+import ast
+quantities = ast.literal_eval("[1, 2, 3]")  # works
+ast.literal_eval("__import__('os').system('rm -rf /')")  # raises ValueError
+```
+
+`ast.literal_eval` evaluates only Python literals (numbers, strings, tuples, lists, dicts, booleans, `None`), so a malicious payload raises `ValueError` instead of running. For actual math expressions from users, build a small evaluator with a whitelist of allowed operations, or use a library like `simpleeval`.
+
+<h1 id="global-mutable-state">Global Mutable State</h1>
+
+Global variables that change over time are hard to test, hard to reason about, and a constant source of "why did that change?" debugging sessions. Two functions that look pure (they only read their parameters) behave differently because some other code modified the global between calls.
+
+```python
+# Anti-pattern
+TAX_RATE = 0.08
+
+def update_tax_rate(rate):
+    global TAX_RATE
+    TAX_RATE = rate
+
+def total_with_tax(amount):
+    return amount * (1 + TAX_RATE)
+
+print(total_with_tax(100))   # 108.0
+update_tax_rate(0.20)
+print(total_with_tax(100))   # 120.0
+```
+
+The bug doesn't show until two pieces of code disagree about whether the rate has been updated yet. Tests pass in isolation and fail in combination. Threads see partial updates.
+
+**Fix:** pass the state explicitly, or wrap it in a class.
+
+```python
+def total_with_tax(amount, tax_rate=0.08):
+    return amount * (1 + tax_rate)
+
+class TaxCalculator:
+    def __init__(self, rate):
+        self.rate = rate
+
+    def total(self, amount):
+        return amount * (1 + self.rate)
+```
+
+The first form is a pure function: the same inputs always produce the same output. The second form scopes the state inside an object, so two `TaxCalculator` instances can coexist without stepping on each other.
+
+Module-level **constants** (`UPPER_SNAKE_CASE`, set once at import) aren't this anti-pattern. The pattern is mutable state that any code can change at any time.
+
+<h1 id="god-classes">God Classes</h1>
+
+A god class tries to do everything: parse input, run business logic, format output, save to a database, send email, and update metrics, all in one type with two thousand lines. They're hard to test, hard to change without breaking unrelated things, and hard to read in one sitting.
+
+```python
+# Anti-pattern (sketch)
+class OrderManager:
+    def parse_request(self, payload): ...
+    def validate(self, data): ...
+    def compute_total(self, items): ...
+    def apply_discount(self, total, code): ...
+    def charge_card(self, total, card): ...
+    def reserve_inventory(self, items): ...
+    def send_confirmation_email(self, customer, order): ...
+    def update_loyalty_points(self, customer, total): ...
+    def write_to_audit_log(self, order): ...
+    def format_response(self, order): ...
+```
+
+Any change to email logic risks the inventory code, the audit log, or the response format. Tests have to mock half the world to exercise a single behavior.
+
+**Fix:** split the responsibilities. Each class or module does one thing.
+
+<CommentsSection />
+
+</LessonCard>

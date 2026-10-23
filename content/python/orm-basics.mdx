@@ -1,0 +1,299 @@
+---
+title: "ORM Basics"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "ORM Basics explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="what-an-orm-does">What an ORM does</h1>
+
+A raw database driver returns tuples. A query for a product returns something like `(1, "Ceramic Mug", 14.99, 80)`, and the calling code indexes into the tuple to get each column. If the columns change order, every caller breaks. If the wrong column is read as `price` instead of `stock`, the value is wrong without an error. An ORM solves both problems by returning an object with named attributes.
+
+The mapping has two directions. On reads, the ORM takes a row from the database and constructs a Python object whose attributes match the columns. On writes, it takes a Python object and translates attribute changes into SQL `INSERT` or `UPDATE` statements. The class itself, often called a "model," is the schema definition: its attributes are the columns, its name is the table.
+
+The flow above shows the round trip. A class is defined once, the ORM uses it as both the schema and the type of the loaded objects. Code that touches the database stops talking in SQL strings and starts talking in Python objects and method calls.
+
+A minimal SQLAlchemy example:
+
+```python
+from sqlalchemy import create_engine, String, Float, Integer
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session
+
+class Base(DeclarativeBase):
+    pass
+
+class Product(Base):
+    __tablename__ = "products"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String)
+    price: Mapped[float] = mapped_column(Float)
+    stock: Mapped[int] = mapped_column(Integer)
+
+engine = create_engine("sqlite:///:memory:")
+Base.metadata.create_all(engine)
+
+with Session(engine) as session:
+    session.add(Product(name="Ceramic Mug", price=14.99, stock=80))
+    session.commit()
+
+    mug = session.query(Product).filter_by(name="Ceramic Mug").first()
+    print(mug.name, mug.price, mug.stock)
+```
+
+`Base.metadata.create_all(engine)` walks every subclass of `Base` and issues `CREATE TABLE` statements. `session.add(...)` plus `session.commit()` becomes an `INSERT`. `session.query(...).filter_by(...).first()` becomes a `SELECT ... WHERE name = ? LIMIT 1`. No SQL is written by hand; the ORM generates it from the class definition and the method calls. The same `Product` class drives schema creation, inserts, and queries.
+
+<h1 id="why-teams-use-an-orm">Why teams use an ORM</h1>
+
+The strongest argument for an ORM is less boilerplate. Compare the raw-driver version of "find a customer by email and update their address" to the ORM version:
+
+```python
+import sqlite3
+
+conn = sqlite3.connect("shop.db")
+cursor = conn.cursor()
+cursor.execute(
+    "SELECT id, name, email, address FROM customers WHERE email = ?",
+    ("asha@shop.com",),
+)
+row = cursor.fetchone()
+if row is None:
+    print("Customer not found")
+else:
+    cursor.execute(
+        "UPDATE customers SET address = ? WHERE id = ?",
+        ("221B Baker Street", row[0]),
+    )
+    conn.commit()
+```
+
+The same operation through an ORM:
+
+```python
+customer = session.query(Customer).filter_by(email="asha@shop.com").first()
+if customer is None:
+    print("Customer not found")
+else:
+    customer.address = "221B Baker Street"
+    session.commit()
+```
+
+The second version is shorter because the ORM is doing the work. It generated the `SELECT`, ran it, mapped the row to a `Customer` object, tracked the changed attribute, generated the `UPDATE`, ran that, and committed. The application code is one assignment.
+
+The second reason teams adopt ORMs is portability. The same model code runs against SQLite for tests, PostgreSQL in production, and MySQL on a developer's laptop, because the ORM speaks a dialect-aware SQL on the application's behalf. Raw SQL commits to one database's quirks: SQLite's `INTEGER PRIMARY KEY AUTOINCREMENT`, Postgres's `SERIAL`, MySQL's `AUTO_INCREMENT`. The ORM smooths over those differences.
+
+The third reason is composability. Filters chain naturally on Python objects, so a complex query reads as a sequence of small steps:
+
+```python
+recent_orders = (
+    session.query(Order)
+    .filter(Order.status == "placed")
+    .filter(Order.total > 100)
+    .order_by(Order.created_at.desc())
+    .limit(20)
+    .all()
+)
+```
+
+Building that same query with raw strings means either one long SQL literal or a fragile string-concatenation pipeline. The ORM version composes; a single filter can be refactored without rewriting the whole query.
+
+The fourth reason is safety by default. Every value that flows into an ORM filter is bound as a parameter, automatically. Whatever the user types as their email goes through the placeholder mechanism without explicit handling. SQL injection becomes structurally impossible for the queries that go through the ORM. The same is true of escaping, quoting, and type conversion.
+
+The fifth reason is relationships. An order has many items, a customer has many orders, a product belongs to a category. The ORM expresses those connections as Python attributes (`order.items`, `customer.orders`, `product.category`), and a relationship traversal becomes an attribute access. Done well, this collapses ten lines of join logic into one attribute reference.
+
+<h1 id="what-orms-cost">What ORMs cost</h1>
+
+The price of all that convenience is a layer of abstraction between the application and the database. When the abstraction leaks, the engineer has to know both the ORM and the SQL it generated, which is one more thing than the raw driver demanded. Three specific problems come up often enough to name.
+
+The first is the N+1 query problem. Loading 100 customers and then accessing each customer's orders starts with one query for the customers. Each access to `customer.orders` triggers another query (one hundred queries). One hundred and one queries to display a page. The ORM did the literal thing on each attribute access. The fix is to load the orders eagerly with a `JOIN` in the first query, which is one more line of code, but the call has to be added explicitly.
+
+The diagram captures the shape: one query, then a hundred more, all hidden behind innocent-looking attribute accesses. The ORM did exactly what was asked, attribute by attribute, but the total cost only shows up under load.
+
+The second problem is performance surprises in less obvious ways. The ORM might issue a `SELECT *` when only two columns were needed. It might serialize a 50,000-row update into 50,000 individual `UPDATE` statements instead of a single bulk update. It might fetch every related row of a relationship when only the count was needed. The same convenience that makes simple queries short makes complex queries opaque.
+
+The third is the learning curve. SQLAlchemy's full feature set is large enough to be a separate skill from "I know SQL." Sessions, identity maps, flush versus commit, lazy versus eager loading, scoped sessions, declarative bases, and migrations all have their own docs and edge cases. The investment pays off, but the first weeks are slower than writing SQL.
+
+A common fourth issue is that ORMs are well-suited to row-at-a-time CRUD work and clumsy for the set-at-a-time analytical queries that reporting systems do. A query that joins six tables, groups by three columns, and computes window functions is easier to write in SQL than in any ORM's query builder. The pragmatic answer is to use both: ORMs for the CRUD layer, raw SQL (still parameterized) for the heavy analytical queries.
+
+An N+1 problem sounds abstract until measured. A list page that issues 200 queries instead of 2 can turn a 50ms response into a 5-second response. Every ORM has tooling to detect this (SQLAlchemy's `echo=True` and the `sqlalchemy.engine` logger, Django's `django-debug-toolbar`); turn it on during development.
+
+<h1 id="when-the-orm-hurts">When the ORM hurts</h1>
+
+Three situations are worth flagging where raw SQL is the better call.
+
+The first is bulk operations. Updating 100,000 rows one object at a time is much slower than running a single `UPDATE products SET stock = stock - 1 WHERE category = 'mugs'`. SQLAlchemy supports bulk operations (`session.execute(update(Product).where(...).values(...))`, `session.bulk_save_objects(...)`), but they bypass much of the ORM machinery (no per-row events, no relationship cascades). At that point, the ORM is a thin wrapper around the raw query, and the wrapper adds little.
+
+The second is complex analytical queries. Window functions, recursive CTEs, multi-CTE pipelines, and full-text search syntax are all easier in SQL than in any ORM. SQLAlchemy Core (the lower layer below the ORM) can express most of this, but the readability advantage of the ORM is gone. If the query is going into a reporting tool or a one-off data pipeline, write it as a SQL string with parameters and keep the SQL string in source control next to the rest of the migrations.
+
+The third is database-specific features. PostgreSQL's `JSONB` operators, MySQL's `MATCH ... AGAINST`, and SQLite's `RTREE` indices are not equally well supported across ORMs. When a feature is unique to one database, the cross-database abstraction gets in the way. Use the feature directly through the driver, or through the ORM's raw-SQL escape hatch.
+
+The rule of thumb teams settle on is: ORM by default, raw SQL for the cases above. The choice isn't all-or-nothing for the whole codebase. The same `Session` can run an ORM query on one line and a raw SQL query on the next.
+
+<h1 id="the-python-orm-ecosystem">The Python ORM ecosystem</h1>
+
+Python has several mature ORMs, and the choice between them depends on the project, the framework, and the team's preferences. A tour of the main options:
+
+| ORM          | Strengths                                                                  | Trade-offs                                           | Typical use                                                             |
+| ------------ | -------------------------------------------------------------------------- | ---------------------------------------------------- | ----------------------------------------------------------------------- |
+| SQLAlchemy   | Most powerful, two layers (Core + ORM), database-agnostic, huge ecosystem  | Steep learning curve, lots of vocabulary             | Standalone services, complex schemas, anything where SQL access matters |
+| Django ORM   | Tight integration with Django, batteries-included migrations, admin, forms | Tied to Django, less flexible than SQLAlchemy        | Django web apps                                                         |
+| Peewee       | Small, readable, fast to learn, expressive query API                       | Smaller ecosystem, fewer advanced features           | Small to medium services, scripts                                       |
+| Tortoise ORM | Async-first, modern API, inspired by Django ORM                            | Younger, smaller community                           | Async services with FastAPI or aiohttp                                  |
+| SQLModel     | Built on SQLAlchemy plus Pydantic, type-friendly                           | Newer, fewer production patterns documented          | FastAPI services that already use Pydantic                              |
+| Pony ORM     | Python expression-based queries (generator syntax)                         | Unusual API takes getting used to, smaller community | Personal projects, query-heavy code                                     |
+
+A short example from each shows the surface differences.
+
+SQLAlchemy 2.0 style:
+
+```python
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+# (Engine and models defined elsewhere.)
+with Session(engine) as session:
+    stmt = select(Product).where(Product.price < 20)
+    cheap_products = session.scalars(stmt).all()
+```
+
+Django ORM, used inside Django views:
+
+```python
+# Conceptual; runs inside a Django project.
+# from shop.models import Product
+# cheap_products = Product.objects.filter(price__lt=20)
+```
+
+Peewee, lightweight and quick to pick up:
+
+```python
+# Conceptual.
+# from peewee import Model, CharField, FloatField, SqliteDatabase
+# db = SqliteDatabase("shop.db")
+#
+# class Product(Model):
+#     name = CharField()
+#     price = FloatField()
+#     class Meta:
+#         database = db
+#
+# cheap_products = Product.select().where(Product.price < 20)
+```
+
+Tortoise ORM, designed for async code:
+
+```python
+# Conceptual.
+# from tortoise.models import Model
+# from tortoise import fields
+#
+# class Product(Model):
+#     id = fields.IntField(pk=True)
+#     name = fields.CharField(max_length=100)
+#     price = fields.FloatField()
+#
+# cheap_products = await Product.filter(price__lt=20)
+```
+
+SQLModel, popular in the FastAPI ecosystem because it doubles as a Pydantic model:
+
+```python
+# Conceptual.
+# from sqlmodel import SQLModel, Field, Session, select
+#
+# class Product(SQLModel, table=True):
+#     id: int = Field(default=None, primary_key=True)
+#     name: str
+#     price: float
+#
+# with Session(engine) as session:
+#     stmt = select(Product).where(Product.price < 20)
+#     cheap_products = session.exec(stmt).all()
+```
+
+The common shape across all of them is "a Python class defines the table, queries chain through method calls, the ORM emits SQL." Once one is learned, the others come quickly because the same patterns recur with minor syntax differences. SQLAlchemy is the most widely used of the bunch and the one most production codebases run on.
+
+<h1 id="the-query-and-update-lifecycle">The query-and-update lifecycle</h1>
+
+Most ORMs share a small set of operations that map cleanly to CRUD: create, read, update, delete. The vocabulary varies, but the shape is the same.
+
+The cycle in the diagram is the common case. Build an object, hand it to the ORM, and commit. To change a row, load it, set an attribute, and commit. To delete, call `delete` on the object and commit. The ORM tracks which objects are new, which are changed, and which are marked for deletion, and at commit time it issues the SQL for all of them in one transaction.
+
+A concrete walkthrough using SQLAlchemy:
+
+```python
+from sqlalchemy import create_engine, String, Float, Integer
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session
+
+class Base(DeclarativeBase):
+    pass
+
+class Product(Base):
+    __tablename__ = "products"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String)
+    price: Mapped[float] = mapped_column(Float)
+    stock: Mapped[int] = mapped_column(Integer)
+
+engine = create_engine("sqlite:///:memory:")
+Base.metadata.create_all(engine)
+
+with Session(engine) as session:
+    # Create
+    mug = Product(name="Ceramic Mug", price=14.99, stock=80)
+    session.add(mug)
+    session.commit()
+
+    # Read
+    loaded = session.query(Product).filter_by(name="Ceramic Mug").first()
+    print(loaded.id, loaded.name, loaded.stock)
+
+    # Update
+    loaded.stock = loaded.stock - 1
+    session.commit()
+    print("New stock:", loaded.stock)
+
+    # Delete
+    session.delete(loaded)
+    session.commit()
+    print("Remaining rows:", session.query(Product).count())
+```
+
+The same four operations would take three times the code with the raw driver, with a separate query for each. The ORM expresses each operation in the natural Python way, then translates the whole batch into the right sequence of SQL statements at commit time.
+
+<h1 id="migrations-are-part-of-the-deal">Migrations are part of the deal</h1>
+
+Schemas change over time: a column gets added, a table gets renamed, an index gets dropped. Every serious ORM has a companion migration tool that turns a model diff into a sequence of `ALTER TABLE` statements that can be applied, versioned, and rolled back.
+
+| ORM          | Migration tool                              |
+| ------------ | ------------------------------------------- |
+| SQLAlchemy   | Alembic                                     |
+| Django ORM   | `django-admin makemigrations` + `migrate`   |
+| Peewee       | `playhouse.migrate`                         |
+| Tortoise ORM | Aerich                                      |
+| SQLModel     | Alembic (since SQLModel sits on SQLAlchemy) |
+
+The basic workflow is the same across tools. Change the model in Python; the migration tool inspects the diff between the current model state and the database state; it generates a Python file that captures the migration; review the file (because auto-generated migrations sometimes miss things, especially renames); apply the migration with one command; the migration tool records the version in a dedicated table so the same migration won't run twice.
+
+Migrations are how schemas evolve in production. Manually editing the database with `ALTER TABLE` statements works for the very first deploy and breaks down within months as the team grows, deployments multiply, and rollbacks become necessary. Treating migrations as code, in version control, alongside the application is the only sustainable approach.
+
+<h1 id="choosing-between-orm-and-raw-sql-in-practice">
+  Choosing between ORM and raw SQL in practice
+</h1>
+
+A short decision guide for everyday code:
+
+1. CRUD on individual rows or small sets: ORM. The convenience is exactly what ORMs are designed for.
+2. Bulk operations (more than a few hundred rows): raw SQL or the ORM's bulk methods. Avoid looping over objects.
+3. Complex joins, window functions, recursive CTEs: raw SQL, parameterized. Keep the SQL in a `.sql` file or alongside the model.
+4. Reporting and analytics: raw SQL, often run against a read replica. The ORM's query builder gets in the way more than it helps.
+5. Anything that needs database-specific features: raw SQL through the driver, or the ORM's raw-SQL escape hatch.
+
+The same codebase routinely uses both. SQLAlchemy in particular makes this easy: `session.execute(text("SELECT ..."))` runs raw queries in the same session that's building ORM queries elsewhere.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

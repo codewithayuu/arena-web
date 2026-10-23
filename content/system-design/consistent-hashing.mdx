@@ -1,0 +1,735 @@
+---
+title: "Consistent Hashing"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Consistent Hashing explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+The challenge is what happens when the cluster changes. If we add a server for more capacity or remove one after a failure, we want to update the routing without moving too many profiles around.
+
+<h1 id="2-modulo-hashing">2. Modulo Hashing</h1>
+
+Let's start with the simplest approach. We hash the key to get a number, then take that number modulo the number of servers. The result gives us the server index.
+
+```javascript
+server_index = hash(key) % number_of_servers;
+```
+
+With five servers, the output is always between 0 and 4.
+
+If a key hashes to 42, then 42 modulo 5 is 2, so the request goes to S2. If another key hashes to 17, 17 modulo 5 is also 2, so it goes to S2 as well.
+
+| Key Hash | Calculation  | Server |
+| -------- | ------------ | ------ |
+| 42       | 42 mod 5 = 2 | S2     |
+| 17       | 17 mod 5 = 2 | S2     |
+| 18       | 18 mod 5 = 3 | S3     |
+| 37       | 37 mod 5 = 2 | S2     |
+| 91       | 91 mod 5 = 1 | S1     |
+
+With a good hash function, keys are distributed fairly evenly across the servers. Each server ends up owning roughly one fifth of the keys, and the same key always lands on the same server.
+
+<h1 id="3-what-happens-when-servers-change">
+  3. What Happens When Servers Change
+</h1>
+
+Now suppose we add S5, bringing the total to six servers. The formula becomes `hash(key) % 6`, and the same keys are suddenly mapped differently.
+
+42 modulo 6 is 0, so that key moves from S2 to S0. 17 modulo 6 is 5, so the other key moves from S2 to S5.
+
+| Key Hash | With 5 Servers   | With 6 Servers   | Moved? |
+| -------- | ---------------- | ---------------- | ------ |
+| 42       | 42 mod 5 = 2, S2 | 42 mod 6 = 0, S0 | Yes    |
+| 17       | 17 mod 5 = 2, S2 | 17 mod 6 = 5, S5 | Yes    |
+| 18       | 18 mod 5 = 3, S3 | 18 mod 6 = 0, S0 | Yes    |
+| 37       | 37 mod 5 = 2, S2 | 37 mod 6 = 1, S1 | Yes    |
+| 91       | 91 mod 5 = 1, S1 | 91 mod 6 = 1, S1 | No     |
+
+And this happens to many other keys as well. Even though we added just one server, a large portion of the cache gets reassigned. In the table, four of the five keys changed owners.
+
+The cached data is still sitting on the old servers, so requests that hit the new owners miss the cache and have to fetch the data again.
+
+Removing a server causes the same kind of reshuffling. If S4 fails and we drop to four servers, the formula becomes `hash(key) % 4`, and again most keys change owners.
+
+| Key Hash | With 5 Servers | With 4 Servers   | Moved? |
+| -------- | -------------- | ---------------- | ------ |
+| 42       | S2             | 42 mod 4 = 2, S2 | No     |
+| 17       | S2             | 17 mod 4 = 1, S1 | Yes    |
+| 18       | S3             | 18 mod 4 = 2, S2 | Yes    |
+| 37       | S2             | 37 mod 4 = 1, S1 | Yes    |
+| 91       | S1             | 91 mod 4 = 3, S3 | Yes    |
+
+What we really want is to move only the keys that need to move, while keeping most existing cache entries useful.
+
+<h1 id="4-the-hash-ring">4. The Hash Ring</h1>
+
+Consistent hashing solves this by placing both servers and keys in a fixed hash space.
+
+For simplicity, imagine positions from 0 to 999. After 999, we wrap back to 0, forming a ring. In real systems, the range is much larger, such as 0 to 2^32 - 1 or 2^64 - 1, but the idea stays the same.
+
+We hash each server's identifier to place it somewhere on the ring. Suppose S0 lands at 100, S1 at 300, S2 at 500, S3 at 700, and S4 at 900.
+
+These evenly spaced positions make the routing easier to follow. Each server owns the range of positions between the previous server and itself.
+
+| Server | Position | Owns Keys in Range        |
+| ------ | -------- | ------------------------- |
+| S0     | 100      | 901 to 999, then 0 to 100 |
+| S1     | 300      | 101 to 300                |
+| S2     | 500      | 301 to 500                |
+| S3     | 700      | 501 to 700                |
+| S4     | 900      | 701 to 900                |
+
+<h1 id="5-looking-up-a-key">5. Looking Up a Key</h1>
+
+To find which server owns a key, we hash the key, place it on the ring, and move clockwise until we reach the first server.
+
+For example, if a profile key lands at 250, the next server is S1 at 300, so S1 owns it. A key at 620 goes to S3 at 700. If a key lands at 950, we pass the end of the ring, wrap back to 0, and reach S0 at 100.
+
+| Key Position | First Server Clockwise      | Owner |
+| ------------ | --------------------------- | ----- |
+| 250          | S1 at 300                   | S1    |
+| 620          | S3 at 700                   | S3    |
+| 950          | Wraps past 999 to S0 at 100 | S0    |
+| 700          | Lands exactly on S3         | S3    |
+
+If a key lands exactly on a server's position, that server owns it.
+
+<h1 id="6-adding-a-server">6. Adding a Server</h1>
+
+Now suppose S5 joins the ring at position 400.
+
+Before that, S2 at 500 owned the keys between 300 and 500. After S5 joins, it takes over the range from 300 to 400.
+
+So a key at 350 now reaches S5 first and moves from S2 to S5, while a key at 450 still goes to S2. Keys in the rest of the ring stay exactly where they were.
+
+| Key Position | Owner Before S5 | Owner After S5 | Moved? |
+| ------------ | --------------- | -------------- | ------ |
+| 250          | S1              | S1             | No     |
+| 350          | S2              | S5             | Yes    |
+| 450          | S2              | S2             | No     |
+| 620          | S3              | S3             | No     |
+| 950          | S0              | S0             | No     |
+
+That is the key advantage over modulo hashing. Adding a server changes only a small part of the mapping instead of reshuffling keys across the entire cluster.
+
+<h1 id="7-removing-a-server">7. Removing a Server</h1>
+
+Next, suppose S4 at 900 leaves the ring. It previously owned the keys between 700 and 900.
+
+Once S4 is gone, those keys continue clockwise, wrap around the ring, and reach S0 at 100.
+
+So a key at 850 now moves to S0. But a key at 620 still belongs to S3, and a key at 250 still belongs to S1.
+
+| Key Position | Owner Before | Owner After S4 Leaves | Moved? |
+| ------------ | ------------ | --------------------- | ------ |
+| 250          | S1           | S1                    | No     |
+| 620          | S3           | S3                    | No     |
+| 850          | S4           | S0                    | Yes    |
+| 950          | S0           | S0                    | No     |
+
+Only the range owned by the failed server needs to move.
+
+<h1 id="8-how-many-keys-move">8. How Many Keys Move</h1>
+
+With evenly distributed keys and balanced server positions, adding one new server to a cluster of N servers moves roughly 1 / (N + 1) of the keys. So when we grow from five servers to six, we would expect about one sixth of the keys to move.
+
+That is only an average, though. The exact amount depends on where the servers land on the ring. In our simple example, S5 took 100 out of 1,000 positions, so only about 10% of the keys moved.
+
+Also, consistent hashing only changes ownership. It does not move the data itself.
+
+For a cache, that is usually fine, because missing entries can be loaded again on demand. For persistent storage, we still need a separate process to safely transfer the affected data to its new owner.
+
+<h1 id="9-the-problem-of-uneven-ranges">9. The Problem of Uneven Ranges</h1>
+
+In our example, the servers were evenly spaced around the ring. In practice, hashing real server names usually creates uneven gaps.
+
+One server may own a small range, while another ends up owning a much larger one and therefore handles more keys, memory, and traffic.
+
+In this ring, S2 owns almost half the positions while S1 owns one twentieth. With evenly distributed keys, S2 handles roughly ten times the traffic of S1.
+
+There is another issue when a server fails. With only one position per server, its entire range moves to the next server clockwise. That neighbor can suddenly take on a large amount of extra load. If S2 above fails, S3 goes from owning 80 positions to owning 570.
+
+A common solution is to give each physical server multiple positions on the ring instead of just one.
+
+<h1 id="10-virtual-nodes">10. Virtual Nodes</h1>
+
+These extra positions are called **virtual nodes**, or **vnodes**.
+
+For example, instead of hashing only `S1`, we might hash identifiers like `S1-0`, `S1-1`, and `S1-2`. Each one gets its own position on the ring, but they all point back to the same physical server. We do the same for every server, spreading their virtual nodes across the ring.
+
+The same positions, grouped by physical server, look like this.
+
+| Physical Server | Virtual Nodes    | Ring Positions |
+| --------------- | ---------------- | -------------- |
+| S1              | S1-0, S1-1, S1-2 | 10, 70, 120    |
+| S2              | S2-0, S2-1, S2-2 | 50, 80, 160    |
+| S3              | S3-0, S3-1, S3-2 | 30, 90, 140    |
+
+The lookup rule stays exactly the same. We move clockwise to the first position, then route the request to the physical server behind it.
+
+A key still has only one primary owner. Virtual nodes simply give each server several smaller ranges instead of one large range. They do not create extra machines or duplicate the data.
+
+<h3 id="why-virtual-nodes-help">Why Virtual Nodes Help</h3>
+
+Using many smaller ranges usually balances keys more evenly than giving each server just one position. The large and small gaps from hashing individual server names average out across dozens of positions.
+
+If a physical server leaves, its ranges are also spread across multiple neighbors instead of being handed to a single server.
+
+Virtual nodes also let us account for different server capacities. A more powerful server can be assigned more virtual nodes, giving it a larger expected share of the keys.
+
+| Benefit                | One Position per Server           | Many Virtual Nodes per Server                  |
+| ---------------------- | --------------------------------- | ---------------------------------------------- |
+| **Balance**            | Ranges vary widely in size        | Many small ranges average out                  |
+| **Failure handling**   | Whole range lands on one neighbor | Ranges spread across several neighbors         |
+| **Capacity weighting** | Not possible                      | Bigger servers get more virtual nodes          |
+| **Cost**               | Tiny routing table                | More metadata, more work on membership changes |
+
+But there is a trade-off. More virtual nodes mean more routing metadata and more work when membership changes. So in practice, we choose enough virtual nodes to get good balance and then measure the actual distribution. Tens to a few hundred virtual nodes per server is a common starting point.
+
+Virtual nodes improve balance statistically, but they do not guarantee perfectly equal load across every server.
+
+<h1 id="11-implementing-the-ring">11. Implementing the Ring</h1>
+
+In code, we do not need to represent the ring as an actual circle. We can store the virtual node positions in a sorted array and keep a mapping from each position to its physical server.
+
+To route a key, we hash it and use binary search to find the first position greater than or equal to that hash. If there is no such position, we wrap around and use the first entry in the array. If the ring is empty, there is no server to route to, so we return an error.
+
+We also need to handle hash collisions between virtual nodes deterministically, so that one server does not accidentally overwrite another. With a large hash space, collisions are rare, but a production ring should still pick a fixed rule, such as keeping the virtual node whose server id sorts first. The implementation below keeps things short and leaves that rule to the map it uses.
+
+For production code, use a fast, stable, well-distributed non-cryptographic hash such as MurmurHash, xxHash, or CityHash. The examples use FNV-1a because it is short and gives the same output across languages.
+
+```java
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+
+class ConsistentHashRing {
+    private final int virtualNodes;
+    private final TreeMap<Long, String> ring = new TreeMap<>();
+    private final Set<String> servers = new HashSet<>();
+
+    public ConsistentHashRing(Collection<String> initialServers, int virtualNodes) {
+        if (virtualNodes <= 0) {
+            throw new IllegalArgumentException("virtualNodes must be positive");
+        }
+        this.virtualNodes = virtualNodes;
+
+        for (String server : initialServers) {
+            addServer(server);
+        }
+    }
+
+    private long hash(String value) {
+        return fnv1a32(value);
+    }
+
+    private static long fnv1a32(String value) {
+        long hash = 0x811c9dc5L;
+        for (byte b : value.getBytes(StandardCharsets.UTF_8)) {
+            hash ^= Byte.toUnsignedInt(b);
+            hash = (hash * 0x01000193L) & 0xffffffffL;
+        }
+        return hash;
+    }
+
+    public void addServer(String server) {
+        if (!servers.add(server)) {
+            return;
+        }
+
+        for (int i = 0; i < virtualNodes; i++) {
+            ring.put(hash(server + "#" + i), server);
+        }
+    }
+
+    public void removeServer(String server) {
+        if (!servers.remove(server)) {
+            return;
+        }
+
+        for (int i = 0; i < virtualNodes; i++) {
+            ring.remove(hash(server + "#" + i));
+        }
+    }
+
+    public String getServer(String key) {
+        if (ring.isEmpty()) {
+            throw new IllegalStateException("hash ring has no servers");
+        }
+
+        long position = hash(key);
+        Map.Entry<Long, String> entry = ring.ceilingEntry(position);
+        if (entry == null) {
+            entry = ring.firstEntry();
+        }
+        return entry.getValue();
+    }
+}
+
+public class Main {
+    public static void main(String[] args) {
+        ConsistentHashRing ring = new ConsistentHashRing(
+            List.of("S0", "S1", "S2", "S3", "S4"),
+            100
+        );
+
+        System.out.println("user:123 -> " + ring.getServer("user:123"));
+        System.out.println("order:987 -> " + ring.getServer("order:987"));
+
+        ring.addServer("S5");
+        System.out.println("After adding S5:");
+        System.out.println("user:123 -> " + ring.getServer("user:123"));
+
+        ring.removeServer("S2");
+        System.out.println("After removing S2:");
+        System.out.println("order:987 -> " + ring.getServer("order:987"));
+    }
+}
+```
+
+```python
+import bisect
+
+
+class ConsistentHashRing:
+    def __init__(self, initial_servers, virtual_nodes):
+        if virtual_nodes <= 0:
+            raise ValueError("virtual_nodes must be positive")
+        self.virtual_nodes = virtual_nodes
+        self.positions = []          # sorted ring positions
+        self.ring = {}               # position -> server
+        self.servers = set()
+        for server in initial_servers:
+            self.add_server(server)
+
+    @staticmethod
+    def _fnv1a32(value):
+        hash = 0x811C9DC5
+        for b in value.encode("utf-8"):
+            hash ^= b
+            hash = (hash * 0x01000193) & 0xFFFFFFFF
+        return hash
+
+    def add_server(self, server):
+        if server in self.servers:
+            return
+        self.servers.add(server)
+        for i in range(self.virtual_nodes):
+            position = self._fnv1a32(server + "#" + str(i))
+            if position not in self.ring:
+                self.ring[position] = server
+                bisect.insort(self.positions, position)
+
+    def remove_server(self, server):
+        if server not in self.servers:
+            return
+        self.servers.remove(server)
+        for i in range(self.virtual_nodes):
+            position = self._fnv1a32(server + "#" + str(i))
+            if position in self.ring:
+                del self.ring[position]
+                index = bisect.bisect_left(self.positions, position)
+                if index < len(self.positions) and self.positions[index] == position:
+                    self.positions.pop(index)
+
+    def get_server(self, key):
+        if not self.positions:
+            raise RuntimeError("hash ring has no servers")
+        position = self._fnv1a32(key)
+        index = bisect.bisect_left(self.positions, position)
+        if index == len(self.positions):
+            index = 0
+        return self.ring[self.positions[index]]
+```
+
+```cpp
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
+#include <cstdint>
+#include <stdexcept>
+
+class ConsistentHashRing {
+private:
+    int virtualNodes;
+    std::map<uint32_t, std::string> ring;
+    std::set<std::string> servers;
+
+    static uint32_t fnv1a32(const std::string& value) {
+        uint32_t hash = 0x811c9dc5u;
+        for (unsigned char b : value) {
+            hash ^= b;
+            hash *= 0x01000193u;
+        }
+        return hash;
+    }
+
+    uint32_t hash(const std::string& value) const {
+        return fnv1a32(value);
+    }
+
+public:
+    ConsistentHashRing(const std::vector<std::string>& initialServers, int virtualNodes)
+        : virtualNodes(virtualNodes) {
+        if (virtualNodes <= 0) {
+            throw std::invalid_argument("virtualNodes must be positive");
+        }
+        for (const std::string& server : initialServers) {
+            addServer(server);
+        }
+    }
+
+    void addServer(const std::string& server) {
+        if (!servers.insert(server).second) {
+            return;
+        }
+        for (int i = 0; i < virtualNodes; i++) {
+            ring[hash(server + "#" + std::to_string(i))] = server;
+        }
+    }
+
+    void removeServer(const std::string& server) {
+        if (servers.erase(server) == 0) {
+            return;
+        }
+        for (int i = 0; i < virtualNodes; i++) {
+            ring.erase(hash(server + "#" + std::to_string(i)));
+        }
+    }
+
+    std::string getServer(const std::string& key) const {
+        if (ring.empty()) {
+            throw std::runtime_error("hash ring has no servers");
+        }
+        uint32_t position = hash(key);
+        auto it = ring.lower_bound(position);
+        if (it == ring.end()) {
+            it = ring.begin();
+        }
+        return it->second;
+    }
+};
+```
+
+```go
+package main
+
+import (
+	"sort"
+	"strconv"
+)
+
+type ConsistentHashRing struct {
+	virtualNodes int
+	positions    []uint32          // sorted ring positions
+	ring         map[uint32]string // position -> server
+	servers      map[string]bool
+}
+
+func NewConsistentHashRing(initialServers []string, virtualNodes int) *ConsistentHashRing {
+	if virtualNodes <= 0 {
+		panic("virtualNodes must be positive")
+	}
+	r := &ConsistentHashRing{
+		virtualNodes: virtualNodes,
+		ring:         make(map[uint32]string),
+		servers:      make(map[string]bool),
+	}
+	for _, server := range initialServers {
+		r.AddServer(server)
+	}
+	return r
+}
+
+func fnv1a32(value string) uint32 {
+	var hash uint32 = 0x811c9dc5
+	for i := 0; i < len(value); i++ {
+		hash ^= uint32(value[i])
+		hash *= 0x01000193
+	}
+	return hash
+}
+
+func (r *ConsistentHashRing) AddServer(server string) {
+	if r.servers[server] {
+		return
+	}
+	r.servers[server] = true
+	for i := 0; i < r.virtualNodes; i++ {
+		position := fnv1a32(server + "#" + strconv.Itoa(i))
+		if _, exists := r.ring[position]; !exists {
+			r.ring[position] = server
+			index := sort.Search(len(r.positions), func(j int) bool {
+				return r.positions[j] >= position
+			})
+			r.positions = append(r.positions, 0)
+			copy(r.positions[index+1:], r.positions[index:])
+			r.positions[index] = position
+		}
+	}
+}
+
+func (r *ConsistentHashRing) RemoveServer(server string) {
+	if !r.servers[server] {
+		return
+	}
+	delete(r.servers, server)
+	for i := 0; i < r.virtualNodes; i++ {
+		position := fnv1a32(server + "#" + strconv.Itoa(i))
+		if _, exists := r.ring[position]; exists {
+			delete(r.ring, position)
+			index := sort.Search(len(r.positions), func(j int) bool {
+				return r.positions[j] >= position
+			})
+			if index < len(r.positions) && r.positions[index] == position {
+				r.positions = append(r.positions[:index], r.positions[index+1:]...)
+			}
+		}
+	}
+}
+
+func (r *ConsistentHashRing) GetServer(key string) string {
+	if len(r.positions) == 0 {
+		panic("hash ring has no servers")
+	}
+	position := fnv1a32(key)
+	index := sort.Search(len(r.positions), func(j int) bool {
+		return r.positions[j] >= position
+	})
+	if index == len(r.positions) {
+		index = 0
+	}
+	return r.ring[r.positions[index]]
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+class ConsistentHashRing
+{
+    private readonly int virtualNodes;
+    private readonly SortedDictionary<uint, string> ring = new SortedDictionary<uint, string>();
+    private readonly List<uint> positions = new List<uint>();
+    private readonly HashSet<string> servers = new HashSet<string>();
+
+    public ConsistentHashRing(IEnumerable<string> initialServers, int virtualNodes)
+    {
+        if (virtualNodes <= 0)
+        {
+            throw new ArgumentException("virtualNodes must be positive");
+        }
+        this.virtualNodes = virtualNodes;
+        foreach (string server in initialServers)
+        {
+            AddServer(server);
+        }
+    }
+
+    private static uint Fnv1a32(string value)
+    {
+        uint hash = 0x811c9dc5u;
+        foreach (byte b in Encoding.UTF8.GetBytes(value))
+        {
+            hash ^= b;
+            hash *= 0x01000193u;
+        }
+        return hash;
+    }
+
+    private uint Hash(string value)
+    {
+        return Fnv1a32(value);
+    }
+
+    public void AddServer(string server)
+    {
+        if (!servers.Add(server))
+        {
+            return;
+        }
+        for (int i = 0; i < virtualNodes; i++)
+        {
+            uint position = Hash(server + "#" + i);
+            if (!ring.ContainsKey(position))
+            {
+                ring[position] = server;
+                int index = positions.BinarySearch(position);
+                if (index < 0) index = ~index;
+                positions.Insert(index, position);
+            }
+        }
+    }
+
+    public void RemoveServer(string server)
+    {
+        if (!servers.Remove(server))
+        {
+            return;
+        }
+        for (int i = 0; i < virtualNodes; i++)
+        {
+            uint position = Hash(server + "#" + i);
+            if (ring.Remove(position))
+            {
+                int index = positions.BinarySearch(position);
+                if (index >= 0) positions.RemoveAt(index);
+            }
+        }
+    }
+
+    public string GetServer(string key)
+    {
+        if (positions.Count == 0)
+        {
+            throw new InvalidOperationException("hash ring has no servers");
+        }
+        uint position = Hash(key);
+        int index = positions.BinarySearch(position);
+        if (index < 0) index = ~index;
+        if (index == positions.Count) index = 0;
+        return ring[positions[index]];
+    }
+}
+```
+
+```typescript
+class ConsistentHashRing {
+  private readonly virtualNodes: number;
+  private readonly positions: number[] = []; // sorted ring positions
+  private readonly ring = new Map<number, string>(); // position -> server
+  private readonly servers = new Set<string>();
+
+  constructor(initialServers: string[], virtualNodes: number) {
+    if (virtualNodes <= 0) {
+      throw new Error("virtualNodes must be positive");
+    }
+    this.virtualNodes = virtualNodes;
+    for (const server of initialServers) {
+      this.addServer(server);
+    }
+  }
+
+  private static fnv1a32(value: string): number {
+    let hash = 0x811c9dc5;
+    for (const b of new TextEncoder().encode(value)) {
+      hash ^= b;
+      hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash;
+  }
+
+  private search(position: number): number {
+    let lo = 0;
+    let hi = this.positions.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (this.positions[mid] < position) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+
+  addServer(server: string): void {
+    if (this.servers.has(server)) {
+      return;
+    }
+    this.servers.add(server);
+    for (let i = 0; i < this.virtualNodes; i++) {
+      const position = ConsistentHashRing.fnv1a32(server + "#" + i);
+      if (!this.ring.has(position)) {
+        this.ring.set(position, server);
+        this.positions.splice(this.search(position), 0, position);
+      }
+    }
+  }
+
+  removeServer(server: string): void {
+    if (!this.servers.has(server)) {
+      return;
+    }
+    this.servers.delete(server);
+    for (let i = 0; i < this.virtualNodes; i++) {
+      const position = ConsistentHashRing.fnv1a32(server + "#" + i);
+      if (this.ring.has(position)) {
+        this.ring.delete(position);
+        const index = this.search(position);
+        if (
+          index < this.positions.length &&
+          this.positions[index] === position
+        ) {
+          this.positions.splice(index, 1);
+        }
+      }
+    }
+  }
+
+  getServer(key: string): string {
+    if (this.positions.length === 0) {
+      throw new Error("hash ring has no servers");
+    }
+    const position = ConsistentHashRing.fnv1a32(key);
+    let index = this.search(position);
+    if (index === this.positions.length) index = 0;
+    return this.ring.get(this.positions[index])!;
+  }
+}
+```
+
+Lookup is `O(log V)`, where `V` is the number of virtual nodes. Adding or removing a physical server is `O(R log V)`, where `R` is the number of virtual nodes assigned to that server.
+
+One more requirement follows from this design. Every client that routes keys must use the same server list and the same hash function. If two clients see different membership, they can send the same key to different owners, and the cache stops behaving consistently. Systems usually publish ring updates from one place, such as a configuration service, so all clients converge on the same view.
+
+<h1 id="12-replication-on-the-ring">12. Replication on the Ring</h1>
+
+So far, each key has had a single owner. If we want to replicate the data for higher availability, we can keep three copies of each key. We choose the primary owner, then continue clockwise to find two more **distinct physical servers**.
+
+The word distinct is important. The next virtual node might belong to the same machine, and storing another copy there would not help if that machine fails.
+
+| Key at 75, Walking Clockwise | Virtual Node | Physical Server | Action             |
+| ---------------------------- | ------------ | --------------- | ------------------ |
+| First position               | S2-1 at 80   | S2              | Primary            |
+| Second position              | S3-1 at 90   | S3              | Replica 1          |
+| Third position               | S1-2 at 120  | S1              | Replica 2          |
+| If the third had been S2-2   | S2-2         | S2              | Skip, already used |
+
+In practice, we may also spread replicas across different racks or availability zones, so that one rack losing power does not take out all three copies.
+
+The ring only helps decide where replicas should live. Other parts of the system still need to copy the data, decide when a write is considered successful, and repair missing replicas.
+
+<h1 id="13-when-to-use-consistent-hashing">
+  13. When to Use Consistent Hashing
+</h1>
+
+Consistent hashing works well for caches, storage shards, and other systems where each key should usually go to the same server. If any server can handle any request, a normal load balancer is often simpler.
+
+There are other ways to keep routing stable too. Rendezvous hashing scores each server for a key and picks the highest one. Another common approach is to hash keys into a fixed number of logical partitions, then assign those partitions to servers. Modulo hashing works fine in that case, because the partition count does not change.
+
+| Technique                   | How It Picks an Owner                                       | Good Fit                                                   |
+| --------------------------- | ----------------------------------------------------------- | ---------------------------------------------------------- |
+| **Consistent hashing ring** | First server clockwise from the key's position              | Caches, storage shards, stateful routing                   |
+| **Rendezvous hashing**      | Score every server for the key, pick the highest            | Small to medium server sets, no ring to maintain           |
+| **Fixed partitions**        | Key maps to a partition, a table maps partitions to servers | Logs, queues, databases that move whole partitions         |
+| **Plain load balancing**    | Any healthy server                                          | Stateless services where any server can handle any request |
+
+<h1 id="summary">Summary</h1>
+
+Consistent hashing gives keys stable owners in a cluster whose servers change. Plain modulo hashing moves most keys whenever the live server count changes, which is expensive for caches and stateful stores.
+
+Consistent hashing maps both keys and servers onto a fixed ring and assigns each key to the next server clockwise from its position. Adding a server moves only the keys in that server's new range. Removing a server moves only the keys it owned. With N balanced servers, adding one moves about 1 / (N + 1) of the keys.
+
+Virtual nodes give each physical server many positions on the ring. That evens out the ranges, spreads a failed server's load across several neighbors, and lets bigger servers take a larger share.
+
+Consistent hashing decides placement. It does not move data, copy replicas, or decide when a write is durable. Those are separate parts of the system.
+
+As an exercise, draw a small ring yourself with four or five servers and a handful of keys. Add a server and see which keys move. Then remove one and follow those keys to their new owners.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

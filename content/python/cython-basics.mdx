@@ -1,0 +1,368 @@
+---
+title: "Cython Basics"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Cython Basics explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="what-cython-actually-is">What Cython Actually Is</h1>
+
+Cython has two faces. From one angle, it is a superset of Python: every valid Python program is also a valid Cython program, and a `.py` file can be renamed to `.pyx` and compiled as-is. From the other angle, it is a hybrid language that adds C type declarations on top of Python syntax. The added types are what let the compiler generate fast C code instead of CPython bytecode.
+
+The compilation pipeline goes from `.pyx` source to generated C source to a compiled shared library that Python imports like any other module.
+
+The `.so` (or `.pyd` on Windows) sits next to the Python code and behaves like a Python module. Calling code does not know it is compiled. The cost is the build step: every machine that imports the module needs either the compiled binary or the ability to compile it from source.
+
+Cython is a build-time tool. The C compiler must be installed wherever the extension is built. For distribution, this usually means shipping wheels (precompiled binaries on PyPI) for every Python version and platform the users have.
+
+<h1 id="why-cython-exists">Why Cython Exists</h1>
+
+NumPy makes vectorized operations fast. Pure Python loops are slow. The gap between them is the problem Cython solves. Work that fits NumPy's broadcasting model (element-wise operations on big arrays) belongs in NumPy. Work that is a loop with branches, state across iterations, or operations NumPy does not express well leaves pure Python too slow and NumPy unhelpful. That is the Cython sweet spot.
+
+A small comparison makes this concrete. Consider computing the total revenue across a list of orders, where each order has a base price, a discount percent, and a quantity. The discount-and-quantity logic does not vectorize trivially in NumPy.
+
+```python
+def revenue_python(prices, discounts, quantities):
+    total = 0.0
+    for i in range(len(prices)):
+        line = prices[i] * (1.0 - discounts[i] / 100.0) * quantities[i]
+        total += line
+    return total
+
+prices = [29.99, 49.99, 9.99, 14.99, 79.99] * 200_000
+discounts = [10.0, 0.0, 20.0, 5.0, 15.0] * 200_000
+quantities = [2, 1, 3, 1, 2] * 200_000
+
+import time
+start = time.perf_counter()
+total = revenue_python(prices, discounts, quantities)
+elapsed = time.perf_counter() - start
+print(f"Pure Python: ${total:.2f} in {elapsed:.3f}s")
+```
+
+For a million iterations, pure Python spends most of its time in interpreter overhead: bytecode dispatch, type checks, attribute lookups, refcount adjustments. The actual math is the cheap part. Cython removes most of the overhead.
+
+The equivalent Cython version typically runs in around 5 to 15 milliseconds for the same input. That is a 30x to 80x speedup with the same algorithm. The reason is that the type-annotated loop becomes a plain C loop in the generated code: integer indexing, double arithmetic, no PyObject creation, no attribute lookup.
+
+<h1 id="your-first-pyx-file">Your First .pyx File</h1>
+
+A minimal Cython module is a `.pyx` file with regular Python in it. No annotations, no build configuration. Starting this way shows that Cython runs Python code by default.
+
+```python
+# revenue.pyx
+def revenue(prices, discounts, quantities):
+    total = 0.0
+    for i in range(len(prices)):
+        line = prices[i] * (1.0 - discounts[i] / 100.0) * quantities[i]
+        total += line
+    return total
+```
+
+Compiling it needs either an inline build (with `pyximport` or `Cython.Build.cythonize` in a script) or a `setup.py`. The standard pattern uses `setup.py`:
+
+```python
+# setup.py
+from setuptools import setup
+from Cython.Build import cythonize
+
+setup(
+    name="revenue",
+    ext_modules=cythonize("revenue.pyx", language_level=3),
+)
+```
+
+Build with:
+
+```text
+python setup.py build_ext --inplace
+```
+
+This invokes Cython to translate `revenue.pyx` into `revenue.c`, then invokes the platform's C compiler to produce `revenue.cpython-311-x86_64-linux-gnu.so` (the exact name encodes Python version and platform). The `--inplace` flag puts the `.so` next to the source so `import revenue` works from the same directory.
+
+Once built, the module is usable like any other:
+
+```python
+# usage.py
+import revenue
+total = revenue.revenue([29.99, 49.99], [10.0, 0.0], [2, 1])
+print(f"${total:.2f}")
+```
+
+At this point, Cython has compiled the Python source to C, but without type annotations, the generated C still does all the PyObject manipulation that the regular interpreter does. The speedup over pure Python is small (often 10 to 30 percent), not dramatic. The large gains come from typing.
+
+The build cycle is the same every time: edit the `.pyx`, run `setup.py build_ext --inplace`, import. For development, `pyximport` shortens this to a single import that triggers compilation automatically.
+
+<h1 id="adding-types-with-cdef">Adding Types with cdef</h1>
+
+The main Cython feature is type declarations. `cdef int x` declares `x` as a C `int`, not a Python `int`. The generated code stores `x` in a machine register or stack slot, not a `PyObject`. Arithmetic on `x` becomes a single CPU instruction.
+
+The same revenue function with C types:
+
+```python
+# revenue_typed.pyx
+def revenue(prices, discounts, quantities):
+    cdef double total = 0.0
+    cdef double line
+    cdef Py_ssize_t i
+    cdef Py_ssize_t n = len(prices)
+    for i in range(n):
+        line = prices[i] * (1.0 - discounts[i] / 100.0) * quantities[i]
+        total += line
+    return total
+```
+
+The signature is the same; the body is the same logic; only the local variables have C types. `cdef double total = 0.0` declares `total` as a C `double` with initial value `0.0`. `cdef Py_ssize_t i` declares the loop counter as a signed integer of the right size for indexing. `Py_ssize_t` is the type CPython uses for sizes and indices; it is `int` on 32-bit systems and `long long` on 64-bit ones.
+
+Even with these annotations, there is still work happening for `prices[i]`. The Python lists still hold `PyObject *`, so each index access calls into the CPython C API. To remove that overhead, type the arguments as typed memoryviews (covered next).
+
+The available C types in `cdef` include:
+
+| Cython type               | C type                    | Notes                         |
+| ------------------------- | ------------------------- | ----------------------------- |
+| `int`, `unsigned int`     | `int`, `unsigned int`     | Platform-dependent size       |
+| `long`, `unsigned long`   | `long`, `unsigned long`   | Often 64 bits on 64-bit Linux |
+| `long long`               | `long long`               | Always at least 64 bits       |
+| `short`, `unsigned short` | `short`, `unsigned short` | Usually 16 bits               |
+| `float`, `double`         | `float`, `double`         | IEEE 754 single/double        |
+| `char`, `unsigned char`   | `char`, `unsigned char`   | 8 bits                        |
+| `Py_ssize_t`              | `Py_ssize_t`              | Signed integer for indexing   |
+| `bint`                    | `int` (boolean)           | Cython-specific, holds 0 or 1 |
+| `size_t`                  | `size_t`                  | Unsigned integer for sizes    |
+| `void *`                  | `void *`                  | Untyped pointer               |
+
+`bint` ("boolean int") is a Cython convenience: it is stored as a C `int` but coerces to `True`/`False` when crossing back into Python.
+
+A `cdef int` overflows on overflow, just like in C. Computing `2_000_000_000 * 2` in a `cdef int` produces a wrapped-around negative number, not an error. For most loop counters and array sizes this is fine. For arithmetic that might overflow, use `long long` or do the math in Python types.
+
+<h1 id="three-function-flavors-def-cdef-cpdef">
+  Three Function Flavors: def, cdef, cpdef
+</h1>
+
+Cython provides three ways to declare a function, each with different visibility and calling conventions.
+
+| Form    | Callable from Python  | Callable from Cython               | Speed                                                   |
+| ------- | --------------------- | ---------------------------------- | ------------------------------------------------------- |
+| `def`   | Yes                   | Yes (but goes through Python call) | Normal Python call overhead                             |
+| `cdef`  | No                    | Yes (direct C call)                | C-fast, no Python overhead                              |
+| `cpdef` | Yes (through wrapper) | Yes (direct C call)                | C-fast when called from Cython, Python-fast from Python |
+
+`def` is regular Python: callable from anywhere, but every call pays the Python function-call overhead (frame creation, argument tuple, return value boxing). Use it for the public API of the module.
+
+`cdef` is C-only: a fast C function that does not exist at the Python level. Use it for inner loops and helper functions that do not need to be called from Python. The trade-off is that a `cdef` function cannot be imported and called from a `.py` file; it is invisible from outside the compiled module.
+
+`cpdef` provides both. Cython generates two versions: a fast C function for Cython callers and a Python wrapper for Python callers. Use it when one function should be efficient for both audiences. The Python wrapper still pays the call overhead, but the inner Cython calls are fast.
+
+```python
+# kernel.pyx
+def compute_total_py(prices):
+    """Public Python entry point."""
+    cdef double total = 0.0
+    cdef Py_ssize_t i
+    cdef Py_ssize_t n = len(prices)
+    for i in range(n):
+        total += _process_one(prices[i])
+    return total
+
+cdef double _process_one(double price):
+    """Internal helper, called from Cython only."""
+    if price < 0.0:
+        return 0.0
+    return price * 1.0825  # add tax
+
+cpdef double tax_inclusive(double price):
+    """Available from both Python and Cython callers."""
+    return _process_one(price)
+```
+
+In this snippet, `compute_total_py` calls `_process_one` directly in C with no Python overhead. A Python caller can use `compute_total_py` and `tax_inclusive`, but not `_process_one`. From inside the same module, `_process_one` is the cheapest of the three to call because it does not even need the `cpdef` wrapper.
+
+<h1 id="cdef-class-typed-classes">cdef class: Typed Classes</h1>
+
+A regular `class` in Cython compiles to a regular Python class with regular `__dict__`-based attribute access. A `cdef class` compiles to a C extension type with typed attribute storage. The attributes are stored as C-level struct fields, not Python attributes, which makes attribute access as fast as a C struct member access.
+
+```python
+# product.pyx
+cdef class Product:
+    cdef public int product_id
+    cdef public double price
+    cdef public int stock
+
+    def __init__(self, int product_id, double price, int stock):
+        self.product_id = product_id
+        self.price = price
+        self.stock = stock
+
+    cpdef double discounted(self, double percent_off):
+        return self.price * (1.0 - percent_off / 100.0)
+```
+
+The `cdef public` modifier means the attribute is also visible from Python (so `p.product_id` works from a `.py` file). Without `public`, the attribute is C-only. `readonly` exists for "Python can read, only C can write".
+
+Compared to a regular class:
+
+| Aspect                       | `class`                    | `cdef class`                                  |
+| ---------------------------- | -------------------------- | --------------------------------------------- |
+| Attribute storage            | `__dict__` (a Python dict) | C struct fields                               |
+| Attribute access             | Hashed dict lookup         | Direct memory offset                          |
+| Adding attributes at runtime | Yes                        | No (unless you declare `__dict__` explicitly) |
+| Subclassable from Python     | Yes                        | Yes, with caveats                             |
+| Memory per instance          | Higher (dict overhead)     | Lower (just the declared fields)              |
+
+The main trade-off is that `cdef class` instances are fixed-shape. Every attribute must be declared up front. Adding a `last_seen_at` attribute at runtime, as is possible with a regular class, does not work. For data objects in a hot path, that constraint is acceptable. Using the typed class:
+
+```python
+# usage.py
+from product import Product
+
+p = Product(101, 29.99, 50)
+print(p.discounted(20.0))
+```
+
+`Product` looks like a regular Python class from the outside, but internally the attribute storage is C-level and method dispatch is faster than for a `dict`-backed instance. For data classes that get instantiated in the millions, this matters.
+
+<h1 id="typed-memoryviews">Typed Memoryviews</h1>
+
+Indexing into Python lists is slow in Cython because each `lst[i]` goes through the Python C API. The fix is **typed memoryviews**, which provide direct C-level access to the bytes inside a buffer-like object (NumPy array, `array.array`, `bytes`, anything that supports the buffer protocol).
+
+```python
+# fast_revenue.pyx
+import numpy as np
+cimport numpy as np
+
+def revenue(double[:] prices, double[:] discounts, long[:] quantities):
+    cdef double total = 0.0
+    cdef Py_ssize_t i
+    cdef Py_ssize_t n = prices.shape[0]
+    for i in range(n):
+        total += prices[i] * (1.0 - discounts[i] / 100.0) * quantities[i]
+    return total
+```
+
+The `double[:]` syntax declares a 1D memoryview of `double` values. Indexing into it is a single C-level memory access, no Python machinery. The same revenue calculation that took 420ms in pure Python typically runs in 5 to 15ms with this version, because the loop body is now a plain C loop on contiguous memory.
+
+The corresponding caller looks like:
+
+```python
+# usage.py
+import numpy as np
+import fast_revenue
+
+prices = np.array([29.99, 49.99, 9.99, 14.99, 79.99] * 200_000)
+discounts = np.array([10.0, 0.0, 20.0, 5.0, 15.0] * 200_000)
+quantities = np.array([2, 1, 3, 1, 2] * 200_000, dtype=np.int64)
+
+total = fast_revenue.revenue(prices, discounts, quantities)
+print(f"${total:.2f}")
+```
+
+The arrays are passed in as NumPy arrays, and Cython's memoryview machinery sees them as `double[:]` and `long[:]` without any per-element conversion. This is the typical Cython kernel shape: pass NumPy arrays in, loop over them with typed memoryviews, return a scalar or another array.
+
+The path from Python to C is a single conversion at function entry. Inside the loop, every read is a direct memory dereference. This is the source of the order-of-magnitude speedup.
+
+For 2D memoryviews, the syntax is `double[:, :]`. For specifying contiguity (which lets Cython generate the fastest possible code), `double[::1]` means "1D contiguous in the last dimension".
+
+<h1 id="releasing-the-gil-with-nogil">Releasing the GIL with nogil</h1>
+
+By default, Cython holds the GIL during every function call, like CPython. For CPU-bound numerical kernels that do not touch any Python objects, `with nogil:` releases the GIL and lets other threads make progress concurrently.
+
+```python
+# parallel_revenue.pyx
+def revenue(double[:] prices, double[:] discounts, long[:] quantities):
+    cdef double total = 0.0
+    cdef Py_ssize_t i
+    cdef Py_ssize_t n = prices.shape[0]
+    with nogil:
+        for i in range(n):
+            total += prices[i] * (1.0 - discounts[i] / 100.0) * quantities[i]
+    return total
+```
+
+Inside the `with nogil:` block, Cython generates code that drops the GIL on entry and reacquires it on exit. Other Python threads can run during the loop. The limitation is that no Python objects can be touched inside the block: no list indexing, no attribute access on Python types, no exceptions that need to allocate a Python object. Typed memoryviews and C types are fine; Python lists and dicts are not.
+
+For functions that should never need the GIL, declare them `nogil`:
+
+```python
+cdef double process(double price) nogil:
+    return price * 1.0825
+```
+
+This function is callable from a `with nogil:` block in any caller. The compiler enforces that no Python state is touched inside.
+
+Combining `nogil` with parallel loops provides actual parallelism in Cython, through `prange` from `cython.parallel`. That is beyond the scope of this lesson. For most workloads, single-threaded Cython is already fast enough.
+
+Releasing the GIL has overhead per call. For micro-kernels that take less than a microsecond, the GIL release-and-reacquire costs more than holding it through. Release the GIL for kernels that take milliseconds or longer.
+
+<h1 id="pyximport-for-development">pyximport for Development</h1>
+
+`setup.py` is the production build path. For development and quick experiments, `pyximport` compiles `.pyx` files on the fly the first time they are imported.
+
+```python
+# usage.py
+import pyximport
+pyximport.install()
+
+import revenue  # This triggers compilation of revenue.pyx on first import.
+
+print(revenue.revenue([29.99, 49.99], [10.0, 0.0], [2, 1]))
+```
+
+`pyximport.install()` registers an import hook. The first import of a `.pyx` file in the current Python session compiles it (without output, unless there are errors); subsequent imports use the cached `.so`. The compiled binaries live in `~/.pyxbld` by default, so the project directory stays clean.
+
+`pyximport` is a development convenience, not a production tool. It assumes the user has a C compiler, can deal with build failures, and is willing to wait a second or two for the first import. For shipping code to others, use `setup.py` and produce wheels.
+
+<h1 id="when-to-use-cython-vs-alternatives">
+  When to Use Cython vs Alternatives
+</h1>
+
+Cython is one of several tools for "make Python faster". The choice depends on the shape of the code and the acceptable build complexity and dependencies.
+
+| Tool                            | What it is                                  | Best for                                            | Build complexity                    |
+| ------------------------------- | ------------------------------------------- | --------------------------------------------------- | ----------------------------------- |
+| Cython                          | Python superset that compiles to C          | Numerical kernels, tight loops, mixed Python/C code | Medium (needs C compiler, setup.py) |
+| Numba                           | JIT compiler for a subset of Python         | Pure-numeric functions, NumPy-heavy code            | Low (just `pip install numba`)      |
+| PyPy                            | Whole-interpreter JIT replacement           | Pure Python code with no C extensions               | Low (drop-in interpreter)           |
+| C extension via `ctypes`/`cffi` | Call existing C from Python                 | Wrapping existing libraries                         | Medium (need the .so)               |
+| PyO3 (Rust)                     | Rust crate that compiles to a Python module | New native extensions with memory safety            | High (Rust toolchain)               |
+| Free-threaded Python            | CPython without the GIL                     | True multi-threaded parallelism in Python           | Low (but ecosystem still maturing)  |
+
+Numba is the closest competitor to Cython. Both compile Python-like code to fast machine code. The differences:
+
+- **Numba uses LLVM JIT.** No build step on the user's side; compilation happens at runtime on first call. The trade-off is a slightly slower startup and a runtime dependency on LLVM (bundled with Numba).
+- **Cython compiles ahead of time** to C, then to a `.so`. No runtime compilation, no LLVM dependency, but a build step is required.
+- **Numba is purely about speed.** It does not help with calling C libraries.
+- **Cython does both.** It can speed up Python code and wrap C libraries in the same file.
+
+PyPy is for code that does not have C extensions. For a codebase that is pure Python, PyPy is often a 3x to 10x speedup with zero changes. For code that depends on NumPy, pandas, or similar, PyPy may be slower because those packages talk to CPython internals that PyPy cannot optimize the same way.
+
+For new native code, PyO3 (Rust) is the modern option. The Rust compiler enforces memory safety in ways that C does not, and the resulting Python extensions are reliable. The cost is the learning curve: Rust, Cargo, and integration with `maturin` or `setuptools-rust`.
+
+The decision flow looks like this:
+
+Cython lands at the bottom of the tree: after profiling, after vectorizing with NumPy, after considering Numba and wrapping C libraries, Cython is the choice when the work is loop-heavy, does not vectorize cleanly, and would benefit from typed C-speed code.
+
+<h1 id="when-not-to-use-cython">When NOT to Use Cython</h1>
+
+The first failure mode is reaching for Cython before profiling. The profile usually shows that the slow part is not where the guess pointed. Without a line that accounts for 80% of the runtime, optimization is premature.
+
+The second is using Cython where pure Python is fast enough. Cython adds a build step, a generated `.c` file in version control (or `.gitignore`), and a dependency on a C compiler. For code that runs once a second on a small input, pure Python is the right choice.
+
+The third is using Cython where NumPy would work. For an operation like "multiply two arrays element-wise" or "sum across an axis", NumPy already did the optimization in C and exposes it through a one-line Python call. Cython would rewrite the same C loop with extra ceremony.
+
+The fourth is using Cython for I/O-bound code. Network calls, file reads, and database queries spend almost no time in Python; they spend their time waiting. Rewriting them in Cython does not help. Async I/O (`asyncio`) is the answer for that.
+
+Cython is well-suited to:
+
+- A hot loop that is real Python code, not a wrapper around NumPy.
+- A loop body with branches, state, or sequential dependencies that do not vectorize.
+- A function called millions of times in inner loops.
+- C-level performance without leaving Python.
+
+It is the wrong call for other cases. Use it after the cheaper alternatives do not move the needle.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,291 @@
+---
+title: "Distributed Cache Architecture"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Distributed Cache Architecture explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+Behind the scenes, the cache client or cache service decides which node should store `product:123`.
+
+A distributed cache is usually **split across nodes**, not copied fully onto every node.
+
+If you have 100 GB of cached data and 5 cache nodes, each node might hold about 20 GB. That is how the cache grows beyond the limits of one machine.
+
+Some systems also keep extra copies for availability. That can make failures easier to handle, but it uses more memory and adds complexity.
+
+<h1 id="2-why-use-distributed-caching">2. Why Use Distributed Caching?</h1>
+
+Distributed caching is useful when one cache node is no longer enough.
+
+<h3 id="more-memory">More Memory</h3>
+
+Each cache node contributes memory to the cluster. Adding nodes lets the cache hold a larger working set.
+
+This matters when the application repeatedly reads millions of products, profiles, permissions, search results, feed items, or computed responses.
+
+<h3 id="more-throughput">More Throughput</h3>
+
+Requests are spread across nodes, so no single cache process has to serve every read and write.
+
+This helps when cache traffic is high enough that one node runs out of CPU, network bandwidth, or available connections.
+
+<h3 id="better-availability">Better Availability</h3>
+
+With multiple nodes, the failure of one cache node does not have to take down the whole cache layer.
+
+There is still a cost. Keys on the failed node may be unavailable, cold, or served from another copy depending on the cache design. The application must still handle misses and fall back to the database.
+
+<h3 id="lower-database-load">Lower Database Load</h3>
+
+The main reason to cache is still the same: protect slower dependencies.
+
+A well-designed distributed cache can absorb a large share of read traffic and keep the database focused on writes, cache misses, and queries that truly need fresh data.
+
+<h1 id="3-how-distributed-caching-works">3. How Distributed Caching Works</h1>
+
+Most distributed caches follow the same basic flow:
+
+1. The application builds a cache key.
+2. A cache client or proxy maps that key to a cache node.
+3. The request goes to the selected node.
+4. On a hit, the value returns from cache.
+5. On a miss, the application fetches from the database and may store the result in cache.
+
+<h3 id="key-distribution">Key Distribution</h3>
+
+The cache has to answer one question for every key:
+
+There are two common approaches:
+
+| Approach           | How It Works                                   | Trade-off                                            |
+| ------------------ | ---------------------------------------------- | ---------------------------------------------------- |
+| Modulo hashing     | `hash(key) % number_of_nodes` chooses the node | Simple, but adding or removing nodes moves many keys |
+| Consistent hashing | Keys and nodes are placed around a ring        | Moves fewer keys when nodes are added or removed     |
+
+Modulo hashing is easy to understand, but it behaves badly when the cluster size changes. If you move from 5 nodes to 6 nodes, many keys move to different nodes. That creates lots of cache misses at once.
+
+Consistent hashing reduces that disruption. When a node is added or removed, only a smaller portion of keys move. This is why consistent hashing is common in distributed caches and storage systems.
+
+<h3 id="sharding">Sharding</h3>
+
+**Sharding** means splitting the cache keys across multiple nodes.
+
+For example:
+
+| Key               | Owning Node  |
+| ----------------- | ------------ |
+| `user:10`         | Cache node A |
+| `product:123`     | Cache node B |
+| `feed:77`         | Cache node C |
+| `settings:global` | Cache node A |
+
+Sharding is what lets a distributed cache grow beyond the memory and request capacity of one node.
+
+<h3 id="replication">Replication</h3>
+
+**Replication** means keeping a copy of a cache entry on more than one node.
+
+Replication can improve availability. If the main node for a key fails, another node may still have a copy.
+
+But replication is not free:
+
+- It uses more memory
+- Writes have to reach more nodes
+- Failover behavior becomes more complex
+- Copies may briefly lag behind the main node
+
+For many cache-aside systems, losing cached data is acceptable because the database still has the real data. In those systems, replication is useful but not always required.
+
+<h3 id="eviction">Eviction</h3>
+
+Caches have limited memory. When memory fills up, the cache must remove something. Common policies include LRU, LFU, TTL-based expiration, and size-based limits.
+
+- **LRU:** Remove entries that have not been used recently.
+- **LFU:** Remove entries that are used least often.
+- **TTL-based expiration:** Remove entries after a set amount of time.
+- **Size-based limits:** Reject or remove very large entries to protect memory.
+
+Eviction is normal. Applications should treat the cache as a performance optimization, not as the only copy of important data.
+
+<h1 id="4-dedicated-vs-co-located-caches">4. Dedicated vs Co-Located Caches</h1>
+
+One design decision is where the cache runs.
+
+The two common options are **dedicated cache servers** and **co-located caches**.
+
+<h3 id="dedicated-cache-servers">Dedicated Cache Servers</h3>
+
+Dedicated cache servers run separately from application servers.
+
+This is the most common design for shared caches such as Redis, Valkey, or Memcached.
+
+<h3 id="co-located-cache">Co-Located Cache</h3>
+
+A co-located cache runs on the same machine or in the same process as the application.
+
+This is often called an **in-process cache** or **local cache**.
+
+It is fast because it avoids a network call. It is useful for small, frequently read data such as feature flags, routing tables, permissions, templates, or reference data.
+
+<h3 id="multi-level-caching">Multi-Level Caching</h3>
+
+Large systems often stack two cache layers in front of the database. An **L1 cache** is a small local cache inside each application instance. An **L2 cache** is the shared distributed cache that every instance can reach. The database remains the real data source behind both.
+
+This design can work well, but cache invalidation becomes harder. If data changes, you may need to delete or refresh both the shared cache entry and every local copy.
+
+<h1 id="5-common-challenges">5. Common Challenges</h1>
+
+Distributed caching improves scale, but it also introduces new ways things can go wrong.
+
+<h3 id="cache-invalidation">Cache Invalidation</h3>
+
+Invalidation means deleting or refreshing cached data when the real data changes. It is often the hardest part of caching.
+
+If the database changes but the cache still returns the old value, users see stale data. In distributed systems, this gets harder because the value may exist in several places: local caches, shared cache nodes, replicated copies, and client-side caches.
+
+Common approaches include TTL-based expiration, deleting the cache entry when data is written, versioned cache keys, sending cache-delete events through a message queue, and using short TTLs for sensitive data. There is no universal answer. The right choice depends on how old the cached data is allowed to be.
+
+<h3 id="hot-keys">Hot Keys</h3>
+
+Even with many cache nodes, traffic may not be evenly distributed.
+
+A single celebrity profile, flash-sale product, leaderboard, or global configuration key can receive a large share of traffic. The node holding that key becomes overloaded while the rest of the cluster is underused.
+
+Common fixes include copying very hot keys to more than one node, adding short-lived local caching, splitting large values into smaller keys, rate limiting expensive rebuilds, and making only one request rebuild a missing value while the others wait.
+
+<h3 id="rebalancing">Rebalancing</h3>
+
+When nodes are added or removed, some keys move.
+
+Moving keys can create cache misses, uneven load, and extra traffic to the database. Consistent hashing reduces the damage, but it does not eliminate it.
+
+During rebalancing, watch cache hit rate, database queries per second, latency, and error rates.
+
+<h3 id="network-failures">Network Failures</h3>
+
+A distributed cache depends on the network. The application must handle timeouts, too many cache connections being used, partial cache outages, slow cache nodes, and failure handling in replicated systems.
+
+Cache calls should have tight timeouts. A slow cache should not be allowed to make the whole application slower than going directly to the database.
+
+<h3 id="memory-pressure">Memory Pressure</h3>
+
+When memory fills up, the cache removes entries. If this happens too often, hit rate drops and database load rises.
+
+Large values can make this worse. A few oversized entries can push out many useful small entries.
+
+Track memory usage, eviction rate, item sizes, and hit rate together. Looking at only one metric can hide the real problem.
+
+<h3 id="consistency-expectations">Consistency Expectations</h3>
+
+A cache is usually not the real data source.
+
+Most systems accept some stale data in exchange for speed. Problems happen when the application expects database-like freshness from a cache that was designed for performance.
+
+Be explicit about which data can be stale and for how long.
+
+<h1 id="6-best-practices">6. Best Practices</h1>
+
+Running a distributed cache well comes down to a few habits that hold up under load and failure.
+
+<h3 id="cache-data-that-is-worth-caching">Cache Data That Is Worth Caching</h3>
+
+A good fit for caching is data that is read often, expensive to fetch or compute, small enough to store efficiently, safe to serve slightly stale, and shared by many requests. Poor fits are rarely read, cheap to fetch, very large, highly sensitive to stale data, or unique to a single request.
+
+<h3 id="use-clear-cache-keys">Use Clear Cache Keys</h3>
+
+Good keys are predictable, grouped by purpose, and easy to version.
+
+```text
+product:v2:123
+user-profile:v1:456
+tenant:88:feature-flags:v4
+```
+
+Versioned keys are useful when the stored value changes shape. Instead of trying to delete every old key, the application starts writing and reading a new key prefix.
+
+<h3 id="set-ttls-intentionally">Set TTLs Intentionally</h3>
+
+TTL is a product and operations decision, not only a memory setting.
+
+Use shorter TTLs for data that changes often or must not be stale for long. Use longer TTLs for stable reference data.
+
+Add jitter to avoid many keys expiring at the same time:
+
+```python
+import random
+
+ttl = 3600 + random.randint(-300, 300)
+cache.set(key, value, ttl=ttl)
+```
+
+<h3 id="protect-the-database-on-misses">Protect the Database on Misses</h3>
+
+Cache misses are normal. Miss storms are dangerous. Use techniques such as letting one request rebuild a value while others wait, warming critical keys ahead of time, rate limiting expensive rebuilds, stopping calls to overloaded dependencies temporarily, and serving stale data briefly when availability matters more than perfect freshness.
+
+<h3 id="design-for-cache-failure">Design for Cache Failure</h3>
+
+The application should continue to work when the cache is slow, empty, or partly unavailable. That means tight cache timeouts, connection limits, fallback to the database, simpler behavior for non-critical features, and alerts on hit rate, latency, errors, memory usage, and evictions.
+
+<h3 id="keep-values-small">Keep Values Small</h3>
+
+Large cache values increase network cost, encoding and decoding cost, memory pressure, and eviction damage.
+
+Cache the shape the application needs, but avoid turning the cache into a dumping ground for huge objects.
+
+<h3 id="monitor-by-route-and-key-pattern">Monitor by Route and Key Pattern</h3>
+
+Global hit rate can be misleading.
+
+A 95% hit rate may still hide a bad miss rate on checkout, login, or search. Track hit rate, latency, and error rate by route, tenant, key pattern, and cache node.
+
+<h1 id="7-common-technologies">7. Common Technologies</h1>
+
+A handful of systems show up repeatedly when teams build distributed caches. Each one has different trade-offs around data structures, persistence, licensing, and how much work it takes to run well.
+
+<h3 id="memcached">Memcached</h3>
+
+[Memcached](https://memcached.org/) is a high-performance distributed memory object cache. It is simple, fast, and commonly used for small chunks of arbitrary data such as database query results, API responses, and rendered page fragments.
+
+Memcached is a good fit when you want a simple temporary cache and do not need disk persistence, replication features, or rich data structures.
+
+<h3 id="redis">Redis</h3>
+
+[Redis](https://redis.io/) is an in-memory data store that supports strings, hashes, lists, sets, sorted sets, streams, geospatial indexes, and other data structures.
+
+Redis is often used as a cache, but it is also used for rate limiting, queues, leaderboards, sessions, and lightweight coordination. Because Redis can do much more than a simple cache, teams should be clear about whether the data is disposable cache data or important workflow data.
+
+Redis licensing has shifted twice in recent years. Redis 7.4 moved from the BSD 3-clause license to a dual SSPL and RSALv2 model in early 2024.
+
+Redis 8 added AGPLv3 as an additional option in 2025, so current Redis releases are once again available under an OSI-approved open-source license. Teams with open-source or managed-service requirements should still review the license terms before choosing a deployment model.
+
+<h3 id="valkey">Valkey</h3>
+
+[Valkey](https://valkey.io/) is an open-source, Redis-compatible in-memory data store created after the Redis licensing change.
+
+It is relevant when teams want Redis-compatible behavior under an open-source project model.
+
+<h3 id="managed-cache-services">Managed Cache Services</h3>
+
+Cloud providers offer managed cache services that handle setup, patching, monitoring integrations, backups where supported, and failover options.
+
+For example, [Amazon ElastiCache](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/SelectEngine.html) supports Valkey, Memcached, and Redis OSS engines.
+
+Managed services reduce the work of running the cache, but they do not remove the design work. You still need good keys, TTLs, capacity planning, failure handling, and an invalidation strategy.
+
+<h1 id="summary">Summary</h1>
+
+Distributed caching stores cached data across multiple machines so the cache layer can scale beyond a single node.
+
+The main building blocks are key distribution, sharding, optional replication, eviction, and client routing. The main design choices are whether to use dedicated cache servers, local caches, or a multi-level L1/L2 design.
+
+Distributed caches reduce latency and database load, but they introduce trade-offs around invalidation, hot keys, rebalancing, network failures, memory pressure, and stale data.
+
+Treat the cache as a fast, partial, temporary copy of data, designed so it can be empty, stale, slow, or missing without taking the whole system down.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

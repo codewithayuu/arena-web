@@ -1,0 +1,288 @@
+---
+title: "doctest"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "doctest explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="what-doctest-is">What doctest Is</h1>
+
+A doctest is a chunk of text in a docstring that looks like a copy of an interactive Python session. Lines starting with `>>>` are the code; the lines after them are the expected output. When `doctest` runs the docstring, it executes each `>>>` line, captures whatever the line prints (or returns, for an expression), and compares it character-by-character to the text that follows.
+
+The smallest useful example:
+
+```python
+def apply_discount(price, percent):
+    """Return the price after a percentage discount.
+
+    >>> apply_discount(100, 10)
+    90.0
+    >>> apply_discount(50, 50)
+    25.0
+    """
+    return price * (1 - percent / 100)
+```
+
+Save that to `pricing.py`. Then run:
+
+```text
+python -m doctest pricing.py -v
+```
+
+That's it. No imports, no extra test files, no framework setup. The docstring is the test. Strip the `-v` flag and `doctest` only prints when something fails, which is the usual mode.
+
+The shape that makes this work is rigid. `>>>` (three greater-than signs followed by a single space) marks an input line. A blank line ends the example. Continuation lines (inside multi-line statements) start with `...`. Anything between the input line and the next blank line, or the next `>>>`, is treated as expected output.
+
+```python
+def cart_total(prices):
+    """Sum all prices in a cart and return the total.
+
+    >>> cart_total([19.99, 9.99, 4.99])
+    34.97
+    >>> cart_total([])
+    0
+    >>> total = cart_total([10, 20, 30])
+    >>> total
+    60
+    """
+    return sum(prices)
+```
+
+Three examples in one docstring. The third one assigns a result before checking it. `doctest` keeps a fresh namespace per docstring, so the assignment in the third example doesn't leak into other docstrings.
+
+<h1 id="why-this-pattern-exists">Why This Pattern Exists</h1>
+
+Most testing frameworks separate tests from code. The function lives in one file, the test lives in `tests/test_thing.py`, and the two stay synchronized through discipline. doctest does the opposite: the test sits inside the function it tests, in the form anyone reading the help text will see.
+
+That collocation gives doctest two real strengths.
+
+**Documentation that can't go stale.** Comments can lie. Docstring examples can lie too, but only until `doctest` runs. The moment a refactor changes the return value, the docstring example becomes a failing test, and the build complains. Users who copy-paste an example from the docs get code that actually works, because every example was executed as recently as the last test run.
+
+**Examples that match how Python feels to use.** Most real Python learning happens in the REPL: type a thing, see what it returns, adjust, repeat. A doctest is a transcript of that experience. There's no boilerplate, no `assertEqual`, no framework vocabulary in between the reader and the behavior.
+
+The pattern has limits. For the use case it fits (library docs, tutorial code, small utility functions where the inputs and outputs are short enough to read in passing), nothing else gives "running examples in the docstring" without building a custom framework around it.
+
+<h1 id="how-doctest-parses-and-runs-examples">
+  How doctest Parses and Runs Examples
+</h1>
+
+The model is simple enough that knowing it removes most of the surprises. When doctest runs on a module, it does this for every docstring it finds:
+
+1. Scan the docstring line by line, looking for `>>>` and `...` markers.
+2. Group consecutive input lines plus their expected output into one **example**.
+3. For each example, compile the input lines as a code block.
+4. Execute the block in a private namespace (one per docstring).
+5. Capture stdout and the value of the last expression.
+6. Compare the captured text to the expected output, exactly.
+
+The diagram below shows the flow.
+
+One pitfall in the match check: doctest doesn't run a smart comparison. It compares strings. If a function returns `0.1 + 0.2`, the captured output is the literal `0.30000000000000004`, not `0.3`. The docstring must say `0.30000000000000004` too, or the test fails.
+
+A failing example looks like this:
+
+```python
+def shipping_fee(cart_total):
+    """Return the shipping fee for a cart.
+
+    >>> shipping_fee(60)
+    0.0
+    >>> shipping_fee(20)
+    4.99
+    """
+    if cart_total > 50:
+        return 0.0
+    return 5.99  # bug: should be 4.99
+```
+
+Running `python -m doctest pricing.py` prints:
+
+```text
+**********************************************************************
+File "pricing.py", line 5, in pricing.shipping_fee
+Failed example:
+    shipping_fee(20)
+Expected:
+    4.99
+Got:
+    5.99
+**********************************************************************
+1 items had failures:
+   1 of   2 in pricing.shipping_fee
+***Test Failed*** 1 failures.
+```
+
+The output shows the file, the line number, the input that ran, the expected output, and the actual output. Enough to fix it. The first example (`shipping_fee(60)`) still passed; doctest doesn't stop at the first failure inside a single docstring.
+
+The namespace rule deserves more explanation. Each docstring runs in its own fresh namespace. Names defined in one function's docstring don't leak into another's. Inside a single docstring, examples share the namespace, so this works:
+
+```python
+def make_cart():
+    """Build a fresh cart.
+
+    >>> cart = make_cart()
+    >>> cart.append("Wireless Mouse")
+    >>> cart
+    ['Wireless Mouse']
+    """
+    return []
+```
+
+The first example creates `cart`. The second example uses it. The third inspects it. All three see the same local namespace because they're in the same docstring.
+
+Each docstring gets its own namespace, but every example within a docstring shares state. If example three depends on example one having run, doctest preserves that. To isolate examples, put them in separate docstrings, or rebuild state at the top of each example block.
+
+<h1 id="running-doctest">Running doctest</h1>
+
+Two main ways to run doctests cover slightly different situations.
+
+<h3 id="command-line-python-m-doctest">Command Line: python -m doctest</h3>
+
+Pass one or more files to `python -m doctest`. It loads each module, walks the docstrings, and runs everything it finds.
+
+```text
+python -m doctest pricing.py
+```
+
+Silent on success. Run with `-v` (verbose) to see every example pass or fail:
+
+```text
+python -m doctest -v pricing.py
+```
+
+Multiple files can be passed at once:
+
+```text
+python -m doctest pricing.py cart.py orders.py
+```
+
+This form fits CI pipelines or a Makefile target. It's also the simplest way to check a single file during development.
+
+<h3 id="inside-a-script-doctesttestmod">Inside a Script: doctest.testmod()</h3>
+
+For a file that tests itself when run directly (common in tutorial-style scripts), add this at the bottom:
+
+```python
+def apply_discount(price, percent):
+    """Return the discounted price.
+
+    >>> apply_discount(100, 10)
+    90.0
+    """
+    return price * (1 - percent / 100)
+
+if __name__ == "__main__":
+    import doctest
+    doctest.testmod()
+```
+
+Now `python pricing.py` runs the doctests automatically. `testmod()` returns a `TestResults` named tuple with `attempted` and `failed` counts, useful for making the script exit non-zero on failure:
+
+```python
+if __name__ == "__main__":
+    import doctest
+    import sys
+    result = doctest.testmod()
+    sys.exit(1 if result.failed else 0)
+```
+
+`testmod()` accepts a `verbose=True` keyword, equivalent to passing `-v` on the command line. `doctest.testfile("some.txt")` runs doctests stored in plain text files instead of docstrings, useful for longer tutorials or README files where prose drives the structure.
+
+<h1 id="strengths-where-doctest-fits">Strengths: Where doctest Fits</h1>
+
+doctest fits well in three specific situations.
+
+**Library API documentation.** For a library where users will read the help text or the rendered docs, every function-level docstring example becomes proof that the example works. Tools like Sphinx render doctests as code blocks in HTML, so the user sees the same example that was tested. The Python standard library uses doctest heavily for this reason: `decimal`, `pathlib`, and `textwrap` all have docstrings full of `>>>` blocks.
+
+**Tutorials and teaching materials.** A `.txt` file passed to `doctest.testfile` can contain prose, code blocks, expected outputs, and explanatory text, all readable as a tutorial and runnable as tests. If a code block stops matching, the tutorial broke. The Python "What's New" pages and the standard library's how-to documents use this pattern.
+
+**Quick smoke tests for small functions.** For a five-line utility function where the inputs and outputs are short, doctest is the lowest-ceremony way to lock in behavior. No new file, no import, no class setup, no framework syntax. The REPL session goes straight into the docstring.
+
+```python
+def format_price(amount):
+    """Format a price with a currency symbol and two decimals.
+
+    >>> format_price(19.99)
+    '$19.99'
+    >>> format_price(5)
+    '$5.00'
+    >>> format_price(0)
+    '$0.00'
+    """
+    return f"${amount:.2f}"
+```
+
+Three lines of test for three lines of code, in the same place the user reads the help. That's the sweet spot.
+
+<h1 id="weaknesses-where-doctest-falls-apart">
+  Weaknesses: Where doctest Falls Apart
+</h1>
+
+The same things that make doctest pleasant for small examples make it painful for anything bigger.
+
+**Whitespace sensitivity.** A trailing space in the expected output, a missing newline, an extra tab anywhere, and the test fails with a comparison that visually looks identical to the actual output. Editors that strip trailing whitespace can fix examples that were broken without anyone noticing, and editors that don't can break examples that were working.
+
+**Sensitivity to `repr` changes.** When a function returns a custom object, the expected output is the `repr()` of that object. Change the `__repr__` method and every doctest that mentions the object breaks. The same applies to the formatting of dict and set displays, which can vary across versions.
+
+**Dict ordering.** Before Python 3.7, dict iteration order was implementation-defined. Code like `>>> {"a": 1, "b": 2}` could print either `{'a': 1, 'b': 2}` or `{'b': 2, 'a': 1}`, and a doctest would pass on one Python version and fail on another. Python 3.7+ guarantees insertion order, which fixes most of the problem, but doctests that build dicts dynamically (from set operations, from iteration over a set) can still be non-deterministic.
+
+**Float precision.** `>>> 0.1 + 0.2` prints `0.30000000000000004`. Any doctest involving floating-point arithmetic has to either show the full value or use the `ELLIPSIS` directive.
+
+**No setup or teardown.** Each docstring runs in a fresh namespace, but there's no equivalent of pytest fixtures. A doctest that needs a temporary database, a fake HTTP service, or a fresh file system has to build it inline in the docstring, which clutters the documentation.
+
+**Hard to organize at scale.** A test suite of fifty `test_*` functions can be filtered, marked, parametrized, and grouped. A test suite of fifty docstring examples is fifty docstrings, scattered across however many functions exist. Doctests don't scale into a real test suite. They scale into documentation that's verified.
+
+The summary: doctest is great when the test is also the example. It's bad when the test is just a test.
+
+<h1 id="directives-ellipsis-normalize_whitespace-ignore_exception_detail">
+  Directives: ELLIPSIS, NORMALIZE_WHITESPACE, IGNORE_EXCEPTION_DETAIL
+</h1>
+
+Three directives handle most of the brittleness problems. Enable them by adding `# doctest: +DIRECTIVE_NAME` after the input line.
+
+<h3 id="ellipsis">ELLIPSIS</h3>
+
+`ELLIPSIS` allows `...` in the expected output to match any text. Useful for any output that contains values that shouldn't be pinned down: memory addresses, timestamps, long sequences where only the start or end matters.
+
+```python
+def make_order():
+    """Build a fresh order with a unique id.
+
+    >>> order = make_order()
+    >>> order  # doctest: +ELLIPSIS
+    <Order id=... status='placed'>
+    """
+    class Order:
+        def __init__(self):
+            self.id = id(self)
+            self.status = "placed"
+        def __repr__(self):
+            return f"<Order id={self.id} status={self.status!r}>"
+    return Order()
+```
+
+The `...` in the expected output matches the actual `id` value, whatever it happens to be. Without `ELLIPSIS`, the test would need to know the exact id ahead of time, which is impossible for values that change between runs.
+
+`ELLIPSIS` is also a clean approach for floating-point values without pinning the precision:
+
+```python
+def cart_total(prices):
+    """Sum prices with the usual float noise.
+
+    >>> cart_total([0.1, 0.2])  # doctest: +ELLIPSIS
+    0.300000...
+    """
+    return sum(prices)
+```
+
+`0.300000...` matches `0.30000000000000004`, `0.30000000123`, or any other value that starts with `0.300000`. Loose enough to absorb float drift, tight enough to catch real errors.
+
+<h3 id="normalize_whitespace">NORMALIZE_WHITESPACE</h3>
+
+`NORMALIZE_WHITESPACE` collapses any run of whitespace (spaces, tabs, newlines) into a single space for comparison purposes. It applies when the output has extra spacing that doesn't matter.
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,273 @@
+---
+title: "Vector"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Vector explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="what-vector-is">What Vector Is</h1>
+
+`Vector<E>` is a growable array of objects, backed by an internal `Object[]` that gets reallocated when it fills up. Functionally, it stores elements by index, lets you add, set, and remove them, and resizes itself as needed. If that description sounds like `ArrayList`, that's because the two classes do the same job. The difference is that `Vector` was written first, for a single-threaded world that turned out not to exist, and it tried to solve thread safety by synchronizing every method.
+
+When the Collections Framework arrived in Java 1.2, `Vector` was retrofitted to implement `List`, so it slots into the same interfaces as `ArrayList`. You can pass a `Vector` anywhere a `List` is expected, iterate with the enhanced for loop, sort it with `Collections.sort`, and use it with streams.
+
+```java
+import java.util.Vector;
+
+public class FirstVector {
+    public static void main(String[] args) {
+        Vector<String> cart = new Vector<>();
+        cart.add("Notebook");
+        cart.add("Pen");
+        cart.add("Eraser");
+
+        System.out.println("Cart: " + cart);
+        System.out.println("Size: " + cart.size());
+        System.out.println("First item: " + cart.get(0));
+    }
+}
+```
+
+The API looks identical to `ArrayList`. The same `add`, `get`, `size`, `remove`, `set`, and `indexOf` methods are there, with the same signatures. If you swapped `Vector` for `ArrayList` in this program, nothing about the output would change.
+
+The class also keeps a handful of pre-Collections methods that `ArrayList` doesn't have, like `elementAt`, `addElement`, and `removeElementAt`. They predate the `List` interface and do the same things as `get`, `add`, and `remove`. There's no reason to use the older names in new code; they exist for backward compatibility with code written before Java 1.2.
+
+<h1 id="how-vector-stores-elements">How Vector Stores Elements</h1>
+
+Internally, `Vector` keeps two fields that drive its behavior: an `Object[] elementData` array that holds the elements, and an `int elementCount` that tracks how many slots are in use. The array's `length` is the capacity, which can be larger than the number of stored elements.
+
+When you call `add`, `Vector` writes the new element at `elementData[elementCount]` and increments `elementCount`. When the count catches up to the array length, the next `add` triggers a resize: a new, larger array is allocated, the contents are copied over with `System.arraycopy`, and `elementData` is replaced.
+
+The same layout as `ArrayList`, in other words. Where the two diverge is in **how much** the array grows when it fills up.
+
+`ArrayList` grows by roughly 50 percent: a 10-slot array becomes 15, then 22, then 33, and so on. `Vector` doubles by default: 10 becomes 20, then 40, then 80. The doubling is the historical default; you can change it through the constructor.
+
+`Vector` exposes a constructor that other resizable arrays don't:
+
+```java
+Vector<String> products = new Vector<>(16, 8);
+```
+
+The first argument is the initial capacity (the starting size of the backing array). The second is the **capacity increment**, the fixed number of slots added on each resize. With `(16, 8)`, the array starts at 16 and grows by exactly 8 each time it fills: 16, then 24, then 32, then 40.
+
+If you pass `0` for the increment (or use the no-arg or single-arg constructors), `Vector` falls back to doubling.
+
+| Constructor           | Initial Capacity | Growth Behavior   |
+| --------------------- | ---------------- | ----------------- |
+| `new Vector<>()`      | 10               | Doubles when full |
+| `new Vector<>(50)`    | 50               | Doubles when full |
+| `new Vector<>(16, 8)` | 16               | Adds 8 each time  |
+| `new Vector<>(16, 0)` | 16               | Doubles when full |
+
+This is the one feature `Vector` has that `ArrayList` doesn't: a knob to control growth in fixed increments rather than by ratio. In practice, almost no one needs it. Doubling works well in most cases, and the increment knob existed because 1996 hardware had much tighter memory budgets than today's.
+
+```java
+import java.util.Vector;
+
+public class VectorGrowth {
+    public static void main(String[] args) {
+        Vector<String> products = new Vector<>(2, 2);
+        System.out.println("Initial capacity: " + products.capacity());
+
+        products.add("Notebook");
+        products.add("Pen");
+        System.out.println("After 2 adds, capacity: " + products.capacity());
+
+        products.add("Eraser");
+        System.out.println("After 3 adds, capacity: " + products.capacity());
+
+        products.add("Pencil");
+        products.add("Stapler");
+        System.out.println("After 5 adds, capacity: " + products.capacity());
+    }
+}
+```
+
+`capacity()` returns the length of the underlying array, which is a method `Vector` exposes but `ArrayList` does not. After 2 adds, the array is full. The third `add` resizes it by the increment of 2, bumping capacity to 4. The fifth `add` resizes again by 2, bumping it to 6. If the increment had been `0`, the third `add` would have doubled the capacity from 2 to 4 and the fifth would have doubled it again to 8.
+
+Each resize allocates a new array and copies every existing element. Doubling keeps the amortized cost of `add` at O(1), the same as `ArrayList`. A small fixed increment changes that: if your `Vector` ends up with 10,000 elements and the increment is 10, you'll have done roughly 1,000 reallocations and copied O(n^2) elements in total. Set a sensible initial capacity, or leave the increment at 0 and let it double.
+
+<h1 id="every-method-is-synchronized">Every Method Is Synchronized</h1>
+
+This is the part that defines `Vector`. The source for `Vector.add`, `Vector.get`, `Vector.size`, or any other public method shows the `synchronized` keyword on the method signature:
+
+```java
+public synchronized boolean add(E e) { ... }
+public synchronized E get(int index) { ... }
+public synchronized int size() { ... }
+```
+
+`synchronized` on an instance method means a thread has to acquire the `Vector` object's monitor lock before the method body runs, and it releases the lock when the method returns. While one thread holds the lock, every other thread that calls any other synchronized method on the same `Vector` has to wait.
+
+The intent was simple: make the class safe to share across threads without forcing callers to think about locking. In 1996, that sounded like a reasonable default.
+
+It looks like this in practice:
+
+Thread A grabs the lock, runs `add`, and releases it. Thread B was already trying to call `get`, but it had to wait. Once A releases the lock, B acquires it, runs `get`, and releases it. Only one thread is ever inside any method of the `Vector` at a time.
+
+That serialization is what makes `Vector` "thread-safe" at the per-method level. Three things make it less useful than it sounds.
+
+First, even single-threaded code pays the synchronization cost. Acquiring and releasing a monitor lock isn't free, especially when the JVM can't prove the lock is uncontended. Calling `add` in a tight loop on a `Vector` is measurably slower than the same loop on an `ArrayList` in single-threaded code, even though no other thread is involved.
+
+Second, in concurrent code, the per-method locking serializes all access. Two threads that just want to read from different indices have to take turns. There's no separation between readers and writers, no fine-grained locking, just one big lock around everything. As contention rises, throughput collapses.
+
+Third, per-method synchronization does not give atomic compound operations. Consider this snippet:
+
+```java
+if (!cart.isEmpty()) {
+    String last = cart.get(cart.size() - 1);
+    System.out.println("Last item: " + last);
+}
+```
+
+Each individual call (`isEmpty`, `size`, `get`) is synchronized and atomic. But between them, any other thread can mutate the vector. Thread A could call `isEmpty` and see `false`, then thread B could call `clear`, then thread A would call `cart.size() - 1`, which now returns `-1`, and `get(-1)` would throw `ArrayIndexOutOfBoundsException`. Per-method locking doesn't help here. You'd still need an external lock around the whole sequence, the same way you would with an `ArrayList`.
+
+So `Vector` charges every caller (including single-threaded callers) for thread safety, gives up performance under contention, and doesn't actually solve the compound-operation problem that real concurrent code runs into.
+
+<h1 id="vector-vs-arraylist-side-by-side">Vector vs ArrayList Side by Side</h1>
+
+A direct comparison helps put `Vector` in its place.
+
+| Aspect                      | `Vector`                               | `ArrayList`           |
+| --------------------------- | -------------------------------------- | --------------------- |
+| Introduced in               | Java 1.0 (1996)                        | Java 1.2 (1998)       |
+| Implements `List`           | Yes (retrofitted in 1.2)               | Yes                   |
+| Default initial capacity    | 10                                     | 10                    |
+| Growth strategy             | Doubles (configurable)                 | Grows by ~50%         |
+| Thread safety               | Every method synchronized              | None                  |
+| Single-threaded performance | Slower (lock overhead)                 | Faster                |
+| Legacy enumeration methods  | Yes (`elements()`, `addElement`, etc.) | No                    |
+| Modern usage                | Mostly avoided                         | Default `List` choice |
+
+The decisive row is "thread safety". `Vector` was built around per-method locking; `ArrayList` deliberately omits it. If you don't need locking, `ArrayList` is cheaper. If you do, `Vector`'s locking is too coarse and too narrow to actually solve concurrent-access problems on its own. Either way, `Vector` rarely comes out ahead.
+
+A small benchmark-style demo, single-threaded:
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Vector;
+
+public class AddLoop {
+    public static void main(String[] args) {
+        int n = 1_000_000;
+
+        long arrayListStart = System.nanoTime();
+        List<Integer> arrayList = new ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            arrayList.add(i);
+        }
+        long arrayListNanos = System.nanoTime() - arrayListStart;
+
+        long vectorStart = System.nanoTime();
+        List<Integer> vector = new Vector<>();
+        for (int i = 0; i < n; i++) {
+            vector.add(i);
+        }
+        long vectorNanos = System.nanoTime() - vectorStart;
+
+        System.out.println("ArrayList: " + arrayListNanos / 1_000_000 + " ms");
+        System.out.println("Vector:    " + vectorNanos / 1_000_000 + " ms");
+    }
+}
+```
+
+The exact numbers depend on the JVM and the machine, but the shape is consistent: `Vector` is slower, even in a single-threaded loop where no other thread is competing for the lock. The JVM is doing work to acquire and release the monitor on every `add`, and that work adds up.
+
+<h1 id="modern-alternatives-for-thread-safe-lists">
+  Modern Alternatives for Thread-Safe Lists
+</h1>
+
+If you need a thread-safe `List`, `Vector` isn't the right answer in modern Java. Two better options exist in production code.
+
+The first is `Collections.synchronizedList(new ArrayList<>())`. This wraps an existing `List` in a synchronized facade. Every method on the wrapper acquires a lock before delegating to the underlying list, the same way `Vector` does internally. The advantage over `Vector` is that you start from a regular `ArrayList`, so callers who don't need synchronization can use the unwrapped list, and you can swap implementations later (for example, to a `LinkedList`) without changing the wrapping code.
+
+```java
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+public class SynchronizedListDemo {
+    public static void main(String[] args) {
+        List<String> cart = Collections.synchronizedList(new ArrayList<>());
+        cart.add("Notebook");
+        cart.add("Pen");
+        System.out.println("Items: " + cart);
+    }
+}
+```
+
+Functionally this is very close to `Vector`: every operation goes through a lock, compound operations still need external synchronization, and the per-method locking is just as coarse. The main improvement is that you have an `ArrayList` underneath and a clean separation between "the data structure" and "the locking policy".
+
+The second option is `CopyOnWriteArrayList`, which is part of `java.util.concurrent`. It uses a completely different strategy: every write operation (add, set, remove) creates a fresh internal array. Readers don't take any lock at all; they just read the current array snapshot. This makes reads essentially free and writes expensive (because each write copies the whole array), which is a great fit for read-heavy scenarios like event listener lists or rarely-updated config tables.
+
+```java
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+public class CopyOnWriteDemo {
+    public static void main(String[] args) {
+        List<String> listeners = new CopyOnWriteArrayList<>();
+        listeners.add("logger");
+        listeners.add("metrics");
+        System.out.println("Listeners: " + listeners);
+    }
+}
+```
+
+The takeaway: when you need a thread-safe list in new code, use `Collections.synchronizedList` or `CopyOnWriteArrayList` depending on the access pattern. Don't use `Vector`.
+
+<h1 id="where-you-might-still-see-vector">Where You Might Still See Vector</h1>
+
+`Vector` hasn't been deprecated, and it still appears in some codebases. A few situations to know about.
+
+Older Java libraries return `Vector` from public methods, and changing the return type would break their callers. The most visible examples are in `javax.swing`: `JTable.getSelectedRows()` returns nothing related to `Vector`, but `DefaultTableModel`'s constructor accepts a `Vector<Vector<Object>>` for its row data. Feeding rows into a Swing table requires handing a `Vector` to it. Code that integrates with Swing, AWT, or other early Java GUI APIs ends up using `Vector` because that's what the API speaks.
+
+Legacy code in older systems (think 2000s-era Java applications, JSP pages, or anything built before the Collections Framework became dominant) often uses `Vector` everywhere. When maintaining or porting that code, leaving the `Vector` types in place is usually safer than swapping them for `ArrayList`, because some caller somewhere might depend on the synchronization behavior even if nothing makes that dependency visible.
+
+`Stack` extends `Vector`. That's a piece of history rather than a design choice: `Stack` was written in Java 1.0 alongside `Vector`, and it inherits all of `Vector`'s methods, including the synchronized ones. The modern recommendation is to use `Deque` (via `ArrayDeque`) for stack-like usage, but `Stack` is still in `java.util` for backward compatibility.
+
+Consider an older order-processing module that uses `Vector` because that's what the API it integrates with expects. A legacy reporting hook hands back row data as `Vector<Vector<Object>>`:
+
+```java
+import java.util.Vector;
+
+public class LegacyOrderReport {
+    public static Vector<Vector<Object>> buildRows() {
+        Vector<Vector<Object>> rows = new Vector<>();
+
+        Vector<Object> firstOrder = new Vector<>();
+        firstOrder.add("ORDER-1001");
+        firstOrder.add("Notebook");
+        firstOrder.add(29.99);
+        rows.add(firstOrder);
+
+        Vector<Object> secondOrder = new Vector<>();
+        secondOrder.add("ORDER-1002");
+        secondOrder.add("Pen");
+        secondOrder.add(4.50);
+        rows.add(secondOrder);
+
+        return rows;
+    }
+
+    public static void main(String[] args) {
+        Vector<Vector<Object>> rows = buildRows();
+        for (Vector<Object> row : rows) {
+            System.out.println(row);
+        }
+    }
+}
+```
+
+There's nothing wrong with this code given the constraint that the reporting API expects `Vector<Vector<Object>>`. In new code, with no such constraint, you'd build the same structure with `List<List<Object>>` and `ArrayList`, and the rest of the application would be slightly faster and easier to reason about.
+
+The rule of thumb: if you're writing new code, use `ArrayList`. If you need thread safety, use `Collections.synchronizedList` or `CopyOnWriteArrayList`. Use `Vector` only when an external API forces your hand.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

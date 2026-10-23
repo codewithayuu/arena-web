@@ -1,0 +1,455 @@
+---
+title: "FileReader & FileWriter"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "FileReader & FileWriter explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="why-a-separate-api-for-characters">
+  Why a Separate API for Characters?
+</h1>
+
+A file on disk is a sequence of bytes. A `String` in Java is a sequence of `char` values, where each `char` is a UTF-16 code unit. The two are not the same thing. The word `"Café"` is four characters long, but encoded as UTF-8 it takes five bytes (because `é` needs two bytes). Encoded as ISO-8859-1, the same word takes four bytes. Encoded as UTF-16, it takes eight bytes plus a byte-order mark. Same text, three different on-disk representations.
+
+That mismatch is why Java ships two parallel I/O hierarchies. The byte streams (`InputStream`, `OutputStream`) move raw bytes and don't care what the bytes mean. The character streams (`Reader`, `Writer`) move `char` values and apply a character set to translate between bytes and characters on the way in or out.
+
+The diagram traces one read. The bytes `43 61 66 C3 A9` come off disk. The UTF-8 decoder consumes them and produces four `char` values: `C`, `a`, `f`, `é`. Going the other way (a write) flips the arrows: each `char` enters the encoder, and one or more bytes come out the other side.
+
+Skipping the decoder and reading the bytes directly as ASCII produces five "characters", with `é` showing up as two garbled boxes. That's the mojibake problem, and it's exactly what character streams exist to prevent.
+
+For an English-only `welcome-email.txt` with no accented letters, the difference between byte streams and character streams may not be visible. Both produce the right output because ASCII bytes happen to be valid UTF-8 single-byte sequences. As soon as the data picks up a `Café`, a `naïve`, or a `日本語`, the abstraction starts to matter.
+
+<h1 id="the-reader-and-writer-hierarchies">
+  The Reader and Writer Hierarchies
+</h1>
+
+`Reader` and `Writer` are the two abstract base classes that anchor the character-stream world. Every class that produces or consumes `char` data extends one of them. `FileReader` and `FileWriter` are the file-backed concrete classes used directly in this chapter.
+
+`FileReader` is a thin convenience subclass of `InputStreamReader`. Internally, an `InputStreamReader` wraps an underlying `InputStream` and a `Charset` decoder. `FileReader` just hardcodes that the underlying `InputStream` is a `FileInputStream` pointed at a file. `FileWriter` does the symmetric thing on the writing side: it's an `OutputStreamWriter` over a `FileOutputStream`.
+
+The hierarchy matters later. Reading text from a network socket or a ZIP entry doesn't use `FileReader` (the source isn't a file), but it still uses an `InputStreamReader` to wrap whatever byte source is available. The byte-to-char bridge is the same; only the byte source changes.
+
+For this chapter, stick with `FileReader` and `FileWriter`. They cover the file case, the most common one, and they're a clean way to learn the character-stream model.
+
+<h1 id="reading-text-with-filereader">Reading Text with FileReader</h1>
+
+`FileReader` reads characters from a file. The class has a few constructors; in practice, one of these two appears in real code:
+
+| Constructor                                  | Charset used                     |
+| -------------------------------------------- | -------------------------------- |
+| `new FileReader(String fileName)`            | Default platform charset         |
+| `new FileReader(File file, Charset charset)` | The charset passed in (Java 11+) |
+
+The first form is older and depends on the JVM's default charset, which varies by platform (more on this later, and it's not good news). The second form, added in Java 11, states the charset explicitly. For any real code, use the second form.
+
+`FileReader` exposes two main read methods inherited from `Reader`:
+
+- `int read()`. Reads one character. Returns the character as an `int` in the range 0 to 65535, or `-1` at end of stream.
+- `int read(char[] buffer)`. Reads up to `buffer.length` characters into the buffer. Returns the number of characters actually read, or `-1` at end of stream.
+
+A small program that reads a product description and prints it character by character. Assume `product-description.txt` contains the text `Soft cotton t-shirt`.
+
+```java
+import java.io.FileReader;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+
+public class ReadProductDescription {
+    public static void main(String[] args) throws IOException {
+        try (FileReader reader = new FileReader("product-description.txt", StandardCharsets.UTF_8)) {
+            int ch;
+            while ((ch = reader.read()) != -1) {
+                System.out.print((char) ch);
+            }
+            System.out.println();
+        }
+    }
+}
+```
+
+The loop reads one character at a time. `read()` returns an `int` so it can use `-1` as the end-of-stream sentinel without colliding with any valid character value. The `int` is cast back to `char` before printing or storing it. The `try-with-resources` block makes sure `reader.close()` runs no matter how the loop exits.
+
+Reading character by character works but it's slow. Each `read()` call goes through the decoder and (without buffering underneath) does a small read from the underlying `FileInputStream`. Reading into a buffer is much faster:
+
+```java
+import java.io.FileReader;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+
+public class ReadIntoBuffer {
+    public static void main(String[] args) throws IOException {
+        try (FileReader reader = new FileReader("product-description.txt", StandardCharsets.UTF_8)) {
+            char[] buffer = new char[1024];
+            int charsRead;
+            while ((charsRead = reader.read(buffer)) != -1) {
+                System.out.print(new String(buffer, 0, charsRead));
+            }
+            System.out.println();
+        }
+    }
+}
+```
+
+`read(buffer)` fills as much of the buffer as it can in one call. The return value indicates how many characters landed in the buffer (it can be less than `buffer.length` if the file is small or partially read). The `new String(buffer, 0, charsRead)` call builds a `String` from just the valid portion, ignoring any leftover slots.
+
+A character-by-character loop with bare `FileReader` does an underlying system call (or close to it) per read. Reading into a `char[1024]` cuts the number of round trips by roughly 1000x for a typical file. A `BufferedReader` is the more idiomatic way to get the same speedup plus line-oriented reads.
+
+The `-1` sentinel is the only end-of-stream signal. There's no `hasNext()` on `Reader`. Skipping the `-1` check leads to an infinite loop.
+
+**What's wrong with this code?**
+
+```java
+try (FileReader reader = new FileReader("product-description.txt")) {
+    char ch;
+    while ((ch = (char) reader.read()) != -1) {  // bug
+        System.out.print(ch);
+    }
+}
+```
+
+**Fix:**
+
+```java
+try (FileReader reader = new FileReader("product-description.txt", StandardCharsets.UTF_8)) {
+    int ch;
+    while ((ch = reader.read()) != -1) {
+        System.out.print((char) ch);
+    }
+}
+```
+
+Casting to `char` before checking for `-1` loses information. A `char` is unsigned 16-bit, so `(char) -1` wraps to `65535` and never equals `-1`. The loop never terminates. Keep the result of `read()` as an `int`, compare to `-1`, then cast to `char` only when you use it.
+
+<h1 id="writing-text-with-filewriter">Writing Text with FileWriter</h1>
+
+`FileWriter` is the mirror image of `FileReader`. It accepts `char` data, encodes it to bytes through a charset, and writes those bytes to a file. The common constructors are:
+
+| Constructor                                                  | Behavior                                    |
+| ------------------------------------------------------------ | ------------------------------------------- |
+| `new FileWriter(String fileName)`                            | Default charset, overwrite mode             |
+| `new FileWriter(String fileName, boolean append)`            | Default charset, append if `true`           |
+| `new FileWriter(File file, Charset charset)`                 | Explicit charset, overwrite mode (Java 11+) |
+| `new FileWriter(File file, Charset charset, boolean append)` | Explicit charset and append flag (Java 11+) |
+
+A `FileWriter` constructor with no append flag overwrites the file. If `welcome-email.txt` already exists with content in it, opening a new `FileWriter` over it truncates it to zero bytes the moment the constructor runs.
+
+The write methods inherited from `Writer`:
+
+- `void write(int c)`. Writes one character. Only the low 16 bits are used.
+- `void write(char[] buffer)`. Writes all the characters in the array.
+- `void write(char[] buffer, int offset, int length)`. Writes a slice.
+- `void write(String text)`. Writes a string. Convenient and the most common form.
+- `void write(String text, int offset, int length)`. Writes a slice of a string.
+
+Here's a program that creates a welcome-email template file:
+
+```java
+import java.io.FileWriter;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+
+public class WriteWelcomeEmail {
+    public static void main(String[] args) throws IOException {
+        try (FileWriter writer = new FileWriter("welcome-email.txt", StandardCharsets.UTF_8)) {
+            writer.write("Hi {{customerName}},\n");
+            writer.write("Welcome to our store. ");
+            writer.write("Your first order ships free with code WELCOME10.\n");
+        }
+    }
+}
+```
+
+**Output (file contents):**
+
+```text
+Hi {{customerName}},
+Welcome to our store. Your first order ships free with code WELCOME10.
+```
+
+Three calls to `write`, one file, no surprises. The `\n` puts a line break between the greeting and the body. The try-with-resources block calls `close()` automatically, which also flushes any buffered output to disk.
+
+A common writing pattern is exporting an order summary as a plain-text receipt:
+
+```java
+import java.io.FileWriter;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+
+public class ExportOrderSummary {
+    public static void main(String[] args) throws IOException {
+        String summary = """
+                Order #1042
+                Customer: Priya Sharma
+                ---
+                Notebook x 2     $9.98
+                Pen x 5          $4.95
+                Eraser x 3       $2.37
+                ---
+                Total:          $17.30
+                """;
+
+        try (FileWriter writer = new FileWriter("order-1042.txt", StandardCharsets.UTF_8)) {
+            writer.write(summary);
+        }
+        System.out.println("Order summary saved.");
+    }
+}
+```
+
+The file `order-1042.txt` now contains the formatted summary. `write(String)` writes the entire string in one call. Using a text block (the `"""` form) keeps the multi-line content readable in the source.
+
+<h1 id="append-mode">Append Mode</h1>
+
+Sometimes clobbering the file is the wrong outcome. A log of customer reviews, for example, should add a new review at the end and leave the existing ones alone. That's what the `append` flag is for:
+
+```java
+import java.io.FileWriter;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+
+public class AppendReview {
+    public static void main(String[] args) throws IOException {
+        try (FileWriter writer = new FileWriter("reviews.txt", StandardCharsets.UTF_8, true)) {
+            writer.write("4 stars: Comfortable fit, ships fast.\n");
+        }
+        System.out.println("Review added.");
+    }
+}
+```
+
+If `reviews.txt` already has content, the new line is added at the end. If the file doesn't exist, it's created. The `true` argument is the append flag; passing `false` or omitting it would truncate.
+
+Forgetting the append flag is a common bug in I/O code. The symptom is a log file that mysteriously contains only the last entry. The fix is to set the flag once, in the constructor:
+
+```java
+new FileWriter("reviews.txt", StandardCharsets.UTF_8, true);  // append
+new FileWriter("reviews.txt", StandardCharsets.UTF_8, false); // overwrite
+new FileWriter("reviews.txt", StandardCharsets.UTF_8);        // overwrite (default)
+```
+
+There's no way to switch between modes on an open writer. The mode is fixed at construction time.
+
+**What's wrong with this code?**
+
+```java
+for (String review : reviewsToAppend) {
+    try (FileWriter writer = new FileWriter("reviews.txt", StandardCharsets.UTF_8)) {
+        writer.write(review + "\n");
+    }
+}
+```
+
+**Fix:**
+
+```java
+try (FileWriter writer = new FileWriter("reviews.txt", StandardCharsets.UTF_8, true)) {
+    for (String review : reviewsToAppend) {
+        writer.write(review + "\n");
+    }
+}
+```
+
+The original code opens a new `FileWriter` inside the loop without the append flag, which truncates the file on every iteration. Only the last review survives. The fix opens the writer once, in append mode, and writes every review through that single handle. As a side benefit, opening the file once is much faster than opening it once per review.
+
+<h1 id="charset-matters-the-java-11-story">
+  Charset Matters: The Java 11 Story
+</h1>
+
+Before Java 11, `FileReader` and `FileWriter` had no constructor that accepted a `Charset`. They always used the JVM's default charset, which depends on the operating system and locale. On a US English Windows machine, the default might be `Cp1252`. On Linux it's typically `UTF-8`. On older macOS it was `MacRoman`. Writing a file on one machine and reading it on another can produce garbage.
+
+Java 11 added the `Charset`-accepting constructors. Java 18 changed the default platform charset to UTF-8 on every supported OS (JEP 400), which finally made the no-charset constructors safe by default. Pre-Java-18 systems are still common, and code that relies on a default is fragile regardless of the Java version.
+
+The rule for production code: always pass a `Charset` explicitly. The `StandardCharsets` class has constants for the common ones:
+
+| Constant                      | Purpose                                                                      |
+| ----------------------------- | ---------------------------------------------------------------------------- |
+| `StandardCharsets.UTF_8`      | Default choice. Variable-width, ASCII-compatible, handles every language.    |
+| `StandardCharsets.UTF_16`     | UTF-16 with a byte-order mark. Used by some Windows APIs and Java internals. |
+| `StandardCharsets.ISO_8859_1` | Western European, single-byte. Useful for legacy data.                       |
+| `StandardCharsets.US_ASCII`   | Strict ASCII. Anything outside it fails on encode.                           |
+
+The same product description, written with an explicit charset on the way out and read back on the way in:
+
+```java
+import java.io.FileReader;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+
+public class CharsetRoundTrip {
+    public static void main(String[] args) throws IOException {
+        String description = "Café au lait mug. Holds 350 ml.";
+
+        try (FileWriter writer = new FileWriter("mug.txt", StandardCharsets.UTF_8)) {
+            writer.write(description);
+        }
+
+        StringBuilder content = new StringBuilder();
+        try (FileReader reader = new FileReader("mug.txt", StandardCharsets.UTF_8)) {
+            char[] buffer = new char[256];
+            int charsRead;
+            while ((charsRead = reader.read(buffer)) != -1) {
+                content.append(buffer, 0, charsRead);
+            }
+        }
+
+        System.out.println(content);
+    }
+}
+```
+
+The round trip works because both ends agreed on UTF-8. The `é` was encoded to the bytes `C3 A9` on the way out, and decoded back to a single `char` on the way in.
+
+Picking the right charset isn't a performance issue, it's a correctness issue. UTF-8 is the safe default for new files. The cost of guessing wrong is data corruption, which is the most expensive bug there is.
+
+<h1 id="common-encoding-pitfalls">Common Encoding Pitfalls</h1>
+
+Mismatched charsets are a leading source of "weird characters in my file" bugs. The pattern is almost always the same: text written with charset A, read with charset B, and the symbols don't agree.
+
+The diagram shows one specific failure. UTF-8 encodes `é` to the two bytes `C3 A9`. Reading those bytes as Cp1252 causes the decoder to see `C3` and produce `Ã`, then see `A9` and produce `©`. The original four-character word turns into five characters of nonsense. The bytes on disk are untouched; only the interpretation is wrong.
+
+A small program that demonstrates the bug under controlled conditions:
+
+```java
+import java.io.FileReader;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+
+public class CharsetMismatch {
+    public static void main(String[] args) throws IOException {
+        try (FileWriter writer = new FileWriter("multilingual.txt", StandardCharsets.UTF_8)) {
+            writer.write("Café 日本語");
+        }
+
+        StringBuilder content = new StringBuilder();
+        try (FileReader reader = new FileReader("multilingual.txt", StandardCharsets.ISO_8859_1)) {
+            char[] buffer = new char[64];
+            int charsRead;
+            while ((charsRead = reader.read(buffer)) != -1) {
+                content.append(buffer, 0, charsRead);
+            }
+        }
+
+        System.out.println("Read back as ISO-8859-1:");
+        System.out.println(content);
+    }
+}
+```
+
+The file on disk is correct UTF-8. The reader is wrong; it interpreted multi-byte UTF-8 sequences as separate single-byte ISO-8859-1 characters. The fix is to use `StandardCharsets.UTF_8` on the reader too.
+
+A related pitfall: `US_ASCII` is unforgiving. Encoding `Café` with `StandardCharsets.US_ASCII` causes the encoder to hit the `é` and substitute a `?` (or throw, depending on the API used). Picking ASCII for a multilingual product catalog guarantees data loss.
+
+A third pitfall is the byte-order mark, or BOM. UTF-16 files often start with the bytes `FE FF` (big endian) or `FF FE` (little endian) to mark the byte order. `FileReader` with `StandardCharsets.UTF_16` reads the BOM correctly and strips it from the output. `FileReader` with `StandardCharsets.UTF_8` sees the BOM bytes as the literal three-byte sequence `EF BB BF`, leaving a stray invisible character at the start of the string. A "leading zero-width space" in text from a Windows file is usually the UTF-8 BOM.
+
+<h1 id="when-character-streams-are-the-wrong-choice">
+  When Character Streams Are the Wrong Choice
+</h1>
+
+Use character streams for text. Don't use them for binary data. A PNG image, a ZIP archive, a compiled `.class` file, an executable, an encrypted blob: all of these are byte sequences with no character interpretation. Pushing those bytes through a charset decoder corrupts them. Bytes that don't form valid sequences in the decoder's charset get replaced with `U+FFFD` (the replacement character) with no warning, and any "round trip" ends up with a different file than the original.
+
+The rule: if the file is readable in a text editor, use `FileReader` / `FileWriter`. If opening it in a text editor produces a screen of `??????` or random punctuation, use `FileInputStream` / `FileOutputStream` and treat the contents as bytes.
+
+```java
+// Wrong: corrupts the image
+try (FileReader reader = new FileReader("product-photo.png", StandardCharsets.UTF_8)) {
+    // ...
+}
+
+// Right: bytes in, bytes out, no decoding
+try (FileInputStream in = new FileInputStream("product-photo.png")) {
+    // ...
+}
+```
+
+The first version sends each byte through the UTF-8 decoder. Most byte values in a PNG are not valid UTF-8 sequences, so the decoder replaces them, and the "characters" returned have no relationship to the file's actual bytes. Writing them back out produces a broken image. The second version reads the bytes as-is. No decoder, no corruption.
+
+<h1 id="flush-and-close">flush() and close()</h1>
+
+`FileWriter` (like all `Writer` subclasses) inherits `flush()` and `close()`. They do different things:
+
+- `flush()` forces any buffered output to be written to the underlying stream. `FileWriter` itself doesn't buffer much, but its decoder and the underlying `FileOutputStream` may. For long-running writers that need data on disk at specific checkpoints, call `flush()` after a logical unit of work.
+- `close()` flushes any remaining data, then releases the file handle. After `close()`, the writer can't be used.
+
+With try-with-resources, `close()` runs automatically at the end of the block. Calling `flush()` separately is rarely needed unless data must be visible to other processes mid-stream without ending the writer.
+
+```java
+import java.io.FileWriter;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+
+public class FlushExample {
+    public static void main(String[] args) throws IOException {
+        try (FileWriter writer = new FileWriter("session-log.txt", StandardCharsets.UTF_8, true)) {
+            writer.write("Customer logged in.\n");
+            writer.flush();  // make it visible immediately
+
+            // ... slow work that takes a while ...
+
+            writer.write("Customer added item to cart.\n");
+            // close() at end of block will flush again
+        }
+    }
+}
+```
+
+If the program crashes after the first `write` but before the second, the explicit `flush` makes sure the first line is on disk. Without the `flush`, the first line might still be sitting in a buffer when the crash happens, and it would be lost.
+
+For most short-lived programs (write a file, close it, exit), try-with-resources is enough. The explicit `flush` is a tool for long-running writers and checkpointing workflows.
+
+<h1 id="a-brief-note-on-buffering">A Brief Note on Buffering</h1>
+
+One detail in the read examples: even with a 1024-character buffer, the basic `FileReader` model is doing one read at a time through the decoder. There's no internal buffer that pre-fetches a big chunk from disk. Each call to `read()` ends up making a small read on the underlying byte stream.
+
+That's where `BufferedReader` and `BufferedWriter` come in. They wrap a `Reader` or `Writer` and add an in-memory buffer that batches reads and writes. They also add line-oriented helpers like `readLine()`, which is the more common need when processing text files.
+
+Bare `FileReader` and `FileWriter` are correct, but they're rarely the fastest choice. Wrapping them in a buffered counterpart is a one-line change that gives a large speedup.
+
+<h1 id="putting-it-together">Putting It Together</h1>
+
+A small end-to-end example that writes a multilingual product catalog and reads it back. Each product name has accented or non-Latin characters, so the charset choice really matters.
+
+```java
+import java.io.FileReader;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+
+public class ProductCatalog {
+    public static void main(String[] args) throws IOException {
+        String catalog = """
+                Café au lait mug
+                Naïve traveler journal
+                日本語 phrasebook
+                Crème brûlée torch
+                """;
+
+        try (FileWriter writer = new FileWriter("catalog.txt", StandardCharsets.UTF_8)) {
+            writer.write(catalog);
+        }
+
+        StringBuilder content = new StringBuilder();
+        try (FileReader reader = new FileReader("catalog.txt", StandardCharsets.UTF_8)) {
+            char[] buffer = new char[512];
+            int charsRead;
+            while ((charsRead = reader.read(buffer)) != -1) {
+                content.append(buffer, 0, charsRead);
+            }
+        }
+
+        System.out.println("Catalog contents:");
+        System.out.print(content);
+    }
+}
+```
+
+Both ends agree on UTF-8, every character round-trips correctly, and the program is short enough to fit on one screen. Swap either charset to something else and at least one product name comes back wrong.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

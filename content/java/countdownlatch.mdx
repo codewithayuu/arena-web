@@ -1,0 +1,491 @@
+---
+title: "CountDownLatch"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "CountDownLatch explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+A `Semaphore` controls how many threads can be inside a section at the same time. The latch is a different shape. It doesn't gate access to anything. It gates time: nobody passes the gate until a counted set of events has happened.
+
+<h1 id="what-a-latch-counts">What a Latch Counts</h1>
+
+The constructor takes a non-negative `int`. That number is the initial count.
+
+```java
+import java.util.concurrent.CountDownLatch;
+
+public class FirstLatch {
+    public static void main(String[] args) {
+        CountDownLatch gate = new CountDownLatch(3);
+        System.out.println("Initial count: " + gate.getCount());
+        gate.countDown();
+        gate.countDown();
+        System.out.println("After two countDowns: " + gate.getCount());
+        gate.countDown();
+        System.out.println("After three countDowns: " + gate.getCount());
+        gate.countDown();
+        System.out.println("Extra countDown is ignored: " + gate.getCount());
+    }
+}
+```
+
+The count starts at the value passed to the constructor. Each `countDown()` subtracts one. Once it reaches zero, additional `countDown` calls become no-ops; the count stays at zero rather than going negative. That last property lets the latch behave predictably when threads call `countDown` more times than planned. It still won't reopen, but it won't throw either.
+
+`await()` is the other side of the contract. A thread that calls `await()` blocks until the count is zero. If the count is already zero, `await()` returns immediately. There is no exception, no fallthrough delay. It just returns.
+
+```java
+import java.util.concurrent.CountDownLatch;
+
+public class AwaitImmediate {
+    public static void main(String[] args) throws InterruptedException {
+        CountDownLatch alreadyOpen = new CountDownLatch(0);
+        long start = System.nanoTime();
+        alreadyOpen.await();
+        long elapsedMicros = (System.nanoTime() - start) / 1_000;
+        System.out.println("await returned in " + elapsedMicros + " microseconds");
+    }
+}
+```
+
+The exact number varies. A latch built with `0` is already open. Any `await()` on it returns immediately. This edge case handles "what if no work needs to happen" code paths cleanly. A zero-count latch can be passed around as a "wait for this thing that already happened" placeholder without a special branch.
+
+The diagram lays out the lifecycle. The count walks down from its starting value, one `countDown` at a time. The moment it touches zero, every thread parked on `await` is released. After that, the latch is spent. It cannot be rewound. For a barrier that can be reset, see `CyclicBarrier`.
+
+<h1 id="pattern-1-the-finish-gate">Pattern 1: The Finish Gate</h1>
+
+The most common use of a latch is "wait for N things to be done." The main thread builds a latch with N as the count, fires off N workers, each worker calls `countDown()` when it finishes, and the main thread calls `await()`. When all N workers have reported in, the count hits zero, and `await` returns.
+
+The setup is an e-commerce service starting up. Before the storefront accepts orders, the product catalog, the pricing service, and the inventory service all have to warm up. Each one takes a different amount of time. The application can't open the door until all three are ready.
+
+```java
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+public class StartupFinishGate {
+
+    public static void main(String[] args) throws InterruptedException {
+        CountDownLatch ready = new CountDownLatch(3);
+        ExecutorService warmupPool = Executors.newFixedThreadPool(3);
+
+        warmupPool.submit(new WarmupTask("Catalog", 800, ready));
+        warmupPool.submit(new WarmupTask("Pricing", 1200, ready));
+        warmupPool.submit(new WarmupTask("Inventory", 600, ready));
+
+        System.out.println("Main: waiting for all services to warm up...");
+        ready.await();
+        System.out.println("Main: all services ready. Accepting orders.");
+
+        warmupPool.shutdown();
+    }
+
+    static class WarmupTask implements Runnable {
+        private final String name;
+        private final long warmupMillis;
+        private final CountDownLatch ready;
+
+        WarmupTask(String name, long warmupMillis, CountDownLatch ready) {
+            this.name = name;
+            this.warmupMillis = warmupMillis;
+            this.ready = ready;
+        }
+
+        @Override
+        public void run() {
+            try {
+                System.out.println(name + ": warming up...");
+                TimeUnit.MILLISECONDS.sleep(warmupMillis);
+                System.out.println(name + ": ready.");
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                ready.countDown();
+            }
+        }
+    }
+}
+```
+
+The output order of the three workers depends on which threads the scheduler runs first, but the structure is fixed. The main thread parks on `ready.await()`. Each worker runs its warmup, then calls `ready.countDown()`. When the slowest worker (`Pricing`, at 1200ms) finishes and calls `countDown()`, the count hits zero, and `await` returns. The main thread prints `Accepting orders.` and the storefront is live.
+
+The `countDown()` call lives inside a `finally` block. That is the discipline to keep. If `Pricing` throws mid-warmup with a runtime exception, the `finally` still fires, the count still drops, the latch still opens.
+
+The shape of this pattern is consistent regardless of how many workers there are:
+
+One main thread waits. N workers run in parallel. Each worker reports its completion through the latch. The main thread is released only after all workers have reported. The latch is the rendezvous point.
+
+This is sometimes called a "barrier" in casual conversation, but the latch is one-directional. The main thread is the only one waiting. The workers don't wait for each other; they finish independently and tick the count down. That asymmetry makes it lightweight and easy to reason about.
+
+`await()` parks the calling thread efficiently. It does not spin. The thread is descheduled until the count reaches zero, so the main thread is not burning CPU while it waits. Each `countDown()` is a small CAS-style decrement and an LockSupport-style wake-up of waiters once the count hits zero, so the fixed cost of the latch itself is tiny compared to the work being coordinated.
+
+<h1 id="pattern-2-the-start-gate">Pattern 2: The Start Gate</h1>
+
+The latch also works in the opposite direction. Instead of the main thread waiting for many workers, all the workers wait for the main thread to flip one switch. This is a start gate: a way to release N workers at exactly the same instant.
+
+The use case is a load test against your e-commerce API. You want 50 threads to hit the checkout endpoint simultaneously to see how the system handles concurrent traffic. If you start them one by one with `submit()`, the first thread gets a head start while you're still preparing the 50th. The load you measure is staggered, not simultaneous. The fix is to have every worker block on a latch built with count `1`, set up the world, then have the main thread call `countDown()` once. All 50 workers wake up together.
+
+```java
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class LoadTestStartGate {
+
+    public static void main(String[] args) throws InterruptedException {
+        int workerCount = 5;
+        CountDownLatch startSignal = new CountDownLatch(1);
+        CountDownLatch doneSignal = new CountDownLatch(workerCount);
+        AtomicInteger requestsSent = new AtomicInteger();
+
+        ExecutorService pool = Executors.newFixedThreadPool(workerCount);
+
+        for (int i = 1; i <= workerCount; i++) {
+            pool.submit(new CheckoutClient(i, startSignal, doneSignal, requestsSent));
+        }
+
+        System.out.println("Main: workers staged, sleeping briefly so they all reach await");
+        TimeUnit.MILLISECONDS.sleep(200);
+
+        System.out.println("Main: releasing the gate, go go go");
+        long start = System.nanoTime();
+        startSignal.countDown();
+
+        doneSignal.await();
+        long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+
+        System.out.println("Main: " + requestsSent.get() + " checkouts in "
+            + elapsedMillis + " ms");
+
+        pool.shutdown();
+    }
+
+    static class CheckoutClient implements Runnable {
+        private final int id;
+        private final CountDownLatch startSignal;
+        private final CountDownLatch doneSignal;
+        private final AtomicInteger requestsSent;
+
+        CheckoutClient(int id,
+                       CountDownLatch startSignal,
+                       CountDownLatch doneSignal,
+                       AtomicInteger requestsSent) {
+            this.id = id;
+            this.startSignal = startSignal;
+            this.doneSignal = doneSignal;
+            this.requestsSent = requestsSent;
+        }
+
+        @Override
+        public void run() {
+            try {
+                System.out.println("Client " + id + ": waiting at the gate");
+                startSignal.await();
+                System.out.println("Client " + id + ": gate open, sending checkout");
+                TimeUnit.MILLISECONDS.sleep(50);
+                requestsSent.incrementAndGet();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                doneSignal.countDown();
+            }
+        }
+    }
+}
+```
+
+Two latches in one program is a common shape. `startSignal` is the start gate; the count is 1, the workers all `await` on it, and the main thread releases them with a single `countDown`. `doneSignal` is the finish gate from the previous pattern; the count is 5, each worker `countDown`s it when its checkout completes, and the main thread waits for all five to report. Together they bracket the measurement. The main thread knows the test starts at the moment of `countDown` and ends at the moment `doneSignal.await()` returns.
+
+The 200ms sleep before flipping the start gate is a small concession to reality. Workers might not have reached `await` yet by the time the main thread is ready to release them. The sleep is one cheap way to give every worker time to park. A more rigorous approach uses a third latch, a "ready" latch that workers `countDown` once they've reached the gate, so the main thread knows everyone is in position. For load tests of 5 workers, the sleep is fine; for production-grade test harnesses, the third-latch pattern is cleaner.
+
+The diagram makes the symmetry visible. The main thread sits on top, the two latches hang off it, and the workers thread through both gates. Every worker waits on the start gate, runs its work, then ticks the finish gate. The main thread releases the start gate and then waits on the finish gate. Two latches form a sandwich around the parallel work.
+
+One latch can be used for both ends, but it gets awkward. Two latches let each side own one direction of the handshake, and the code reads cleanly without comments explaining which counter is for what.
+
+<h1 id="whats-wrong-missing-the-exception-path">
+  What's Wrong: Missing the Exception Path
+</h1>
+
+Latches are simple. The bug pattern that hangs programs forever is even simpler. If a worker is supposed to call `countDown()` once but skips the call on an exception path, the count never reaches zero and `await()` never returns.
+
+**What's wrong with this code?**
+
+```java
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+public class HangingFinishGate {
+
+    public static void main(String[] args) throws InterruptedException {
+        CountDownLatch ready = new CountDownLatch(3);
+        ExecutorService pool = Executors.newFixedThreadPool(3);
+
+        pool.submit(() -> warmup("Catalog", 0, ready));
+        pool.submit(() -> warmup("Pricing", 1, ready));
+        pool.submit(() -> warmup("Inventory", 0, ready));
+
+        System.out.println("Main: waiting for all services...");
+        ready.await();
+        System.out.println("Main: ready");
+        pool.shutdown();
+    }
+
+    static void warmup(String name, int failChance, CountDownLatch ready) {
+        System.out.println(name + ": warming up");
+        if (failChance == 1) {
+            throw new RuntimeException(name + " warmup failed");
+        }
+        ready.countDown();
+        System.out.println(name + ": done");
+    }
+}
+```
+
+The `Pricing` worker throws before reaching `ready.countDown()`. The count starts at 3, the other two workers each subtract 1, and the count stalls at 1 forever. The main thread is parked on `ready.await()` and never wakes up. The pool keeps its threads alive because the main thread never reaches `pool.shutdown()`. The JVM keeps running because non-daemon threads are still alive. The program hangs.
+
+The output is something like:
+
+```text
+Main: waiting for all services...
+Catalog: warming up
+Pricing: warming up
+Inventory: warming up
+Exception in thread "pool-1-thread-2" java.lang.RuntimeException: Pricing warmup failed
+    at ...
+Catalog: done
+Inventory: done
+(here the program hangs forever)
+```
+
+The exception is printed (because uncaught exceptions in pool threads end up at the default handler), but the program doesn't exit. Two workers finished. One died without ticking the latch. The main thread is parked on the latch and will be parked for as long as the JVM stays alive.
+
+**Fix:** Put the `countDown` in a `finally` block, so it runs whether the worker succeeded or threw.
+
+```java
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+public class SafeFinishGate {
+
+    public static void main(String[] args) throws InterruptedException {
+        CountDownLatch ready = new CountDownLatch(3);
+        ExecutorService pool = Executors.newFixedThreadPool(3);
+
+        pool.submit(() -> warmup("Catalog", 0, ready));
+        pool.submit(() -> warmup("Pricing", 1, ready));
+        pool.submit(() -> warmup("Inventory", 0, ready));
+
+        System.out.println("Main: waiting for all services...");
+        ready.await();
+        System.out.println("Main: ready (some workers may have failed)");
+        pool.shutdown();
+    }
+
+    static void warmup(String name, int failChance, CountDownLatch ready) {
+        try {
+            System.out.println(name + ": warming up");
+            if (failChance == 1) {
+                throw new RuntimeException(name + " warmup failed");
+            }
+            System.out.println(name + ": done");
+        } catch (RuntimeException e) {
+            System.out.println(name + ": failed, releasing latch anyway");
+        } finally {
+            ready.countDown();
+        }
+    }
+}
+```
+
+`finally` is the contract that the latch needs from every worker. Each worker says "I will tick the count down exactly once, no matter what." With that, the latch behaves predictably: the count goes from 3 to 0, the main thread wakes up, and the program exits cleanly. The fixed code says `ready (some workers may have failed)` because the latch doesn't tell you whether the work succeeded, only that it finished. For success/failure information per worker, use `Future` and `CompletableFuture`; the latch is purely a counter.
+
+The same rule applies to start gates. If a start gate is built and then the main thread throws before calling `countDown` on it, every worker is parked forever. Put the start gate `countDown` in a `finally` (or, if the main thread is doing setup that could fail, wrap the setup in try/catch and call `countDown` either way).
+
+<h1 id="timing-out-awaittimeout-unit">Timing Out: await(timeout, unit)</h1>
+
+`await()` blocks forever. If the workers stall or deadlock, the main thread is stuck with them. Most production code needs a deadline. The timed overload `await(long timeout, TimeUnit unit)` returns a `boolean`: `true` if the count reached zero before the timeout, `false` if the timeout expired first.
+
+```java
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+public class WarmupWithTimeout {
+
+    public static void main(String[] args) throws InterruptedException {
+        CountDownLatch ready = new CountDownLatch(3);
+        ExecutorService pool = Executors.newFixedThreadPool(3);
+
+        pool.submit(() -> slowWarmup("Catalog", 200, ready));
+        pool.submit(() -> slowWarmup("Pricing", 5000, ready));
+        pool.submit(() -> slowWarmup("Inventory", 300, ready));
+
+        System.out.println("Main: waiting up to 2 seconds...");
+        boolean allReady = ready.await(2, TimeUnit.SECONDS);
+
+        if (allReady) {
+            System.out.println("Main: all services ready, opening storefront");
+        } else {
+            System.out.println("Main: timed out, "
+                + ready.getCount() + " service(s) still warming up. Aborting startup.");
+        }
+
+        pool.shutdownNow();
+    }
+
+    static void slowWarmup(String name, long warmupMillis, CountDownLatch ready) {
+        try {
+            TimeUnit.MILLISECONDS.sleep(warmupMillis);
+            System.out.println(name + ": ready");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            System.out.println(name + ": interrupted before warmup finished");
+        } finally {
+            ready.countDown();
+        }
+    }
+}
+```
+
+The main thread waits up to 2 seconds. `Catalog` and `Inventory` finish well within that window. `Pricing` is configured to take 5 seconds, so the timeout fires before it reports. `await(2, TimeUnit.SECONDS)` returns `false`, and the main thread takes the failure path: log what's still missing, call `pool.shutdownNow()` to interrupt the stragglers, and bail out. Without the timeout, the program would have waited a full 5 seconds at minimum, plus however long the rest of the startup logic takes.
+
+A few things to be careful about with timed `await`:
+
+| Aspect                    | Detail                                                                                     |
+| ------------------------- | ------------------------------------------------------------------------------------------ |
+| Return value              | `true` if count reached zero, `false` on timeout                                           |
+| Spurious wake-up handling | Loop if doing partial waits with shorter timeouts; the single call doesn't loop on its own |
+| Interrupt                 | Throws `InterruptedException` like the un-timed `await`                                    |
+| After timeout             | The latch is still alive; call `await` again, check `getCount()`, or ignore it and move on |
+| Timeout of 0              | Polls once and returns immediately; effectively a "is this latch open yet" check           |
+
+The last row is a small but useful trick. `await(0, TimeUnit.NANOSECONDS)` returns `true` if the count is already zero and `false` otherwise, without blocking. It is not the most readable way to write that check (`getCount() == 0` is clearer), but it shows up in code that wants the symmetry of always using `await`.
+
+Picking a timeout matters. Too short, and a startup that would have finished a hair later is aborted. Too long, and the service is stuck in a non-responsive state when something is actually wrong. A common pattern is to pick a timeout that is 2-3x the slowest worker's expected warmup time, so brief slowdowns don't trip it but a stuck worker eventually does.
+
+<h1 id="latch-versus-the-tools-around-it">Latch Versus the Tools Around It</h1>
+
+Two questions come up every time someone learns about `CountDownLatch`. The first is "why not just `join()` the worker threads?" The second is "isn't this just a `Semaphore` with a starting count of zero?"
+
+`Thread.join()` does work for the finish-gate pattern. You can start three threads and have the main thread `t1.join(); t2.join(); t3.join();`. The reasons to use a latch instead are about flexibility. `join()` only works on a `Thread` you have a reference to; if your workers run on an `ExecutorService`, you don't get the thread back. `join()` also doesn't compose with start gates, where the wait happens on the workers' side. And `join()` ties the lifetime of the wait to the lifetime of the thread, so if a worker hands off its work to another thread before finishing, `join` returns prematurely. The latch decouples the "signal of done" from the thread that ran the work.
+
+`Semaphore` and `CountDownLatch` look similar from a distance because both wrap a counter. They are shaped differently. A semaphore's count goes up and down; threads call `acquire` to take a permit and `release` to give one back. The interesting behavior is the counter as inventory. A latch's count only goes down, and there is no concept of giving one back. The interesting behavior is the moment the counter crosses zero, which releases waiters. Modeling "wait for N events" with a semaphore by starting with zero permits and calling `release` N times technically works but reads oddly, because semaphores are not usually written to be exhausted as a milestone.
+
+| Tool             | Resettable                             | Symmetric                                      | Best for                                                       |
+| ---------------- | -------------------------------------- | ---------------------------------------------- | -------------------------------------------------------------- |
+| `CountDownLatch` | No                                     | No (one side `await`s, the other `countDown`s) | Wait for N events to happen once, or release N threads at once |
+| `CyclicBarrier`  | Yes                                    | Yes (all N threads call `await`)               | Synchronizing N threads at repeated phases                     |
+| `Semaphore`      | Yes (you `release` what you `acquire`) | Yes (any thread can call either method)        | Capping concurrent access to a resource                        |
+| `Thread.join`    | N/A                                    | No                                             | Waiting for one specific thread you own                        |
+
+The table covers the practical decision points. For a one-shot wait for N events, use `CountDownLatch`. To synchronize the same threads repeatedly (start of round 1, start of round 2, start of round 3), use `CyclicBarrier`. To ration access to a pool of N resources, use `Semaphore`. For a single thread that you started and want to wait for specifically, use `Thread.join`. These tools overlap in places, but the natural fit usually picks itself once the shape of the waiting is written out.
+
+The decision tree is rough, not absolute. Two tools sometimes layer for one problem (a `CountDownLatch` plus a `Semaphore` is common in load tests, where the latch coordinates start and the semaphore caps in-flight requests). But the tree picks the primary tool for most cases.
+
+<h1 id="putting-both-patterns-together">Putting Both Patterns Together</h1>
+
+A small program that uses both a start gate and a finish gate, modeling a tiny e-commerce load test. The main thread releases all clients at once with a start gate, waits for all of them to finish with a finish gate, and prints how long the burst took.
+
+```java
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+
+public class CheckoutBurst {
+
+    public static void main(String[] args) throws InterruptedException {
+        int clientCount = 8;
+
+        CountDownLatch readyToFire = new CountDownLatch(clientCount);
+        CountDownLatch fireSignal = new CountDownLatch(1);
+        CountDownLatch finished = new CountDownLatch(clientCount);
+
+        AtomicInteger successCount = new AtomicInteger();
+        AtomicLong totalLatencyMicros = new AtomicLong();
+
+        ExecutorService pool = Executors.newFixedThreadPool(clientCount);
+        for (int i = 1; i <= clientCount; i++) {
+            final int id = i;
+            pool.submit(() -> runClient(id, readyToFire, fireSignal, finished,
+                successCount, totalLatencyMicros));
+        }
+
+        readyToFire.await();
+        System.out.println("Main: all 8 clients staged");
+
+        long startNanos = System.nanoTime();
+        fireSignal.countDown();
+        System.out.println("Main: fired the gate");
+
+        boolean allDone = finished.await(5, TimeUnit.SECONDS);
+        long elapsedMillis = (System.nanoTime() - startNanos) / 1_000_000;
+
+        if (allDone) {
+            long avgMicros = totalLatencyMicros.get() / Math.max(1, successCount.get());
+            System.out.println("Main: " + successCount.get() + "/" + clientCount
+                + " succeeded in " + elapsedMillis + " ms, avg latency "
+                + avgMicros + " micros");
+        } else {
+            System.out.println("Main: only " + (clientCount - finished.getCount())
+                + " of " + clientCount + " finished before timeout");
+        }
+
+        pool.shutdown();
+    }
+
+    static void runClient(int id,
+                          CountDownLatch readyToFire,
+                          CountDownLatch fireSignal,
+                          CountDownLatch finished,
+                          AtomicInteger successCount,
+                          AtomicLong totalLatencyMicros) {
+        try {
+            readyToFire.countDown();
+            fireSignal.await();
+
+            long clientStart = System.nanoTime();
+            TimeUnit.MILLISECONDS.sleep(20 + (id * 5L));
+            long elapsedMicros = (System.nanoTime() - clientStart) / 1_000;
+
+            successCount.incrementAndGet();
+            totalLatencyMicros.addAndGet(elapsedMicros);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } finally {
+            finished.countDown();
+        }
+    }
+}
+```
+
+There are three latches in this program, each owning one piece of the choreography. `readyToFire` is a finish gate from the worker side: each worker ticks it as it reaches the gate, so the main thread knows when all eight are staged. `fireSignal` is the start gate: the main thread holds it closed, then opens it with one `countDown` to release all eight clients simultaneously. `finished` is the second finish gate, the conventional one: each worker ticks it on the way out, the main thread waits on it with a 5-second timeout. The two metrics (`successCount`, `totalLatencyMicros`) are kept as atomic counters because all eight workers update them concurrently.
+
+The numbers tell the story. All eight clients reported in, the burst took 61 milliseconds end to end, and the average per-client latency was 42.5 milliseconds, which lines up with the workload (20 + id\*5 ms each). The latches give you a clean start, a clean end, and a clean failure mode if the burst hangs.
+
+The diagram walks the burst from staging through reporting. Each phase boundary is a latch event. With the shape in place, more latches can be added for more boundaries (a "warmup phase complete" latch before staging, a "cool-down complete" latch after finishing) without changing the basic mechanism.
+
+<h1 id="the-limits-of-a-one-shot-gate">The Limits of a One-Shot Gate</h1>
+
+Two limits are worth remembering before using a latch.
+
+**A latch is one-shot.** Once the count is zero, it stays at zero. It cannot be reset, reopened, or reused. For a problem like "synchronize the same group of threads at the start of each round of a multi-round simulation," use `CyclicBarrier`. The barrier is built around the same N-thread rendezvous idea, but it resets when the rendezvous completes, so the next round can use the same barrier.
+
+**The count is fixed at construction.** The initial count cannot be added to or subtracted from after the fact. If a fourth worker turns up midway through, the latch cannot be told "wait for one more." Build a new latch with the new count, or redesign the coordination. This is occasionally annoying when worker count is dynamic; in those cases `Phaser` (which this course does not cover) or `CompletableFuture.allOf` for arbitrary collections of futures fits better.
+
+Inside those two limits, the latch fits "wait for N events to happen once" or "release N threads at once." Bending something else into those shapes (a semaphore with zero permits, a busy-wait on a `volatile` counter, a wall of `Thread.join` calls) usually ends up reinventing the latch with more code and more bugs.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

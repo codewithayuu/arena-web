@@ -1,0 +1,525 @@
+---
+title: "Connecting to Database"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Connecting to Database explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="what-a-jdbc-connection-actually-is">
+  What a JDBC Connection Actually Is
+</h1>
+
+A JDBC `Connection` is the handle your program holds onto an open session with a database. Internally, the driver has opened a TCP socket to the database server (or attached to an in-process engine, in the case of H2 in memory), gone through an authentication exchange, negotiated a protocol version, and reserved server-side resources to track your session: a transaction, a default schema, a set of prepared statements, locks you hold, and so on. None of that is free.
+
+The `Connection` object is your way of using that session. Through it you create statements, run queries, control transactions, and ask the database about itself. When you close the connection, the driver tears down the session, and the server releases everything it was tracking on your behalf.
+
+The diagram shows what happens when you call `DriverManager.getConnection`. `DriverManager` is the broker. It scans the URL, picks the registered driver that recognizes the prefix (`jdbc:h2:`, `jdbc:postgresql:`, etc.), and asks that driver to open the actual session. Once the session is ready, the driver returns a `Connection` object you can use.
+
+Opening a JDBC connection is expensive. For a remote database, you pay for a TCP handshake, a TLS handshake if the URL uses SSL, authentication, and any per-session setup the server does. On a typical cloud database this is often 30 to 200 ms before your first query. Reuse connections aggressively, or use a pool.
+
+<h1 id="the-drivermanagergetconnection-overloads">
+  The DriverManager.getConnection Overloads
+</h1>
+
+`DriverManager` has three overloads of `getConnection`. They differ in how credentials and connection options are passed.
+
+<h3 id="overload-1-url-only">Overload 1: URL Only</h3>
+
+The shortest form takes just the JDBC URL. Use this when the URL itself encodes everything the driver needs, or when no authentication is required. H2 in memory falls into that bucket: there's no user account to verify.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+
+public class ConnectUrlOnly {
+    public static void main(String[] args) throws Exception {
+        String url = "jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1";
+
+        Connection conn = DriverManager.getConnection(url);
+        System.out.println("Connected: " + !conn.isClosed());
+        System.out.println("Catalog:   " + conn.getCatalog());
+        conn.close();
+    }
+}
+```
+
+The URL `jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1` says three things. `jdbc:h2:` picks the H2 driver. `mem:shop` means "an in-memory database named `shop`," which lives only as long as the JVM (and only as long as someone holds a connection, normally). The `DB_CLOSE_DELAY=-1` setting tells H2 to keep the database alive even when every connection is closed, so multiple `main` runs in the same JVM see the same data. We use that URL throughout the lesson so you can run any snippet on its own.
+
+<h3 id="overload-2-url-user-password">Overload 2: URL + User + Password</h3>
+
+The second overload separates the username and password from the URL. This is the form to use against a real database, because embedding credentials in the URL leaks them into logs, exception messages, and stack traces.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+
+public class ConnectWithCredentials {
+    public static void main(String[] args) throws Exception {
+        String url      = "jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1";
+        String user     = "sa";          // H2 default user.
+        String password = "";            // H2 default password is empty.
+
+        Connection conn = DriverManager.getConnection(url, user, password);
+        System.out.println("Connected as: " + conn.getMetaData().getUserName());
+        conn.close();
+    }
+}
+```
+
+H2's default account is `sa` with no password, which is why the snippet works. Against PostgreSQL or MySQL you'd pass real credentials here. The driver sends the username and password to the server during the authentication step of the handshake, and the server decides whether to accept the session.
+
+Sending the password on every connection is fine for one session but adds up if you reopen connections for each request. A pool keeps the authenticated session open and hands it out to whichever request needs it, which avoids paying for authentication every time.
+
+<h3 id="overload-3-url-properties">Overload 3: URL + Properties</h3>
+
+The third overload is the one to use when you need more than user and password. You build a `java.util.Properties` object with named options and pass it in. Each driver documents the keys it recognizes; `user` and `password` are standard across all drivers.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.util.Properties;
+
+public class ConnectWithProperties {
+    public static void main(String[] args) throws Exception {
+        String url = "jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1";
+
+        Properties props = new Properties();
+        props.setProperty("user", "sa");
+        props.setProperty("password", "");
+        // Driver-specific options would go here, for example:
+        //   props.setProperty("useSSL", "true");
+        //   props.setProperty("characterEncoding", "UTF-8");
+        //   props.setProperty("connectTimeout", "2000");
+
+        Connection conn = DriverManager.getConnection(url, props);
+        System.out.println("Connected with " + props.size() + " properties");
+        System.out.println("Auto-commit: " + conn.getAutoCommit());
+        conn.close();
+    }
+}
+```
+
+Why bother with `Properties` when overload 2 already handles user and password? Three reasons. First, real drivers expose dozens of options that have no place in a URL: SSL settings, character encoding, connection timeout, socket buffer sizes, application name, statement caching limits. Second, building a `Properties` map composes well with configuration files; you load `application.properties` and pass it straight in. Third, the URL stays short and readable when complex options live in a separate object.
+
+The commented-out lines show the most common option keys against PostgreSQL or MySQL. `useSSL=true` forces a TLS handshake. `characterEncoding=UTF-8` makes sure non-ASCII strings round-trip cleanly. `connectTimeout=2000` bounds the TCP handshake at two seconds so a dead server fails fast instead of hanging. The exact keys vary by driver, so check the driver docs for the database you're using.
+
+<h1 id="the-connection-interface">The Connection Interface</h1>
+
+`java.sql.Connection` is the type you get back from `getConnection`. It's an interface, so the actual object is a driver-specific class that implements it. What matters is what the interface promises, because your code only ever talks to the interface.
+
+| Method                   | What it does                                                          | Covered in                     |
+| ------------------------ | --------------------------------------------------------------------- | ------------------------------ |
+| `createStatement()`      | Returns a `Statement` for one-off SQL strings.                        | Lesson 4 (Statement Interface) |
+| `prepareStatement(sql)`  | Returns a `PreparedStatement` with placeholders you bind values to.   | Lesson 5 (PreparedStatement)   |
+| `prepareCall(sql)`       | Returns a `CallableStatement` for stored procedures.                  | Lesson 6 (CallableStatement)   |
+| `setAutoCommit(boolean)` | Switches between "commit every statement" and "commit on my command." | Lesson 8 (Transactions)        |
+| `commit()`               | Commits the current transaction.                                      | Lesson 8 (Transactions)        |
+| `rollback()`             | Rolls back the current transaction.                                   | Lesson 8 (Transactions)        |
+| `close()`                | Ends the session and releases server-side resources.                  | This lesson                    |
+| `getMetaData()`          | Returns a `DatabaseMetaData` describing the database.                 | This lesson                    |
+| `isClosed()`             | Returns `true` if `close()` was called on this connection.            | This lesson                    |
+| `isValid(int)`           | Returns `true` if the connection is still usable, with a timeout.     | This lesson                    |
+
+The first three methods are how you actually run SQL. The remaining four are housekeeping methods you'll use right next to `getConnection`, so we'll cover them here.
+
+<h3 id="close-isclosed-and-isvalid">close(), isClosed(), and isValid()</h3>
+
+`close()` is the most important of the three. It tells the driver "I'm done with this session," and the driver tears down the network connection, releases server-side memory, and clears any uncommitted transaction (most drivers roll it back, though the spec is fuzzy about this). After `close()`, almost every other method on the connection throws `SQLException` if you call it.
+
+`isClosed()` tells you whether `close()` has been called on this connection object. It does **not** check whether the underlying network connection is still healthy. A connection can be open from your side, while the database has long since killed it because of an idle timeout or a server restart. `isClosed()` will happily return `false` for that dead connection.
+
+`isValid(int timeoutSeconds)` is the method that actually pings the database. The driver sends a small no-op (often `SELECT 1`) and waits up to the given number of seconds for a reply. If the round trip succeeds within the timeout, `isValid` returns `true`; otherwise `false`. Pools use this to weed out dead connections before handing them to your code.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+
+public class ConnectionLifecycle {
+    public static void main(String[] args) throws Exception {
+        Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1");
+
+        System.out.println("isClosed before: " + conn.isClosed());
+        System.out.println("isValid(2):      " + conn.isValid(2));
+
+        conn.close();
+
+        System.out.println("isClosed after:  " + conn.isClosed());
+        System.out.println("isValid(2):      " + conn.isValid(2));
+    }
+}
+```
+
+The contract for `isValid` after `close` is that it must return `false`, which the output confirms. The two methods answer different questions: `isClosed` is "did I (the caller) close this?", and `isValid` is "is this connection actually usable right now?"
+
+Calling `isValid` is a round trip to the database. Don't call it before every single query; that doubles your network traffic. Pools call it once when checking a connection out and rely on it being healthy through the rest of the borrow.
+
+<h3 id="getmetadata">getMetaData()</h3>
+
+`getMetaData()` returns a `DatabaseMetaData` object that describes the database and the driver. You'll use it most often to log what you're connected to, to write code that adapts to the database vendor, or to introspect schemas for tooling.
+
+```java
+import java.sql.Connection;
+import java.sql.DatabaseMetaData;
+import java.sql.DriverManager;
+
+public class ConnectionInfo {
+    public static void main(String[] args) throws Exception {
+        Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1");
+
+        DatabaseMetaData meta = conn.getMetaData();
+        System.out.println("Database:     " + meta.getDatabaseProductName()
+                + " " + meta.getDatabaseProductVersion());
+        System.out.println("Driver:       " + meta.getDriverName()
+                + " " + meta.getDriverVersion());
+        System.out.println("JDBC version: " + meta.getJDBCMajorVersion()
+                + "." + meta.getJDBCMinorVersion());
+        System.out.println("URL:          " + meta.getURL());
+        System.out.println("Username:     " + meta.getUserName());
+
+        conn.close();
+    }
+}
+```
+
+**Output (versions will vary by H2 release):**
+
+```text
+Database:     H2 2.2.224 (2023-09-17)
+Driver:       H2 JDBC Driver 2.2.224 (2023-09-17)
+JDBC version: 4.3
+URL:          jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1
+Username:     SA
+```
+
+The methods on `DatabaseMetaData` cover a lot of ground. Beyond product name and driver name, you can list tables, list columns, ask whether the database supports specific SQL features, get the maximum identifier length, and so on. Most application code doesn't need any of that, but logging the database product and version at startup is a habit worth building. When something breaks in production, the first question is usually "what database are we even talking to?"
+
+<h1 id="try-with-resources-for-connections">
+  try-with-resources for Connections
+</h1>
+
+A `Connection` is an `AutoCloseable`. That means you can declare it as the resource of a `try-with-resources` block, and the JVM will call `close()` for you whether the body finishes normally or throws. Every JDBC connection in real production code should be wrapped this way; the cost of forgetting is a leaked session on the database that can take a real server out.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+
+public class ConnectionTwr {
+    public static void main(String[] args) throws Exception {
+        String url = "jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1";
+
+        try (Connection conn = DriverManager.getConnection(url)) {
+            System.out.println("Inside try, isClosed: " + conn.isClosed());
+            // Use the connection here. Statements, queries, transactions.
+        }
+        // Connection is closed automatically by the time we reach this line.
+
+        System.out.println("After try block");
+    }
+}
+```
+
+What makes `try-with-resources` matter is exception safety. Without it, you'd write something like the version below, and almost everyone gets it slightly wrong.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+
+public class LeakyConnection {
+    public static void main(String[] args) throws Exception {
+        Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1");
+
+        // If anything below throws, conn.close() never runs.
+        // The session leaks until the JVM exits.
+        String catalog = conn.getCatalog();
+        if (catalog.equals("DEMO")) {
+            throw new RuntimeException("Wrong database");
+        }
+
+        conn.close();
+    }
+}
+```
+
+The bug isn't always visible in a one-off `main`. It bites in a server that runs the same code thousands of times a day. Every exception path that skips `close()` leaves a session behind, and the database eventually hits its `max_connections` limit. Then every new connection attempt fails until someone restarts the server.
+
+The correct version is one line longer and bulletproof.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+
+public class SafeConnection {
+    public static void main(String[] args) throws Exception {
+        String url = "jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1";
+
+        try (Connection conn = DriverManager.getConnection(url)) {
+            String catalog = conn.getCatalog();
+            if (catalog.equals("DEMO")) {
+                throw new RuntimeException("Wrong database");
+            }
+            System.out.println("Catalog OK: " + catalog);
+        }
+        // Even if the throw above had fired, the connection would still close.
+    }
+}
+```
+
+The mechanics are worth a quick look. When the JVM enters the `try` block, it remembers the resource. When the block exits, whether normally or because an exception is propagating, it calls `close()` on the resource. If both the body and `close()` throw, the `close()` exception is attached to the original as a "suppressed" exception so neither one is silently lost. That last detail matters because pre-Java-7 patterns using `finally` had a habit of swallowing the real error and surfacing the `close()` error instead.
+
+Forgetting `close()` doesn't just leak a Java object. On the database side it holds a slot in `max_connections` (default 100 on PostgreSQL, 151 on MySQL), plus per-session memory, plus any locks the transaction is holding. One forgotten connection is invisible; a thousand take down the database.
+
+<h1 id="using-properties-for-connection-options">
+  Using Properties for Connection Options
+</h1>
+
+We saw the Properties overload earlier. Let's build out a more realistic example that loads settings from somewhere that isn't hard-coded, since that's how it works in real apps. The pattern is: read from a config file, environment variables, or a vault, build a `Properties`, hand it to `DriverManager`.
+
+```java
+import java.sql.Connection;
+import java.sql.DatabaseMetaData;
+import java.sql.DriverManager;
+import java.util.Properties;
+
+public class ConnectFromConfig {
+    public static void main(String[] args) throws Exception {
+        // In real code, load these from a file or environment, not hard-coded.
+        Properties config = new Properties();
+        config.setProperty("user", "sa");
+        config.setProperty("password", "");
+        // H2 happens to ignore unknown keys, so these are harmless here.
+        // Against a real driver they'd enable SSL and bound the handshake.
+        config.setProperty("useSSL", "true");
+        config.setProperty("characterEncoding", "UTF-8");
+        config.setProperty("connectTimeout", "2000");
+
+        String url = "jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1";
+
+        try (Connection conn = DriverManager.getConnection(url, config)) {
+            DatabaseMetaData meta = conn.getMetaData();
+            System.out.println("Connected to: " + meta.getDatabaseProductName());
+            System.out.println("Using driver: " + meta.getDriverName());
+        }
+    }
+}
+```
+
+Two notes on the pattern. First, building the `Properties` map is plain Java; you can populate it from anywhere. A common pattern is `props.load(new FileInputStream("db.properties"))`, which reads a properties file from disk in one call. Second, drivers silently ignore keys they don't recognize, which is both convenient (the same config works on multiple drivers) and dangerous (a typo'd key like `usSSL` won't enable SSL and won't tell you it didn't). Always read the driver docs when you set a non-standard key, and verify in `getMetaData` or a log line that you got the connection you expected.
+
+The same pattern with the file-loading idiom:
+
+```java
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.util.Properties;
+
+public class ConnectFromFile {
+    public static void main(String[] args) {
+        Properties config = new Properties();
+
+        // Try to load db.properties from the current directory.
+        // If the file isn't present, fall back to in-code defaults.
+        try (FileInputStream in = new FileInputStream("db.properties")) {
+            config.load(in);
+        } catch (IOException e) {
+            System.out.println("No db.properties found, using defaults");
+            config.setProperty("user", "sa");
+            config.setProperty("password", "");
+        }
+
+        String url = "jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1";
+
+        try (Connection conn = DriverManager.getConnection(url, config)) {
+            System.out.println("Connected: " + !conn.isClosed());
+        } catch (Exception e) {
+            System.out.println("Failed: " + e.getMessage());
+        }
+    }
+}
+```
+
+**Output (when the file is missing):**
+
+```text
+No db.properties found, using defaults
+Connected: true
+```
+
+A real production file might look like this:
+
+```text
+user=shop_app
+password=hunter2
+useSSL=true
+characterEncoding=UTF-8
+connectTimeout=3000
+socketTimeout=10000
+```
+
+The `socketTimeout` key (driver-specific, present on PostgreSQL and MySQL drivers) bounds how long any single query can sit waiting for a response from the server. It's the JDBC equivalent of `setSoTimeout` on a raw socket; without it, a hung query can block your thread forever. We won't go deeper into per-query timeouts here, but the option exists.
+
+<h1 id="a-quick-tour-of-databasemetadata">A Quick Tour of DatabaseMetaData</h1>
+
+We touched on `DatabaseMetaData` earlier. Because it's reachable from any connection and it's the answer to a lot of "what database am I talking to?" questions, it deserves a focused look.
+
+The diagram groups the methods into four bands. Product methods identify the engine: name and version. Driver methods identify the JDBC driver that wraps it. JDBC version methods say which spec the driver implements (4.0, 4.2, 4.3). Connection methods echo back the URL and username you used. The "feature flags" band (last node) lets you ask the driver whether it supports things like batched updates or specific transaction isolation levels, which is useful for code that has to run against more than one database.
+
+A larger demo that includes a feature flag:
+
+```java
+import java.sql.Connection;
+import java.sql.DatabaseMetaData;
+import java.sql.DriverManager;
+
+public class MetaDataTour {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            DatabaseMetaData meta = conn.getMetaData();
+
+            System.out.println("== Database ==");
+            System.out.println("Product:     " + meta.getDatabaseProductName());
+            System.out.println("Version:     " + meta.getDatabaseProductVersion());
+
+            System.out.println("== Driver ==");
+            System.out.println("Name:        " + meta.getDriverName());
+            System.out.println("Version:     " + meta.getDriverVersion());
+
+            System.out.println("== JDBC ==");
+            System.out.println("Spec:        " + meta.getJDBCMajorVersion()
+                    + "." + meta.getJDBCMinorVersion());
+
+            System.out.println("== Connection ==");
+            System.out.println("URL:         " + meta.getURL());
+            System.out.println("User:        " + meta.getUserName());
+
+            System.out.println("== Features ==");
+            System.out.println("Batched updates: " + meta.supportsBatchUpdates());
+            System.out.println("Transactions:    " + meta.supportsTransactions());
+        }
+    }
+}
+```
+
+Logging the first four bands at application startup is useful. When something breaks at 3 a.m. and the on-call engineer is staring at the logs, "we're on H2 2.2.224 with driver 2.2.224" is exactly the answer they need to skip ten minutes of debugging.
+
+<h1 id="datasource-the-production-path">DataSource: The Production Path</h1>
+
+`DriverManager` is the textbook way to open a connection, and it's what most tutorials show first because it works with no setup. In production code you almost always use `javax.sql.DataSource` instead. The reasons are worth understanding even before you reach the pooling lesson.
+
+A `DataSource` is an interface whose `getConnection()` method returns a `Connection`. That's it. The interface hides where the connection comes from: it might be freshly opened, it might be borrowed from a pool, it might be looked up through JNDI in an application server. Your code doesn't know and doesn't care; it just calls `getConnection()`.
+
+The diagram shows the indirection: `DataSource` is the contract, and many classes can fulfill it. Your business code asks the `DataSource` for a connection; the implementation decides whether to open a fresh one, hand out a pooled one, or look one up in a directory.
+
+Why prefer it over `DriverManager`? Three reasons that mostly come up later, but they're worth flagging now.
+
+First, **pooling**. A `DataSource` backed by a pool reuses connections across many requests. The application asks for a connection, runs a query, and "closes" it. The close call returns the connection to the pool instead of tearing down the session. The next request gets the same warm connection and skips the handshake. That's the difference between a 30 ms query and a 200 ms one for most cloud databases.
+
+Second, **configuration**. A `DataSource` holds its configuration (URL, credentials, pool sizing, timeouts) as object state. You configure it once at startup and inject the same instance everywhere it's needed. With `DriverManager`, every caller has to know the URL and the credentials, which spreads configuration across the codebase.
+
+Third, **testing**. Because `DataSource` is an interface, you can substitute it with a test implementation that returns connections to an in-memory database. Your production code doesn't change; it still calls `dataSource.getConnection()`. Test code points it at H2, production code points it at PostgreSQL.
+
+The simplest possible `DataSource` (not for production, but useful for seeing the shape of the interface):
+
+```java
+import javax.sql.DataSource;
+import java.io.PrintWriter;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.SQLException;
+import java.util.logging.Logger;
+
+public class TrivialDataSource implements DataSource {
+    private final String url;
+    private final String user;
+    private final String password;
+
+    public TrivialDataSource(String url, String user, String password) {
+        this.url = url;
+        this.user = user;
+        this.password = password;
+    }
+
+    @Override
+    public Connection getConnection() throws SQLException {
+        return DriverManager.getConnection(url, user, password);
+    }
+
+    @Override
+    public Connection getConnection(String u, String p) throws SQLException {
+        return DriverManager.getConnection(url, u, p);
+    }
+
+    // The rest of the DataSource interface methods are stubbed out
+    // because we don't need them for this demo.
+    @Override public PrintWriter getLogWriter() { return null; }
+    @Override public void setLogWriter(PrintWriter out) { }
+    @Override public void setLoginTimeout(int seconds) { }
+    @Override public int getLoginTimeout() { return 0; }
+    @Override public Logger getParentLogger() { return null; }
+    @Override public <T> T unwrap(Class<T> iface) { return null; }
+    @Override public boolean isWrapperFor(Class<?> iface) { return false; }
+
+    public static void main(String[] args) throws Exception {
+        DataSource ds = new TrivialDataSource(
+                "jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1", "sa", "");
+
+        try (Connection conn = ds.getConnection()) {
+            System.out.println("Got connection from DataSource");
+            System.out.println("Driver: " + conn.getMetaData().getDriverName());
+        }
+    }
+}
+```
+
+This `TrivialDataSource` adds nothing real; it's a thin wrapper over `DriverManager`. What matters is the shape. The application code that calls `ds.getConnection()` doesn't know or care whether it's getting a fresh session or one from a pool. Swap the implementation for HikariCP later and the calling code doesn't change. That substitutability is what makes `DataSource` a useful abstraction for production code.
+
+A pooled `DataSource` typically gets a connection in under a millisecond because no handshake is needed. `DriverManager.getConnection` against a remote database is two or three orders of magnitude slower per call. If you find yourself opening a connection per request, the pool is the fix.
+
+<h1 id="a-complete-worked-example">A Complete Worked Example</h1>
+
+A complete runnable program that pulls everything together. It connects to the in-memory shop, prints connection metadata, runs through `isClosed` and `isValid`, and closes cleanly through `try-with-resources`.
+
+```java
+import java.sql.Connection;
+import java.sql.DatabaseMetaData;
+import java.sql.DriverManager;
+import java.util.Properties;
+
+public class ShopConnectionDemo {
+
+    private static final String URL = "jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1";
+
+    public static void main(String[] args) throws Exception {
+        Properties props = new Properties();
+        props.setProperty("user", "sa");
+        props.setProperty("password", "");
+
+        try (Connection conn = DriverManager.getConnection(URL, props)) {
+
+            DatabaseMetaData meta = conn.getMetaData();
+            System.out.println("Connected to " + meta.getDatabaseProductName()
+                    + " " + meta.getDatabaseProductVersion());
+            System.out.println("Driver       " + meta.getDriverName());
+            System.out.println("As user      " + meta.getUserName());
+
+            System.out.println("Auto-commit: " + conn.getAutoCommit());
+            System.out.println("Closed?      " + conn.isClosed());
+            System.out.println("Valid?       " + conn.isValid(2));
+
+            // Real work would go here: createStatement, prepareStatement, queries.
+        }
+        // Connection is closed by now, even if anything above had thrown.
+    }
+}
+```
+
+The structure is the template you'll reuse in every JDBC program: build options, open the connection inside `try-with-resources`, do work, let the block close the connection for you.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

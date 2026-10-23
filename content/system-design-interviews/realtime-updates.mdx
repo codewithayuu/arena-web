@@ -1,0 +1,295 @@
+---
+title: "Pushing Real-time Updates"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Pushing Real-time Updates explained with clear examples, visuals, and practice questions in Mindflare's System Design Interviews course."
+---
+
+<LessonCard>
+
+In all of these problems, the underlying requirement is the same, so the techniques in this lesson apply to all of them.
+
+<h1 id="1-why-real-time-updates-are-hard">1. Why Real-time Updates Are Hard</h1>
+
+So what is that requirement? When something changes on the server, the server needs to tell the client, without waiting for the client to ask.
+
+But HTTP works on a request-response model. The client sends a request, the server sends a response, and that's the end of it. The server can't send anything to the client unless the client has asked for it.
+
+So if a new message arrives on the server, the server has no direct way to deliver it. All the techniques in this lesson are different ways of solving this problem.
+
+<h1 id="2-the-two-parts-of-the-problem">2. The Two Parts of the Problem</h1>
+
+Before we look at those techniques, let's break the problem into two parts.
+
+The first part is **how the client and server communicate**. This is where we choose between polling, Server-Sent Events, and WebSockets.
+
+The second part is **on the backend**. When a new update is created, the system needs to send it to the server that has the recipient's connection. If you only have one server, this is simple, because every user is connected to that same server. But when you have hundreds of servers, figuring out where to send each update takes more design work.
+
+In an interview, you'll usually need to explain both parts, so we'll go through them one by one.
+
+| Question to Ask                       | Why It Matters                                                           |
+| ------------------------------------- | ------------------------------------------------------------------------ |
+| Which direction does data flow?       | Server-to-client only fits SSE; frequent two-way traffic fits WebSockets |
+| How quickly must updates arrive?      | A few seconds of delay makes polling acceptable                          |
+| How many users are connected at once? | Sets how many connection servers you need                                |
+| Can an update be lost?                | Chat messages can't be; a typing indicator or an old price can           |
+
+<h1 id="3-short-polling">3. Short Polling</h1>
+
+The simplest approach is **short polling**. Here, the client asks the server for new data at a fixed interval.
+
+For example, every two seconds, a chat app might send a request like `GET /messages?after=500`. If there are new messages, the server returns them. If not, it returns an empty response.
+
+Short polling is easy to build because it uses regular HTTP requests and doesn't need any special setup on the server or the load balancer.
+
+But it wastes a lot of resources. Suppose 1 million users each poll every two seconds. That's 500,000 requests per second, and most of them return nothing. On phones, these frequent requests also use more battery.
+
+It also adds delay. If a message arrives right after the client polls, the user won't see it until the next poll, almost two seconds later.
+
+|                                  | Poll Every 1 Second | Poll Every 2 Seconds | Poll Every 30 Seconds |
+| -------------------------------- | ------------------- | -------------------- | --------------------- |
+| Worst-case delay                 | 1 second            | 2 seconds            | 30 seconds            |
+| Requests/sec for 1 million users | 1,000,000           | 500,000              | ~33,000               |
+
+You can poll more often to reduce the delay, but that increases the load on your servers. And if you poll less often to reduce load, users wait longer for updates.
+
+Short polling works fine when updates are rare and a few seconds of delay is acceptable, like checking whether a file export has finished.
+
+<h1 id="4-long-polling">4. Long Polling</h1>
+
+**Long polling** improves on this. The client still sends a request, but the server doesn't respond right away. Instead, it keeps the request open until new data is available, or until a timeout, usually around 30 seconds.
+
+When a new message arrives, the server responds, and the client immediately sends another request to wait for the next update.
+
+This way, users see updates almost instantly, and the server doesn't have to handle a large number of empty responses. Since long polling uses regular HTTP, it also works well with firewalls, proxies, and older infrastructure.
+
+But long polling has a few downsides.
+
+- **Every update still needs a full HTTP request and response**, including headers.
+- **Messages can be missed.** There's a short gap between when the server responds and when the client sends its next request. If a message arrives during that gap, the client could miss it.
+
+To avoid this, the client sends the ID of the last message it received with each request, and the server returns everything after that ID. That's what the `after=501` in the diagram does.
+
+<h3 id="41-waiting-requests-and-threads">4.1 Waiting Requests and Threads</h3>
+
+A server with many waiting requests usually doesn't use one thread for each. With a thread per request, 100,000 waiting clients means 100,000 mostly idle threads, each with its own memory. Long-polling servers use an async, event-driven framework instead: a waiting request is just a registered callback. When a new message is published, often through a pub/sub channel, the server finds the matching waiting requests and responds to them.
+
+<h1 id="5-server-sent-events">5. Server-Sent Events</h1>
+
+The next option is **Server-Sent Events**, or SSE.
+
+With SSE, the client opens a single HTTP connection, and the server keeps it open and sends events over it whenever there's new data. The server sets the content type to `text/event-stream`, and each event is sent as a small block of text.
+
+```plaintext
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+
+id: 1041
+event: score
+data: {"match": 88, "home": 2, "away": 1}
+
+id: 1042
+event: score
+data: {"match": 88, "home": 3, "away": 1}
+```
+
+SSE only works in one direction, from the server to the client. If the client needs to send data, like posting a comment, it uses a regular HTTP request.
+
+<h3 id="51-automatic-reconnection">5.1 Automatic Reconnection</h3>
+
+One useful thing about SSE is that browsers handle reconnection for you. If the connection drops, the browser's `EventSource` API reconnects automatically and sends a `Last-Event-ID` header, so the server knows which events the client has already received.
+
+The browser only reports the last ID. To resume, the server has to store recent events so it can read them back. Section 10 covers this.
+
+This makes SSE a good choice for live feeds, notifications, stock prices, dashboards, and AI chat responses that are streamed word by word.
+
+<h3 id="52-limitations">5.2 Limitations</h3>
+
+SSE does have two limitations.
+
+- **It can only send text data.** Binary data has to be encoded, for example as Base64.
+- **Connection limits on HTTP/1.1.** Browsers allow only around six open connections per domain, so a user with many tabs open can run into that limit. With HTTP/2, this is mostly not a problem, because many streams can share one connection.
+
+One more practical detail: the browser's `EventSource` can't set custom headers, so authentication usually uses a cookie or a short-lived token in the URL.
+
+<h1 id="6-websockets">6. WebSockets</h1>
+
+When both the client and the server need to send data frequently, **WebSockets** are usually the better option.
+
+A WebSocket connection starts as a regular HTTP request with an `Upgrade` header. The server responds with status `101 Switching Protocols`, and after that, the same TCP connection is used for two-way communication.
+
+Both the client and the server can send messages at any time, and each message adds only a few bytes of overhead.
+
+That's why WebSockets are commonly used for chat, multiplayer games, collaborative editing, and trading platforms, where the client sends data as often as it receives it.
+
+<h3 id="61-stateful-connections">6.1 Stateful Connections</h3>
+
+The downside is that WebSocket connections are **stateful**. Each connection stays on the same server for as long as the user is online.
+
+- **Your load balancer needs to support long-lived connections**, pass the `Upgrade` header through, and not close idle connections too early.
+- **Deploys disconnect users.** When you deploy a new version of the server, existing connections have to be closed and moved to other servers. All clients on that server reconnect at the same time, so deploys usually close a server's connections gradually instead of all at once.
+- **The client needs its own logic to reconnect** when the connection drops. Unlike `EventSource`, the browser's WebSocket API doesn't do it for you.
+
+We'll come back to this later, because it affects how we design the backend.
+
+| Aspect              | Short Polling           | Long Polling              | SSE                      | WebSocket        |
+| ------------------- | ----------------------- | ------------------------- | ------------------------ | ---------------- |
+| Direction           | Client asks             | Client asks, server waits | Server to client         | Both ways        |
+| Delay               | Up to the poll interval | Near instant              | Near instant             | Near instant     |
+| Overhead per update | Full HTTP request       | Full HTTP request         | Small text event         | A few bytes      |
+| Reconnection        | Next poll               | Next request              | Automatic in the browser | You build it     |
+| Server state        | None                    | Open requests             | Open connections         | Open connections |
+
+<h1 id="7-choosing-the-right-approach">7. Choosing the Right Approach</h1>
+
+So how do you choose between these options in an interview? Start by asking two questions.
+
+1. **Does data need to flow in both directions often?**
+2. **How quickly do users need to see updates?**
+
+- If updates are rare and a few seconds of delay is fine, **short polling** is the simplest option.
+- If updates mostly go from the server to the client, **SSE** gives you real-time updates and is simpler to run than WebSockets.
+- If the client also sends data frequently, like chat messages or game moves, **WebSockets** are a good fit.
+- **Long polling** is a useful fallback when your infrastructure doesn't support long-lived connections well.
+
+| Use Case                                 | Approach      | Why                                           |
+| ---------------------------------------- | ------------- | --------------------------------------------- |
+| File export status                       | Short polling | Rare update, a few seconds of delay is fine   |
+| Notifications, live scores, dashboards   | SSE           | Server to client only, automatic reconnection |
+| AI chat response streaming               | SSE           | One-way stream of words                       |
+| Chat with typing indicators              | WebSocket     | Both sides send often                         |
+| Multiplayer games, collaborative editing | WebSocket     | Frequent two-way traffic                      |
+| Restrictive corporate networks           | Long polling  | Plain HTTP passes through proxies             |
+
+Whichever option you choose, explain why it fits the requirements. For example, instead of saying "we'll use WebSockets because it's real-time," you could say "we'll use SSE because notifications only go from the server to the client, and the browser reconnects automatically."
+
+<h1 id="8-connection-servers">8. Connection Servers</h1>
+
+Now let's move to the backend side.
+
+With polling, any server can handle any request, because each request is independent. With SSE and WebSockets, this changes.
+
+Suppose user A is connected to server 1, and user B is connected to server 7. Only server 7 can send data to user B, because that's where user B's connection is open.
+
+To manage this, many systems use a separate group of **connection servers**, sometimes called a **gateway**. The only job of these servers is to keep connections open and send updates to clients. The business logic, like saving a message or updating a score, runs in separate application services. This way, you can scale the connection servers and the application servers independently.
+
+A single connection server can typically handle tens of thousands of open connections, and with careful tuning, some systems handle hundreds of thousands. So if you have 10 million users online, you might need a few hundred connection servers.
+
+The limit is usually memory and open file handles, not CPU. Each open connection holds a socket and its buffers, and the operating system's default limit on open files (often 1,024 per process) has to be raised. That's why a connection tier is sized by the number of connections, not by requests per second.
+
+<h1 id="9-routing-updates-to-the-right-server">
+  9. Routing Updates to the Right Server
+</h1>
+
+This leads to an important question. User A sends a message to user B. The request reaches server 1, but user B is connected to server 7. How does the message get to server 7?
+
+<h3 id="91-a-connection-registry">9.1 A Connection Registry</h3>
+
+One approach is to use a **connection registry**. When a user connects, the connection server stores a mapping in a fast data store like Redis, for example, "user B is connected to server 7". When a message for user B arrives, the application looks up this mapping and sends the message directly to server 7.
+
+This way, each message goes only to the server that needs it. But you have to keep the registry up to date as users connect, disconnect, or move to a different server. Registry entries usually have a TTL that the connection server keeps refreshing, so if a server crashes, its entries expire and are removed.
+
+<h3 id="92-publish-subscribe">9.2 Publish-Subscribe</h3>
+
+Another approach is to use **publish-subscribe**, or pub/sub.
+
+When user B connects to server 7, the server subscribes to a channel for user B, in a system like Redis Pub/Sub. When someone sends a message to user B, the application publishes it to that channel. Server 7 is subscribed to that channel, so it receives the message and sends it to user B.
+
+Here, the sender doesn't need to know which server user B is connected to.
+
+Pub/sub also works well for groups. For a chat room or a live match, every server that has a connected user in that room subscribes to the room's channel, and a single publish reaches all of them.
+
+|                                 | Connection Registry                       | Pub/Sub                      |
+| ------------------------------- | ----------------------------------------- | ---------------------------- |
+| Sender needs to know the server | Yes, looks it up                          | No                           |
+| Groups and rooms                | One lookup per member                     | One publish per room         |
+| What you maintain               | The mapping, as users connect and move    | Subscriptions on each server |
+| Good fit                        | Very large systems that need more control | Most interview answers       |
+
+In most interviews, pub/sub is the easier approach to explain, while a connection registry gives you more control when the system gets very large.
+
+<h1 id="10-handling-disconnects-and-missed-updates">
+  10. Handling Disconnects and Missed Updates
+</h1>
+
+Real-time connections drop often. Phones switch between Wi-Fi and mobile data, laptops go to sleep, and servers restart during deployments. So you need to decide what happens to updates that are sent while a user is disconnected.
+
+Redis Pub/Sub, for example, doesn't store messages. If no server is subscribed to a channel when a message is published, that message is lost.
+
+To handle this, **save every update to a database before sending it in real time**. For example, each chat message is stored in a messages table with a sequence number that keeps increasing. After it's saved, the message is sent to any connected users.
+
+When a user reconnects, the client sends the sequence number of the last message it received, and the server returns all messages after that number from the database.
+
+```sql
+-- On reconnect: messages after the last one the client received
+SELECT seq, sender_id, body, sent_at
+FROM messages
+WHERE conversation_id = 42 AND seq > 901
+ORDER BY seq;
+```
+
+If the real-time delivery works, the user sees the message right away. If it fails, the user still gets the message when they reconnect. This covers dropped connections, server crashes, and users who were offline for a long time.
+
+Two details make this reliable in practice. Because a message can arrive both live and from the catch-up query, the client should ignore any sequence number it has already shown. And an idle connection looks the same as a broken one, so clients and servers exchange small **heartbeat** messages every 30 seconds or so; if the other side stops answering, the connection is treated as closed and the client reconnects.
+
+For mobile apps in the background, the operating system closes these connections to save battery. To reach those users, the server sends the message through a platform push service, like Apple Push Notification service or Firebase Cloud Messaging, and the app fetches missed messages from the database when it opens.
+
+<h1 id="11-reconnection-storms">11. Reconnection Storms</h1>
+
+There's one more problem to watch out for.
+
+Suppose a connection server with 50,000 connected users crashes. All 50,000 clients lose their connection at the same time, and all of them try to reconnect at the same time.
+
+The other servers suddenly receive a large number of new connections, and the database receives a large number of queries from clients fetching missed messages. This spike can overload another server, which causes even more clients to reconnect.
+
+To prevent this, clients should reconnect using **exponential backoff with random jitter**. For example, the first retry waits a random time between 0 and 1 second, the next between 0 and 2 seconds, then 0 and 4 seconds, and so on.
+
+```plaintext
+attempt = 0
+
+function onDisconnect():
+    maxWait = min(2^attempt, 30) seconds    // 1, 2, 4, 8, ... capped at 30
+    sleep(random(0, maxWait))                // random wait, so clients retry at different times
+    attempt += 1
+    connect()
+
+function onConnected():
+    attempt = 0
+    resumeFrom(lastSeenSeq)                  // fetch anything missed
+```
+
+This spreads the reconnections over time, so the servers don't get all of them at once. The same applies to planned restarts: closing a server's connections gradually during a deploy prevents this spike.
+
+<h1 id="12-discussing-real-time-updates-in-an-interview">
+  12. Discussing Real-time Updates in an Interview
+</h1>
+
+Here's a step-by-step approach you can use in an interview.
+
+**1. Clarify the requirements.** Ask which direction the data flows, how many users will be connected at the same time, and how quickly updates need to arrive.
+
+**2. Choose how the client and server will communicate**, and explain why that option fits the requirements.
+
+**3. Explain how an update reaches the server that has the recipient's connection**, using either a connection registry or pub/sub.
+
+**4. Explain how you avoid losing updates.** Save each update to the database first, then send it in real time, and let clients fetch missed updates when they reconnect.
+
+**5. Talk about how you'll scale the connection servers** and handle a large number of clients reconnecting at once.
+
+Following these steps helps you cover both the client side and the backend side of the problem.
+
+<h1 id="13-key-takeaways">13. Key Takeaways</h1>
+
+1. **With plain HTTP, the server can't send data unless the client asks.** Each technique here is a way around this.
+2. **Short polling and long polling use regular HTTP requests.** Short polling is simplest but wasteful; long polling holds the request until there's data.
+3. **SSE lets the server stream updates to the client**, with automatic reconnection in the browser. It's a good fit when data only flows one way.
+4. **WebSockets allow two-way communication** with very little overhead per message, but the connections are stateful.
+5. **On the backend, route each update to the right connection server**, using pub/sub or a connection registry.
+6. **Save first, then send.** Store each update with a sequence number so users can recover what they missed while disconnected.
+7. **Reconnect with exponential backoff and jitter**, so one crashed server doesn't cause a reconnection storm.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

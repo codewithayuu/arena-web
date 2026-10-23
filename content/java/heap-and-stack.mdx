@@ -1,0 +1,395 @@
+---
+title: "Heap & Stack"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Heap & Stack explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+The previous lesson introduced the Java Memory Model as a contract between threads and memory. This lesson focuses on the physical layout: the actual buckets the JVM uses to store data while code runs. Knowing the layout turns vague performance advice ("avoid allocating in tight loops", "watch out for stack depth") into something concrete.
+
+<h1 id="the-jvm-runtime-data-areas">The JVM Runtime Data Areas</h1>
+
+Every running JVM divides memory into five runtime data areas. Two are shared across all threads, and three are private to each thread. The split is not arbitrary. Anything that needs to be visible to other threads (the actual objects in your program, the metadata about loaded classes) lives in the shared area. Anything that belongs to one thread's call chain (its local variables, its current bytecode position) lives in the private area, where no synchronization is needed to read or write it.
+
+The diagram shows two threads sharing the heap and Metaspace, while each owns a private stack, PC register, and native stack. The shared regions are where multi-threaded coordination has to happen, which is why `synchronized` and `volatile` exist. The private regions don't need any coordination because no other thread can see them.
+
+What each region holds:
+
+| Region                           | Scope   | Holds                                                                     |
+| -------------------------------- | ------- | ------------------------------------------------------------------------- |
+| Heap                             | Shared  | Every object created with `new`, every array, every `String`              |
+| Method Area (Metaspace)          | Shared  | Class metadata, method bytecode, static fields, the runtime constant pool |
+| Stack (per thread)               | Private | One frame per method call: local variables, operand stack, return address |
+| PC Register (per thread)         | Private | Address of the JVM instruction the thread is currently executing          |
+| Native Method Stack (per thread) | Private | Frames for `native` methods written in C/C++                              |
+
+The rest of this lesson walks through each region in turn, with code that makes the layout visible.
+
+<h1 id="the-heap-where-objects-live">The Heap: Where Objects Live</h1>
+
+The heap is the big shared pool where every object created with `new` ends up. The reference variable that points at the object can live in many places (a method's local stack frame, an object's field, a static field in the method area), but the object itself is on the heap. This includes arrays, which are objects in Java, and `String` literals, which live in a special part of the heap called the string pool.
+
+A small program creates a `Product`, a `Cart`, and an `Order`. The references are local variables, but the three objects all live on the heap.
+
+```java
+public class HeapDemo {
+
+    static class Product {
+        String name;
+        double price;
+        Product(String name, double price) {
+            this.name = name;
+            this.price = price;
+        }
+    }
+
+    static class Order {
+        long orderId;
+        String customerEmail;
+        Product product;
+        Order(long orderId, String customerEmail, Product product) {
+            this.orderId = orderId;
+            this.customerEmail = customerEmail;
+            this.product = product;
+        }
+    }
+
+    public static void main(String[] args) {
+        Product headphones = new Product("Wireless Headphones", 79.99);
+        Order order = new Order(1001L, "ana@example.com", headphones);
+        System.out.println("Order " + order.orderId + " for " + order.customerEmail);
+        System.out.println("Item: " + order.product.name + " at $" + order.product.price);
+    }
+}
+```
+
+Three objects get allocated on the heap during this `main`: the `Product`, the `Order`, and the `String "ana@example.com"`. (`"Wireless Headphones"` is a string literal, so it lives in the string pool, which is part of the heap.) The variables `headphones` and `order` are local to `main`, so they sit in `main`'s stack frame and hold references that point into the heap.
+
+The diagram traces every reference. `headphones` on the stack points to the `Product` on the heap. `order` on the stack points to the `Order` on the heap. The `Order`'s `customerEmail` field is itself a reference, and it points to the `String` on the heap. The `Order`'s `product` field is a reference too, and it points to the same `Product` that `headphones` points to. Two references, one object. That sharing is normal: a reference is just a pointer-sized value, and copying a reference doesn't copy the underlying object.
+
+One detail to pin down: the `Product` object has a field called `price` of type `double`, and a field called `name` of type `String`. The `price` is stored **inside the object on the heap**, because it's part of the object's layout. The `name` is also stored inside the object on the heap, but as a reference, not as the string itself. The actual character data lives in a separate `String` object somewhere else on the heap. Two levels of heap allocation, one for the `Product` and one for the `String`.
+
+<h3 id="young-and-old-generations-layout-only">
+  Young and Old Generations (Layout Only)
+</h3>
+
+For garbage collection purposes, the heap is itself split into regions. The young generation is where new objects are allocated. It's subdivided into an **Eden** space and two **Survivor** spaces (called `S0` and `S1`). Long-lived objects eventually get promoted into the **old generation** (sometimes called the **tenured generation**), which is collected less frequently.
+
+The diagram shows the regions, not the movement. The key point is that `new Product(...)` typically hands the allocator a slot in Eden, and from there the object may or may not get promoted depending on how long it lives. The split is a layout concern; the why and the how of object aging belong to garbage collection.
+
+<h1 id="the-stack-where-method-frames-live">
+  The Stack: Where Method Frames Live
+</h1>
+
+Every thread gets its own stack. When the thread calls a method, the JVM pushes a new **frame** onto that thread's stack. When the method returns, the frame is popped. The frame holds everything the method needs to execute: its local variables, its working area for intermediate values, and a way to return to the caller.
+
+The reason a stack works for this is that method calls are perfectly nested. If `main` calls `placeOrder`, which calls `calculateTotal`, the call chain unwinds in reverse: `calculateTotal` returns first, then `placeOrder`, then `main`. Push and pop. The stack data structure is the natural fit.
+
+A small example traces the stack during a sequence of calls.
+
+```java
+public class StackDemo {
+
+    public static void main(String[] args) {
+        int customerId = 42;
+        double cartTotal = calculateTotal(2, 29.99);
+        System.out.println("Customer " + customerId + " owes $" + cartTotal);
+    }
+
+    static double calculateTotal(int quantity, double unitPrice) {
+        double subtotal = quantity * unitPrice;
+        double tax = applyTax(subtotal);
+        return subtotal + tax;
+    }
+
+    static double applyTax(double amount) {
+        double rate = 0.08;
+        return amount * rate;
+    }
+}
+```
+
+While `applyTax` is running, the stack looks like this:
+
+The diagram shows the three frames stacked, with the most recent call on top. When `applyTax` returns, its frame is popped, control goes back to `calculateTotal`, and `subtotal + tax` is computed. When `calculateTotal` returns, its frame is popped, and `main` gets the value to assign to `cartTotal`. When `main` returns, its frame is popped, and the thread is done.
+
+<h3 id="anatomy-of-a-stack-frame">Anatomy of a Stack Frame</h3>
+
+A frame is not a flat bucket of variables. The JVM specification defines specific sub-areas inside each frame:
+
+| Frame Component                    | What It Holds                                                                  |
+| ---------------------------------- | ------------------------------------------------------------------------------ |
+| Local Variable Array               | Method parameters and local variables, indexed by slot number                  |
+| Operand Stack                      | A scratch space the bytecode uses to compute values                            |
+| Reference to Runtime Constant Pool | A pointer back to the method area so the frame can resolve symbolic references |
+| Return Address                     | Where to resume in the caller's bytecode after this method returns             |
+
+The **local variable array** is an array of slots, one per local variable. The compiler decides at compile time how many slots a method needs. Each slot holds either a 32-bit value (`int`, `float`, a reference) or half of a 64-bit value (`long`, `double` take two slots). Method parameters occupy the first slots, followed by locals declared inside the method body.
+
+The **operand stack** is where the bytecode does its computation. Java bytecode is stack-based: to add two numbers, you push them onto the operand stack, then execute `iadd`, which pops them and pushes the result. The operand stack is bounded too; the compiler knows the maximum depth needed for any path through the method.
+
+The **return address** points back into the caller's bytecode. When the frame is popped, the JVM uses this address to know where to resume executing in the caller.
+
+The **constant pool reference** lets the frame look up names: class names, method names, field names, and string literals. The pool itself lives in the method area, not in the frame, so the frame keeps a pointer to it.
+
+<h1 id="method-area-metaspace">Method Area / Metaspace</h1>
+
+The method area is the shared region that holds everything about your loaded classes. Class metadata, method bytecode, the layout of fields and methods, static fields, and the runtime constant pool all live here. It's shared across threads because the loaded classes themselves are shared: every thread that uses `Product` is using the same `Product` class metadata.
+
+Before Java 8, the method area was implemented inside the heap, in a region called **PermGen** (permanent generation). PermGen had a fixed maximum size, which caused frequent `OutOfMemoryError: PermGen space` problems when applications loaded many classes (web servers running many web apps, application servers reloading code).
+
+In Java 8, the JVM replaced PermGen with **Metaspace**. The big change: Metaspace lives in **native memory**, not in the Java heap. It grows on demand by allocating from the operating system, and by default it has no fixed upper limit (one can still be set with `-XX:MaxMetaspaceSize`). This eliminated the most common form of PermGen exhaustion and simplified GC tuning.
+
+The diagram makes the post-Java 8 layout explicit: the Java heap holds application objects, and Metaspace lives outside the heap in native memory. The garbage collector still manages classes in Metaspace (it can unload classes that are no longer used), but Metaspace is no longer competing for space with the rest of the heap.
+
+Three practical consequences:
+
+- The size of Metaspace is bounded only by the available native memory by default, not by `-Xmx`.
+- Static fields of a class live in Metaspace, but the **objects** they reference still live in the heap. So `static Product DEFAULT_PRODUCT = new Product(...)` puts the `DEFAULT_PRODUCT` reference in Metaspace and the actual `Product` instance on the heap.
+- String literals were also moved out of PermGen and into the main heap as part of an earlier change (Java 7), so the string pool is a heap structure now, not a method area structure.
+
+Metaspace grows on demand. An app that dynamically loads thousands of classes (heavy reflection, dynamic proxies, classloader-per-tenant) can see Metaspace grow and produce a different `OutOfMemoryError: Metaspace`. The flag `-XX:MaxMetaspaceSize=256m` caps it.
+
+<h1 id="the-pc-register">The PC Register</h1>
+
+Every thread has its own **program counter** register. In a JVM, the PC register holds the address of the JVM instruction the thread is currently executing. When the thread executes the next bytecode, the PC advances. When the thread makes a method call, the PC for the current frame is saved (as part of the return address), and a new PC is set up for the called method's bytecode.
+
+The PC is small (one machine-word per thread) and isn't accessed directly. It exists in the JVM model because the JVM specification has to define exactly what "where am I" means for a running thread.
+
+For native methods, the PC register is undefined (the JVM doesn't track native code positions; the operating system and CPU do). This is one of the reasons native frames live in a separate stack from regular Java frames.
+
+<h1 id="native-method-stack">Native Method Stack</h1>
+
+The **native method stack** is a parallel stack used for `native` methods, which are methods written in C or C++ and called through the **Java Native Interface (JNI)**. When a Java method calls a native method, the JVM switches from the regular stack to the native stack for the duration of the native call. When the native method returns, control switches back.
+
+Most code never calls native methods directly. But Java itself uses them internally for things like `Object.hashCode()`, `System.currentTimeMillis()`, and most file and network I/O. The native stack isn't visible from Java, but it's there, and a deeply recursive native call can overflow it just like a deeply recursive Java method overflows the Java stack.
+
+The size and behavior of the native stack are platform-specific and not part of the JVM specification in detail. The JVM exposes a single conceptual entity: a per-thread stack for native frames, parallel to the per-thread stack for Java frames.
+
+<h1 id="primitive-vs-reference-storage-where-does-each-live">
+  Primitive vs Reference Storage: Where Does Each Live?
+</h1>
+
+This rule has subtleties. The answer is "it depends on where the variable lives", and that splits into two cases.
+
+**Case 1: Local primitive variables live on the stack.** A local `int`, `double`, `boolean`, etc., declared inside a method, is stored directly in the method's stack frame, in the local variable array. There's no object involved.
+
+**Case 2: Primitive fields of an object live inside the object on the heap.** An `int` field of a `Product` is stored as part of the `Product`'s memory layout on the heap, because it's part of the object. There's no separate boxing into an `Integer`; the raw 4 bytes sit inline inside the object.
+
+```java
+public class PrimitivePlacement {
+
+    static class Product {
+        int stockCount;      // lives inside the Product object, on the heap
+        double price;        // lives inside the Product object, on the heap
+        boolean inStock;     // lives inside the Product object, on the heap
+        String name;         // a REFERENCE lives in the Product object,
+                             // the actual String lives elsewhere on the heap
+    }
+
+    public static void main(String[] args) {
+        int quantity = 3;            // local primitive: main's stack frame
+        double unitPrice = 19.99;    // local primitive: main's stack frame
+
+        Product item = new Product(); // reference 'item' on stack,
+                                       // Product object on heap
+
+        item.stockCount = 50;        // primitive field, written on the heap
+        item.price = unitPrice;      // copies the double value into the heap
+        item.inStock = true;         // primitive field, written on the heap
+        item.name = "Notebook";      // reference field, points to heap string
+
+        double total = quantity * item.price;
+        System.out.println("Total: $" + total);
+    }
+}
+```
+
+The local variables `quantity` and `unitPrice` live in `main`'s stack frame. The `Product` object lives on the heap, and its four fields (`stockCount`, `price`, `inStock`, `name`) are part of its memory layout on the heap. Even though `name` is declared as a `String`, the field itself just holds a reference; the actual character data lives in a separate `String` object on the heap.
+
+`price = 19.99` appears **twice**: once in `main`'s stack frame as the local `unitPrice`, and once in the `Product` on the heap as the field. The assignment `item.price = unitPrice` copied the value from the stack into the heap. They're independent now; changing the local `unitPrice` later would not change the field, and vice versa. Primitive assignment in Java is always a copy.
+
+<h1 id="stackoverflowerror-vs-outofmemoryerror">
+  StackOverflowError vs OutOfMemoryError
+</h1>
+
+The two famous JVM errors come from different regions and mean different things. Both extend `Error`, not `Exception`, because both indicate the JVM cannot continue normal operation.
+
+`StackOverflowError` is thrown when a thread's stack runs out of room. The most common cause is uncontrolled recursion: a method that calls itself without a base case, or one whose base case is wrong. Each call adds a frame, and eventually the stack fills up.
+
+```java
+public class StackOverflowDemo {
+
+    static int processOrder(int level) {
+        // No base case - keeps recursing forever
+        return 1 + processOrder(level + 1);
+    }
+
+    public static void main(String[] args) {
+        try {
+            processOrder(0);
+        } catch (StackOverflowError e) {
+            System.out.println("Caught: " + e);
+        }
+    }
+}
+```
+
+Each recursive call pushes another `processOrder` frame onto the stack. Each frame holds the parameter `level` and a return address. On a typical 64-bit JVM, the default thread stack size is around 512 KB to 1 MB, and a small frame might be 32-64 bytes, so the depth before exhaustion is usually tens of thousands of frames. Then the JVM detects that the next push would overflow the stack's allocated memory, and it throws `StackOverflowError`.
+
+The fix is almost always to find the missing or buggy base case in the recursion. Occasionally a legitimately deep recursive algorithm needs more stack room, which can be granted with `-Xss2m` to set a 2 MB stack per thread. Most of the time, deep recursion is a bug or should be rewritten iteratively.
+
+`OutOfMemoryError` is thrown when the JVM cannot allocate memory it needs and the garbage collector has no more to give back. The most common variant is `OutOfMemoryError: Java heap space`, which means the heap itself is full of objects that are still reachable, so GC can't reclaim them.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class OutOfMemoryDemo {
+
+    static class Order {
+        long orderId;
+        byte[] payload = new byte[1024 * 1024]; // 1 MB each
+        Order(long id) { this.orderId = id; }
+    }
+
+    public static void main(String[] args) {
+        List<Order> orderHistory = new ArrayList<>();
+        try {
+            long id = 0;
+            while (true) {
+                orderHistory.add(new Order(id++));
+            }
+        } catch (OutOfMemoryError e) {
+            System.out.println("Caught: " + e);
+            System.out.println("Orders allocated before failure: " + orderHistory.size());
+        }
+    }
+}
+```
+
+**Output (numbers vary by `-Xmx` and JVM):**
+
+```text
+Caught: java.lang.OutOfMemoryError: Java heap space
+Orders allocated before failure: 248
+```
+
+The `Order` objects each carry a 1 MB array. The `ArrayList` keeps references to all of them, so the garbage collector can't reclaim any. Eventually the heap fills, GC fails to free anything substantial, and the JVM gives up and throws `OutOfMemoryError`.
+
+The two errors map to their regions:
+
+| Error                                                  | Region         | Typical Cause                                               |
+| ------------------------------------------------------ | -------------- | ----------------------------------------------------------- |
+| `StackOverflowError`                                   | Thread's stack | Unbounded recursion, very large local arrays                |
+| `OutOfMemoryError: Java heap space`                    | Heap           | Objects held longer than expected, leaks, undersized `-Xmx` |
+| `OutOfMemoryError: Metaspace`                          | Metaspace      | Too many loaded classes, classloader leaks                  |
+| `OutOfMemoryError: unable to create new native thread` | Native memory  | Too many threads, native memory exhaustion                  |
+
+<h1 id="escape-analysis-when-objects-dont-quite-make-it-to-the-heap">
+  Escape Analysis: When Objects Don't Quite Make It to the Heap
+</h1>
+
+The JIT compiler performs an optimization called **escape analysis**, which can sometimes allow an object to be allocated on the stack instead of the heap. The rule: if the JIT can prove that an object never "escapes" the method that created it (no reference to it is stored in a field, returned, or passed to another method that might keep it), then there's no need for the object to live on the shared heap. It can live in the method's stack frame, and it gets cleaned up automatically when the frame is popped, with no garbage collection involved.
+
+This is implemented as **scalar replacement** in HotSpot: the JIT breaks the object apart into its individual primitive fields and stores those directly in the stack frame's local variable array, sometimes even in CPU registers. The object effectively disappears.
+
+```java
+public class EscapeAnalysisDemo {
+
+    static class Coordinates {
+        double latitude;
+        double longitude;
+        Coordinates(double lat, double lon) {
+            this.latitude = lat;
+            this.longitude = lon;
+        }
+        double distanceFromOrigin() {
+            return Math.sqrt(latitude * latitude + longitude * longitude);
+        }
+    }
+
+    static double computeShippingDistance() {
+        Coordinates warehouse = new Coordinates(37.77, -122.41);
+        return warehouse.distanceFromOrigin();
+    }
+
+    public static void main(String[] args) {
+        for (int i = 0; i < 1_000_000; i++) {
+            computeShippingDistance();
+        }
+        System.out.println("Done. Last distance: " + computeShippingDistance());
+    }
+}
+```
+
+A naive reading says this allocates a million `Coordinates` objects on the heap, all of which then become garbage. In practice, with escape analysis enabled (the default on the HotSpot JIT for years), the JIT recognizes that `warehouse` never leaves `computeShippingDistance`: no field stores it, nothing returns it, no method that might keep a reference is called with it. The compiler can either stack-allocate it or replace it with two `double` slots directly in the frame. The garbage collector never sees these "objects" at all.
+
+Escape analysis is an optimization, not a guarantee. Java code can't explicitly ask for stack allocation. Code that's friendly to the optimizer (small, short-lived objects that don't escape) lets the JIT do its job. Common cases where escape analysis kicks in: iterator objects in `for-each` loops, small temporary `Optional` values, intermediate `Stream` operations.
+
+Escape analysis isn't free; the JIT spends compile time analyzing methods. It also can't help with objects passed to methods that might keep references, or objects returned from a method. For hot loops, keep allocations local to the loop body to give the optimizer the best chance.
+
+The rule "all objects live on the heap" is true at the language level, but the JIT is allowed to bend that rule when it's safe and profitable. The runtime memory layout can be slightly different from the conceptual one.
+
+<h1 id="tying-it-together-with-an-e-commerce-trace">
+  Tying It Together with an E-Commerce Trace
+</h1>
+
+A small program exercises the heap, the stack, primitive fields, and reference fields together. The exercise: predict where each piece of state lives, then check against the diagram.
+
+```java
+public class OrderTrace {
+
+    static class Product {
+        String name;
+        double price;
+        Product(String name, double price) {
+            this.name = name;
+            this.price = price;
+        }
+    }
+
+    static class Order {
+        long orderId;
+        String customerEmail;
+        Product product;
+        int quantity;
+        Order(long orderId, String customerEmail, Product product, int quantity) {
+            this.orderId = orderId;
+            this.customerEmail = customerEmail;
+            this.product = product;
+            this.quantity = quantity;
+        }
+    }
+
+    static double totalCost(Order order) {
+        double linePrice = order.product.price * order.quantity;
+        return linePrice;
+    }
+
+    public static void main(String[] args) {
+        Product headphones = new Product("Wireless Headphones", 79.99);
+        Order order = new Order(1001L, "ana@example.com", headphones, 2);
+        double cost = totalCost(order);
+        System.out.println("Order " + order.orderId + " total: $" + cost);
+    }
+}
+```
+
+At the moment `totalCost` is running, the picture looks like this:
+
+The trace highlights several things. Both `main`'s `order` and `totalCost`'s `order` are separate stack slots in different frames, but they hold the same reference value, so both point at the same heap `Order`. The primitive fields `price` (79.99), `orderId` (1001), and `quantity` (2) sit directly inside their containing objects on the heap. The reference fields (`name`, `customerEmail`, `product`) hold pointers to other heap objects. The local primitive `linePrice` (159.98) in `totalCost` sits in the `totalCost` frame on the stack, not on the heap.
+
+When `totalCost` returns, its entire frame is popped at once. `linePrice` vanishes immediately, with no work for the garbage collector to do; the stack pointer decrements past the slot. The heap objects are unaffected because `main`'s `headphones` and `order` references still keep them reachable.
+
+<h1 id="a-word-on-tuning">A Word on Tuning</h1>
+
+JVM flags can influence the size of most of these regions. The key flags are `-Xmx` for the maximum heap size, `-Xms` for the initial heap size, `-Xss` for the per-thread stack size, and `-XX:MaxMetaspaceSize` for the Metaspace cap. The defaults are reasonable for most applications. Tune when measurement shows a real problem, not based on documentation alone.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

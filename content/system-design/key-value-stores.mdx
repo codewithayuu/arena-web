@@ -1,0 +1,383 @@
+---
+title: "Key-Value Stores"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Key-Value Stores explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+For this kind of access pattern, we want something simpler and faster. That is where a key-value store comes in.
+
+<h1 id="2-what-is-a-key-value-store">2. What Is a Key-Value Store?</h1>
+
+A key-value store is a database that stores data as pairs of **keys** and **values**. It works like a hash map, but as a separate service that many application servers can share.
+
+- The **key** is a unique identifier, usually a string.
+- The **value** is the data associated with that key.
+
+For example, the key might be `session:abc123`, and the value might be the session details.
+
+The interface is usually very small:
+
+- **Put** stores a value under a key.
+- **Get** returns it.
+- **Delete** removes it.
+
+In Redis, those look like this:
+
+```text
+SET session:abc123 '{"user_id": 42, "roles": ["user"]}'
+GET session:abc123
+DEL session:abc123
+```
+
+In most key-value stores, the database does not care what is inside the value. It could be a JSON string, a serialized object, an image, or just a number. To the database, it is simply a blob of bytes.
+
+Some stores, like **Redis**, go further and support structured values such as **lists**, **sets**, **sorted sets**, and **hashes**, with operations on each. A sorted set, for example, makes a leaderboard easy:
+
+```text
+ZADD leaderboard:daily 1500 user:1001
+ZADD leaderboard:daily 2300 user:1002
+ZADD leaderboard:daily 1800 user:1003
+
+ZRANGE leaderboard:daily 0 9 REV WITHSCORES
+```
+
+But the core idea is still the same. You access data by its key.
+
+<h1 id="3-common-use-cases">3. Common Use Cases</h1>
+
+Key-value stores appear in many large-scale systems because they are simple and fast.
+
+<h3 id="caching">Caching</h3>
+
+One of the most common use cases is **caching**. An application can store the result of an expensive database query or API call under a key, then reuse that result on future requests instead of doing the same work again.
+
+This is the **cache-aside** pattern:
+
+1. Read from the cache.
+2. On a hit, return the cached value.
+3. On a miss, read from the database.
+4. Store the result in the cache with a TTL.
+5. Return the value.
+
+The downside is freshness. A cached value may be older than the database value until it expires or the application removes it.
+
+<h3 id="sessions-and-shopping-carts">Sessions and Shopping Carts</h3>
+
+Key-value stores are also commonly used for **session storage**. A session id acts as the key, and the user's session data is stored as the value.
+
+```text
+Key:   session:abc123
+Value: {
+  "user_id": 42,
+  "roles": ["user", "admin"],
+  "cart": ["sku_17", "sku_88"]
+}
+TTL:   30 minutes
+```
+
+**Shopping carts** can work in a similar way, with the user id as the key and the cart contents as the value.
+
+<h3 id="rate-limiting">Rate Limiting</h3>
+
+Rate limiting is another natural fit. The key might combine a user id with a time window, and the value stores a counter that increases with each request.
+
+The increment must be **atomic**, which means the store performs it as one indivisible step. If the application read the number and then wrote a new number itself, two requests could race and let too many requests through.
+
+<h3 id="other-uses">Other Uses</h3>
+
+Key-value stores are also useful for feature flags, configuration settings, leaderboards, password reset tokens, and one-time codes.
+
+The common pattern is simple: **the application already knows exactly which key it wants**, and it needs to retrieve or update the value very quickly.
+
+<h1 id="4-in-memory-vs-persistent-stores">4. In-Memory vs Persistent Stores</h1>
+
+Key-value stores generally fall into two groups.
+
+<h3 id="in-memory-stores">In-Memory Stores</h3>
+
+The first group keeps data in memory. **Redis** and **Memcached** are the best-known examples.
+
+Because reads and writes happen in RAM, these stores can often respond in under a millisecond. The trade-off is that memory is more expensive than disk, and it is lost if the server restarts.
+
+**Memcached** is purely a cache, so if a node restarts, its data is gone.
+
+**Redis** can optionally persist data to disk:
+
+| Mode                   | How It Works                                             | Trade-off                                                    |
+| ---------------------- | -------------------------------------------------------- | ------------------------------------------------------------ |
+| Snapshot (RDB)         | Takes a periodic snapshot of all data                    | Fast restart, but writes since the last snapshot can be lost |
+| Append-only file (AOF) | Writes every change to a log that is replayed on restart | Safer, but more disk use and slower recovery                 |
+| Both                   | Uses snapshots and the append-only file together         | Common practical compromise                                  |
+
+<h3 id="persistent-stores">Persistent Stores</h3>
+
+The second group stores data durably on disk. **Amazon DynamoDB**, **RocksDB**, and **etcd** are examples. They are designed to be the permanent home for data, not just a cache in front of another database. They are usually a little slower than in-memory stores, but they keep data safely and scale across many machines.
+
+So one of the first questions to ask is:
+
+> Is the key-value store a cache that can be rebuilt, or the source of truth that must never lose data? The answer decides which store, which persistence settings, and which eviction policy you can use.
+
+<h1 id="5-how-it-works-internally">5. How It Works Internally</h1>
+
+<h3 id="hash-tables">Hash Tables</h3>
+
+On a single machine, an in-memory key-value store is usually built around a **hash table**.
+
+When you put a key, the store hashes it to find a slot in the table and stores the value there. When you get a key, it hashes the key again and goes straight to that slot.
+
+This takes **constant time on average**, no matter how many keys are stored. That is why lookups stay fast even with millions of keys.
+
+<h3 id="lsm-trees-and-b-trees">LSM Trees and B-Trees</h3>
+
+Disk-based key-value stores need a structure that works well with storage.
+
+- Many use an **LSM Tree**. RocksDB is a well-known example. Writes go to memory first and are flushed to disk as sorted files, which makes writes very fast.
+- Others use a **B-Tree**, which keeps keys sorted in pages on disk.
+
+A useful side effect of these sorted structures is that they can support **range scans**, such as "all keys that start with `user:42:`". A pure hash table cannot do that efficiently, because hashing scatters related keys across the table.
+
+| Structure      | Typical Store                   | Point Lookups | Range Scans | Strength                            |
+| -------------- | ------------------------------- | ------------- | ----------- | ----------------------------------- |
+| **Hash table** | Redis, Memcached                | O(1) average  | ✗           | Fastest single-key access in memory |
+| **LSM Tree**   | RocksDB, DynamoDB-style engines | Fast          | ✓           | Very fast writes on disk            |
+| **B-Tree**     | etcd (bbolt), LMDB              | O(log n)      | ✓           | Predictable reads on disk           |
+
+<h1 id="6-designing-good-keys">6. Designing Good Keys</h1>
+
+In a key-value store, the key is your only way to find data. So key design matters a lot.
+
+<h3 id="use-a-structured-naming-pattern">Use a Structured Naming Pattern</h3>
+
+A common practice is to use a structured naming pattern:
+
+```text
+user:42:profile
+user:42:settings
+order:987:status
+session:abc123
+```
+
+This groups related keys, avoids collisions between different types of data, and makes debugging easier.
+
+<h3 id="make-keys-predictable">Make Keys Predictable</h3>
+
+Keys should also be **predictable**. If the application can build the key from information it already has, like a user id, it can fetch the data in one step.
+
+<h3 id="composite-keys">Composite Keys</h3>
+
+Some stores allow composite keys. In **DynamoDB**, a table has a **partition key** and an optional **sort key**.
+
+For example, the partition key might be a user id, and the sort key might be an order date. That lets us fetch all orders for one user, sorted by date, in a single query.
+
+| user_id (partition key) | order_date (sort key) | total  | status    |
+| ----------------------- | --------------------- | ------ | --------- |
+| 42                      | 2024-08-14            | 59.00  | delivered |
+| 42                      | 2024-09-02            | 18.50  | delivered |
+| 42                      | 2024-10-01            | 120.00 | shipped   |
+| 77                      | 2024-09-20            | 35.00  | delivered |
+
+<h3 id="keep-keys-and-values-small">Keep Keys and Values Small</h3>
+
+Finally, keys and values should stay reasonably small. Very large values take longer to read, send over the network, and replicate. Keys also take memory, which adds up across hundreds of millions of keys.
+
+Prefer `user:42:profile` over `production:application:customer-service:user-profile-object:42`.
+
+<h1 id="7-expiration-and-eviction">7. Expiration and Eviction</h1>
+
+Much of the data in a key-value store is temporary. Sessions expire, cached results go stale, and rate limit counters only matter for the current time window.
+
+<h3 id="time-to-live-ttl">Time-to-Live (TTL)</h3>
+
+So most key-value stores support a **time-to-live**, or **TTL**, on each key. When you store a session, you can set it to expire after 30 minutes. After that, the store removes it automatically, and the application does not need to clean it up.
+
+```text
+SET session:abc123 '{"user_id": 42}' EX 1800   # expires in 30 minutes
+TTL session:abc123                              # seconds remaining
+```
+
+<h3 id="eviction">Eviction</h3>
+
+In-memory stores also need a plan for when memory runs out. This is called **eviction**.
+
+A common policy is **Least Recently Used**, or **LRU**. When memory is full, the store removes the keys that have not been accessed for the longest time.
+
+Redis also supports other policies:
+
+| Policy                          | What It Evicts                   | Good For                                   |
+| ------------------------------- | -------------------------------- | ------------------------------------------ |
+| `allkeys-lru`                   | Least recently used keys         | General-purpose caches                     |
+| `allkeys-lfu`                   | Least frequently used keys       | Caches with a stable set of popular keys   |
+| `volatile-lru` / `volatile-ttl` | Only keys that have a TTL        | Mixing cache data with keys that must stay |
+| `noeviction`                    | Nothing; new writes are rejected | Using Redis as a primary store             |
+
+The right policy depends on whether the store is used as a cache or as a primary data store. For a cache, evicting old keys is fine. For a primary store, silently losing data is not.
+
+<h1 id="8-scaling-with-partitioning">8. Scaling with Partitioning</h1>
+
+Eventually, one machine cannot hold all the keys or handle all the requests.
+
+Key-value stores scale well here, because every key is independent. We can split the keys across many nodes. This is called **sharding**, or partitioning.
+
+<h3 id="hash-modulo-n">Hash Modulo N</h3>
+
+The simplest approach is to hash the key and take the result modulo the number of nodes: `node = hash(key) % N`.
+
+But that approach has a problem. If we add or remove a node, `N` changes, most keys map to a different node, and a large amount of data has to move. Going from 4 nodes to 5, for example, moves about 80% of the keys.
+
+<h3 id="consistent-hashing">Consistent Hashing</h3>
+
+So many systems use **consistent hashing** instead. Nodes and keys are placed on a logical ring, and each key belongs to the next node on the ring, moving clockwise.
+
+Here, `user:42` belongs to Node B, `session:abc` to Node C, and `cart:77` to Node A. When a node is added, only the keys in its section of the ring need to move.
+
+**Amazon's Dynamo** system, which inspired DynamoDB and Cassandra, used this approach.
+
+<h3 id="hash-slots">Hash Slots</h3>
+
+**Redis Cluster** uses a related idea. It divides the key space into **16,384 hash slots** and assigns groups of slots to each node. Moving capacity between nodes means moving slots, not rehashing every key.
+
+Keys that must be used together, for example in one multi-key operation, can be forced into the same slot with **hash tags**. Only the part inside `{}` is hashed:
+
+```text
+{user:42}:profile
+{user:42}:settings
+```
+
+<h1 id="9-replication-and-consistency">9. Replication and Consistency</h1>
+
+Sharding spreads the load, but if a node fails, its keys become unavailable. So each partition is usually **replicated** to multiple nodes. There are two common models.
+
+<h3 id="primary-replica-replication">Primary-Replica Replication</h3>
+
+The first is **primary-replica** replication. Redis uses this.
+
+Writes go to the primary for a partition, and the primary copies them to its replicas. If the primary fails, a replica can be promoted to primary.
+
+<h3 id="leaderless-replication">Leaderless Replication</h3>
+
+The second is **leaderless** replication, used in Dynamo-style systems. Here, a write is sent to several replicas at once. The system uses three numbers:
+
+- **N** is the number of replicas.
+- **W** is how many replicas must confirm a write.
+- **R** is how many replicas must respond to a read.
+
+If **R + W > N**, every read overlaps with at least one replica that has the latest write.
+
+For example, with 3 replicas, writing to 2 and reading from 2 gives that overlap:
+
+The read touches B and C. C is stale, but B has v2, so the newest version wins.
+
+Lower values give faster responses but weaker consistency. With `W = 1` and `R = 1`, a read can easily land on a replica that has not seen the write yet.
+
+<h3 id="consensus">Consensus</h3>
+
+Other stores take a stricter approach. **etcd**, which Kubernetes uses to store cluster state, uses the **Raft** consensus algorithm, so every read can reflect the latest committed write.
+
+| Model               | How Writes Work                              | Consistency                         | Example           |
+| ------------------- | -------------------------------------------- | ----------------------------------- | ----------------- |
+| Primary-replica     | Primary accepts writes, copies to replicas   | Reads from replicas may lag         | Redis             |
+| Leaderless (quorum) | Write to W of N replicas, read from R        | Tunable with R, W, N                | Dynamo, Cassandra |
+| Consensus           | A majority must agree before a write commits | Strong; reads see the latest commit | etcd (Raft)       |
+
+The right choice depends on the data. A slightly old product page cache may be fine. A slightly old permission decision or lock owner may be dangerous.
+
+<h1 id="10-limitations">10. Limitations</h1>
+
+The simplicity of key-value stores is also their main limitation.
+
+<h3 id="lookups-only-by-key">Lookups Only by Key</h3>
+
+You can only look up data efficiently by its key.
+
+Suppose we store user profiles with the user id as the key. Now we want to find all users in India. The store has no idea what is inside each value, so it cannot answer that without scanning every key.
+
+The common workaround is to maintain a **second key** yourself. For example, a key `country:India` whose value is a list of user ids.
+
+But now the application has to keep that index in sync on every write. If a user moves from India to Canada, both index keys must be updated.
+
+<h3 id="no-joins">No Joins</h3>
+
+Key-value stores also have **no joins**. If you need data from two keys, you fetch both and combine them in the application.
+
+<h3 id="limited-transactions">Limited Transactions</h3>
+
+And transactions are usually limited:
+
+- Some stores support **atomic operations on a single key**, like incrementing a counter or "set only if it does not exist".
+- Some, like **Redis** and **DynamoDB**, support **limited multi-key transactions**.
+
+But they are far less flexible than transactions in a relational database.
+
+| Good Fit                          | Poor Fit                            |
+| --------------------------------- | ----------------------------------- |
+| Get session by session id         | Find sessions by browser or city    |
+| Get product cache by product id   | Search products by text             |
+| Increment rate counter by user id | Compute analytics across all users  |
+| Get cart by user id               | Join carts with orders and payments |
+| Store feature flag by key         | Search feature flags by any field   |
+
+<h1 id="11-hot-keys">11. Hot Keys</h1>
+
+Another common production problem is the **hot key**.
+
+Sharding works well when traffic is spread reasonably evenly across many keys. But in real systems, that is not always the case.
+
+Suppose a celebrity publishes a post and millions of users request the same piece of data at once. Because that data belongs to a single key, all of those requests may be routed to the same node. That node can become overloaded even while the rest of the cluster is mostly idle.
+
+There are several ways to reduce this problem:
+
+- **Local cache.** The application can keep extremely popular values in a small local in-memory cache, so many requests never reach the key-value store.
+- **Key splitting.** A hot key can be replicated across multiple keys, for example `post:celebrity:1` through `post:celebrity:10`, and each read can choose one of those copies at random. The same trick works for a hot counter: split it into several bucket keys and add them up when the total is needed.
+- **Read replicas.** Replicas can help distribute read traffic for the partition across multiple machines.
+
+The important point is that partitioning spreads traffic across different keys. It does not automatically spread the load of one extremely popular key. Handling hot keys requires an additional strategy.
+
+<h1 id="12-popular-key-value-stores">12. Popular Key-Value Stores</h1>
+
+| Store               | Type                                             | Typical Use                                                          |
+| ------------------- | ------------------------------------------------ | -------------------------------------------------------------------- |
+| **Redis**           | In-memory, rich data structures                  | Caching, sessions, leaderboards, rate limiting                       |
+| **Memcached**       | Simple, multi-threaded, in-memory cache          | Storing and fetching values when nothing more is needed              |
+| **Amazon DynamoDB** | Managed, durable key-value and document database | Predictable performance at large scale                               |
+| **RocksDB**         | Embeddable storage engine                        | Used inside other databases and services, not as a standalone server |
+| **etcd**            | Strongly consistent key-value store              | Configuration, service discovery, coordination                       |
+
+They share the same basic model, but make very different choices around memory, durability, and consistency.
+
+A note on Redis: its license changed in 2024, and the Linux Foundation started **Valkey**, a community fork of the last BSD-licensed version. For most cache use cases, Redis and Valkey behave the same and share the same commands.
+
+<h1 id="13-when-to-use-a-key-value-store">13. When to Use a Key-Value Store</h1>
+
+A key-value store is a good fit when:
+
+- **You always know the key you need.** It works well for caching, sessions, shopping carts, counters, rate limits, and user preferences.
+- **You need very low latency.**
+- **You need to scale to a large number of simple reads and writes.**
+
+It is not a good fit when you need to:
+
+- Search or filter by values.
+- Join related data.
+- Run ad hoc reports.
+
+In those cases, a relational or document database is usually a better choice.
+
+In practice, many systems use both. A relational database holds the source of truth, and a key-value store like Redis sits in front of it to serve the hottest data quickly.
+
+<h1 id="summary">Summary</h1>
+
+- Key-value stores store data as simple **key and value** pairs, with a tiny interface: put, get, and delete.
+- They look data up using **hash tables**, **LSM Trees**, or **B-Trees**. Sorted structures also allow range scans.
+- **In-memory** stores like Redis and Memcached are fastest; **persistent** stores like DynamoDB and etcd are the permanent home for data.
+- **TTLs** clean up temporary data, and **eviction** policies decide what to drop when memory is full.
+- They scale by **partitioning** keys across nodes (consistent hashing or hash slots) and **replicating** each partition for availability.
+- Their strength is fast, predictable access by key. Their limitation is that **the key is the only efficient way to find anything**, and a single **hot key** can still overload one node.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

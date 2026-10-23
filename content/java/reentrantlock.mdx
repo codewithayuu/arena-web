@@ -1,0 +1,550 @@
+---
+title: "ReentrantLock"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "ReentrantLock explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="why-a-class-lock-instead-of-synchronized">
+  Why a Class Lock Instead of synchronized
+</h1>
+
+The `synchronized` keyword has been part of Java since day one. It works, it's simple, and the JVM is good at optimizing it. So why does `java.util.concurrent.locks` exist at all?
+
+The honest answer is that `synchronized` is rigid in three ways that hurt in real systems. First, it has no timeout. When a thread asks for the lock with `synchronized`, it waits forever if the lock is held. Second, a thread waiting for a `synchronized` lock cannot be interrupted. Calling `interrupt()` on it just sets a flag the thread will notice only after it finally acquires the lock. Third, `synchronized` is block-structured: you enter a block, you leave the same block, and the lock is released as part of leaving. You can't hand a lock from one method to another, or acquire it in one method and release it in another.
+
+`ReentrantLock` removes all three constraints. Same mutual exclusion semantics, more flexible control surface.
+
+The diagram lines up the constraints on the `synchronized` side against the abilities on the `ReentrantLock` side. None of these matter if your code is doing trivial in-memory updates with no contention. They matter when you're running an e-commerce checkout under peak load, where a thread stuck behind a slow holder of an inventory lock means a real customer is staring at a spinner.
+
+<h1 id="creating-and-using-a-reentrantlock">
+  Creating and Using a ReentrantLock
+</h1>
+
+`ReentrantLock` lives in `java.util.concurrent.locks`. You instantiate it like any other class and use the `Lock` interface methods.
+
+```java
+import java.util.concurrent.locks.ReentrantLock;
+
+public class InventoryUpdate {
+
+    private static final ReentrantLock inventoryLock = new ReentrantLock();
+    private static int stockCount = 100;
+
+    public static void main(String[] args) throws InterruptedException {
+        Runnable buyOne = () -> {
+            inventoryLock.lock();
+            try {
+                if (stockCount > 0) {
+                    stockCount--;
+                    System.out.println(Thread.currentThread().getName()
+                        + " bought one, stock now " + stockCount);
+                }
+            } finally {
+                inventoryLock.unlock();
+            }
+        };
+
+        Thread t1 = new Thread(buyOne, "shopper-1");
+        Thread t2 = new Thread(buyOne, "shopper-2");
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+
+        System.out.println("Final stock: " + stockCount);
+    }
+}
+```
+
+A few details about this layout. The `lock()` call sits before the `try`. The `unlock()` call sits inside the `finally`. The protected work goes inside the `try` block. That layout isn't decorative: if `lock()` throws (it usually doesn't, but it can be interrupted in some forms), there's nothing to release yet, so we don't want it inside the `try`. And if the body throws, the `finally` still runs and the lock is released. Skip the `finally` and an exception in the body will leak the lock, and every subsequent thread that asks for it waits forever.
+
+Forgetting `unlock` in a `finally` block is the canonical `ReentrantLock` bug. With `synchronized`, the JVM releases the monitor automatically when control leaves the block (even by exception). With `ReentrantLock`, you're responsible. Static analysis tools and IDEs flag missing `unlock` calls, but the language doesn't enforce it.
+
+The order of output for the two shoppers may swap. The total at the end is always `98` because the lock guarantees that the read-modify-write of `stockCount` is atomic across the two threads.
+
+<h1 id="reentrance-re-acquiring-a-lock-you-already-hold">
+  Reentrance: Re-Acquiring a Lock You Already Hold
+</h1>
+
+The "Reentrant" in `ReentrantLock` means a thread that already holds the lock can call `lock()` again without blocking. The lock keeps an internal counter. Each `lock()` call increments it, each `unlock()` call decrements it. The lock is actually released only when the counter reaches zero. This matters when one synchronized operation calls another that also needs the lock.
+
+A common case: a `placeOrder` method takes a lock, then calls a helper that also takes the same lock. Without reentrance, the thread would block on itself. With reentrance, the second acquisition is free.
+
+```java
+import java.util.concurrent.locks.ReentrantLock;
+
+public class ReentranceDemo {
+
+    private static final ReentrantLock orderLock = new ReentrantLock();
+    private static int orderCount = 0;
+
+    public static void placeOrder(String customer) {
+        orderLock.lock();
+        try {
+            System.out.println("placeOrder hold count: " + orderLock.getHoldCount());
+            orderCount++;
+            recordOrder(customer);
+        } finally {
+            orderLock.unlock();
+        }
+    }
+
+    public static void recordOrder(String customer) {
+        orderLock.lock();
+        try {
+            System.out.println("recordOrder hold count: " + orderLock.getHoldCount());
+            System.out.println("Recorded order for " + customer);
+        } finally {
+            orderLock.unlock();
+        }
+    }
+
+    public static void main(String[] args) {
+        placeOrder("Ana");
+    }
+}
+```
+
+When `placeOrder` calls `recordOrder`, the second `lock()` call doesn't block. The lock notices the requesting thread is already the owner and bumps the hold count from `1` to `2`. When `recordOrder` finishes and calls `unlock()`, the count drops to `1`. The outer method's `unlock()` then drops it to `0`, at which point the lock is actually released and another thread could acquire it. If there were three `lock()` calls deep, there would have to be exactly three `unlock()` calls before the lock is free.
+
+The diagram traces the counter through one nested acquisition. The lock is only really free when the counter hits zero, which happens after the outermost `unlock`.
+
+`synchronized` is reentrant too. A thread that owns the monitor on an object can enter another synchronized method on the same object without blocking. Reentrance isn't unique to `ReentrantLock`; it's just named explicitly in this class.
+
+One consequence to remember: every `lock()` needs a matching `unlock()`. If you call `lock()` twice and `unlock()` once, the lock is still held, and the next thread that tries to acquire it will wait forever. Pairing them in a `try/finally` block per acquisition keeps the count balanced.
+
+<h1 id="fair-vs-unfair-locks">Fair vs Unfair Locks</h1>
+
+The default `ReentrantLock` constructor creates an **unfair** lock. There's a second constructor that takes a `boolean` and, if you pass `true`, gives you a **fair** lock.
+
+```java
+ReentrantLock unfair = new ReentrantLock();        // default
+ReentrantLock fair = new ReentrantLock(true);      // fair
+```
+
+The difference is in which waiting thread gets the lock next when the current holder releases it.
+
+An **unfair** lock lets a brand-new arriver "barge in" and grab the lock if it shows up at the exact instant the current holder releases it, even if there are threads already waiting in the queue. The waiting threads don't lose their place permanently, but they can be skipped over occasionally.
+
+A **fair** lock strictly hands the lock to the thread that has been waiting the longest. New arrivals always queue up at the back. No barging.
+
+It seems like fair should always win. It's the polite option. But it has a real cost.
+
+Fair locks have noticeably lower throughput than unfair locks under contention, often by 5-10x in microbenchmarks. The reason is context-switch overhead: a fair lock has to wake up the longest-waiting thread, even if it's been parked and is cold in the CPU cache. An unfair lock can hand the lock to a thread that's already running and warm, which costs almost nothing.
+
+The throughput trade-off in code: The same task runs once with a fair lock and once with an unfair lock, and we measure how many lock acquisitions finish per second.
+
+```java
+import java.util.concurrent.locks.ReentrantLock;
+
+public class FairnessThroughput {
+
+    private static int counter = 0;
+
+    private static long runFor(ReentrantLock lock, int threads, long durationMs)
+            throws InterruptedException {
+        counter = 0;
+        long endAt = System.currentTimeMillis() + durationMs;
+        Thread[] workers = new Thread[threads];
+        for (int i = 0; i < threads; i++) {
+            workers[i] = new Thread(() -> {
+                while (System.currentTimeMillis() < endAt) {
+                    lock.lock();
+                    try {
+                        counter++;
+                    } finally {
+                        lock.unlock();
+                    }
+                }
+            });
+            workers[i].start();
+        }
+        for (Thread w : workers) {
+            w.join();
+        }
+        return counter;
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        long unfair = runFor(new ReentrantLock(false), 8, 500);
+        long fair = runFor(new ReentrantLock(true), 8, 500);
+        System.out.println("Unfair acquisitions: " + unfair);
+        System.out.println("Fair acquisitions:   " + fair);
+        System.out.println("Unfair is faster by ~" + (unfair / Math.max(fair, 1)) + "x");
+    }
+}
+```
+
+The exact numbers depend on the machine and JDK, but the ratio is the point. An unfair lock processes several times more work in the same window because it avoids the wake-up overhead. The fair lock guarantees nobody starves, at a real throughput price.
+
+When is fair appropriate? When starvation is a real concern. If you have a few long-running threads that grab the lock for milliseconds at a time, and one occasional short-running thread that needs to make progress for a user-facing response, an unfair lock can keep starving the short one. Fair fixes that. For typical caching, counter updates, and short critical sections, unfair is the appropriate default.
+
+`synchronized` is effectively unfair too. It has never offered a fairness guarantee, and trying to add one would change the optimization profile of the JVM. If you need fairness, `new ReentrantLock(true)` is the way to ask for it.
+
+<h1 id="trylock-dont-wait-at-all">tryLock(): Don't Wait at All</h1>
+
+`tryLock()` attempts to acquire the lock and returns immediately. It returns `true` if it got the lock, `false` if someone else holds it. No waiting, no blocking. The caller decides what to do next.
+
+This is the building block for deadlock avoidance. A thread that needs two locks can grab the first, then call `tryLock` on the second. If the second is busy, it can release the first and back off instead of holding one while waiting for the other (which is exactly the shape of every two-lock deadlock).
+
+```java
+import java.util.concurrent.locks.ReentrantLock;
+
+public class TryLockDemo {
+
+    private static final ReentrantLock inventoryLock = new ReentrantLock();
+
+    public static void main(String[] args) throws InterruptedException {
+        // Thread 1 grabs and holds the lock for 200ms
+        Thread holder = new Thread(() -> {
+            inventoryLock.lock();
+            try {
+                System.out.println("holder: got lock, doing work");
+                try {
+                    Thread.sleep(200);
+                } catch (InterruptedException ignored) {
+                }
+            } finally {
+                inventoryLock.unlock();
+                System.out.println("holder: released lock");
+            }
+        }, "holder");
+        holder.start();
+
+        Thread.sleep(50); // make sure holder is in the critical section
+
+        // Thread 2 tries and gives up immediately
+        if (inventoryLock.tryLock()) {
+            try {
+                System.out.println("requester: got lock");
+            } finally {
+                inventoryLock.unlock();
+            }
+        } else {
+            System.out.println("requester: lock busy, skipping");
+        }
+
+        holder.join();
+    }
+}
+```
+
+The requester didn't block. It asked, got `false`, and moved on. That's the entire `tryLock()` contract.
+
+There's an important footnote on `tryLock()` and fairness. The plain `tryLock()` (no arguments) **barges** even on a fair lock. It tries to take the lock immediately, regardless of any threads already waiting. The thinking is that `tryLock` is for code that explicitly doesn't want to wait, so making it line up at the back of a queue would defeat the purpose. If you do want the fair behavior with a timeout, use `tryLock(0, TimeUnit.SECONDS)`, which respects the queue.
+
+<h1 id="trylocktimeout-timeunit-wait-but-not-forever">
+  tryLock(timeout, TimeUnit): Wait, but Not Forever
+</h1>
+
+The single-argument form returns immediately. The two-argument form `tryLock(long timeout, TimeUnit unit)` waits up to a bounded amount of time. If it gets the lock within that window, it returns `true`. If the timeout elapses first, it returns `false`. If the thread is interrupted while waiting, it throws `InterruptedException`.
+
+Use this form in a service with an SLA. Consider an inventory check during Black Friday: hundreds of customers are clicking buy on the same hot item, the inventory lock is contended, and you cannot let a request thread sit on that lock for ten seconds. Time out, return a friendly retry response, free the thread for the next request.
+
+```java
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class CheckoutWithTimeout {
+
+    private static final ReentrantLock inventoryLock = new ReentrantLock();
+    private static int stockCount = 1;
+
+    public static String checkout(String customer) {
+        try {
+            boolean got = inventoryLock.tryLock(50, TimeUnit.MILLISECONDS);
+            if (!got) {
+                return "sorry " + customer + ", try again";
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "interrupted";
+        }
+        try {
+            if (stockCount > 0) {
+                stockCount--;
+                // simulate slow downstream call
+                try {
+                    Thread.sleep(150);
+                } catch (InterruptedException ignored) {
+                }
+                return customer + ": order placed";
+            } else {
+                return customer + ": out of stock";
+            }
+        } finally {
+            inventoryLock.unlock();
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread first = new Thread(() -> System.out.println(checkout("Ana")), "Ana");
+        Thread second = new Thread(() -> System.out.println(checkout("Ben")), "Ben");
+        first.start();
+        Thread.sleep(10); // let Ana grab the lock first
+        second.start();
+        first.join();
+        second.join();
+    }
+}
+```
+
+Ana enters the checkout, grabs the lock, and starts the slow downstream call. Ben arrives ten milliseconds later, calls `tryLock(50, MILLISECONDS)`, waits fifty milliseconds, and gives up because Ana is going to be holding the lock for another hundred. Ben returns the "try again" response immediately instead of blocking the thread for the full one hundred fifty milliseconds. Under peak load, this is the difference between a server that gracefully sheds load and one that builds up a thundering queue of waiting threads.
+
+The right timeout depends on the workload. Make it too short and you'll bounce legitimate requests during routine contention. Make it too long and you're back to "wait forever" territory. A common pattern is to size the timeout based on the expected p99 latency of the protected section, with some headroom.
+
+<h1 id="lockinterruptibly-cancellable-waiting">
+  lockInterruptibly(): Cancellable Waiting
+</h1>
+
+`lock()` ignores interrupts while waiting. If you call `interrupt()` on a thread that is blocked inside `lock()`, the flag is set but the thread stays blocked. It will only notice the flag after it eventually acquires the lock and finishes its critical section.
+
+For most code, that's fine. For long-running tasks where the user might cancel, or for a thread pool that wants to shut down gracefully, ignoring interrupts means cancellations don't actually cancel anything.
+
+`lockInterruptibly()` is the version that respects interrupts. While the thread is waiting for the lock, if some other thread calls `interrupt()` on it, the wait stops and `InterruptedException` is thrown. The lock is not acquired.
+
+```java
+import java.util.concurrent.locks.ReentrantLock;
+
+public class InterruptibleLockDemo {
+
+    private static final ReentrantLock cacheLock = new ReentrantLock();
+
+    public static void main(String[] args) throws InterruptedException {
+        // Hold the lock for a long time
+        Thread holder = new Thread(() -> {
+            cacheLock.lock();
+            try {
+                try {
+                    Thread.sleep(2000);
+                } catch (InterruptedException ignored) {
+                }
+            } finally {
+                cacheLock.unlock();
+            }
+        }, "holder");
+        holder.start();
+
+        Thread.sleep(50); // ensure holder has the lock
+
+        Thread waiter = new Thread(() -> {
+            System.out.println("waiter: trying lockInterruptibly");
+            try {
+                cacheLock.lockInterruptibly();
+                try {
+                    System.out.println("waiter: got lock");
+                } finally {
+                    cacheLock.unlock();
+                }
+            } catch (InterruptedException e) {
+                System.out.println("waiter: interrupted while waiting");
+            }
+        }, "waiter");
+        waiter.start();
+
+        Thread.sleep(100);
+        waiter.interrupt();   // cancel the waiting thread
+
+        waiter.join();
+        holder.join();
+    }
+}
+```
+
+The waiter never acquired the lock. The holder still had it, but the interrupt broke the wait cleanly. If we had used `lock()` instead of `lockInterruptibly()`, the interrupt call would have set the interrupted flag, and the waiter would have continued blocking until the holder finished, two seconds later.
+
+A natural use is shutting down a thread pool while threads are blocked waiting for a contended lock. `ExecutorService.shutdownNow()` calls `interrupt()` on each worker. Workers using `lockInterruptibly()` will wake up and exit. Workers using `lock()` will continue blocking and the shutdown will hang or only complete after the slow holder finishes.
+
+<h1 id="diagnostic-methods">Diagnostic Methods</h1>
+
+`ReentrantLock` exposes a small set of inspection methods that don't change the lock state. They're useful for assertions in tests, for diagnostic logging during incidents, and for the occasional defensive check in production code.
+
+| Method                    | Returns   | Use                                                                                     |
+| ------------------------- | --------- | --------------------------------------------------------------------------------------- |
+| `getHoldCount()`          | `int`     | How many times the current thread has acquired this lock (0 if not held by this thread) |
+| `isHeldByCurrentThread()` | `boolean` | Whether the calling thread is the owner                                                 |
+| `isLocked()`              | `boolean` | Whether any thread holds the lock                                                       |
+| `getQueueLength()`        | `int`     | Estimated number of threads waiting to acquire the lock                                 |
+| `hasQueuedThreads()`      | `boolean` | Whether any thread is waiting                                                           |
+| `isFair()`                | `boolean` | Whether this lock was constructed with `fair = true`                                    |
+
+`getHoldCount` and `isHeldByCurrentThread` answer questions about the calling thread. `getQueueLength` and `hasQueuedThreads` answer questions about everyone else. None of these are guaranteed to be accurate the instant you read them in a multi-threaded context (another thread can come or go between the call and your use of the result), but they're useful for monitoring and for asserting invariants in code.
+
+```java
+import java.util.concurrent.locks.ReentrantLock;
+
+public class DiagnosticsDemo {
+
+    private static final ReentrantLock orderLock = new ReentrantLock();
+
+    public static void processOrder(int orderId) {
+        orderLock.lock();
+        try {
+            System.out.println("order " + orderId
+                + " holdCount=" + orderLock.getHoldCount()
+                + " heldByMe=" + orderLock.isHeldByCurrentThread()
+                + " queueLength=" + orderLock.getQueueLength());
+            recordOrder(orderId);
+        } finally {
+            orderLock.unlock();
+        }
+    }
+
+    public static void recordOrder(int orderId) {
+        orderLock.lock();
+        try {
+            System.out.println("record " + orderId
+                + " holdCount=" + orderLock.getHoldCount());
+        } finally {
+            orderLock.unlock();
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread t1 = new Thread(() -> processOrder(1));
+        Thread t2 = new Thread(() -> processOrder(2));
+        Thread t3 = new Thread(() -> processOrder(3));
+        t1.start();
+        Thread.sleep(20);
+        t2.start();
+        Thread.sleep(20);
+        t3.start();
+        t1.join();
+        t2.join();
+        t3.join();
+    }
+}
+```
+
+The first order sees a queue of two threads behind it. The second sees one. The third sees zero. The `holdCount` inside `recordOrder` is `2` because the outer `processOrder` already incremented it. `isHeldByCurrentThread` is always `true` inside the protected section.
+
+A common use of `isHeldByCurrentThread` is a method that wants to be safe whether it's called by code that already holds the lock or not:
+
+```java
+public void appendItem(String item) {
+    boolean owned = orderLock.isHeldByCurrentThread();
+    if (!owned) {
+        orderLock.lock();
+    }
+    try {
+        // do work
+    } finally {
+        if (!owned) {
+            orderLock.unlock();
+        }
+    }
+}
+```
+
+This pattern lets the same method be called from inside a larger critical section (without double-locking) and from outside (where it acquires the lock itself). Used sparingly. Most code is cleaner if it's clear about who owns the lock at each call site.
+
+`getQueueLength` is documented as an estimate. It walks the internal queue, so calling it in a tight loop is wasteful. Use it for monitoring and for occasional diagnostic logging, not as a control-flow signal.
+
+<h1 id="when-to-actually-prefer-reentrantlock">
+  When to Actually Prefer ReentrantLock
+</h1>
+
+For most code, `synchronized` is fine. It's shorter, automatically managed by the JVM, and well-optimized. Pick `ReentrantLock` when you need one of its specific capabilities:
+
+- **You need a timeout on acquisition.** The Black Friday inventory-lock case. `tryLock(timeout, unit)` returns a clean false instead of blocking your request thread.
+- **You need cancellable waits.** Long-running operations, graceful shutdown of thread pools, user-cancelable tasks. `lockInterruptibly()` lets the wait be interrupted.
+- **The lock acquisition and release are in different methods or scopes.** A queue that locks on enqueue and unlocks when the consumer takes an item. A streaming pipeline that hands a row-level lock across processing stages. `synchronized` can't express this; `ReentrantLock` can.
+- **You need fairness.** Rare, but real. Workloads where a slow background thread keeps starving a fast user-facing thread benefit from `new ReentrantLock(true)`.
+- **You want multiple `Condition` objects on the same lock.** A bounded buffer with separate "not full" and "not empty" conditions is one example.
+
+For everything else, `synchronized` is the simpler answer. A common mistake is choosing `ReentrantLock` because it sounds more powerful and then writing the same code as with `synchronized`, just with more `try/finally` boilerplate and a higher chance of forgetting `unlock`.
+
+<h1 id="reentrantlock-vs-synchronized">ReentrantLock vs synchronized</h1>
+
+A side-by-side reference for the differences that actually matter:
+
+| Aspect                                               | `synchronized`                                | `ReentrantLock`                      |
+| ---------------------------------------------------- | --------------------------------------------- | ------------------------------------ |
+| Reentrant                                            | Yes                                           | Yes                                  |
+| Block-structured (acquire and release in same scope) | Required                                      | Optional                             |
+| Timeout on acquisition                               | No                                            | Yes (`tryLock` with timeout)         |
+| Cancellable wait                                     | No (interrupt is queued)                      | Yes (`lockInterruptibly`)            |
+| Try without waiting                                  | No                                            | Yes (`tryLock`)                      |
+| Fairness option                                      | No (effectively unfair)                       | Yes (constructor flag)               |
+| Multiple condition variables per lock                | No (one implicit `wait`/`notify`)             | Yes (`newCondition()` per condition) |
+| Release on exception                                 | Automatic                                     | Manual (`try/finally`)               |
+| Hold count inspection                                | No                                            | `getHoldCount()`                     |
+| Queue length inspection                              | No                                            | `getQueueLength()`                   |
+| Per-call-site memory overhead                        | None (uses object monitor)                    | Small (the `ReentrantLock` object)   |
+| JVM optimization                                     | Biased locking, lock elision, lock coarsening | Standard class, fewer JIT hooks      |
+
+Both are reentrant. Both provide mutual exclusion. Both have the same memory-model guarantees (a `lock` is a happens-before edge with a prior `unlock` by another thread on the same lock). The differences are all about control: how long to wait, how to cancel, where to acquire, and what to inspect.
+
+For a counter increment, both options compile to similar machine code under contention. For a Black Friday checkout, only `ReentrantLock` gives you the timeout you need. Pick based on what the code actually has to do.
+
+<h1 id="putting-it-together">Putting It Together</h1>
+
+A condensed example tying the main pieces together: a checkout service with a fair inventory lock, a timed acquisition for graceful degradation, a reentrant nested call, and an interruptible variant for shutdown.
+
+```java
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class CheckoutService {
+
+    // Fair: we don't want a hot customer to monopolize stock updates
+    private static final ReentrantLock inventoryLock = new ReentrantLock(true);
+    private static int stockCount = 5;
+
+    public static String checkout(String customer) {
+        try {
+            if (!inventoryLock.tryLock(100, TimeUnit.MILLISECONDS)) {
+                return "sorry " + customer + ", try again";
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return customer + ": interrupted";
+        }
+        try {
+            if (stockCount <= 0) {
+                return customer + ": out of stock";
+            }
+            stockCount--;
+            return logAndConfirm(customer);   // re-enters the same lock
+        } finally {
+            inventoryLock.unlock();
+        }
+    }
+
+    private static String logAndConfirm(String customer) {
+        // Re-acquires the lock to demonstrate reentrance
+        inventoryLock.lock();
+        try {
+            return customer + ": confirmed (stock now " + stockCount
+                + ", holdCount=" + inventoryLock.getHoldCount() + ")";
+        } finally {
+            inventoryLock.unlock();
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        String[] customers = {"Ana", "Ben", "Cara", "Dan", "Eve", "Finn"};
+        Thread[] threads = new Thread[customers.length];
+        for (int i = 0; i < customers.length; i++) {
+            final String c = customers[i];
+            threads[i] = new Thread(() -> System.out.println(checkout(c)));
+            threads[i].start();
+        }
+        for (Thread t : threads) {
+            t.join();
+        }
+        System.out.println("Final stock: " + stockCount);
+    }
+}
+```
+
+Six customers, five units of stock. Five get confirmed orders, the sixth gets the out-of-stock response. The order of customer names may shuffle (the fair lock keeps the queue ordered by arrival, but `Thread.start()` doesn't guarantee strict arrival order). Every confirmation shows a `holdCount` of `2` because `logAndConfirm` re-enters the lock the outer `checkout` already holds. Under heavier load, you'd start seeing "try again" responses as the timeout kicks in.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

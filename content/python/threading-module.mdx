@@ -1,0 +1,503 @@
+---
+title: "threading Module"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "threading Module explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="what-the-threading-module-gives-you">
+  What the threading Module Gives You
+</h1>
+
+The `threading` module is part of the standard library, so there's nothing to install. It wraps the operating system's threading primitives in a Python-friendly API, with a `Thread` class for spawning workers and a handful of helper functions for inspecting what's running.
+
+A thread is a unit of execution that shares its parent process's memory. That last part is the key contrast with `multiprocessing`: processes are isolated, threads are not. Two threads in the same Python process see the same global variables, the same module-level state, and the same objects. This makes threading cheap and communication easy, but it also means you have to be careful when two threads touch the same data at the same time.
+
+Here's the smallest possible threaded program. It runs a function in the background while the main thread keeps going:
+
+```python
+import threading
+import time
+
+def send_order_confirmation(order_id):
+    print(f"Sending confirmation for order {order_id}")
+    time.sleep(1)
+    print(f"Confirmation sent for order {order_id}")
+
+worker = threading.Thread(target=send_order_confirmation, args=(101,))
+worker.start()
+print("Main thread is free to do other work")
+worker.join()
+print("All done")
+```
+
+The order of the first two lines can flip depending on scheduling. That's part of the deal with threads: the operating system decides who runs when, and you don't get to assume anything about timing. What you can rely on is the structure: `start()` kicks off the worker, the main thread keeps going, and `join()` waits for the worker to finish.
+
+The `target` is the function the new thread should run. `args` is a tuple of positional arguments to pass to that function. The tuple needs a trailing comma when you pass a single argument, otherwise Python reads `(101)` as the integer `101` rather than a one-element tuple.
+
+The diagram shows the basic shape every threaded program follows. The main thread spawns workers, the workers run their tasks in parallel from the program's view, and the main thread waits at a `join()` call until each worker is done. The order in which workers finish has nothing to do with the order in which they were started.
+
+<h1 id="creating-threads-with-target">Creating Threads with target=</h1>
+
+The most common way to create a thread is to pass a function to `Thread(target=...)`. The function runs in a new thread when you call `start()`. The function can be anything callable: a plain function, a lambda, a method, a partial. No special inheritance, no decoration.
+
+Here's a more realistic example. You have three product IDs and you want to fetch each product's details in parallel:
+
+```python
+import threading
+import time
+
+def fetch_product(product_id):
+    print(f"Fetching product {product_id}")
+    time.sleep(2)
+    print(f"Got product {product_id}")
+
+workers = []
+for product_id in [101, 102, 103]:
+    worker = threading.Thread(target=fetch_product, args=(product_id,))
+    workers.append(worker)
+    worker.start()
+
+for worker in workers:
+    worker.join()
+
+print("All products fetched")
+```
+
+The whole thing takes about 2 seconds, not 6. Each `time.sleep(2)` represents the I/O wait you'd see in real code: a network round-trip, a database query, a disk read. While one thread is waiting, the others get to run, so the waits overlap.
+
+You can pass keyword arguments through `kwargs`:
+
+```python
+import threading
+import time
+
+def send_email(to, subject, body=""):
+    print(f"Sending '{subject}' to {to}")
+    time.sleep(0.5)
+    print(f"Sent to {to}: {body[:30]}")
+
+worker = threading.Thread(
+    target=send_email,
+    args=("alice@example.com",),
+    kwargs={"subject": "Your order has shipped", "body": "Tracking number: ABC123XYZ"},
+)
+worker.start()
+worker.join()
+```
+
+`args` gets unpacked as positional arguments, `kwargs` as keyword arguments. The function signature is what it is; `args` and `kwargs` are how you feed it. A thread that takes no arguments at all just gets `Thread(target=some_function)`.
+
+> **Cost:** Creating a thread is cheaper than creating a process, but it isn't free. On most systems, each thread gets a fresh stack (often 1-8 MB depending on the OS) and a small kernel-side bookkeeping cost. Spawning hundreds of threads to do a few milliseconds of work is wasteful. Reach for thread pools when you have many short-lived tasks.
+
+<h1 id="creating-threads-by-subclassing-thread">
+  Creating Threads by Subclassing Thread
+</h1>
+
+The second way to create a thread is to subclass `Thread` and override the `run` method. This is the pattern you reach for when the thread has state of its own, or when you want to bundle related setup into a class.
+
+```python
+import threading
+import time
+
+class ProductFetcher(threading.Thread):
+    def __init__(self, product_id):
+        super().__init__()
+        self.product_id = product_id
+        self.result = None
+
+    def run(self):
+        print(f"Fetching product {self.product_id}")
+        time.sleep(1)
+        self.result = {"id": self.product_id, "name": f"Product-{self.product_id}", "price": 29.99}
+        print(f"Done with product {self.product_id}")
+
+fetchers = [ProductFetcher(pid) for pid in [101, 102, 103]]
+for fetcher in fetchers:
+    fetcher.start()
+for fetcher in fetchers:
+    fetcher.join()
+
+for fetcher in fetchers:
+    print(fetcher.result)
+```
+
+Two things to notice. First, you must call `super().__init__()` in your subclass's `__init__`, otherwise the `Thread` machinery isn't set up and `start()` will fail. Second, you override `run`, not `start`. `start()` is what kicks off the OS thread; it then calls `run()` in the new thread. If you accidentally override `start` instead of `run`, you'll bypass the threading machinery and the code will execute in the main thread.
+
+Another use-case for subclassing: holding return values. Plain `Thread(target=...)` discards whatever the target function returns, because there's nowhere to put it. A subclass can stash the result on `self`, like `self.result` above, and the caller reads it after `join()` returns.
+
+When should you pick which? Use `Thread(target=...)` for one-off tasks, simple functions, or when you're firing off the same function with different arguments. Subclass `Thread` when each worker has its own configuration, state, or result it needs to expose. Most everyday code uses the function form; the subclass form is mostly a tool for the rare cases where the function form gets ugly.
+
+<h1 id="start-join-is_alive">start, join, is_alive</h1>
+
+These are the three methods you'll use the most.
+
+**`start()`** asks the OS to spin up a new thread and run `run()` in it. You call `start` exactly once per `Thread` instance. Calling it twice raises `RuntimeError`. Calling it zero times means the function never runs in a new thread, which is a surprisingly common bug when you forget the line.
+
+**`join(timeout=None)`** blocks the calling thread until the target thread finishes. If you pass `timeout`, `join` returns after at most that many seconds, whether the target finished or not. Without a timeout, `join` waits forever, which is usually what you want.
+
+**`is_alive()`** returns `True` if the thread has been started and hasn't finished yet, `False` otherwise. It's useful for status checks and for deciding whether to call `join` with a timeout.
+
+```python
+import threading
+import time
+
+def process_order(order_id):
+    print(f"Processing order {order_id}")
+    time.sleep(2)
+    print(f"Finished order {order_id}")
+
+worker = threading.Thread(target=process_order, args=(501,))
+print(f"Before start: is_alive={worker.is_alive()}")
+
+worker.start()
+print(f"After start: is_alive={worker.is_alive()}")
+
+worker.join(timeout=0.5)
+print(f"After join timeout 0.5s: is_alive={worker.is_alive()}")
+
+worker.join()
+print(f"After full join: is_alive={worker.is_alive()}")
+```
+
+A short `join` timeout is a common pattern when you want to show progress or check a cancellation flag periodically. Loop with a small timeout, check `is_alive`, do something useful, repeat.
+
+```python
+import threading
+import time
+
+def slow_export():
+    time.sleep(3)
+    print("Export done")
+
+worker = threading.Thread(target=slow_export)
+worker.start()
+
+while worker.is_alive():
+    worker.join(timeout=1.0)
+    if worker.is_alive():
+        print("Still exporting...")
+
+print("Worker finished")
+```
+
+One gotcha worth remembering: `join` doesn't return the function's return value. If the target raised an exception, it died inside the thread and the main thread doesn't get notified by default. Threads swallow their exceptions unless you catch them explicitly inside the target, or set up a custom `excepthook`. This is one of the reasons `concurrent.futures` is often easier than raw threads for production code.
+
+<h1 id="naming-threads">Naming Threads</h1>
+
+Every thread has a name. By default, Python generates one like `Thread-1`, `Thread-2`, and so on. You can set your own name, which makes log messages a lot easier to read when several threads are running at once.
+
+```python
+import threading
+import time
+
+def fetch_product(product_id):
+    name = threading.current_thread().name
+    print(f"[{name}] fetching product {product_id}")
+    time.sleep(0.5)
+    print(f"[{name}] done")
+
+worker = threading.Thread(
+    target=fetch_product,
+    args=(101,),
+    name="product-fetcher-101",
+)
+worker.start()
+worker.join()
+```
+
+You can also read or change the name after construction via the `name` attribute:
+
+```python
+import threading
+
+worker = threading.Thread(target=lambda: None)
+print(worker.name)
+worker.name = "email-sender"
+print(worker.name)
+```
+
+The default name in newer Python versions includes the target function name in parentheses, which is already a small quality-of-life improvement. Naming threads explicitly is still worth it for anything that runs alongside other threads, because it lets you tell which one is which in logs.
+
+<h1 id="daemon-threads-vs-non-daemon">Daemon Threads vs Non-Daemon</h1>
+
+Every thread is either a **daemon** or a **non-daemon**. The difference is what happens when the main thread (and all other non-daemon threads) finish.
+
+A non-daemon thread will keep the program running until it finishes. If your main thread reaches the end of the script and a non-daemon worker is still running, Python will wait for that worker before exiting. Non-daemon is the default.
+
+A daemon thread gets killed abruptly when the main thread (and all other non-daemon threads) exit. The program doesn't wait. This is useful for background tasks that should die with the program: a thread polling a stats endpoint, a thread flushing logs every few seconds, anything that doesn't need to finish cleanly.
+
+```python
+import threading
+import time
+
+def background_log_flusher():
+    while True:
+        print("Flushing logs...")
+        time.sleep(1)
+
+flusher = threading.Thread(target=background_log_flusher, daemon=True)
+flusher.start()
+
+print("Main thread doing 3 seconds of work")
+time.sleep(3)
+print("Main thread done, program exits")
+```
+
+Without `daemon=True`, that infinite loop would keep the program running forever. With it, the moment the main thread returns from `time.sleep(3)` and reaches the end of the script, the flusher dies and the process exits.
+
+You can also set the daemon flag via attribute, before `start`:
+
+```python
+worker = threading.Thread(target=some_function)
+worker.daemon = True
+worker.start()
+```
+
+Setting `daemon` after `start` raises `RuntimeError`. The flag has to be locked in before the thread runs.
+
+> **Caution:** Daemon threads die mid-instruction when the program exits. They don't get a chance to flush buffers, close files, release locks, or finish writing data. Use daemons for fire-and-forget background tasks, not for anything that mutates external state you care about.
+
+<h1 id="inspecting-threads-at-runtime">Inspecting Threads at Runtime</h1>
+
+The `threading` module has a small set of functions for asking "who's running right now?" They're handy for logging, debugging, and making sure you understand what your program is doing.
+
+| Function                     | Returns                                                         |
+| ---------------------------- | --------------------------------------------------------------- |
+| `threading.current_thread()` | The `Thread` object for the thread that called it               |
+| `threading.main_thread()`    | The `Thread` object for the original main thread                |
+| `threading.active_count()`   | The number of `Thread` objects currently alive (including main) |
+| `threading.enumerate()`      | A list of all currently alive `Thread` objects                  |
+| `threading.get_ident()`      | An integer OS-level thread identifier                           |
+
+Here's all of them in one program:
+
+```python
+import threading
+import time
+
+def fetch_product(product_id):
+    me = threading.current_thread()
+    print(f"[{me.name}] alive count={threading.active_count()}")
+    time.sleep(1)
+
+workers = []
+for product_id in [101, 102, 103]:
+    worker = threading.Thread(
+        target=fetch_product,
+        args=(product_id,),
+        name=f"fetcher-{product_id}",
+    )
+    workers.append(worker)
+    worker.start()
+
+print(f"Main thread name: {threading.main_thread().name}")
+print(f"Active threads right after spawning: {threading.active_count()}")
+print("All alive threads:")
+for t in threading.enumerate():
+    print(f"  - {t.name}")
+
+for worker in workers:
+    worker.join()
+```
+
+The active count is 4 because the main thread counts too. `threading.main_thread()` always returns the original thread that ran the script; it doesn't change when you spawn workers. `threading.current_thread()` returns whichever thread is calling it, so the same line of code returns different objects depending on who runs it.
+
+These functions are read-only views of the threading system. They don't let you kill a thread, restart one, or change priorities. Python threads don't have a `kill` or `terminate` method by design; threads cooperate by checking flags or sentinels, they don't get terminated from the outside.
+
+<h1 id="why-threads-share-memory">Why Threads Share Memory</h1>
+
+Here's a core idea about threading. Every thread in a Python process runs inside the same memory space. They share:
+
+- All module-level (global) variables.
+- All objects on the heap, including dicts, lists, sets, custom class instances.
+- All open files, sockets, and other resources.
+
+What they don't share is:
+
+- The call stack (each thread has its own local variables).
+- The currently executing line of code.
+
+This setup is what makes threading useful for I/O work. One thread can stuff a result into a shared dict, and the next thread can read it without any serialization, file writes, or pipes. Compare that to processes, where you have to deliberately set up shared memory or send messages over pipes to move data between them.
+
+```python
+import threading
+import time
+
+product_cache = {}
+
+def fetch_and_cache(product_id):
+    time.sleep(0.5)
+    product_cache[product_id] = {"name": f"Product-{product_id}", "price": 29.99 + product_id}
+    print(f"Cached product {product_id}")
+
+workers = [
+    threading.Thread(target=fetch_and_cache, args=(pid,))
+    for pid in [101, 102, 103]
+]
+for worker in workers:
+    worker.start()
+for worker in workers:
+    worker.join()
+
+print(product_cache)
+```
+
+`product_cache` is a single dict that all three workers write into. No coordination, no message passing. The main thread sees all three entries after `join`. This is shared memory at work.
+
+But here's where it starts to bite. When two threads write to the same shared variable at the same time, the result is unpredictable. Consider counting how many orders have been processed:
+
+```python
+import threading
+
+processed_count = 0
+
+def process_orders(batch):
+    global processed_count
+    for _ in range(batch):
+        processed_count += 1
+
+workers = [
+    threading.Thread(target=process_orders, args=(100_000,))
+    for _ in range(5)
+]
+for worker in workers:
+    worker.start()
+for worker in workers:
+    worker.join()
+
+print(f"Expected: 500000, got: {processed_count}")
+```
+
+You'd expect `500000` every time, and on small workloads in CPython you often get it because of the way the interpreter schedules bytecode. Crank the number up or move to a more contended scenario and the result starts drifting. The issue is that `processed_count += 1` is not one atomic operation; it's three steps under the hood (read, add, write), and another thread can sneak in between any two of them.
+
+This is the **race condition** problem. The takeaway: threads share memory, sharing memory means you have to think about who writes what when, and Python's threading module has tools (locks, semaphores, events) to make that safe.
+
+<h1 id="a-practical-example-fetching-product-pages-concurrently">
+  A Practical Example: Fetching Product Pages Concurrently
+</h1>
+
+Time to put the pieces together with a realistic I/O-bound example. Imagine you're building an admin tool that needs to fetch details for a list of products from a slow internal service. Each request takes about a second. Serial fetching would scale linearly with the number of products; threading lets the waits overlap.
+
+We'll simulate the slow service with `time.sleep`. In real code, the `time.sleep` line would be a `requests.get`, a database query, or something else that mostly waits on the network.
+
+First, the serial version:
+
+```python
+import time
+
+def fetch_product(product_id):
+    time.sleep(1)
+    return {"id": product_id, "name": f"Product-{product_id}", "price": 29.99}
+
+product_ids = [101, 102, 103, 104, 105]
+
+start = time.perf_counter()
+results = [fetch_product(pid) for pid in product_ids]
+elapsed = time.perf_counter() - start
+
+print(f"Serial: fetched {len(results)} products in {elapsed:.2f}s")
+```
+
+Five products, one second each, five seconds total. Now the threaded version:
+
+```python
+import threading
+import time
+
+def fetch_product(product_id, results):
+    time.sleep(1)
+    results[product_id] = {"id": product_id, "name": f"Product-{product_id}", "price": 29.99}
+
+product_ids = [101, 102, 103, 104, 105]
+results = {}
+
+start = time.perf_counter()
+workers = []
+for product_id in product_ids:
+    worker = threading.Thread(
+        target=fetch_product,
+        args=(product_id, results),
+        name=f"fetcher-{product_id}",
+    )
+    workers.append(worker)
+    worker.start()
+
+for worker in workers:
+    worker.join()
+
+elapsed = time.perf_counter() - start
+print(f"Threaded: fetched {len(results)} products in {elapsed:.2f}s")
+for product_id in sorted(results):
+    print(f"  {product_id}: {results[product_id]['name']}")
+```
+
+Five products in one second, roughly the same time as fetching one. The waits overlap, so the total time is the longest single wait, not the sum of all waits.
+
+A few details worth pointing out. Each worker writes its result into a shared `results` dict, keyed by product ID. Writing different keys from different threads is safe in CPython's dict implementation in practice, but the moment two threads write the **same** key, or one reads while another writes, you're back in race-condition territory. A lock makes this airtight; the key-per-thread pattern shown here avoids the issue by construction.
+
+Naming the threads (`name=f"fetcher-{product_id}"`) doesn't change behavior, but it pays off the moment you add logging. A line like `[fetcher-103] timeout retrying` is much more useful than `[Thread-3]`.
+
+Here's the same pattern with the subclass form, in case you prefer it:
+
+```python
+import threading
+import time
+
+class ProductFetcher(threading.Thread):
+    def __init__(self, product_id):
+        super().__init__(name=f"fetcher-{product_id}")
+        self.product_id = product_id
+        self.result = None
+
+    def run(self):
+        time.sleep(1)
+        self.result = {"id": self.product_id, "name": f"Product-{self.product_id}", "price": 29.99}
+
+fetchers = [ProductFetcher(pid) for pid in [101, 102, 103, 104, 105]]
+
+start = time.perf_counter()
+for fetcher in fetchers:
+    fetcher.start()
+for fetcher in fetchers:
+    fetcher.join()
+elapsed = time.perf_counter() - start
+
+print(f"Subclass version: {len(fetchers)} products in {elapsed:.2f}s")
+for fetcher in fetchers:
+    print(f"  {fetcher.product_id}: {fetcher.result['name']}")
+```
+
+Each fetcher carries its own result, so there's no shared dict at all. The main thread reads `fetcher.result` after `join` returns, and the result is local to that specific thread instance.
+
+> **Cost:** Both patterns scale fine for a handful of workers, but spawning a thread per item gets wasteful once you're past a few dozen. A pool of long-lived workers reusing themselves across many tasks is more efficient. That's `concurrent.futures.ThreadPoolExecutor`.
+
+<h1 id="when-threads-arent-the-right-tool">
+  When Threads Aren't the Right Tool
+</h1>
+
+Threads shine on I/O-bound work. They struggle on CPU-bound work, because of the Global Interpreter Lock (GIL). The short version: in CPython, only one thread executes Python bytecode at a time, so threading doesn't speed up pure-Python number crunching. For CPU-bound parallelism you want `multiprocessing` or, increasingly, sub-interpreters and free-threaded builds in modern Python versions.
+
+A quick reference table of when each fits:
+
+| Workload                                     | Use threads?     | Better option                                             |
+| -------------------------------------------- | ---------------- | --------------------------------------------------------- |
+| Fetching multiple URLs                       | Yes              | `concurrent.futures.ThreadPoolExecutor` for many requests |
+| Reading many small files                     | Yes              | `ThreadPoolExecutor` for many reads                       |
+| Sending order confirmation emails to a batch | Yes              | `ThreadPoolExecutor`                                      |
+| Image resizing on many photos                | No               | `multiprocessing`                                         |
+| Running a long ML inference                  | No               | `multiprocessing` or a GPU                                |
+| Compressing files                            | No               | `multiprocessing`                                         |
+| Polling a status endpoint in the background  | Yes, as a daemon | `asyncio` for many such tasks                             |
+
+Threading isn't always the cleanest tool even for I/O. `asyncio` often gives you the same overlap with less memory overhead and more explicit control over scheduling. But asyncio requires the libraries you're calling to be async-aware, and a lot of real-world code is still sync. Threads work with any sync I/O code, no rewrites required, which is why they remain a practical first choice for "make this batch of waits go in parallel" problems.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

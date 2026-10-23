@@ -1,0 +1,347 @@
+---
+title: "TCP vs UDP"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "TCP vs UDP explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+IP helps get a packet to the correct machine. TCP or UDP helps deliver that data to the correct application running on that machine.
+
+A **port** identifies a specific application or service on the machine. For example, a server might have a single IP address but run a web server on one port, a database on another, and several other services on different ports. HTTPS commonly uses port `443`, and PostgreSQL commonly uses port `5432`.
+
+Both TCP and UDP use port numbers for this purpose.
+
+The main difference is not where they operate, but what guarantees they provide while moving data between those endpoints.
+
+<h1 id="2-tcp">2. TCP</h1>
+
+**TCP** stands for **Transmission Control Protocol**. It is a connection-oriented transport protocol designed to provide reliable and ordered communication between two endpoints.
+
+TCP is a good fit when the application needs all bytes delivered in order and would rather wait than process stale or incomplete data.
+
+<h3 id="the-three-way-handshake">The Three-Way Handshake</h3>
+
+Before sending application data, TCP first establishes a connection between the sender and receiver using a process called the **three-way handshake**.
+
+1. **SYN:** The client sends a SYN packet to the server, essentially saying, "I want to start a connection." It carries the client's initial sequence number.
+2. **SYN-ACK:** The server responds with a SYN-ACK, acknowledging the client's request and indicating that it is ready to communicate. It carries the server's own sequence number.
+3. **ACK:** Finally, the client sends an ACK back to the server.
+
+At that point, the TCP connection is established and application data can start flowing.
+
+This handshake allows both sides to confirm that they can communicate and initialize the state needed for the connection, including the sequence numbers used to track data.
+
+The trade-off is that establishing a TCP connection takes additional network round trips before useful application data can be exchanged. In practice, systems reduce that cost with connection reuse, TLS 1.3, TCP Fast Open in limited environments, or QUIC.
+
+<h3 id="reliable-delivery-and-retransmissions">
+  Reliable Delivery and Retransmissions
+</h3>
+
+Once the connection is established, TCP keeps track of the data being sent so it can detect when something goes missing. It does this mainly using **sequence numbers** and **acknowledgments**.
+
+Imagine the sender transmits several pieces of data in order. The receiver acknowledges the data it has successfully received.
+
+If some data is lost along the way, TCP can detect the gap because the expected sequence is incomplete. The sender can then retransmit the missing data.
+
+Once the missing segment arrives, the receiver can reconstruct the complete stream and deliver it correctly to the application.
+
+This means applications using TCP usually do not need to implement packet-loss recovery themselves. TCP handles it underneath.
+
+<h3 id="ordered-delivery">Ordered Delivery</h3>
+
+Packets do not always arrive in the same order they were sent. Different packets can take different paths through the network, and some may be delayed more than others.
+
+TCP handles this using sequence numbers. It keeps track of where each piece of data belongs in the byte stream and reorders the data before giving it to the application.
+
+So the application still sees the original data in the correct order.
+
+This is important for things like web responses, database queries, and file transfers, where receiving the right bytes in the wrong order would produce incorrect results.
+
+The cost of this ordering is waiting. If one segment is lost, later bytes may already be sitting in the receiver's buffer, but the application cannot receive them until the missing earlier bytes arrive. This is called **head-of-line blocking** at the TCP stream level.
+
+For many systems, that waiting is exactly what you want. A SQL result, an HTTP response body, or a file download is usually useless if bytes are missing or out of order.
+
+But reliable delivery is only one part of TCP. TCP also needs to make sure a fast sender does not overwhelm a slower receiver. That is where flow control comes in.
+
+<h3 id="flow-control">Flow Control</h3>
+
+Imagine a fast server sending data to a much slower client.
+
+Even if the network can carry the traffic, the client may not be able to process incoming data quickly enough. If the sender keeps transmitting at full speed, the receiver's buffer can fill up and data may have to be dropped.
+
+TCP prevents this using **flow control**.
+
+The receiver tells the sender how much additional data it currently has space for. This value is called the **receive window**. The sender uses that information to limit how much unacknowledged data it has in flight.
+
+- If the receiver is processing data quickly, it can advertise a larger window and allow the sender to send more.
+- If the receiver starts falling behind, it can advertise a smaller window, causing the sender to slow down.
+
+So flow control is essentially about matching the sending rate to the receiver's capacity.
+
+But the receiver is not the only thing that can become overloaded. The network itself can also become congested, and TCP handles that with a separate mechanism called congestion control.
+
+<h3 id="congestion-control">Congestion Control</h3>
+
+If too many devices send too much traffic at once, routers can become congested, queues can fill up, and packets may be dropped.
+
+TCP tries to avoid this by adjusting how much data it sends based on network conditions.
+
+It maintains a **congestion window**, which limits how much unacknowledged data can be in flight.
+
+- When the network appears healthy, TCP gradually increases the amount of data it sends.
+- When it detects signs of congestion, such as packet loss or other congestion signals, it reduces the sending rate.
+
+The exact behavior depends on the congestion-control algorithm being used, such as Reno, CUBIC, or BBR. But the main idea is simple: TCP continuously adapts its sending rate to avoid overwhelming the network.
+
+The two mechanisms protect different things. Flow control protects the receiver. Congestion control protects the network path.
+
+<h3 id="tcp-is-a-byte-stream">TCP Is a Byte Stream</h3>
+
+TCP delivers a stream of bytes, not a sequence of messages.
+
+If an application writes three messages, the receiver may read them as one combined chunk, three chunks, or several partial chunks. TCP keeps the bytes in order, but it does not remember your message boundaries.
+
+That means the application protocol must define where one message ends and the next begins. Common approaches include length prefixes, delimiters, or structured formats.
+
+<h3 id="what-tcp-does-not-guarantee">What TCP Does Not Guarantee</h3>
+
+TCP does not guarantee that a business operation succeeded.
+
+It only guarantees reliable, ordered delivery of bytes while the connection stays healthy. If a server commits a database transaction but the connection breaks before the client receives the response, the client still does not know what happened.
+
+That is why real systems still need timeouts, retries, idempotency keys, and duplicate handling.
+
+<h3 id="connection-close">Connection Close</h3>
+
+TCP connections can close gracefully with FIN packets or abruptly with RST packets.
+
+A graceful close means each side has finished sending bytes. It does not mean the business operation succeeded. Applications still need clear success responses and safe state handling.
+
+<h3 id="where-tcp-fits">Where TCP Fits</h3>
+
+TCP is still the default choice for a huge number of applications.
+
+You’ll commonly find it underneath:
+
+- HTTP/1.1 and HTTP/2
+- Traditional HTTPS connections
+- SSH
+- Email protocols such as SMTP and IMAP
+- Database connections like PostgreSQL and MySQL
+- Most internal RPC systems, including standard gRPC over HTTP/2
+- Message brokers and queues that need reliable, ordered delivery
+
+For request-response APIs, admin tools, database protocols, and most service-to-service communication, TCP is still the simple and dependable choice.
+
+<h1 id="3-udp">3. UDP</h1>
+
+UDP takes a much simpler approach.
+
+**UDP** stands for **User Datagram Protocol**. Unlike TCP, UDP is connectionless. There is no handshake before sending data.
+
+<h3 id="how-udp-works">How UDP Works</h3>
+
+The sender simply creates a datagram and sends it to the destination IP and port.
+
+UDP also does not guarantee that the data will arrive:
+
+- If a packet is lost, UDP does not retransmit it.
+- If packets arrive out of order, UDP does not reorder them.
+- If the receiver cannot keep up, UDP does not provide TCP-style flow control.
+
+That makes UDP much simpler than TCP. Each datagram is treated as an independent message, and the protocol adds very little machinery around it.
+
+What UDP does provide:
+
+- **Ports:** Source and destination program identifiers.
+- **Datagram boundaries:** One send maps to one datagram at the UDP layer.
+- **Length:** The receiver knows the datagram size.
+- **Checksum:** Corruption detection. The UDP checksum is mandatory in IPv6 and optional in IPv4, though commonly used.
+
+UDP's header is small: 8 bytes. TCP's base header is 20 bytes before options.
+
+This lower overhead can be useful for applications where latency matters more than perfect delivery.
+
+For example, in a live voice call, losing one small audio packet may cause a tiny glitch. Waiting to retransmit that packet could be worse, because by the time it arrives, the conversation has already moved on.
+
+<h3 id="application-level-reliability-with-udp">
+  Application-Level Reliability with UDP
+</h3>
+
+UDP doesn't mean reliability is impossible. It simply means reliability is not built into the transport protocol itself.
+
+If the application needs reliability on top of UDP, it has to build that behavior itself, or use a higher-level protocol like QUIC.
+
+Applications that use UDP responsibly usually add the pieces they need:
+
+- Sequence numbers to detect loss or reordering
+- Timestamps to discard stale data
+- Application-level acknowledgments for important messages
+- Forward error correction for media
+- Rate control so they do not flood the network
+- Encryption through DTLS, SRTP, or QUIC
+
+<h3 id="why-use-udp">Why Use UDP</h3>
+
+UDP is still useful because sometimes latency matters more than perfect delivery.
+
+- **No handshake:** UDP has no connection handshake, so data can be sent immediately.
+- **Less overhead:** It has less protocol overhead and does not automatically pause to recover every lost packet.
+
+That makes it a good fit for real-time applications like video calls and online games.
+
+UDP also gives applications more control. If an application needs some reliability, but not TCP's exact behavior, it can implement its own acknowledgments, retransmissions, or ordering rules on top of UDP.
+
+<h3 id="where-udp-fits">Where UDP Fits</h3>
+
+UDP is commonly used for:
+
+- DNS queries
+- Real-time voice and video
+- Online games
+- WebRTC media
+- QUIC and HTTP/3
+- Service discovery and local network protocols
+- Telemetry where occasional loss is acceptable
+
+UDP is a good fit when fresh data matters more than complete delivery, or when a higher-level protocol adds the missing behavior itself.
+
+<h3 id="tcp-and-udp-side-by-side">TCP and UDP Side by Side</h3>
+
+<h1 id="4-quic-and-http3">4. QUIC and HTTP/3</h1>
+
+A good modern example of a reliable protocol built on top of UDP is **QUIC**. It was originally developed at Google and later standardized by the IETF.
+
+Traditional HTTP/1.1 and HTTP/2 usually run on top of TCP. HTTP/3 works differently. It runs on top of QUIC, and QUIC itself runs on top of UDP.
+
+QUIC uses UDP as a lightweight transport foundation, then adds many of the features applications need on top of it:
+
+- Reliable delivery and retransmission
+- Congestion control and flow control
+- Encryption by default, with TLS 1.3 built in
+- Support for multiple independent streams
+- Connection migration when a client changes networks, such as moving from WiFi to cellular
+
+UDP is a good foundation because most networks already support it. It also lets QUIC implement its own rules for reliability, ordering, and congestion control instead of depending on the operating system's TCP stack.
+
+<h3 id="faster-connection-setup">Faster Connection Setup</h3>
+
+One of the biggest advantages of this design is faster connection setup.
+
+With TCP, the client first establishes a TCP connection, and secure applications then perform a TLS handshake before sending application data.
+
+QUIC integrates transport and security more tightly, which can reduce the number of round trips needed before useful data starts flowing.
+
+<h3 id="independent-streams">Independent Streams</h3>
+
+QUIC also handles multiple streams differently.
+
+TCP gives you a single ordered byte stream, so packet loss can temporarily block data that comes after it. In HTTP/2 over TCP, many streams share one TCP connection, so one lost segment can hold up every stream behind it.
+
+With QUIC, streams are independent. If data is lost on one stream, the other streams can continue making progress instead of waiting for that missing data to arrive.
+
+<h3 id="caveats">Caveats</h3>
+
+QUIC is not always better. Some networks block or degrade UDP. Some older network devices are harder to use with QUIC. Teams still need monitoring, fallback to TCP-based HTTP, and a careful rollout.
+
+<h1 id="5-choosing-between-tcp-udp-and-quic">
+  5. Choosing Between TCP, UDP, and QUIC
+</h1>
+
+Start with what the application needs, not with protocol fashion.
+
+<h3 id="choose-tcp-when">Choose TCP When</h3>
+
+TCP is usually right when every byte matters and the data must be processed in order.
+
+It is also the safer default when the application protocol is already built around streams, or when you want mature behavior through firewalls, proxies, and company networks.
+
+Use TCP for common protocols such as HTTP/1.1, HTTP/2, SSH, PostgreSQL, MySQL, SMTP, or standard gRPC.
+
+This describes most day-to-day backend traffic: payment API calls, database transactions, file uploads, internal gRPC calls, and admin SSH sessions.
+
+<h3 id="choose-udp-when">Choose UDP When</h3>
+
+UDP is usually right when fresh data is more valuable than complete old data, and the application can tolerate loss or repair it itself.
+
+It also fits when you need datagram boundaries, when you are using an existing UDP-based protocol, or when your application controls pacing, retries, and congestion behavior.
+
+Real-time voice and video, game state updates, DNS lookups, local discovery protocols, and telemetry where occasional loss is acceptable all match this pattern.
+
+<h3 id="choose-quic-or-http3-when">Choose QUIC or HTTP/3 When</h3>
+
+QUIC or HTTP/3 can be a strong fit when you want HTTP over a modern encrypted transport and connection setup time matters.
+
+It also helps when clients move between networks, such as mobile users switching from WiFi to cellular, or when many streams suffer from TCP head-of-line blocking.
+
+The practical requirement is that you can run UDP on port `443` reliably and fall back to TCP-based HTTP when needed.
+
+These properties can pay off for large web platforms, mobile APIs, streaming AI responses, latency-sensitive edge APIs, and systems that benefit from HTTP/3 but can fall back to HTTP/2.
+
+<h1 id="6-real-world-examples">6. Real-World Examples</h1>
+
+The choice between TCP and UDP shows up in many different systems.
+
+The same question applies each time: **what should happen when data is late or lost?**
+
+Two systems can make opposite choices from that question. A delayed database response may be a small stall. A delayed audio packet may be useless.
+
+<h3 id="web-and-apis">Web and APIs</h3>
+
+HTTP/1.1 and HTTP/2 commonly run over TCP with TLS. HTTP/3 runs over QUIC over UDP.
+
+A mature web platform often supports HTTP/2 and HTTP/3, measures performance, and falls back cleanly when UDP is blocked.
+
+<h3 id="databases">Databases</h3>
+
+Databases generally use TCP because queries, results, transactions, and replication streams need reliable ordered bytes.
+
+The harder design problems are connection pooling, timeouts, transaction retries, and backpressure.
+
+<h3 id="dns">DNS</h3>
+
+DNS traditionally uses UDP for small queries because it is simple and low latency.
+
+DNS can also use TCP. Modern encrypted DNS options include DNS over TLS, DNS over HTTPS, and DNS over QUIC. The right choice depends on response size, privacy needs, deployment environment, and resolver support.
+
+<h3 id="real-time-media">Real-Time Media</h3>
+
+Voice and video systems usually prefer timely delivery over perfect delivery. A late audio packet is often useless.
+
+These systems use jitter buffers, codecs, packet loss concealment, forward error correction, and congestion control to keep the session usable.
+
+<h3 id="online-games">Online Games</h3>
+
+Games often send frequent state updates over UDP.
+
+If a player position update is lost, the next update may replace it. Critical events, such as inventory changes or purchases, still need reliable application-level handling or a separate reliable channel.
+
+<h3 id="ai-systems">AI Systems</h3>
+
+Most AI APIs use TCP-based HTTPS because request correctness, authentication, and broad compatibility matter.
+
+Streaming tokens can use HTTP chunking, Server-Sent Events, WebSockets, gRPC streaming, or HTTP/3 depending on the client and platform.
+
+Internal AI infrastructure may use TCP or gRPC for control-plane calls and model metadata. It may use specialized streaming or UDP-based protocols for real-time media input, low-latency interactive experiences, or telemetry where occasional loss is acceptable.
+
+<h1 id="summary">Summary</h1>
+
+TCP and UDP both sit on top of IP and use ports to reach the right application. The difference is what guarantees they provide.
+
+TCP opens a connection with a three-way handshake, then gives a reliable, ordered byte stream. Sequence numbers and acknowledgments let it retransmit missing data and reorder what arrives. Flow control protects the receiver, and congestion control protects the network. It does not preserve message boundaries, and it does not prove that a business operation succeeded.
+
+UDP sends independent datagrams with no handshake. It does not retransmit, reorder, or slow down for the receiver. That keeps it simple and low latency, which suits real-time applications. When an application needs reliability on top of UDP, it builds exactly the parts it needs, or uses a protocol like QUIC.
+
+QUIC runs over UDP and adds reliable delivery, congestion control, encryption, and independent streams. It powers HTTP/3, sets up connections in fewer round trips, and keeps one lost packet from blocking unrelated streams.
+
+The best design question is not "Which one is faster?" It is:
+
+**What should the application do when data is late, lost, duplicated, reordered, or processed twice?**
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

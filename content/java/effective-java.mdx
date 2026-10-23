@@ -1,0 +1,276 @@
+---
+title: "Effective Java Tips"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Effective Java Tips explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+The previous lesson covered the surface rules: naming, formatting, file layout, the kind of guidance a linter can enforce. This lesson is about the deeper habits that separate Java code that works from Java code that's pleasant to live with for years. Most of these tips come from Joshua Bloch's _Effective Java_, distilled and pointed at the e-commerce code from earlier in the course. Each tip below names a habit, shows the version of the code that ignores it, then the version that follows it, and ends with the trade-off that signals when the habit bends.
+
+<h1 id="1-prefer-static-factory-methods-over-constructors">
+  1. Prefer Static Factory Methods Over Constructors
+</h1>
+
+A constructor has one job: build an instance. It has one name (the class name), and the only way to overload is by changing parameter types. A static factory method is a regular static method that returns an instance. It has a chosen name, can cache and return existing instances, can return any subtype, and can be the only public entry point with a private constructor.
+
+`Discount.percent(10)` reads better than `new Discount(10.0, 0.0)`. The name describes intent. The constructor is private, so no caller can build a `Discount` outside the two named entry points. The `NONE` constant is shared, which means every "no discount" reference in the codebase points at the same object: no allocation, no garbage to collect.
+
+Factories also enable caching. `Boolean.valueOf(true)` and `Boolean.valueOf(false)` return the same two pre-built objects every time. The constructor `new Boolean(true)` is deprecated for exactly this reason: it allocates a new object for a value that has only two distinct states.
+
+Two calls to `OrderStatus.of("PENDING")` return the same instance because the factory checks the cache first. A constructor can't do that; every `new` allocates.
+
+**Trade-off:** classes with only static factories and no public constructor can't be subclassed, because subclasses need an accessible parent constructor. That's usually a feature for value types like `Discount`, but it can be a constraint for a class meant to be a base class. Also, static factories don't stand out in IDEs the way constructors do, so use clear names (`of`, `from`, `valueOf`, `getInstance`, `newInstance`) that signal "this builds an instance."
+
+<h1 id="2-use-the-builder-pattern-when-constructors-get-unwieldy">
+  2. Use the Builder Pattern When Constructors Get Unwieldy
+</h1>
+
+A constructor with three or four parameters is fine. A constructor with eight is a maintenance trap. Callers have to remember the order of arguments, optional values get encoded as `null` or `0`, and every new field forces a new overload. The builder pattern fixes this by letting the caller name each value at the call site.
+
+The call site reads like prose. Each value has a name. Optional fields stay optional because they have defaults. The `build` method runs the final validation, so a half-built `Order` never escapes the builder. Compare this to `new Order("ORD-1", "cust-42", 2999, 500, 300, null, null)`. Same data, but the reader has to count argument positions and guess what each one means.
+
+The builder shines with several fields, many of them optional. For two or three required fields, a regular constructor is still the right answer. The threshold for switching is usually around four parameters, especially when several of them have the same type and could be swapped without the compiler noticing.
+
+The diagram shows the split of responsibilities. The builder owns construction time: it's mutable, it collects values one by one, and it validates at the end. The `Order` owns value time: it's immutable, it's already correct, and nothing more can change.
+
+**Trade-off:** a builder doubles the boilerplate. For small classes that would not otherwise need it, a record with named components is usually cleaner. Use the builder when the class has many fields, when several are optional, or when validation should happen in one place at the end of construction.
+
+<h1 id="3-enforce-singleton-with-an-enum">3. Enforce Singleton With an Enum</h1>
+
+A singleton is a class with exactly one instance. The classic implementation uses a private constructor, a static field, and double-checked locking, all of which are fiddly to get right and easy to break with reflection or serialization. The single-line replacement that handles all of it is a one-element enum.
+
+The JVM guarantees that `CartIdGenerator.INSTANCE` is created exactly once, lazily, in a thread-safe way, and that no amount of reflection or serialization trickery can produce a second instance. The enum machinery handles the parts that a hand-rolled singleton would have to fight with: the synchronization on first access, the protection against reflection, and the correct deserialization behaviour. All of that comes from writing `enum X { INSTANCE; }`.
+
+**Trade-off:** an enum singleton can't extend another class (it already extends `java.lang.Enum`). It can implement interfaces freely. For a singleton that has to extend something, fall back to the lazy holder idiom, but that's a rarer need than it looks.
+
+<h1 id="4-avoid-creating-unnecessary-objects">
+  4. Avoid Creating Unnecessary Objects
+</h1>
+
+Every `new` costs memory. Most of the cost is invisible until a profiler on a hot path reveals that half the CPU is collecting garbage. Three common allocation traps catch even experienced developers: autoboxing, throwaway strings, and regex compiled inside a loop.
+
+**Autoboxing:**
+
+Both loops produce the same number. The second loop is much slower. Every `boxedSum += i` unboxes the current `Long`, adds `i`, and boxes the result into a new `Long`. A million iterations means a million temporary `Long` objects, all destined for the garbage collector. Use the primitive type (`long`) where possible; use the wrapper (`Long`) only when the object form is needed, like in a collection.
+
+Autoboxing in a loop turns a fast arithmetic operation into an allocate-and-collect cycle. The difference is often 5x to 10x on simple sums.
+
+**Throwaway strings:**
+
+The first loop builds a new `String` on every iteration. Strings are immutable, so `result += item` copies the entire existing string plus the new piece into a fresh allocation. With three items that's a small cost. With a thousand items in a hot path, it's quadratic work. The `StringBuilder` version writes into a single growing buffer.
+
+**Regex in a loop:**
+
+`Pattern.compile` is expensive: it parses the regex, builds a state machine, and allocates internal structures. Doing it once and storing it in a `static final` field amortizes the cost across every call. The shorthand `input.matches("regex")` recompiles the pattern on every call, which is a small line of code with an outsized cost. For one-off checks it's fine. In a validator that runs on every request, it's wasteful.
+
+**Trade-off:** chasing every allocation is its own trap. Premature micro-optimization makes code harder to read and rarely matters for cold paths. The rule is: profile, find the hot paths, fix the allocations there. Elsewhere, write the clear version.
+
+<h1 id="5-eliminate-obsolete-object-references">
+  5. Eliminate Obsolete Object References
+</h1>
+
+Java has a garbage collector, but the collector can only reclaim objects that nothing references. A reference that hangs around past its useful life keeps the object alive forever, which is the textbook definition of a memory leak. The classic offender is a hand-rolled collection that grows but never shrinks.
+
+**Bad:**
+
+The `removeLast` method decrements `size`, but the slot at the old index still holds the reference. The "removed" object is invisible to clients (`size` has shrunk past it), but the garbage collector still sees the reference and refuses to collect the object. A long-lived cart that goes through millions of adds and removes leaves the heap full of unreachable references from the client's perspective but reachable from the array.
+
+**Good:**
+
+Nulling the slot lets the garbage collector see that the reference is gone. The collector now reclaims the object on the next pass.
+
+The same leak shape appears in caches that never evict, listeners that subscribe but never unsubscribe, and `ThreadLocal` values that outlive the thread's interest in them. The rule of thumb: when an object's lifecycle is wider than the lifecycle of one user's interest in it, explicit cleanup is required. Standard library collections handle this; hand-rolled ones don't.
+
+**Trade-off:** nulling out references is only necessary when managing custom storage. For everyday code that uses `ArrayList`, `HashMap`, and the rest of the collections framework, the JVM and the library already handle it. Adding `= null` everywhere in regular code is noise.
+
+<h1 id="6-prefer-try-with-resources-to-try-finally">
+  6. Prefer try-with-resources to try-finally
+</h1>
+
+Closing a resource by hand looks simple until every failure path is traced. If a class implements `AutoCloseable`, use try-with-resources.
+
+**Bad:**
+
+The pattern is correct, but it's also fragile. The null check is necessary because `new FileWriter` can throw before `writer` is assigned. If `writer.close()` throws inside `finally`, and the body of `try` was also throwing, the original exception is lost: `finally`'s exception wins. The fix is more code, more nesting, and a `Throwable.addSuppressed` call that's easy to forget.
+
+**Good:**
+
+The try-with-resources form handles every edge case. If the constructor fails, no resource exists and there's nothing to close. If the body throws and the close also throws, the close-time exception is attached as a suppressed exception on the original, so neither is lost. Fewer lines, fewer ways to get it wrong.
+
+**Trade-off:** only types that implement `AutoCloseable` work with try-with-resources. For the rare resource that doesn't, the hand-rolled version is required, but that's also a signal to wrap the resource in an `AutoCloseable`.
+
+<h1 id="7-override-equals-and-hashcode-together-and-tostring-too">
+  7. Override equals and hashCode Together (and toString Too)
+</h1>
+
+The `equals` contract is straightforward in principle: two objects are equal when they represent the same value. A common mistake is overriding `equals` without overriding `hashCode`. The two methods are bound by a contract: equal objects must have equal hash codes. Break that, and objects behave strangely in `HashMap`, `HashSet`, and anything else that hashes.
+
+**Bad:**
+
+`a.equals(b)` returns `true` (same id), but `set.contains(b)` returns `false`. The `HashSet` first hashes `b` to find the bucket. `b` has the inherited `Object.hashCode`, which is identity-based, so its hash points at a different bucket from `a`'s. The bucket is empty, so the search reports "not found" without ever calling `equals`.
+
+**Good:**
+
+`hashCode` uses the same fields as `equals`, so equal objects hash to the same bucket. The `toString` override turns debug output and log lines into something readable. The three methods travel as a set: if you override one, the other two probably need attention too.
+
+Records and Lombok's `@Data` generate all three correctly. Hand-written classes need the discipline to do it explicitly.
+
+**Trade-off:** for a class with identity rather than value (a session object, a connection, an open file), the inherited `Object.equals` (reference equality) is correct, and overriding `equals` would be wrong. Override only when the class represents a value, where "same fields" means "same thing."
+
+<h1 id="8-minimize-mutability">8. Minimize Mutability</h1>
+
+An immutable object can't change after construction. Two threads can share it without synchronization, callers can pass it without making defensive copies, and the object can be cached and reused freely. Mutable objects have none of those guarantees, and every place they're passed has to ask "what if someone else changes this during the read?"
+
+The fields are `private final`, there are no setters, and the only way to "change" a value is to build a new instance with `withQuantity`. The original is untouched. Two threads can share the original safely. A method that receives a `LineItem` can trust that the value won't change during the read.
+
+The five rules for an immutable class:
+
+1. Mark the class `final` (or use private constructors and static factories).
+2. Make all fields `private` and `final`.
+3. Don't provide setters or any other mutator methods.
+4. Don't expose internal mutable state. Defensive-copy any mutable field on the way in and on the way out.
+5. For "modifications," return a new instance.
+
+Records satisfy points 1 through 4 automatically. They cover the common case so well that for any new value type, the question should be "is there a reason not to use a record?" before "should this class be a record?"
+
+**Trade-off:** every "modification" allocates a new object. For tiny objects in tight loops, that adds up, but the JVM's escape analysis often elides allocations when the new object doesn't escape the local method. For large objects with deep structure, pair immutability with structural sharing (the way `List.copyOf` doesn't always copy if the source is already unmodifiable) to keep the cost reasonable. For a hot mutable buffer, use a regular class; otherwise, immutable is the default.
+
+<h1 id="9-favour-composition-over-inheritance">
+  9. Favour Composition Over Inheritance
+</h1>
+
+Inheritance is one of the first things Java teaches, and it's often overused. The problem is that inheritance is a strong commitment: a subclass depends on the exact behaviour of its parent's methods, including ones the parent's author didn't intend to be part of the contract. Change the parent and the subclass breaks in subtle ways.
+
+**Bad: inheritance for code reuse:**
+
+The `addCount` is supposed to track every time something is added. It works for single `add`. It also tries to handle `addAll` by adding the collection's size. But `ArrayList.addAll` is implemented by calling `add` internally on each element. So a single `addAll` call increments `addCount` twice: once for the override, then once per element from the inherited path. The bug isn't in the override; it's in coupling to the implementation details of the parent.
+
+**Good: composition with a wrapper:**
+
+`CountingCart` holds an `ArrayList` as a private field. It exposes its own `add` and `addAll`. Whatever the `ArrayList` does internally doesn't affect the count, because `CountingCart` only counts at its own boundary. The class is now resilient to changes in `ArrayList`'s implementation, and it can't be misused by callers casting it to `ArrayList` and bypassing the count.
+
+The diagram captures the structural difference. Inheritance binds the subclass to the parent's internals. Composition gives you a layer between the two, and that layer is where you control the contract.
+
+**Trade-off:** composition adds a forwarding layer. Exposing all thirty methods of a wrapped class requires thirty forwarders. Modern IDEs generate these in seconds, but the boilerplate is real. Inheritance fits a genuine "is-a" relationship where both ends are under the same control. For "has-a" relationships, composition wins almost always.
+
+<h1 id="10-refer-to-objects-by-their-interfaces">
+  10. Refer to Objects by Their Interfaces
+</h1>
+
+Given a choice between declaring a variable as an interface type or as a concrete class, pick the interface. The code becomes more flexible: the concrete implementation can change later without touching every caller.
+
+**Bad:**
+
+The method's parameter is `ArrayList<Double>`. A caller with a `LinkedList<Double>` or a `List.of(...)` immutable list can't pass it in without first copying into an `ArrayList`. The method doesn't actually need `ArrayList`-specific behaviour; it just iterates. The concrete type misrepresents what the method requires.
+
+**Good:**
+
+The parameter is now `List<Double>`. Any implementation passes. The method advertises only what it actually needs (the ability to iterate), and callers can choose whatever concrete list type fits the situation.
+
+The same rule applies to variable declarations:
+
+The right hand side is the concrete type, where the choice has to be made. The left hand side is the abstract type, where every reader cares only about the contract.
+
+**Trade-off:** when an implementation-specific method is needed (`ArrayList.ensureCapacity`, `LinkedHashMap`'s ordering guarantees), declare the variable with the concrete type. The rule is "interface unless more is needed," not "interface always."
+
+<h1 id="11-avoid-raw-types-use-parameterized-types">
+  11. Avoid Raw Types, Use Parameterized Types
+</h1>
+
+A raw type is a generic class used without its type parameter: `List` instead of `List<String>`. The compiler accepts raw types for compatibility with code written before generics, but it turns off most type checking inside the raw type, and the resulting bugs usually show up as a `ClassCastException` at runtime.
+
+**Bad:**
+
+The `List` accepted both a `String` and an `Integer` without complaint. The loop tries to cast each element to `String` and crashes on the second iteration. The compiler had no way to help, because the raw type erased its type checking.
+
+**Good:**
+
+The parameterized list `List<String>` rejects the `Integer` at compile time. The error message points at the call site. The cast in the loop disappears, because the compiler already knows the elements are strings.
+
+The middle ground is the wildcard. `List<?>` means "a list of some unknown type." It's safer than raw `List` because the compiler still prevents adding the wrong thing, but it gives up the ability to read elements as a specific type. Use parameterized types when the type is known, wildcards when it legitimately isn't, and raw types essentially never.
+
+**Trade-off:** older APIs (some pre-generics frameworks, reflection-heavy code) sometimes return a raw type. Cast it to the parameterized form at the boundary, suppress the warning if needed, and keep the raw type from spreading further into the code.
+
+<h1 id="12-use-enums-instead-of-int-constants">
+  12. Use Enums Instead of Int Constants
+</h1>
+
+The pre-generics, pre-enum way to represent a finite set of states was with `public static final int` constants. The compiler doesn't know they belong together, so any `int` can be passed where a status is expected, and bugs slip through silently.
+
+**Bad:**
+
+The `describe(7)` call compiles fine and prints "Unknown" at runtime. The compiler can't tell that `7` isn't a valid status. The default branch is the only line of defense, and it gives the same answer for "bug in the caller" as for "future status we haven't named yet."
+
+**Good:**
+
+The compiler now enforces that only an `OrderStatus` value can be passed. The `switch` expression has no `default` branch and the compiler is satisfied, because it has proved that every enum value is handled. Adding a fifth value later causes the compiler to point at this `switch` as needing an update.
+
+Enums can also carry data and behaviour:
+
+Each value carries its own cost and delivery time. The data lives next to the value it describes, so a separate table isn't needed to understand what `EXPRESS` means.
+
+**Trade-off:** enums are heavier than ints in memory and serialization size. For most applications that's irrelevant. In an embedded system squeezing every byte, ints might still win. For ordinary application code, enums are the default.
+
+<h1 id="13-return-empty-collections-not-nulls">
+  13. Return Empty Collections, Not Nulls
+</h1>
+
+A method that sometimes returns a list and sometimes returns `null` forces every caller to write defensive null checks. A forgotten check produces a `NullPointerException`. The cleaner alternative is to always return a collection: empty when there's no data, populated when there is.
+
+**Bad:**
+
+The `for` loop crashes on the `null` list because `for` calls `iterator()` on whatever the right-hand side is. Every caller has to remember the check.
+
+**Good:**
+
+`List.of()` returns an immutable empty list. The caller's `for` loop runs zero times. No null check, no special branch, just the same shape of code whether there's data or not.
+
+The same rule applies to arrays. Return a zero-length array, not `null`. The standard library does this everywhere; your code should too.
+
+<h3 id="optional-for-single-values">Optional for Single Values</h3>
+
+For a method that returns at most one thing, `Optional<T>` makes "might not be there" visible in the type system.
+
+`Optional` shines for return types where absence is a normal outcome. Don't use it for fields (the indirection is a waste), don't use it for parameters (just overload the method or accept `null` with a clear contract), and don't use it for collections (an empty list already conveys absence). The right use is "this method returns either a value or nothing, and the caller has to decide what to do."
+
+**Trade-off:** wrapping every return value in `Optional` adds a layer of indirection and a small memory cost. For performance-critical hot paths, returning a sentinel or a paired primitive can be cheaper. For everyday application code, the clarity is worth the cost.
+
+<h1 id="14-prefer-for-each-over-traditional-for-loops">
+  14. Prefer For-Each Over Traditional For Loops
+</h1>
+
+The for-each loop (`for (T item : collection)`) is shorter, harder to get wrong, and the same speed as the indexed equivalent. The indexed form is needed only when you need the index or when you're modifying the collection while iterating.
+
+**Bad:**
+
+The loop works, but it's noisier than it needs to be. The `i` variable is declared, incremented, and never used for anything except indexing into `cart`. The `cart.get(i)` call is fine for `ArrayList`, but if the collection switches to `LinkedList`, every `get(i)` walks from the head and the loop becomes O(n^2). The indexed form makes that surprise possible.
+
+**Good:**
+
+The for-each form names what the code wants: each item in the cart. The compiler picks the right iteration strategy (a real iterator internally), so a `LinkedList` walks linearly without surprise. There is no index variable to misuse, no off-by-one error to introduce, no chance of accidentally indexing past the end.
+
+`for (int i = 0; i < list.size(); i++) list.get(i)` is O(n) for `ArrayList` but O(n^2) for `LinkedList`. For-each avoids the surprise by always using the right iterator.
+
+**Trade-off:** the for-each loop hides the index, so when the index is required (parallel arrays, every-other-element iteration, removing items by position), the indexed form still fits. The same goes for modifying the collection while iterating: use an `Iterator` explicitly to call `remove`.
+
+<h1 id="15-putting-it-together-a-cart-workflow">
+  15. Putting It Together: A Cart Workflow
+</h1>
+
+A final example that uses many of the tips at once: a `Cart` modeled as an immutable value, with a builder for construction, an enum for status, interface types for parameters, and `Optional` for absent values.
+
+Read the program as a whole. The `Cart` is immutable: every field is `private final`, the items list is wrapped with `List.copyOf` to take a defensive copy, and there are no setters. The `Builder` collects values fluently and validates at the end. The `CartStatus` enum prevents callers from passing arbitrary strings. The `couponCode` accessor returns `Optional<String>` so the absence case is part of the type. The `totalCents` method uses for-each. The `items` accessor returns the unmodifiable copy, so callers can iterate but not mutate.
+
+<h1 id="a-condensed-reference">A Condensed Reference</h1>
+
+The table below is the chapter on a single screen, for the next time you're staring at a piece of code and asking which tip applies.
+
+Each row stands on a section above. The combination of these habits is what turns code that works into code that's worth coming back to.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

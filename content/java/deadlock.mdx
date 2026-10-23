@@ -1,0 +1,607 @@
+---
+title: "Deadlock"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Deadlock explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="what-deadlock-actually-means">What Deadlock Actually Means</h1>
+
+A thread that calls `synchronized(someObject)` is asking to hold the monitor lock on that object. If another thread already holds it, the asking thread waits. That's the basic mechanic. Deadlock is the situation where every thread in a group is waiting for a lock that some other thread in the same group is holding, and none of them can move forward to release what they have.
+
+The smallest example needs two threads and two locks. Thread A holds lock 1 and wants lock 2. Thread B holds lock 2 and wants lock 1. Neither thread will let go of what it has until it gets what it's waiting for. The wait is infinite.
+
+The diagram shows the crossed-arrows shape that defines a deadlock. Each thread is on the "want" side of one arrow and the "have" side of another. As long as both threads sit in that configuration, the JVM has no reason to break the wait, because each one is doing exactly what `synchronized` is supposed to do: block until the lock is free.
+
+The reason this isn't a runtime error is that the JVM doesn't actively detect deadlock in the sense of breaking it. It just lets the threads sit there. The program's main thread might keep running, an unrelated thread pool might keep processing tasks, but the two stuck threads stay stuck. From the outside, it looks like a slow request, a hung worker, or a queue that stops draining. Users see a spinner. Logs go quiet. Then someone restarts the service.
+
+The cost of one deadlock is rarely just two stuck threads. The threads usually hold other resources too (a connection from a pool, a slot in a queue, a request that the client is waiting on), and those resources are stuck along with them. A web service can drain its connection pool one stuck thread at a time until every incoming request hits "no available connection" and the whole service looks down, even though most of its threads are idle.
+
+<h1 id="the-four-coffman-conditions">The Four Coffman Conditions</h1>
+
+A deadlock needs four conditions to hold at the same time. Edward Coffman published the list in 1971, and it's still the clearest way to think about the problem because removing any single condition prevents the deadlock. Arguing that one of the four cannot happen in the code proves the code is deadlock-free.
+
+The four conditions are:
+
+| Condition        | What it means                                                 | E-commerce flavor                                                                |
+| ---------------- | ------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| Mutual exclusion | A resource can be held by only one thread at a time           | Only one thread can update a warehouse's stock count at a time                   |
+| Hold and wait    | A thread holds a resource while waiting for another           | The thread holds the source warehouse's lock while waiting for the destination's |
+| No preemption    | A resource cannot be forcibly taken from a thread             | The JVM won't yank `synchronized` away mid-block                                 |
+| Circular wait    | A cycle of threads each waiting for a resource the next holds | Transfer A->B and B->A running at the same time                                  |
+
+**Mutual exclusion** is the property that makes locks useful in the first place. If two threads could both update the stock count for warehouse 1 at the same time, the result would be a lost update. Removing this condition usually means moving to lock-free data structures or making the data immutable.
+
+**Hold and wait** is what stretches a single lock acquisition into a chain. A thread that grabs lock A and then immediately reaches for lock B is sitting in this condition. The fix here is to either acquire all needed locks up front in one step, or to release each lock before asking for the next.
+
+**No preemption** is a property of `synchronized`. The JVM doesn't have a way to say "you've been holding this lock for too long, give it back." Once a thread is inside a `synchronized` block, it stays there until the block returns or throws. `tryLock` is the explicit answer to this condition: it lets a thread give up after a timeout instead of waiting forever.
+
+**Circular wait** is the shape on the diagram. Thread A waits on B, B waits on A. With three threads, it's A waits on B waits on C waits on A. A cycle in the "who is waiting for what" graph produces deadlock. The standard fix is global lock ordering.
+
+All four arrows have to point into the same `DEADLOCK` node at the same instant. Knock any one of them out and the others can't produce a deadlock on their own. Each avoidance strategy maps to one of the four conditions. Lock ordering kills the circular wait. `tryLock` with a timeout removes no-preemption (the thread opts out). Acquiring all locks at once kills hold-and-wait. Atomic types and immutability remove mutual exclusion entirely.
+
+<h1 id="the-classic-two-lock-example-inventory-transfer">
+  The Classic Two-Lock Example: Inventory Transfer
+</h1>
+
+The canonical example is a transfer between two warehouses. The warehouse class has a stock count and uses its own lock to keep updates safe. Moving items between two warehouses requires locking both, because both stock counts change. Two transfers running at the same time in opposite directions produce the crossed arrows from the diagram.
+
+```java
+public class InventoryTransferDeadlock {
+
+    static class Warehouse {
+        private final String id;
+        private int stock;
+
+        Warehouse(String id, int stock) {
+            this.id = id;
+            this.stock = stock;
+        }
+
+        public String id() {
+            return id;
+        }
+
+        public int stock() {
+            return stock;
+        }
+
+        public void addStock(int units) {
+            this.stock += units;
+        }
+
+        public void removeStock(int units) {
+            this.stock -= units;
+        }
+    }
+
+    static void transfer(Warehouse source, Warehouse destination, int units) {
+        synchronized (source) {
+            System.out.println(Thread.currentThread().getName()
+                + " locked " + source.id());
+            sleep(100); // makes the deadlock easy to hit
+            synchronized (destination) {
+                System.out.println(Thread.currentThread().getName()
+                    + " locked " + destination.id());
+                source.removeStock(units);
+                destination.addStock(units);
+                System.out.println(Thread.currentThread().getName()
+                    + " moved " + units + " from " + source.id()
+                    + " to " + destination.id());
+            }
+        }
+    }
+
+    static void sleep(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    public static void main(String[] args) {
+        Warehouse warehouseA = new Warehouse("A", 100);
+        Warehouse warehouseB = new Warehouse("B", 100);
+
+        Thread t1 = new Thread(
+            () -> transfer(warehouseA, warehouseB, 10), "transfer-A-to-B");
+        Thread t2 = new Thread(
+            () -> transfer(warehouseB, warehouseA, 10), "transfer-B-to-A");
+
+        t1.start();
+        t2.start();
+
+        // The main thread will exit, but t1 and t2 will hang forever.
+        System.out.println("main: started both transfers, going to sleep");
+    }
+}
+```
+
+The program prints three lines and then never prints anything else. `transfer-A-to-B` holds the lock on warehouse A and is sitting at `synchronized (destination)`, waiting for warehouse B. `transfer-B-to-A` holds the lock on warehouse B and is sitting at the same line, waiting for warehouse A. Neither thread will release what it has.
+
+The `Thread.sleep(100)` in the middle isn't required to cause a deadlock. It just makes the race reliable. Without the sleep, the program might run ten times and only show the deadlock once or twice; with it, the window between the first and second lock acquisition is wide enough that the second thread almost always slips in.
+
+The four Coffman conditions line up here as follows:
+
+- **Mutual exclusion**: each warehouse's monitor lock is held by one thread at a time.
+- **Hold and wait**: each thread holds one lock while asking for the other.
+- **No preemption**: `synchronized` cannot be revoked.
+- **Circular wait**: A waits on B, B waits on A.
+
+All four are present at the same time, so the program deadlocks.
+
+This is the exact crossed-arrows pattern from the opening diagram, drawn over the actual objects in the code. Two locks taken in different orders by different threads produces this same shape.
+
+A deadlock is not a bug that costs CPU cycles; the stuck threads use almost no CPU. The cost is the work that does not get done. A web request waiting on a deadlocked transfer holds its HTTP connection, its database connection, and its slot in the request queue. One deadlock can cascade into a full outage by draining pools.
+
+<h1 id="refund-and-reorder-the-same-bug-in-different-clothing">
+  Refund and Reorder: The Same Bug in Different Clothing
+</h1>
+
+The two-warehouse example makes the bug obvious because it is symmetric. Real codebases rarely look that clean. The same deadlock shows up in subtler shapes when two unrelated operations happen to touch the same two locks in opposite orders.
+
+Consider an e-commerce service with a `refund` operation and a `reorder` operation. A refund locks the order to mark it refunded, then locks the customer's account to credit the balance. A reorder locks the customer's account to check the balance, then locks the order to update its status to "placed again." Different code paths, possibly written by different team members, both perfectly safe in isolation.
+
+```java
+public class RefundReorderDeadlock {
+
+    static class Order {
+        final String id;
+        String status = "delivered";
+
+        Order(String id) {
+            this.id = id;
+        }
+    }
+
+    static class Account {
+        final String customerId;
+        double balance;
+
+        Account(String customerId, double balance) {
+            this.customerId = customerId;
+            this.balance = balance;
+        }
+    }
+
+    static void refund(Order order, Account account, double amount) {
+        synchronized (order) {
+            System.out.println("refund locked order " + order.id);
+            sleep(100);
+            synchronized (account) {
+                order.status = "refunded";
+                account.balance += amount;
+                System.out.println("refund: " + amount + " credited");
+            }
+        }
+    }
+
+    static void reorder(Account account, Order order, double amount) {
+        synchronized (account) {
+            System.out.println("reorder locked account " + account.customerId);
+            sleep(100);
+            synchronized (order) {
+                account.balance -= amount;
+                order.status = "placed";
+                System.out.println("reorder: " + amount + " charged");
+            }
+        }
+    }
+
+    static void sleep(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    public static void main(String[] args) {
+        Order order = new Order("ORD-1");
+        Account account = new Account("CUST-1", 200.0);
+
+        new Thread(() -> refund(order, account, 25.0), "refund").start();
+        new Thread(() -> reorder(account, order, 25.0), "reorder").start();
+    }
+}
+```
+
+Same deadlock, different lock pair. `refund` takes `order` then `account`. `reorder` takes `account` then `order`. Running them at the same time on the same objects causes the threads to cross paths. The bug isn't in either method individually. Each one acquires two locks safely. The bug is that the two methods, taken together, don't agree on an order.
+
+This pattern is the more common shape of deadlock in production. Symmetric "transfer A to B vs transfer B to A" code is usually caught in code review because the symmetry is visible. Asymmetric pairs like `refund` and `reorder` slip through because the two methods don't get reviewed side by side until something hangs.
+
+<h1 id="diagnosing-deadlock-with-jstack-and-thread-dumps">
+  Diagnosing Deadlock with jstack and Thread Dumps
+</h1>
+
+When a program hangs, the standard tool is `jstack`. It prints a thread dump: a snapshot of every thread, its stack trace, and what it's waiting on. The JVM also runs a deadlock detector on the dump and reports any cycle it finds.
+
+Find the PID of the Java process (with `jps` or `ps`) and run `jstack <pid>`. The output for the inventory-transfer deadlock looks like this:
+
+```text
+"transfer-A-to-B" #11 prio=5 os_prio=31 tid=0x00007f8b... nid=0x5103 waiting for monitor entry [0x000070000d6e1000]
+   java.lang.Thread.State: BLOCKED (on object monitor)
+        at InventoryTransferDeadlock.transfer(InventoryTransferDeadlock.java:28)
+        - waiting to lock <0x000000076ac1a248> (a InventoryTransferDeadlock$Warehouse)
+        - locked <0x000000076ac1a210> (a InventoryTransferDeadlock$Warehouse)
+        at InventoryTransferDeadlock.lambda$main$0(InventoryTransferDeadlock.java:55)
+        at java.lang.Thread.run(Thread.java:833)
+
+"transfer-B-to-A" #12 prio=5 os_prio=31 tid=0x00007f8b... nid=0x5303 waiting for monitor entry [0x000070000d7e4000]
+   java.lang.Thread.State: BLOCKED (on object monitor)
+        at InventoryTransferDeadlock.transfer(InventoryTransferDeadlock.java:28)
+        - waiting to lock <0x000000076ac1a210> (a InventoryTransferDeadlock$Warehouse)
+        - locked <0x000000076ac1a248> (a InventoryTransferDeadlock$Warehouse)
+        at InventoryTransferDeadlock.lambda$main$0(InventoryTransferDeadlock.java:56)
+        at java.lang.Thread.run(Thread.java:833)
+
+Found one Java-level deadlock:
+=============================
+"transfer-A-to-B":
+  waiting to lock monitor 0x00007f8b... (object 0x000000076ac1a248, a InventoryTransferDeadlock$Warehouse),
+  which is held by "transfer-B-to-A"
+"transfer-B-to-A":
+  waiting to lock monitor 0x00007f8b... (object 0x000000076ac1a210, a InventoryTransferDeadlock$Warehouse),
+  which is held by "transfer-B-to-A"
+
+Java stack information for the threads listed above:
+===================================================
+"transfer-A-to-B":
+        at InventoryTransferDeadlock.transfer(InventoryTransferDeadlock.java:28)
+        ...
+```
+
+Three things stand out in that dump.
+
+First, the **thread state is `BLOCKED (on object monitor)`**. That's the unambiguous signature of a thread waiting on `synchronized`. A thread waiting on `wait()` would be `WAITING` or `TIMED_WAITING`. A thread running normally would be `RUNNABLE`. `BLOCKED` specifically means "stopped because of a contended monitor."
+
+Second, each thread reports both **what it's `locked`** (lines with `- locked <0x...>`) and **what it's waiting to lock** (lines with `- waiting to lock <0x...>`). The hex addresses are object identities. Comparing them across threads reveals the cycle. In the dump above, `transfer-A-to-B` is locked on `...a210` and waiting on `...a248`; `transfer-B-to-A` is locked on `...a248` and waiting on `...a210`. That's the cycle.
+
+Third, the JVM prints a **`Found one Java-level deadlock`** section at the end. The JVM's deadlock detector runs over the thread states and explicitly calls it out. The block names which threads are involved, what monitors are at stake, and the stack frames where each thread is stuck.
+
+When terminal access to the running JVM isn't available, the same dump is reachable through JMX, Mission Control, VisualVM, and most modern profilers. Production services often log a thread dump on a slow-request alert so the data is available even after the symptom passes.
+
+On Linux and macOS, `kill -3 <pid>` produces an equivalent dump to standard error, which is useful when the JVM is running inside a container without `jstack` installed. The dump appears in the container's logs.
+
+A thread dump is cheap to take (a single STW pause of a few milliseconds for most programs), so taking one on every slow-request alarm is a low-cost piece of telemetry. Storing raw dumps for later analysis costs almost nothing in storage.
+
+<h1 id="avoidance-strategy-1-global-lock-ordering">
+  Avoidance Strategy 1: Global Lock Ordering
+</h1>
+
+The most reliable fix is to make every thread acquire locks in the same order. Pick a total order on the lockable objects, and make every code path that needs more than one lock acquire them smallest-first. With a global order, the circular wait condition becomes impossible. If thread A is holding lock 1 and waiting for lock 2, no other thread can be holding lock 2 while waiting for lock 1, because that thread would have had to acquire lock 2 before lock 1, which the rule forbids.
+
+The cleanest implementation uses `System.identityHashCode` (or any other stable, unique number per object) to sort the locks:
+
+```java
+public class OrderedTransfer {
+
+    static class Warehouse {
+        final String id;
+        int stock;
+
+        Warehouse(String id, int stock) {
+            this.id = id;
+            this.stock = stock;
+        }
+    }
+
+    static void transfer(Warehouse source, Warehouse destination, int units) {
+        int sourceHash = System.identityHashCode(source);
+        int destinationHash = System.identityHashCode(destination);
+
+        Warehouse firstLock;
+        Warehouse secondLock;
+        if (sourceHash < destinationHash) {
+            firstLock = source;
+            secondLock = destination;
+        } else {
+            firstLock = destination;
+            secondLock = source;
+        }
+
+        synchronized (firstLock) {
+            synchronized (secondLock) {
+                source.stock -= units;
+                destination.stock += units;
+                System.out.println(Thread.currentThread().getName()
+                    + " moved " + units + " from " + source.id
+                    + " to " + destination.id);
+            }
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        Warehouse warehouseA = new Warehouse("A", 100);
+        Warehouse warehouseB = new Warehouse("B", 100);
+
+        Thread t1 = new Thread(
+            () -> transfer(warehouseA, warehouseB, 10), "transfer-A-to-B");
+        Thread t2 = new Thread(
+            () -> transfer(warehouseB, warehouseA, 10), "transfer-B-to-A");
+
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+
+        System.out.println("A stock: " + warehouseA.stock);
+        System.out.println("B stock: " + warehouseB.stock);
+    }
+}
+```
+
+Both transfers complete. Both threads, regardless of which direction they're moving stock in, sort the two warehouses by identity hash and lock the lower one first. They both end up grabbing the same lock first, which serializes them. One waits for the other, and the deadlock cycle never forms.
+
+One sharp edge: `System.identityHashCode` can collide for different objects. The collision is rare, but when it happens, the simple "less than" comparison can't pick a winner. Production code that uses this pattern adds a tiebreaker. A common one is to give each lockable object a unique `long id` field assigned from an `AtomicLong` at construction time and sort by that id instead. Another approach is to introduce a third "tiebreaker" lock that both threads acquire first when their primary locks hash to the same value.
+
+The diagram captures the whole strategy in four steps. Both threads run the same four steps. Both threads compare the same two objects and produce the same ordering. They acquire the locks in lockstep instead of head-on.
+
+Global lock ordering doesn't just work for two locks. With N locks, sort all N and acquire them in order. The same proof still applies: any cycle in the wait graph would require some thread to go "backwards," which the rule forbids.
+
+<h1 id="avoidance-strategy-2-lock-timeouts-with-trylock">
+  Avoidance Strategy 2: Lock Timeouts with tryLock
+</h1>
+
+`ReentrantLock` is worth mentioning here from the deadlock-avoidance angle, because it's a different family of fix. Instead of preventing the cycle (lock ordering), `tryLock` lets the thread give up if a wait is taking too long.
+
+```java
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.TimeUnit;
+
+public class TimeoutTransfer {
+
+    static class Warehouse {
+        final String id;
+        int stock;
+        final ReentrantLock lock = new ReentrantLock();
+
+        Warehouse(String id, int stock) {
+            this.id = id;
+            this.stock = stock;
+        }
+    }
+
+    static boolean transfer(Warehouse source, Warehouse destination, int units) {
+        try {
+            if (source.lock.tryLock(200, TimeUnit.MILLISECONDS)) {
+                try {
+                    if (destination.lock.tryLock(200, TimeUnit.MILLISECONDS)) {
+                        try {
+                            source.stock -= units;
+                            destination.stock += units;
+                            return true;
+                        } finally {
+                            destination.lock.unlock();
+                        }
+                    }
+                } finally {
+                    source.lock.unlock();
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        return false;
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        Warehouse warehouseA = new Warehouse("A", 100);
+        Warehouse warehouseB = new Warehouse("B", 100);
+
+        Thread t1 = new Thread(() -> {
+            boolean ok = transfer(warehouseA, warehouseB, 10);
+            System.out.println("A->B success? " + ok);
+        });
+        Thread t2 = new Thread(() -> {
+            boolean ok = transfer(warehouseB, warehouseA, 10);
+            System.out.println("B->A success? " + ok);
+        });
+
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+    }
+}
+```
+
+Under low contention, both transfers succeed and the output looks just like the lock-ordering version. Under contention, if both threads grab their first lock and then can't get their second lock within 200 milliseconds, both timeouts fire, both threads release their first lock, and both calls return `false`. The caller decides what to do next, usually retry with a small randomized backoff.
+
+The timeout approach has trade-offs. It removes the no-preemption condition (the thread can stop waiting), so the deadlock cannot last forever. The downside: callers have to handle the failure case, retries can pile up under heavy contention (a phenomenon called livelock), and the overall latency of a successful operation is higher because of the chance of a retry. For a service with strict latency requirements, lock ordering usually fits better. For systems where contention is rare and recovery is cheap, `tryLock` is simpler to reason about than designing a global order.
+
+A common pattern in real code is to combine the two: use lock ordering as the primary defense, and add `tryLock` with a long timeout as a backstop in case a code path violates the order. The timeout catches the bug; the alert signals the need to fix the ordering.
+
+<h1 id="avoidance-strategy-3-reducing-lock-scope">
+  Avoidance Strategy 3: Reducing Lock Scope
+</h1>
+
+The simplest deadlock fix is to need fewer locks at the same time. A `synchronized` block that holds a lock across a long-running operation, a network call, or worse, another `synchronized` block, creates the conditions for a deadlock that may never appear in testing but will show up in production under load.
+
+Consider this stock rebalance:
+
+```java
+public class WideLockScope {
+
+    static class Warehouse {
+        final String id;
+        int stock;
+
+        Warehouse(String id, int stock) {
+            this.id = id;
+            this.stock = stock;
+        }
+    }
+
+    static void rebalance(Warehouse source, Warehouse destination) {
+        synchronized (source) {
+            // Slow: read from a remote forecasting service
+            int forecast = fetchForecast(source.id, destination.id);
+            int amountToMove = Math.max(0, source.stock - forecast);
+            synchronized (destination) {
+                source.stock -= amountToMove;
+                destination.stock += amountToMove;
+            }
+        }
+    }
+
+    static int fetchForecast(String sourceId, String destinationId) {
+        sleep(500); // pretend this is a slow service call
+        return 50;
+    }
+
+    static void sleep(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    public static void main(String[] args) {
+        Warehouse warehouseA = new Warehouse("A", 100);
+        Warehouse warehouseB = new Warehouse("B", 100);
+        new Thread(() -> rebalance(warehouseA, warehouseB)).start();
+    }
+}
+```
+
+The 500-millisecond forecast call happens **while holding the source lock**. Any other thread that wants the source warehouse waits for that entire call. If a second rebalance comes in for the opposite direction during those 500ms, the deadlock window is huge.
+
+The fix is to compute everything possible before grabbing locks, and only hold locks for the actual state mutation:
+
+```java
+public class NarrowLockScope {
+
+    static class Warehouse {
+        final String id;
+        int stock;
+
+        Warehouse(String id, int stock) {
+            this.id = id;
+            this.stock = stock;
+        }
+    }
+
+    static void rebalance(Warehouse source, Warehouse destination) {
+        // 1) Read state under a tiny lock
+        int sourceStock;
+        synchronized (source) {
+            sourceStock = source.stock;
+        }
+
+        // 2) Slow call OUTSIDE any lock
+        int forecast = fetchForecast(source.id, destination.id);
+        int amountToMove = Math.max(0, sourceStock - forecast);
+
+        // 3) Apply the change under ordered locks
+        Warehouse first = System.identityHashCode(source)
+                < System.identityHashCode(destination) ? source : destination;
+        Warehouse second = (first == source) ? destination : source;
+
+        synchronized (first) {
+            synchronized (second) {
+                source.stock -= amountToMove;
+                destination.stock += amountToMove;
+            }
+        }
+        System.out.println("Rebalanced " + amountToMove
+            + " from " + source.id + " to " + destination.id);
+    }
+
+    static int fetchForecast(String sourceId, String destinationId) {
+        try {
+            Thread.sleep(500);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        return 50;
+    }
+
+    public static void main(String[] args) {
+        Warehouse warehouseA = new Warehouse("A", 100);
+        Warehouse warehouseB = new Warehouse("B", 100);
+        new Thread(() -> rebalance(warehouseA, warehouseB)).start();
+    }
+}
+```
+
+Three things changed. The slow forecast call now runs outside any lock. The locks are held for only the actual reads and writes, which are nanoseconds of work. And the mutation step uses the global lock ordering trick to prevent the cycle.
+
+There's a trade-off worth naming. Reading `source.stock` before the forecast call and acting on it after uses a slightly stale value. Another thread could change `source.stock` between the read and the final write. For an inventory rebalance, the staleness is usually acceptable, because the operation is approximate anyway. For something like a bank balance check before a transfer, the value would need to be re-read after taking the final lock and revalidated. The pattern is "compute optimistically outside the lock, validate inside the lock." It's also called optimistic locking, and it's how most high-performance concurrent code looks.
+
+Holding fewer locks for shorter periods reduces every kind of concurrency problem at once: deadlock probability, contention latency, missed deadlines, and the size of the critical sections you have to reason about during code review.
+
+<h1 id="avoidance-strategy-4-lock-hierarchies">
+  Avoidance Strategy 4: Lock Hierarchies
+</h1>
+
+A lock hierarchy is a refinement of global lock ordering for cases where the locks come from multiple classes or layers. Assign each lock a level (an integer), and require that a thread already holding a lock at level N can only acquire locks at strictly lower levels. Higher-level locks (coarse-grained, "outer" locks) are acquired first; lower-level locks (fine-grained, "inner" locks) are acquired later. A thread that violates the rule, attempting to acquire a higher-level lock while holding a lower one, gets caught immediately, often by assertion.
+
+A simple e-commerce hierarchy could look like this:
+
+| Level | Lock                       | Why                                |
+| ----- | -------------------------- | ---------------------------------- |
+| 3     | Region-wide inventory lock | Coarsest, taken first when present |
+| 2     | Warehouse lock             | One per warehouse                  |
+| 1     | Bin lock                   | One per bin inside a warehouse     |
+| 0     | Item lock                  | One per item inside a bin          |
+
+A thread doing a single-item update goes straight to level 0. A thread doing a warehouse-wide audit takes level 2 first and then descends. A thread rebalancing across regions takes level 3, then level 2, then level 1, then level 0. Because everyone moves down the hierarchy, no two threads can be holding locks "in opposite directions," and the circular wait condition is impossible.
+
+In real code, the hierarchy can be enforced with a `ThreadLocal<Integer>` that tracks the deepest level currently held. Every lock checks that its level is strictly less than the current `ThreadLocal` value before granting acquisition. A violation throws an assertion in development and the bug is caught the moment it's introduced. Many high-quality concurrent libraries do exactly this in their tests.
+
+The downside of strict hierarchies is rigidity. If a new operation legitimately needs to acquire two same-level locks (two warehouses for a transfer), the hierarchy alone doesn't give an ordering. Either add a tiebreaker (a per-instance id, as in the global ordering example) or introduce a coarser "transfer coordinator" lock at a level above. Both are valid; both add a small amount of complexity in exchange for a stronger invariant.
+
+<h1 id="livelock-and-starvation">Livelock and Starvation</h1>
+
+Deadlock has two close cousins that look similar at first glance. Both involve threads not making progress, but the cause and the fix are different.
+
+**Livelock** is when threads are actively running but their work isn't getting done. The classic shape is two threads that each detect a conflict, back off, retry, and detect the same conflict again. Consider the refund and reorder operations from earlier, but instead of `synchronized`, they use `tryLock` with no random backoff:
+
+```text
+refund: tryLock(order)... got it.
+reorder: tryLock(account)... got it.
+refund: tryLock(account)... failed. Release order. Retry.
+reorder: tryLock(order)... failed. Release account. Retry.
+refund: tryLock(order)... got it.
+reorder: tryLock(account)... got it.
+... (repeat forever)
+```
+
+Both threads behave correctly. Both release their locks when they can't make progress. Both retry. And because both retry on the same schedule, they keep colliding in the same way. The CPU is busy, the threads are running, but no useful work is happening. A thread dump shows the threads in `RUNNABLE`, which is the signature. They aren't `BLOCKED`. They're just spinning.
+
+The fix is to add randomized backoff. Each thread, after a failed `tryLock`, waits a random short interval before retrying. The randomness desynchronizes the threads. One thread retries before the other, picks up both locks, finishes its work, and releases them. The other thread then succeeds on its retry. Backoff is a small change, but it's the difference between a livelock that wastes 100% of a CPU and a system that recovers automatically.
+
+**Starvation** is when a thread is repeatedly denied a resource that other threads keep getting. The thread isn't deadlocked (there's no cycle), and isn't livelocked (it's blocked, not spinning), but every time the resource frees up, some other thread gets there first. Over time, the starved thread accumulates no work.
+
+Starvation is most common with priority-based scheduling or with biased locks. If a `synchronized` block always lets the longest-waiting thread in next, starvation is unlikely. If a custom scheduling rule favors high-priority threads, a low-priority thread might wait forever while higher-priority work keeps showing up. Java's standard `synchronized` is, by default, neither strictly FIFO nor priority-based, but `ReentrantLock` can be configured with a `fair` flag (`new ReentrantLock(true)`) that enforces first-come-first-served acquisition. Fair locks make starvation impossible at a small throughput cost.
+
+The three problems share a symptom (work isn't getting done) but have different signatures and different fixes. A thread dump that shows `BLOCKED` threads in a cycle is deadlock. A thread dump that shows `RUNNABLE` threads consuming CPU without making progress is likely livelock. A monitoring graph that shows one consumer's queue draining quickly while another's grows is likely starvation.
+
+<h1 id="putting-it-together">Putting It Together</h1>
+
+The cleanest mental model for working with multiple locks is to combine the strategies, not pick one. Reduce lock scope so the windows are small. Establish a global order so cycles are impossible. Add `tryLock` with a timeout where the cost of failure is low. Use a hierarchy when the locks belong to a natural hierarchy of structures. Recognize the signatures of livelock and starvation, so the right fix applies when a thread dump doesn't show a cycle.
+
+A small e-commerce inventory service that practices all of this would look like:
+
+| Practice                                     | What it does                        |
+| -------------------------------------------- | ----------------------------------- |
+| Read state under tiny locks, compute outside | Shrinks the hold-and-wait window    |
+| Sort warehouses by id before locking         | Removes the circular wait           |
+| Use `tryLock(200, MS)` as a backstop         | Removes no-preemption forever-waits |
+| Fair `ReentrantLock` on the region lock      | Prevents starvation                 |
+| Randomized backoff on retry                  | Prevents livelock                   |
+
+None of these are heavy. Each is a few lines of code. Put together, they make deadlocks rare and the rare ones recoverable.
+
+A program that hits a deadlock in production is rarely the result of one bad commit. It's the result of two commits, weeks apart, that each looked safe in isolation but together introduced a new lock acquisition order. Code review for any change that touches `synchronized` should specifically ask: "what other code paths take these same locks, and in what order?" An unknown answer signals the bug.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,439 @@
+---
+title: "concurrent.futures (ThreadPoolExecutor, ProcessPoolExecutor)"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "concurrent.futures explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+The standard library has two low-level concurrency tools (`threading` and `multiprocessing`) and one high-level wrapper that sits on top of both: `concurrent.futures`. It gives you a single API where you submit work, hold a `Future` for each piece, and get results back when they finish. The same code shape works whether the workers are threads or processes, so you can switch between them by changing one class name.
+
+This lesson covers the executor interface, the `Future` object, the helpers for waiting on many futures at once, and when to prefer this module over the raw `threading` and `multiprocessing` APIs.
+
+<h1 id="why-concurrentfutures-exists">Why concurrent.futures Exists</h1>
+
+The raw `threading.Thread` and `multiprocessing.Process` / `multiprocessing.Pool` APIs both work, but they expose a lot of plumbing. You manage worker objects, call `start()` and `join()`, set up queues to ship results back, and write your own retry and timeout logic. None of that is hard, but it adds up across a real codebase.
+
+$L46
+
+The picture is the same whether the workers are threads or processes. You submit, the executor dispatches to a worker, and a `Future` becomes the handle you use to read the result, check for errors, or cancel the work. Picking between threads and processes is a runtime decision (a different class), not an architectural one.
+
+The module ships in the standard library as `concurrent.futures`. There's nothing to install.
+
+```python
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+```
+
+<h1 id="the-executor-interface">The Executor Interface</h1>
+
+`Executor` is the abstract base class for both pool types. The two concrete classes (`ThreadPoolExecutor` and `ProcessPoolExecutor`) share four methods you'll use constantly:
+
+| Method                                           | What it does                                                              |
+| ------------------------------------------------ | ------------------------------------------------------------------------- |
+| `submit(fn, *args, **kwargs)`                    | Schedule a single call. Returns a `Future`.                               |
+| `map(fn, *iterables, timeout=None, chunksize=1)` | Apply `fn` to each input. Returns an iterator of results, in input order. |
+| `shutdown(wait=True, cancel_futures=False)`      | Stop accepting new work. Optionally wait for pending work to finish.      |
+| `__enter__` / `__exit__`                         | Context manager support. `__exit__` calls `shutdown(wait=True)`.          |
+
+The context manager form is what you'll see in almost every real codebase. It guarantees the pool is cleaned up even when an exception is raised:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+def fetch_price(product_id: str) -> float:
+    # Pretend this calls an HTTP API
+    fake_prices = {"wireless-mouse": 29.99, "usb-cable": 9.99, "keyboard": 79.99}
+    return fake_prices[product_id]
+
+with ThreadPoolExecutor(max_workers=3) as pool:
+    future = pool.submit(fetch_price, "wireless-mouse")
+    print(future.result())
+```
+
+`with` opens the pool, `submit` schedules the call, and `future.result()` blocks until the worker is done and returns the value. When the `with` block exits, the pool waits for any outstanding work and shuts down. You never call `shutdown()` manually unless you have a long-lived pool that outlives a single function.
+
+> **Cost:** Creating an executor allocates threads or processes up front (depending on the class). Creating a new pool inside a hot loop is a real perf hit. Reuse one pool for many calls, or share it via a module-level variable.
+
+<h1 id="threadpoolexecutor">ThreadPoolExecutor</h1>
+
+`ThreadPoolExecutor` runs your callables on a pool of OS threads. It's the right choice when your work is I/O-bound: HTTP requests, database queries, file reads, anything where the worker spends most of its time waiting for something outside Python. Threads share memory with the parent process, so you don't pay any pickling or serialization cost when you pass arguments or return values.
+
+The `max_workers` parameter controls how many threads the pool keeps. The default since Python 3.8 is `min(32, (os.cpu_count() or 1) + 4)`, which is tuned for I/O-bound work, not CPU-bound work.
+
+A small e-commerce example: download every order PDF for a customer in parallel.
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+import time
+
+def download_order_pdf(order_id: str) -> str:
+    # Simulate a network call that takes about half a second
+    time.sleep(0.5)
+    return f"orders/{order_id}.pdf"
+
+order_ids = ["order-1001", "order-1002", "order-1003", "order-1004", "order-1005"]
+
+start = time.perf_counter()
+with ThreadPoolExecutor(max_workers=5) as pool:
+    paths = list(pool.map(download_order_pdf, order_ids))
+elapsed = time.perf_counter() - start
+
+for path in paths:
+    print(path)
+print(f"elapsed: {elapsed:.2f}s")
+```
+
+Five sequential `time.sleep(0.5)` calls would take 2.5 seconds. With five threads, they wait in parallel and finish in roughly half a second. The speedup comes from the fact that `time.sleep` (and any real I/O call) releases the GIL while it waits, so the other threads keep running.
+
+> **Cost:** Threads don't help with CPU-bound code in CPython. The GIL serializes Python bytecode execution, so a tight Python loop runs no faster on eight threads than on one. Use processes for that case (covered next).
+
+<h1 id="processpoolexecutor">ProcessPoolExecutor</h1>
+
+`ProcessPoolExecutor` runs each callable in a separate OS process. It sidesteps the GIL completely because each process has its own Python interpreter, which means CPU-bound work actually gets parallel. The trade-off is that arguments and return values cross a process boundary, so they have to be pickled and unpickled. Anything you submit must be picklable: top-level functions, primitive arguments, picklable return values.
+
+The default `max_workers` is `os.process_cpu_count()` on Python 3.13 and newer, and `os.cpu_count()` on older versions. The two usually agree, but `process_cpu_count` respects CPU affinity (the set of CPUs your process is allowed to use), which matters in containers and on shared servers.
+
+A CPU-bound e-commerce example: compute the SHA-256 hash of every uploaded product image. Hashing big files in pure Python is a CPU-bound loop, so threads don't help. Processes do.
+
+```python
+from concurrent.futures import ProcessPoolExecutor
+import hashlib
+
+def hash_image(path: str) -> tuple[str, str]:
+    sha = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            sha.update(chunk)
+    return path, sha.hexdigest()
+
+if __name__ == "__main__":
+    image_paths = [
+        "uploads/wireless-mouse.jpg",
+        "uploads/keyboard.jpg",
+        "uploads/usb-cable.jpg",
+        "uploads/monitor.jpg",
+    ]
+
+    with ProcessPoolExecutor() as pool:
+        for path, digest in pool.map(hash_image, image_paths):
+            print(f"{path}: {digest[:12]}...")
+```
+
+Two things to flag here. First, the `if __name__ == "__main__":` guard. On Windows and macOS, `ProcessPoolExecutor` uses the `spawn` start method, which re-imports the main module in each worker. Without the guard, the workers would also try to start a pool, recursively. Lesson 05 covered this in detail; the rule still applies here.
+
+Second, the function `hash_image` is defined at module level. A nested function or a lambda would fail to pickle. The error looks like:
+
+```text
+_pickle.PicklingError: Can't pickle <function <lambda> at 0x...>: attribute lookup <lambda> on __main__ failed
+```
+
+If you see that error, the fix is to move the function to module scope.
+
+> **Cost:** Pickling arguments and return values is not free. For a hash that returns 64 bytes, the overhead is negligible. For a function that returns a 200 MB pandas DataFrame, the pickle round-trip can dominate the runtime. Return the smallest thing you can: an aggregate, a digest, a path on disk.
+
+<h1 id="the-future-object">The Future Object</h1>
+
+Every `submit()` call returns a `concurrent.futures.Future`. The `Future` is a handle to a piece of work that may or may not be done yet. You don't construct it directly; the executor does, and it manages the worker that fulfills it.
+
+The methods you'll use most:
+
+| Method                    | What it does                                                                             |
+| ------------------------- | ---------------------------------------------------------------------------------------- |
+| `result(timeout=None)`    | Block until done, then return the value. Re-raises any exception the callable raised.    |
+| `exception(timeout=None)` | Block until done, then return the exception (or `None` if the call succeeded).           |
+| `done()`                  | Non-blocking check. `True` if the call finished, cancelled, or raised.                   |
+| `cancel()`                | Try to cancel. Returns `True` only if the work hadn't started yet.                       |
+| `add_done_callback(fn)`   | Register a callback that runs when the future is done. The callback receives the future. |
+| `running()`               | `True` while the worker is actively executing the call.                                  |
+| `cancelled()`             | `True` if `cancel()` succeeded.                                                          |
+
+Here's a run that exercises most of them:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+import time
+
+def fetch_competitor_price(competitor: str) -> float:
+    time.sleep(0.2)
+    return {"amazon": 27.99, "ebay": 29.49, "walmart": 28.49}[competitor]
+
+with ThreadPoolExecutor(max_workers=3) as pool:
+    future = pool.submit(fetch_competitor_price, "amazon")
+
+    print("done before result?", future.done())
+    price = future.result(timeout=5)
+    print("price:", price)
+    print("done after result?", future.done())
+    print("exception:", future.exception())
+```
+
+If the callable raises, the exception is captured and re-raised when you call `result()`. This is one of the biggest practical wins over raw threads. With `threading.Thread`, an exception inside the thread just prints a traceback and dies; the parent never sees it. With a `Future`, the exception comes back to the caller:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+def check_stock(product_id: str) -> int:
+    if not product_id:
+        raise ValueError("product_id is required")
+    return 42
+
+with ThreadPoolExecutor(max_workers=2) as pool:
+    future = pool.submit(check_stock, "")
+    try:
+        stock = future.result()
+    except ValueError as e:
+        print("caught:", e)
+```
+
+`add_done_callback` is useful when you want to react as work finishes without blocking. The callback runs on the thread that completed the work (for `ThreadPoolExecutor`) or on a thread in the calling process that drains results (for `ProcessPoolExecutor`). Keep callbacks short and don't put heavy work in them, otherwise you'll bottleneck the pool.
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+def fetch_price(product_id: str) -> float:
+    return {"wireless-mouse": 29.99, "keyboard": 79.99}[product_id]
+
+def log_result(fut):
+    if fut.exception():
+        print("failed:", fut.exception())
+    else:
+        print("got price:", fut.result())
+
+with ThreadPoolExecutor(max_workers=2) as pool:
+    f = pool.submit(fetch_price, "wireless-mouse")
+    f.add_done_callback(log_result)
+```
+
+About `cancel()`: it only works if the future is still pending in the queue. Once a worker has picked the call up, you can't stop it from the outside. Cooperative cancellation (the worker checking a flag) is your only option then.
+
+<h1 id="executormap-order-preserving-parallel-map">
+  executor.map: Order-Preserving Parallel map
+</h1>
+
+`map(fn, iterable)` is the simplest way to apply one function to a batch of inputs. It returns an iterator that yields results in the same order as the inputs, regardless of which workers finished first.
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+def fetch_competitor_price(competitor: str) -> float:
+    return {"amazon": 27.99, "ebay": 29.49, "walmart": 28.49, "target": 28.99}[competitor]
+
+competitors = ["amazon", "ebay", "walmart", "target"]
+
+with ThreadPoolExecutor(max_workers=4) as pool:
+    prices = list(pool.map(fetch_competitor_price, competitors))
+
+for name, price in zip(competitors, prices):
+    print(f"{name}: ${price:.2f}")
+```
+
+Two behaviors to remember. If any worker raises, the exception comes out of the iterator at the point that input would have been yielded. The iterator stops there and the remaining results are dropped. If you need to keep processing after a failure, use `submit()` plus `as_completed()` instead.
+
+The `chunksize` parameter is a `ProcessPoolExecutor` optimization. By default each input is sent to the worker pool individually, which costs one IPC round-trip per item. For very fast-per-item work, `chunksize=N` groups inputs into chunks of N so each round-trip carries more work. `ThreadPoolExecutor` ignores this argument because threads share memory.
+
+```python
+# For a million quick computations, the chunksize argument matters
+with ProcessPoolExecutor() as pool:
+    results = list(pool.map(small_function, big_iterable, chunksize=200))
+```
+
+The `timeout` argument is per-iteration: if the next result isn't ready within `timeout` seconds, you get a `TimeoutError`. The workers keep running in the background; only the iteration is timed out.
+
+> **Cost:** `list(pool.map(...))` reads all results into memory at once. For a million inputs producing big values, iterate the result lazily and write each one out as it arrives.
+
+<h1 id="submit-as_completed-results-as-they-finish">
+  submit + as_completed: Results as They Finish
+</h1>
+
+`map()` is order-preserving, which is what you want most of the time. But sometimes you'd rather see results in the order they finish, so you can stream-process them or react to the fastest ones first. That's what `as_completed` is for.
+
+```python
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import random
+
+def fetch_competitor_price(competitor: str) -> tuple[str, float]:
+    # Each competitor's API has different latency
+    time.sleep(random.uniform(0.1, 0.5))
+    fake = {"amazon": 27.99, "ebay": 29.49, "walmart": 28.49, "target": 28.99}
+    return competitor, fake[competitor]
+
+competitors = ["amazon", "ebay", "walmart", "target"]
+
+with ThreadPoolExecutor(max_workers=4) as pool:
+    futures = [pool.submit(fetch_competitor_price, c) for c in competitors]
+
+    for future in as_completed(futures):
+        competitor, price = future.result()
+        print(f"{competitor}: ${price:.2f}")
+```
+
+The pattern is: submit each input separately (you get a list of futures), then hand that list to `as_completed`. It yields each future as it finishes. Notice the function returns `(competitor, price)`, so the caller knows which input each result came from. With `map`, the input order is the key. With `as_completed`, you typically encode the key into the result.
+
+`as_completed` also takes a `timeout`. If `timeout` seconds elapse before the next future finishes, it raises `concurrent.futures.TimeoutError`. The remaining futures keep running.
+
+A common pattern is to map futures to their inputs with a dict, so you can include the input in error messages:
+
+```python
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def fetch_competitor_price(competitor: str) -> float:
+    fake = {"amazon": 27.99, "ebay": 29.49, "walmart": 28.49}
+    if competitor not in fake:
+        raise KeyError(competitor)
+    return fake[competitor]
+
+competitors = ["amazon", "ebay", "fake-store"]
+
+with ThreadPoolExecutor(max_workers=3) as pool:
+    fut_to_name = {pool.submit(fetch_competitor_price, c): c for c in competitors}
+
+    for future in as_completed(fut_to_name):
+        name = fut_to_name[future]
+        try:
+            print(f"{name}: ${future.result():.2f}")
+        except Exception as e:
+            print(f"{name}: failed with {type(e).__name__}: {e}")
+```
+
+This is the workhorse pattern for "fire off a bunch of network requests and handle each result as it arrives." Failures don't stop the rest of the batch, because each future is independent.
+
+<h1 id="wait-coarse-control-over-batches">wait: Coarse Control over Batches</h1>
+
+When you want to wait for "all of them" or "any one of them" or "until one of them fails," and you don't care about iterating results one by one, `concurrent.futures.wait` is the tool.
+
+```python
+from concurrent.futures import wait, FIRST_COMPLETED, ALL_COMPLETED, FIRST_EXCEPTION
+```
+
+The signature is `wait(futures, timeout=None, return_when=ALL_COMPLETED)`. It returns a named tuple with two sets: `done` (futures that have finished) and `not_done` (futures still running or queued).
+
+| `return_when`             | Wakes up when...                                                 |
+| ------------------------- | ---------------------------------------------------------------- |
+| `ALL_COMPLETED` (default) | Every future is done.                                            |
+| `FIRST_COMPLETED`         | At least one future is done.                                     |
+| `FIRST_EXCEPTION`         | At least one future has raised, or all finished without raising. |
+
+`FIRST_COMPLETED` is good for "race" patterns where you only want the fastest answer:
+
+```python
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+import time
+
+def fetch_competitor_price(competitor: str) -> tuple[str, float]:
+    latency = {"amazon": 0.1, "ebay": 0.3, "walmart": 0.2}
+    time.sleep(latency[competitor])
+    prices = {"amazon": 27.99, "ebay": 29.49, "walmart": 28.49}
+    return competitor, prices[competitor]
+
+with ThreadPoolExecutor(max_workers=3) as pool:
+    futures = [pool.submit(fetch_competitor_price, c) for c in ["amazon", "ebay", "walmart"]]
+    done, not_done = wait(futures, return_when=FIRST_COMPLETED)
+
+    first = next(iter(done))
+    print("fastest:", first.result())
+    print(f"still running: {len(not_done)}")
+```
+
+The two still-running futures keep running in the background. If you don't need them, calling `cancel()` on each one will stop the ones still queued. The pool's `__exit__` will wait for the ones already running.
+
+`FIRST_EXCEPTION` is useful for "fail fast" batches: do as much work as possible in parallel, but if any one of them fails, stop adding to the queue and surface the error.
+
+```python
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_EXCEPTION
+
+def hash_image(path: str) -> str:
+    if path.endswith(".broken"):
+        raise OSError(f"cannot read {path}")
+    return f"sha256({path})"
+
+with ThreadPoolExecutor(max_workers=3) as pool:
+    futures = [pool.submit(hash_image, p) for p in [
+        "uploads/keyboard.jpg",
+        "uploads/wireless-mouse.broken",
+        "uploads/monitor.jpg",
+    ]]
+    done, not_done = wait(futures, return_when=FIRST_EXCEPTION)
+
+    for f in done:
+        if f.exception():
+            print("error:", f.exception())
+        else:
+            print("ok:", f.result())
+```
+
+When to pick `wait` vs `as_completed`: pick `as_completed` when you want to process results one by one as they arrive. Pick `wait` when you want a single decision point ("everything done?", "anyone done yet?", "anyone failed?") and don't need the streaming behavior.
+
+<h1 id="switching-pools-by-swapping-one-class">
+  Switching Pools by Swapping One Class
+</h1>
+
+The whole point of `concurrent.futures` is that the surface area doesn't change between threads and processes. The same code that downloads PDFs over HTTP can hash image files in parallel by changing one line.
+
+```python
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import hashlib, time
+
+def hash_image(path: str) -> tuple[str, str]:
+    # CPU-bound: reads bytes, does a tight hash loop
+    sha = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            sha.update(chunk)
+    return path, sha.hexdigest()
+
+def download_order_pdf(order_id: str) -> str:
+    # I/O-bound: sleeps in a network call
+    time.sleep(0.5)
+    return f"orders/{order_id}.pdf"
+
+def run_parallel(executor_cls, fn, inputs):
+    with executor_cls() as pool:
+        return list(pool.map(fn, inputs))
+
+if __name__ == "__main__":
+    # I/O-bound workload: threads
+    pdfs = run_parallel(ThreadPoolExecutor, download_order_pdf, ["order-1001", "order-1002"])
+    print(pdfs)
+
+    # CPU-bound workload: processes
+    hashes = run_parallel(ProcessPoolExecutor, hash_image, ["uploads/wireless-mouse.jpg"])
+    print(hashes)
+```
+
+The function `run_parallel` is parameterized over the executor class. Threads for the network work, processes for the hashing work. The body of `run_parallel` never changes, and neither does either worker function. That is the unified API in one snapshot.
+
+The decision rule is straightforward: if the work spends most of its time waiting on I/O (network, disk, database), use `ThreadPoolExecutor`. If it spends most of its time running Python bytecode (numerical loops, parsing, compression, hashing), use `ProcessPoolExecutor`. Lesson 11 covers the full decision matrix and the edge cases.
+
+<h1 id="how-this-compares-to-multiprocessingpool">
+  How This Compares to multiprocessing.Pool
+</h1>
+
+Lesson 07 covered `multiprocessing.Pool`, which is the older API for parallelizing CPU-bound work over processes. `ProcessPoolExecutor` and `multiprocessing.Pool` are spiritually similar (both spawn a pool of worker processes), but the APIs differ in ways that matter day to day.
+
+| Feature                  | `multiprocessing.Pool`                                            | `concurrent.futures.ProcessPoolExecutor` |
+| ------------------------ | ----------------------------------------------------------------- | ---------------------------------------- |
+| Returns                  | Plain values or `AsyncResult`                                     | `Future` objects                         |
+| Map function             | `pool.map`, `pool.imap`, `pool.imap_unordered`, `pool.starmap`    | `pool.map`                               |
+| Submit one task          | `pool.apply_async(fn, args)`                                      | `pool.submit(fn, *args)`                 |
+| Wait helpers             | None (use `AsyncResult.wait` per task)                            | `as_completed`, `wait`                   |
+| Mirror class for threads | No (`multiprocessing.pool.ThreadPool` exists but is undocumented) | Yes, `ThreadPoolExecutor`                |
+| Exception in worker      | Re-raised when you call `.get()`                                  | Re-raised when you call `.result()`      |
+| Context manager          | Yes                                                               | Yes                                      |
+
+The modern preference in most Python codebases is `concurrent.futures`. Three reasons:
+
+1. **One mental model across threads and processes.** With `multiprocessing.Pool` plus `threading.Thread`, you're learning two unrelated APIs. With executors, you learn one.
+2. **`Future` is a first-class object.** You can pass it around, attach callbacks, check status, and aggregate it with `as_completed` or `wait`. `AsyncResult` is similar but less ergonomic.
+3. **Cleaner exception propagation.** Errors come back to the caller through `.result()`, with a normal traceback. No surprise silent failures.
+
+`multiprocessing.Pool` still has things `ProcessPoolExecutor` doesn't: `imap_unordered` for memory-efficient streaming, `starmap` for unpacking tuples, the `initializer` argument for per-worker setup (`ProcessPoolExecutor` has this too as of 3.7), and a few advanced controls. Reach for it when you specifically need those features. Otherwise, default to `concurrent.futures`.
+
+If you're working with `asyncio`, there's a small but useful bridge: `loop.run_in_executor(executor, fn, *args)` runs a synchronous function in a thread or process pool and returns an `asyncio.Future` you can `await`. That's the cleanest way to run blocking code from an async function without freezing the event loop. The async lessons (08 and 09) covered the async side; this is just to flag that the bridge exists.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

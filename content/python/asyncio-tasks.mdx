@@ -1,0 +1,171 @@
+---
+title: "asyncio Tasks"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "asyncio Tasks explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="coroutines-vs-tasks">Coroutines vs Tasks</h1>
+
+A coroutine and a Task are not the same thing, and confusing them is the most common source of "coroutine was never awaited" warnings.
+
+A **coroutine** is what you get when you call an `async def` function. It's a description of work, not the work itself. Nothing has started yet. It's a frozen object sitting in memory, waiting for someone to drive it.
+
+A **Task** is a coroutine that has been handed to the event loop and scheduled to run. The loop will pick it up the next time control returns to the scheduler, advance it until it hits an `await`, then move on to the next ready task.
+
+Calling `fetch_product("wireless-mouse")` does not fetch anything. It builds a coroutine object. The actual work happens on the `await coro` line, where the event loop drives the coroutine until it returns. Until you await it, it's inert.
+
+A Task wraps a coroutine and starts running it immediately on the next loop tick, without you having to await right away:
+
+Notice the ordering. `create_task` did not block. The fetch started running concurrently with the surrounding code. By the time `main` got around to `await task`, the work was already partly done.
+
+<h1 id="scheduling-with-create_task">Scheduling with create_task</h1>
+
+`asyncio.create_task(coro)` is how you start a coroutine running without immediately blocking on it. The function returns a Task object you can later await, cancel, or attach callbacks to.
+
+The classic use is firing off independent work in parallel:
+
+Two sleeps of half a second each, but the total wall clock time is half a second. That's the whole point of concurrency: the event loop runs both fetches at the same time, switching between them whenever one hits an `await`.
+
+> **Cost:** `create_task` doesn't add threads or processes. Everything still runs on one thread. If your "fetch" is actually CPU-bound (parsing a large JSON payload, image resizing), the second task can't start until the first releases the loop. Use `concurrent.futures` for CPU work.
+
+A subtle gotcha: tasks need a reference to stay alive. If you let the Task object get garbage-collected, the event loop will silently drop it. The safe pattern is to either await it, store it in a list, or keep it in a variable until you're done with it.
+
+For long-running background tasks, the common pattern is to keep a set of strong references at module or app scope:
+
+This is exactly what the asyncio docs recommend, and it's the easiest way to avoid the "task vanished" footgun.
+
+<h1 id="running-many-coroutines-with-gather">
+  Running Many Coroutines with gather
+</h1>
+
+`asyncio.gather(*aws)` is the workhorse for running a known set of coroutines concurrently and collecting their results in order. It's what you reach for when you need to fan out to twenty product detail endpoints for a category page.
+
+Twenty fetches, each waiting 300 ms, all finish in 300 ms total. `gather` returns the results in the same order as the input coroutines, regardless of which one finished first. That ordering guarantee is the reason most people prefer `gather` over the alternatives when result order matters.
+
+The default behavior on exceptions is the part that bites people. If any coroutine raises, `gather` re-raises the first exception and the remaining tasks keep running in the background unless you wrap things up carefully.
+
+The first raising coroutine ends the `gather` call. The other two were already running and will complete in the background; their results are lost. If you want a coroutine to be cancelled when a sibling fails, you need `TaskGroup` (covered below), not `gather`.
+
+The other mode is `return_exceptions=True`, where `gather` packages each exception as a normal return value:
+
+This mode is useful when one bad product shouldn't kill the whole page render. You log the failure, drop the product from the response, and ship what you have.
+
+<h1 id="wait-and-as_completed">wait and as_completed</h1>
+
+`gather` is the right tool when you need every result in order. Two other utilities cover different patterns.
+
+`asyncio.wait(aws, return_when=...)` lets you wait until a subset of tasks finishes, without forcing you to collect every result. It's lower-level: it returns two sets of Task objects, `done` and `pending`, and you decide what to do with each.
+
+The `return_when` argument controls the trigger. The three options are `FIRST_COMPLETED`, `FIRST_EXCEPTION`, and `ALL_COMPLETED` (the default). For most modern code, `gather` or `TaskGroup` is a better fit than `wait`, but `FIRST_COMPLETED` still earns its keep for "race to find any working backend" patterns.
+
+A practical detail that surprises people: `wait` takes Tasks, not raw coroutines. If you pass coroutines, you'll get a `DeprecationWarning` on 3.10 and a `TypeError` on 3.11+. Wrap your coroutines in `create_task` first.
+
+`asyncio.as_completed(aws)` is the right tool when you want to stream results as they arrive, in completion order rather than input order. It returns an iterator of futures that yield in the order each task finishes:
+
+The fastest fetch yields first, regardless of which slot it occupied in the input list. This is exactly what you want when you're streaming results to a UI or aggregating data and don't care about order.
+
+<h1 id="taskgroup-structured-concurrency-python-311">
+  TaskGroup: Structured Concurrency (Python 3.11+)
+</h1>
+
+`asyncio.TaskGroup` is the newer, recommended primitive for running concurrent tasks. The big idea is **structured concurrency**: all tasks created inside the `async with` block are guaranteed to be done by the time the block exits. There are no orphans, no forgotten background tasks, no "I awaited gather but two tasks are still alive somewhere."
+
+A few things make `TaskGroup` better than `gather` for new code:
+
+- If any task raises, **all sibling tasks are cancelled** automatically. No orphan tasks running in the background after a failure.
+- Exceptions are collected and re-raised as an `ExceptionGroup` (PEP 654), so you can see every failure, not just the first one.
+- The `async with` boundary makes the lifetime of the group obvious. When the block exits, you know everything is done.
+
+Here's the cancel-on-failure behavior in practice:
+
+Once `fetch_product("broken")` raises, the group cancels the two siblings before re-raising. The `except*` syntax (also new in 3.11) lets you catch one exception type out of the group while letting other types propagate.
+
+Here's how the flow looks when a TaskGroup spawns several child tasks:
+
+The diagram shows the two paths out of a TaskGroup. On the happy path, every child finishes and the group exits normally. On the failure path, the first exception triggers cancellation of all siblings, then the group collects whatever errors fired and re-raises them as a single `ExceptionGroup`. You can't accidentally walk out of the `async with` block with tasks still running.
+
+Compare the same fan-out written with `gather` vs `TaskGroup`:
+
+For the happy path, they're equivalent. The difference shows up under failure: `gather` leaks orphan tasks, `TaskGroup` doesn't. The asyncio docs now recommend `TaskGroup` for any code that runs on 3.11 or later.
+
+> **Cost:** `TaskGroup` is only available on Python 3.11+. If you maintain a library that supports 3.10 or older, you still need `gather`. The third-party `anyio` library backports the same structured-concurrency model and works on older Pythons.
+
+<h1 id="timeouts-wait_for-and-asynciotimeout">
+  Timeouts: wait_for and asyncio.timeout
+</h1>
+
+A coroutine that hangs forever is just as bad as one that crashes, and probably worse, because nothing in your logs will mention it. asyncio has two ways to put a wall clock around any awaitable.
+
+`asyncio.wait_for(aw, timeout)` is the older API. It wraps a single awaitable and raises `asyncio.TimeoutError` if the deadline passes:
+
+When the timeout fires, the wrapped coroutine is cancelled. If it ignores cancellation (rare in practice, but possible), `wait_for` will keep waiting. The coroutine sees the cancellation as a `CancelledError` raised at its current `await` point, so you can clean up in a `try/finally` or an `except asyncio.CancelledError:` handler.
+
+`asyncio.timeout()` is the 3.11+ async context manager that does the same job for any code inside the block, including multiple awaits:
+
+The context manager covers everything inside the block. If the deadline passes while you're on the second fetch, the cancellation fires from there. This is more natural than wrapping each call in `wait_for` separately.
+
+Note that on Python 3.11+, `asyncio.TimeoutError` and the built-in `TimeoutError` are the same class, so catching either works. On older versions, the asyncio version is distinct.
+
+For an e-commerce category page where you want every product detail call to complete within 800 ms total or fail the request, `asyncio.timeout` paired with a `TaskGroup` is the idiomatic combination.
+
+<h1 id="cancellation-in-detail">Cancellation in Detail</h1>
+
+Cancellation in asyncio is cooperative. Calling `task.cancel()` doesn't kill the task immediately. It schedules a `CancelledError` to be raised inside the task at its next `await` point. If the task chooses to catch the error and continue, it can (though it generally shouldn't).
+
+Two rules that catch people out:
+
+1. **Always re-raise `CancelledError`** unless you have a very specific reason not to. Swallowing it breaks the cancellation contract and leaves the calling code thinking the task ran to completion.
+2. **Don't suppress it accidentally with a bare `except`.** A pattern like `except Exception:` does not catch `CancelledError` on Python 3.8+, because it's a `BaseException` subclass, not an `Exception`. A bare `except:` clause does catch it, which is one of the many reasons bare excepts are a bad idea.
+
+The "cancel pending API calls when one fails" pattern is what `TaskGroup` does automatically. If you're on a Python version without `TaskGroup`, you can replicate it manually:
+
+You can see how much manual bookkeeping `TaskGroup` saves you. The structured-concurrency block does the same work in one `async with`.
+
+> **Cost:** A task that ignores `CancelledError` cannot be killed. The cancellation message is delivered at the next `await`, so a task stuck in pure CPU work (no awaits) will not respond at all. The fix is either to add `await asyncio.sleep(0)` checkpoints or to move the CPU work into a thread or process pool.
+
+<h1 id="coordination-lock-semaphore-queue">
+  Coordination: Lock, Semaphore, Queue
+</h1>
+
+asyncio ships its own versions of `Lock`, `Semaphore`, and `Queue`. They have the same shape as the `threading` primitives, but they coordinate coroutines on a single thread instead of OS threads. Mixing the two is a category error: never use a `threading.Lock` to protect data accessed by multiple coroutines, and never use an `asyncio.Lock` to protect data accessed by multiple threads.
+
+`asyncio.Lock` is rarely needed in idiomatic asyncio code. Because the event loop runs one coroutine at a time, you only need a lock when a coroutine has an `await` inside the critical section that another coroutine could interleave with:
+
+Without the lock, the `await` inside the critical section gives the event loop a chance to switch to another coroutine, and several could read the same value of `current` before any of them wrote back. The lock serializes the section.
+
+`asyncio.Semaphore(n)` is the bread-and-butter primitive for rate-limiting concurrent API calls. If you've got 100 products to fetch and the upstream API tolerates only 10 in-flight requests at a time, a semaphore is the cleanest answer:
+
+A hundred products at 300 ms each, but at most ten run at once. The total is roughly `100 / 10 * 0.3 = 3.0` seconds, which matches. Drop the semaphore and you'd hammer the API with 100 simultaneous connections; raise it to 20 and the page renders in 1.5 seconds at twice the load.
+
+`asyncio.Queue` is the async producer/consumer primitive. It's useful when you have one or more coroutines producing items (scraping product pages, reading from a stream) and one or more consumers processing them at a different rate:
+
+The `maxsize` argument turns the queue into a back-pressure mechanism: if the consumer falls behind, the producer awaits on `put` until there's room. You get flow control for free.
+
+<h1 id="common-pitfalls">Common Pitfalls</h1>
+
+Even with the high-level APIs, a few patterns reliably trip up real code.
+
+**"Coroutine was never awaited."** This warning means you created a coroutine object and let it get garbage-collected without driving it. The two usual causes are forgetting an `await` and assigning a coroutine to a variable but never using it.
+
+The fix is either `await fetch_product(...)` or `asyncio.create_task(fetch_product(...))`, depending on whether you want to block or fire-and-forget.
+
+**Orphan tasks.** A Task object that nothing holds a strong reference to may be garbage-collected before it runs. The asyncio docs spell this out and recommend keeping tasks in a set. In a web framework like FastAPI or Starlette, the framework itself usually retains references for you, but ad-hoc scripts often don't.
+
+**Awaiting a task twice.** A coroutine and a Task can both be awaited only once. Awaiting a Task that already finished returns the cached result, but awaiting a coroutine twice raises:
+
+If you need the same work twice, call the function twice or use `create_task` (a finished Task can be awaited again to retrieve the result, but the underlying coroutine still ran only once).
+
+**Mixing sync sleep with async code.** A plain `time.sleep(0.5)` inside a coroutine blocks the entire event loop for 500 ms. Every other coroutine, every other request, every queue tick, all frozen. The async version is `await asyncio.sleep(0.5)`. The same warning applies to any blocking call: a synchronous `requests.get` blocks the loop just as badly. Use `httpx`, `aiohttp`, or wrap the blocking call in `asyncio.to_thread()`.
+
+**Forgetting that exceptions in `gather` don't cancel siblings.** Covered above, but worth repeating because it's the single biggest reason new asyncio users get bitten. If sibling cancellation matters, use `TaskGroup`.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

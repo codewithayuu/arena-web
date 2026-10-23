@@ -1,0 +1,507 @@
+---
+title: "Static Methods (@staticmethod)"
+readTime: "10 min read"
+lastUpdated: "June 6, 2026"
+description: "Static Methods (@staticmethod) explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="what-staticmethod-does">What @staticmethod Does</h1>
+
+The `@staticmethod` decorator tells Python not to pass anything as the first argument. No instance, no class. The function inside is treated exactly like a top-level function; the class is purely a namespace.
+
+```python
+class Product:
+    @staticmethod
+    def is_valid_price(price):
+        return isinstance(price, (int, float)) and price >= 0
+
+print(Product.is_valid_price(29.99))
+print(Product.is_valid_price(-5))
+print(Product.is_valid_price("not a number"))
+```
+
+First, the method definition doesn't have `self` or `cls` in the parameter list. It takes `price` directly. Second, the call works whether you go through the class (`Product.is_valid_price(29.99)`) or through an instance (`some_product.is_valid_price(29.99)`); both forms run the same plain function with the same single argument. Third, the body doesn't touch any class state or instance state, because it has no way to. The decorator made sure of that.
+
+Removing `@staticmethod` and writing the same method body shows what the decorator does:
+
+```python
+class Product:
+    def is_valid_price(price):
+        return isinstance(price, (int, float)) and price >= 0
+
+try:
+    Product().is_valid_price(29.99)
+except TypeError as e:
+    print(f"error: {e}")
+```
+
+Without the decorator, calling through an instance still passes the instance as the first argument, so Python is now trying to pass both the instance and `29.99` into a function that only accepts one parameter. The error count is off by one for the same reason "missing `self`" errors are off by one. The decorator fixes this by telling Python "don't pass any extra arguments here". After that, the method behaves like a normal function regardless of how you call it.
+
+**Naming:** Static methods don't get a `self` or `cls` parameter. The first parameter is whatever the function actually needs. Don't add a stub `self` or `cls` "just in case", that defeats the point of the decorator.
+
+<h1 id="static-vs-class-vs-instance-side-by-side">
+  Static vs Class vs Instance: Side By Side
+</h1>
+
+To pin down what makes static methods different, the same class with one of each kind of method.
+
+```python
+class Cart:
+    tax_rate = 0.08
+
+    def __init__(self, items):
+        self.items = items
+
+    # Instance method: needs self.items.
+    def total(self):
+        return sum(self.items) * (1 + Cart.tax_rate)
+
+    # Class method: needs cls (or class-level state).
+    @classmethod
+    def default_tax(cls):
+        return cls.tax_rate
+
+    # Static method: needs neither.
+    @staticmethod
+    def is_valid_price(price):
+        return isinstance(price, (int, float)) and price >= 0
+
+cart = Cart([29.99, 9.99])
+
+print(cart.total())             # instance method
+print(Cart.default_tax())       # class method
+print(Cart.is_valid_price(29))  # static method
+```
+
+The three methods are doing three different jobs. `total` reads per-instance state (`self.items`) and returns a value derived from it. `default_tax` reads class-level state (`cls.tax_rate`) and doesn't care about any single instance. `is_valid_price` doesn't read any state at all; it's a pure helper that lives on the class for organizational reasons.
+
+A diagram makes the difference in argument binding clearer:
+
+The cyan path passes the instance as `self`. The green path passes the class as `cls`. The teal path passes nothing extra; the function receives only what the caller wrote.
+
+A decision table for picking the right one:
+
+| What the function needs                      | Method type                                  |
+| -------------------------------------------- | -------------------------------------------- |
+| Per-instance data (reads or writes `self.x`) | Instance method (default)                    |
+| Class-level data, or builds a new instance   | `@classmethod`                               |
+| Neither instance nor class data              | `@staticmethod` (or a module-level function) |
+
+The last row is the interesting one. If a method needs neither `self` nor `cls`, you have two choices: keep it on the class as a static method, or move it out to a plain function in the module. The next section is about how to pick between those two.
+
+<h1 id="when-to-use-staticmethod-and-when-not-to">
+  When to Use @staticmethod (and When Not To)
+</h1>
+
+`@staticmethod` is rarely the best tool in Python, because Python already has a great place for plain functions: the module. Other languages don't have free-standing functions, so they force you to attach helpers to a class even when there's no real reason to. Python doesn't have that constraint, and the Pythonic preference is usually to write a module-level function unless there's a clear reason to put the helper on the class.
+
+That said, there are real cases where `@staticmethod` fits. Three common ones follow.
+
+<h3 id="case-1-a-helper-that-logically-belongs-to-the-class">
+  Case 1: A Helper That Logically Belongs to the Class
+</h3>
+
+If a helper function is conceptually about the class but doesn't need any of its state, putting it on the class can improve readability. Callers who already know about the class find the helper through dot completion. Readers see at a glance that the function relates to the class.
+
+```python
+class Order:
+    def __init__(self, order_id, status):
+        self.order_id = order_id
+        self.status = status
+
+    @staticmethod
+    def is_valid_status(status):
+        return status in {"placed", "shipped", "delivered", "cancelled"}
+
+    def update_status(self, new_status):
+        if not Order.is_valid_status(new_status):
+            raise ValueError(f"invalid status: {new_status!r}")
+        self.status = new_status
+
+order = Order(101, "placed")
+order.update_status("shipped")
+print(order.status)
+
+print(Order.is_valid_status("frozen"))
+```
+
+`is_valid_status` doesn't read any instance attributes or class attributes; it just checks whether a string is in a fixed set. Putting it on the class makes the relationship obvious. Callers who want to validate a status without first creating an order can use `Order.is_valid_status(...)`. The instance method `update_status` calls it via `Order.is_valid_status(...)` to enforce the rule.
+
+The judgment call is whether the function is "about the class" enough to belong here. A function called `is_valid_status` for `Order` clearly is. A function called `format_currency` probably isn't, even if every `Order` uses it; that one belongs in a `formatting` module that any class can import.
+
+<h3 id="case-2-a-function-that-subclasses-should-be-able-to-override">
+  Case 2: A Function That Subclasses Should Be Able to Override
+</h3>
+
+If you have a helper that a subclass might reasonably want to customize, a static method on the class lets the subclass override it the same way it would override any other method. A module-level function wouldn't support that.
+
+```python
+class Product:
+    def __init__(self, name, price):
+        self.name = name
+        self.price = price
+
+    @staticmethod
+    def format_price(amount):
+        return f"${amount:.2f}"
+
+    def label(self):
+        return f"{self.name} ({Product.format_price(self.price)})"
+
+class EUProduct(Product):
+    @staticmethod
+    def format_price(amount):
+        return f"{amount:.2f} EUR"
+
+us = Product("Wireless Mouse", 29.99)
+eu = EUProduct("Wireless Mouse", 29.99)
+
+print(us.label())
+print(eu.label())
+```
+
+That's not quite what we wanted. The `EUProduct` label still uses the US formatter. The reason is the explicit `Product.format_price(...)` call in `label`. To let subclasses override, we'd need to dispatch through the actual instance's class, which means using `type(self)` or, more commonly, calling the method through `self`:
+
+```python
+class Product:
+    def __init__(self, name, price):
+        self.name = name
+        self.price = price
+
+    @staticmethod
+    def format_price(amount):
+        return f"${amount:.2f}"
+
+    def label(self):
+        return f"{self.name} ({self.format_price(self.price)})"
+
+class EUProduct(Product):
+    @staticmethod
+    def format_price(amount):
+        return f"{amount:.2f} EUR"
+
+us = Product("Wireless Mouse", 29.99)
+eu = EUProduct("Wireless Mouse", 29.99)
+
+print(us.label())
+print(eu.label())
+```
+
+Now `self.format_price(...)` looks up `format_price` on the actual instance's class, finds the overridden version on `EUProduct`, and uses it. The static method participates in the normal lookup chain, which is what gives subclasses room to override. If `format_price` had been a module-level function instead, this kind of override wouldn't be possible without changing the call site.
+
+This is the strongest reason to choose `@staticmethod` over a module-level function. If a subclass might want to change the helper's behavior, keep it on the class.
+
+<h3 id="case-3-grouping-several-related-helpers">
+  Case 3: Grouping Several Related Helpers
+</h3>
+
+When a class has multiple small helpers that work together, grouping them as static methods on the class can read better than scattering them across a module. The class acts as a small namespace.
+
+```python
+class Money:
+    """Helpers for working with money amounts."""
+
+    @staticmethod
+    def to_cents(amount):
+        return round(amount * 100)
+
+    @staticmethod
+    def from_cents(cents):
+        return cents / 100
+
+    @staticmethod
+    def format(amount):
+        return f"${amount:.2f}"
+
+print(Money.to_cents(29.99))
+print(Money.from_cents(2999))
+print(Money.format(29.99))
+```
+
+`Money` here isn't a real class in the OOP sense; nothing is instantiated. It's a bag of related helpers. Some Python codebases lean on this pattern for organization; others prefer a module called `money.py` with three top-level functions. Both are valid; the choice depends on the codebase's conventions.
+
+Calling a static method through an instance (`cart.is_valid_price(29.99)`) has the same speed as calling it through the class (`Cart.is_valid_price(29.99)`). The decorator skips the bind step, so there's no per-call overhead beyond the dotted lookup.
+
+<h1 id="static-method-vs-module-level-function">
+  Static Method vs Module-Level Function
+</h1>
+
+When considering `@staticmethod`, ask whether a module-level function would be cleaner. For helpers that don't really need to live near a class, the function is usually the better choice.
+
+```python
+# Static method on a class.
+class Currency:
+    @staticmethod
+    def format_usd(amount):
+        return f"${amount:.2f}"
+
+# Same thing as a module-level function.
+def format_usd(amount):
+    return f"${amount:.2f}"
+
+print(Currency.format_usd(29.99))
+print(format_usd(29.99))
+```
+
+Both produce the same result. The differences:
+
+| Aspect                        | `@staticmethod`                                      | Module-level function     |
+| ----------------------------- | ---------------------------------------------------- | ------------------------- |
+| Discoverability               | Found via dot completion on the class                | Imported from the module  |
+| Override in subclass          | Yes, subclasses can replace it                       | No, the function is fixed |
+| Implies relationship to class | Yes, the location signals "this is about `Currency`" | Not necessarily           |
+| Boilerplate                   | Needs class definition and decorator                 | Just `def`                |
+| Pythonic preference           | Less common in idiomatic code                        | More common               |
+
+A rule of thumb: write the helper as a module-level function by default. Promote it to a static method on a class when (a) it's strongly tied to one class conceptually, or (b) subclasses might want to override it. If neither applies, leave it as a function.
+
+The Python standard library follows this rule. The `math` module has `math.sqrt`, not `math.Number.sqrt`. The `string` module has `string.ascii_letters`, not `string.String.letters`. Functions live at module level by default; classes are reserved for things that genuinely need instances. Static methods show up in a few places (`str.maketrans`, `dict.fromkeys`), but the pattern is rare relative to module-level functions.
+
+<h1 id="static-method-vs-class-method">Static Method vs Class Method</h1>
+
+Static methods and class methods look similar (both can be called through class or instance) but they're not interchangeable. The difference comes down to whether the function needs the class itself.
+
+```python
+class Product:
+    discount_rate = 0.10
+
+    def __init__(self, name, price):
+        self.name = name
+        self.price = price
+
+    # Class method: needs cls.
+    @classmethod
+    def from_dict(cls, data):
+        return cls(data["name"], data["price"])
+
+    # Static method: doesn't need cls.
+    @staticmethod
+    def is_valid_price(price):
+        return isinstance(price, (int, float)) and price >= 0
+```
+
+`from_dict` builds an instance. It uses `cls(...)` to do that, which is what lets the method work correctly in subclasses (the subclass gets `cls = SubClass`, and `cls(...)` builds the subclass). A static method couldn't do this; it wouldn't have access to `cls`.
+
+`is_valid_price` only checks a value. It doesn't care which class it was called on, because there's no class state involved in the check. A class method here would work but would be misleading; it would imply that the class matters when it doesn't.
+
+The test: if the body of the method needs to reference the class (to read class state or to build an instance), use `@classmethod`. If the body doesn't, use `@staticmethod` (or a module-level function).
+
+<h1 id="common-pitfalls">Common Pitfalls</h1>
+
+A few mistakes show up with `@staticmethod`. Recognizing them saves time during code review.
+
+<h3 id="using-staticmethod-for-methods-that-should-be-regular-functions">
+  Using @staticmethod for Methods That Should Be Regular Functions
+</h3>
+
+A common pitfall is putting a function on a class as a static method when nothing about it is tied to the class. The function would be just as useful in a `utils.py` module, and putting it on the class adds unnecessary coupling.
+
+```python
+# Not great: format_email isn't really "about" Customer.
+class Customer:
+    @staticmethod
+    def format_email(email):
+        return email.strip().lower()
+
+# Better: a module-level function in a string-utility module.
+def format_email(email):
+    return email.strip().lower()
+```
+
+The static-method version forces every caller to import `Customer` even when they don't care about customers. The module-level version is reachable from anywhere without that dependency. Use the static method only when the helper is conceptually tied to the class.
+
+<h3 id="adding-a-stub-self-or-cls-just-to-be-safe">
+  Adding a Stub self or cls "Just to Be Safe"
+</h3>
+
+If a method has no use for `self` or `cls`, don't add one anyway. The point of `@staticmethod` is to declare "this function doesn't need an instance or a class". Adding a stub parameter contradicts that and signals confusion to readers.
+
+```python
+# Wrong: ignores self.
+class Product:
+    @staticmethod
+    def is_valid_price(self, price):
+        return price >= 0
+
+# Right: no stub parameter.
+class Product:
+    @staticmethod
+    def is_valid_price(price):
+        return price >= 0
+```
+
+The decorator already prevents `self` from being passed. Listing `self` in the parameter list means the function will try to receive an extra argument that the caller didn't provide.
+
+<h3 id="using-staticmethod-to-skip-self-inside-an-instance-method">
+  Using @staticmethod to Skip self Inside an Instance Method
+</h3>
+
+Some developers use `@staticmethod` when they have an instance method that doesn't happen to use `self` _in its body_, but is otherwise clearly part of the instance interface. This is usually a mistake. The convention in Python is that methods stay instance methods (with `self`) by default unless there's a clear reason to mark them otherwise.
+
+```python
+class Cart:
+    def __init__(self):
+        self.items = []
+
+    # Technically doesn't use self.
+    def welcome(self):
+        return "Welcome to the cart!"
+```
+
+The method `welcome` doesn't reach into `self`, but it's still part of the `Cart` interface. Making it a static method would force callers who already have a `cart` instance to write `Cart.welcome()` or accept that calling `cart.welcome()` does the same thing internally. The cost of keeping it as an instance method is essentially zero, and the consistency wins. If the method belongs on the class as a static helper (validation, formatting), then `@staticmethod` is fine. If it's an instance method that doesn't happen to need state today, leave it as is.
+
+<h3 id="treating-the-class-as-a-namespace-when-a-module-would-work">
+  Treating the Class as a Namespace When a Module Would Work
+</h3>
+
+Using a class purely as a namespace for static methods is sometimes correct, but more often it's a sign that what you really want is a module. If the class has no instances, no class state, and no inheritance, ask whether the same code in a separate file would be cleaner.
+
+```python
+# Class as namespace: works, but a module may fit better.
+class StringUtils:
+    @staticmethod
+    def slugify(text):
+        return text.lower().replace(" ", "-")
+
+    @staticmethod
+    def truncate(text, n):
+        return text[:n] + "..." if len(text) > n else text
+
+# A module called string_utils.py: equally valid, more Pythonic.
+# def slugify(text):
+#     return text.lower().replace(" ", "-")
+#
+# def truncate(text, n):
+#     return text[:n] + "..." if len(text) > n else text
+```
+
+Both work. The class-as-namespace approach can be useful when you have many related helpers and a module-per-helper-group feels heavy. It's also useful when you want a single import (`from utils import StringUtils`) instead of importing each function. For most codebases, the module is the Pythonic default.
+
+<h1 id="a-worked-example-an-order-class-with-all-three-method-types">
+  A Worked Example: An Order Class With All Three Method Types
+</h1>
+
+Putting it all together, an `Order` class with instance methods, class methods, and a static method, each chosen for the right reason.
+
+```python
+class Order:
+    next_id = 1
+    valid_statuses = {"placed", "shipped", "delivered", "cancelled"}
+
+    def __init__(self, customer, items):
+        self.order_id = Order.next_id
+        self.customer = customer
+        self.items = items
+        self.status = "placed"
+        Order.next_id = Order.next_id + 1
+
+    # Instance method: needs self.items and self.status.
+    def total(self):
+        return sum(self.items)
+
+    def update_status(self, new_status):
+        if not Order.is_valid_status(new_status):
+            raise ValueError(f"invalid status: {new_status!r}")
+        self.status = new_status
+
+    # Class method: builds an instance from an alternate input shape.
+    @classmethod
+    def from_dict(cls, data):
+        return cls(data["customer"], data["items"])
+
+    # Class method: operates on class-level state.
+    @classmethod
+    def count_in_status(cls, orders, status):
+        return sum(1 for order in orders if order.status == status)
+
+    # Static method: doesn't need self or cls.
+    @staticmethod
+    def is_valid_status(status):
+        return status in Order.valid_statuses
+
+orders = [
+    Order("Alice", [29.99, 9.99]),
+    Order.from_dict({"customer": "Bob", "items": [89.99]}),
+    Order("Carol", [4.99]),
+]
+
+orders[0].update_status("shipped")
+
+print(orders[0].total())
+print(Order.count_in_status(orders, "placed"))
+print(Order.is_valid_status("frozen"))
+```
+
+Three method types, three different jobs. `total` and `update_status` work on a single order's state. `from_dict` and `count_in_status` either build new instances or take a class-level view. `is_valid_status` is a pure check that doesn't depend on any instance or class data; it lives on `Order` because it's logically about order statuses.
+
+`is_valid_status` could also be a class method, so subclasses could override the valid set. That argument has merit. The choice depends on whether you expect subclasses to redefine the rules. If yes, use `@classmethod` and read `cls.valid_statuses`. If the rules are fixed at the parent-class level, `@staticmethod` works. Either way, putting the helper on the class instead of in a separate `validation.py` module makes sense because it's tightly tied to the `Order` concept.
+
+<h1 id="quiz">Quiz</h1>
+
+<h1 id="quiz-questions">Quiz Questions</h1>
+
+**Question 1: What is the main effect of decorating a method with @staticmethod?**
+
+- [x] It stops Python from passing self or cls automatically.
+- [ ] It makes the function private to the class body.
+- [ ] It lets the method change class attributes safely.
+- [ ] It caches the result after the first method call.
+
+**Question 2: When is a module-level function usually better than a static method?**
+
+- [x] When the helper is unrelated to the class and needs no class state.
+- [ ] When the helper must read instance attributes like self.items.
+- [ ] When subclasses should receive their own class as cls.
+- [ ] When the helper must be called through an object only.
+
+**Question 3: A method needs to read cls.tax_rate so subclasses can override the value. Which method type fits best?**
+
+- [ ] An instance method, because class attributes are copied into each instance.
+- [ ] A static method, because it can access cls through the class namespace.
+- [x] A class method, because Python passes the current class as cls.
+- [ ] A property, because decorators always receive the class object.
+
+**Question 4: What does Python return when a static method is accessed through an instance?**
+
+- [ ] A bound method whose first argument is the instance.
+- [x] The underlying function, without binding self or cls.
+- [ ] A copy of the function stored in the instance dict.
+- [ ] A class method bound to type(instance).
+
+**Question 5: Which design is least appropriate for @staticmethod?**
+
+- [ ] A price validator that uses only the price argument and returns a boolean.
+- [ ] A small parser tied to one class's file format but needing no instance.
+- [ ] A helper that needs no state but belongs in the public class API.
+- [x] A factory that must construct instances of whichever subclass called it.
+
+**Question 6: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 7: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 8: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+<QuizCard />
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,440 @@
+---
+title: "Logging Best Practices"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Logging Best Practices explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+Take a log line that says:
+
+```text
+Payment failed
+```
+
+It tells you what happened, but nothing else. Now compare it to this:
+
+```text
+2026-01-15T02:03:11.482Z ERROR payment-service v2.3 pod=payment-7f9c
+Payment failed: order_id=842 user_id=19 reason="card processor timed out after 5000ms"
+```
+
+The second log gives you enough to start investigating **without opening the code**. The rest of this chapter is about how to produce logs like the second one, consistently, across every service.
+
+A good test before writing any log statement: _if I saw only this line during an incident, would I understand what happened?_
+
+<h1 id="2-structured-logging">2. Structured Logging</h1>
+
+The first practice is to use **structured logs**.
+
+Many applications write logs as plain sentences, with values mixed into the text:
+
+```text
+2026-01-15 02:03:11 ERROR Payment for order 842 (user 19) timed out after 5000ms
+```
+
+But once you have millions of log lines from dozens of services, you need to search and filter them with a machine. Pulling values out of sentences means writing regex rules, and a small wording change can break every search and alert built on them.
+
+**Structured logging** writes each entry as a set of named fields, most commonly in **JSON**. A structured log for the failed payment might look like this:
+
+```json
+{
+  "timestamp": "2026-01-15T02:03:11.482Z",
+  "level": "ERROR",
+  "service": "payment-service",
+  "message": "Payment charge failed",
+  "order_id": "842",
+  "user_id": "19",
+  "error_type": "timeout",
+  "duration_ms": 5000
+}
+```
+
+Now your log system can **index those fields**. You can ask for every payment timeout in the last hour (`service=payment-service AND error_type=timeout`). You can group errors by type. You can find every log entry for one specific order (`order_id=842`).
+
+<h3 id="consistent-field-names">Consistent Field Names</h3>
+
+Structured logs only help if the fields are **consistent**.
+
+```text
+order-service:    {"user_id": "19", ...}
+payment-service:  {"userId": "19", ...}
+email-service:    {"uid": "19", ...}
+```
+
+Suppose one service logs the user as `user_id`. Another logs it as `userId`. A third uses `uid`. Now a single search for one user's activity has to know every variation.
+
+So teams usually agree on a **shared logging schema**. It defines standard names for common fields:
+
+| Field         | Type     | Description                              | Required             |
+| ------------- | -------- | ---------------------------------------- | -------------------- |
+| `timestamp`   | ISO 8601 | When the event occurred                  | Yes                  |
+| `level`       | string   | DEBUG, INFO, WARN, ERROR                 | Yes                  |
+| `service`     | string   | Name of the service                      | Yes                  |
+| `environment` | string   | prod, staging, dev                       | Yes                  |
+| `message`     | string   | Short, constant description of the event | Yes                  |
+| `trace_id`    | string   | Request or trace identifier              | When available       |
+| `user_id`     | string   | User involved                            | When relevant        |
+| `error_type`  | string   | Error classification                     | For errors           |
+| `duration_ms` | number   | Operation duration                       | For timed operations |
+
+Many teams enforce this through a **shared logging library**, so every service produces the same field names without each developer having to remember them.
+
+```text
+Java (Logback + Logstash encoder):
+─────────────────────────────────────
+logger.error("Payment charge failed",
+    kv("order_id", orderId), kv("error_type", "timeout"), kv("duration_ms", 5000));
+
+Python (structlog):
+─────────────────────────────────────
+logger.error("Payment charge failed", order_id=842, error_type="timeout", duration_ms=5000)
+
+Node.js (pino):
+─────────────────────────────────────
+logger.error({ order_id: 842, error_type: "timeout", duration_ms: 5000 }, "Payment charge failed");
+```
+
+<h1 id="3-log-levels">3. Log Levels</h1>
+
+The next practice is using **log levels** correctly. Most logging libraries support a similar set of levels.
+
+- **DEBUG** is for detailed information that helps during development, such as the value of a variable or the path taken through a function.
+- **INFO** is for normal, meaningful events, such as a service starting up, an order being placed, or a scheduled job finishing.
+- **WARN** is for something unexpected that the system handled, such as a retry that eventually succeeded or a fallback to a default value.
+- **ERROR** is for a failure that affected an operation, such as a payment that could not be processed.
+
+| Level     | When to Use                           | Example                                     | Production Setting                |
+| --------- | ------------------------------------- | ------------------------------------------- | --------------------------------- |
+| **FATAL** | The process cannot continue           | Required config missing at startup          | Always logged                     |
+| **ERROR** | A failure affected an operation       | Payment could not be processed              | Always logged                     |
+| **WARN**  | Unexpected, but the system handled it | Retry succeeded, fallback to default        | Always logged                     |
+| **INFO**  | Normal, meaningful events             | Service started, order placed, job finished | Usually logged                    |
+| **DEBUG** | Detail for development                | Variable values, path through a function    | Off, turned on when investigating |
+| **TRACE** | Even finer detail                     | Entering and exiting methods                | Rarely used                       |
+
+Some libraries also have **FATAL** above ERROR and **TRACE** below DEBUG, but the four in the middle cover almost every case.
+
+Levels let you **control how much detail you keep**. In production, many teams log at INFO and above, and only turn on DEBUG for a specific service when they are investigating something.
+
+<h3 id="choosing-the-right-level">Choosing the Right Level</h3>
+
+Picking the wrong level causes real problems.
+
+Suppose a user types the wrong password. That is not an error in your system. It is an expected part of normal operation.
+
+If you log it at ERROR level, your error count grows every time someone mistypes a password. Alerts built on error logs start firing for things that need no action. Over time, the team learns to ignore those alerts, and **real errors get missed**.
+
+```text
+ERROR: Login failed for user_id=19: wrong password
+       (Expected user behavior - should be INFO)
+
+ERROR: Request to inventory timed out, retrying...
+       (Unexpected but handled - should be WARN)
+
+ERROR: Cache miss for key user:19
+       (Normal operation - should be DEBUG)
+```
+
+A useful rule is to ask **whether someone needs to act**.
+
+If yes, it is probably an **error**. If it is unusual but handled, it is probably a **warning**. If it is part of normal flow, it is **info** or **debug**.
+
+<h1 id="4-add-context-to-every-log">4. Add Context to Every Log</h1>
+
+A log message on its own is rarely enough. It needs **context**.
+
+Some context is **the same for every log a service writes**. This includes the service name, the version being deployed, the environment, and the host or container it runs on.
+
+The version is especially useful. If errors start right after a deployment, the version field lets you confirm that only the new version is affected.
+
+Other context **depends on the request**. This includes the request ID, the user ID, and the main entity being processed, such as an order ID.
+
+```json
+{
+  "service": "payment-service",
+  "version": "2.3.0",
+  "environment": "prod",
+  "host": "payment-7f9c",
+
+  "request_id": "req-4bf92f35",
+  "user_id": "19",
+  "order_id": "842",
+
+  "level": "ERROR",
+  "message": "Payment charge failed"
+}
+```
+
+The first four fields are added once, when the logger is created. The next three are added per request. The developer only writes the last two.
+
+When you log an exception, include the **error type**, the **message**, and the **stack trace**. A log that says `database error` is far less useful than one that shows the exception, the query that failed, and the line of code where it happened.
+
+```text
+Bad (losing the exception):
+─────────────────────────────────────
+try {
+    chargeCard(order);
+} catch (Exception e) {
+    logger.error("Database error");  // Which query? Why? Where?
+}
+
+Good (keep the exception and context):
+─────────────────────────────────────
+try {
+    chargeCard(order);
+} catch (SQLException e) {
+    logger.error("Payment record insert failed",
+                 kv("order_id", order.getId()),
+                 kv("query", "insert_payment"),
+                 e);  // logs error type, message, and stack trace
+}
+```
+
+<h1 id="5-correlation-ids">5. Correlation IDs</h1>
+
+In a distributed system, one request can create log entries in many services. To connect them, every log entry for that request needs to share an identifier. This is called a **correlation ID** or **request ID**.
+
+1. It is usually **generated when the request first enters the system**, for example at the API gateway.
+2. Each service **passes it along** to the next service, typically in an HTTP header or a message attribute.
+3. Every service **includes it in every log entry** it writes for that request.
+
+Now you can search for one ID and see the full story of a request across all services, in order.
+
+If you use **distributed tracing**, the trace ID can serve as this identifier, which also links your logs to your traces.
+
+Most logging libraries can store this ID in a **request-scoped context** and add it to every entry automatically, so developers do not have to pass it through every function call:
+
+```java
+// In a request filter, once per request
+String requestId = request.getHeader("X-Request-ID");
+MDC.put("request_id", requestId);
+try {
+    chain.doFilter(request, response);
+} finally {
+    MDC.clear();
+}
+
+// Anywhere in the request, request_id is added automatically
+logger.info("Order placed", kv("order_id", orderId));
+```
+
+<h1 id="6-what-to-log">6. What to Log</h1>
+
+What should you actually log? A good starting point is the **boundaries of your system**.
+
+- **Requests.** Log when a request arrives and when it completes, along with the status and how long it took.
+- **External calls.** Log calls to databases, payment providers, and other services, especially when they fail or run slowly.
+- **Important state changes.** For example, an order moving from pending to paid, or an account being locked.
+- **Decisions the system makes on its own.** For example, retrying a call, opening a circuit breaker, or falling back to cached data.
+- **Key configuration at startup.** For example, which feature flags are enabled. If a problem turns out to be caused by configuration, that startup log makes it easy to confirm.
+
+```text
+INFO  Service started             version=2.3.0 flags="new_checkout=on,fraud_v2=off"
+INFO  Request completed           route=/checkout status=200 duration_ms=182
+WARN  Payment provider slow       provider=stripe duration_ms=2410
+INFO  Order state changed         order_id=842 from=pending to=paid
+WARN  Circuit breaker opened      dependency=fraud-check failures=12
+WARN  Serving cached data         dependency=pricing reason=timeout
+```
+
+<h1 id="7-what-not-to-log">7. What Not to Log</h1>
+
+Just as important is knowing **what to keep out of logs**.
+
+- **Never** log passwords, API keys, access tokens, or session cookies.
+- **Never** log full credit card numbers.
+- **Be careful** with personal information such as email addresses, phone numbers, and home addresses.
+
+Logs are often **less protected than your database**. They get copied into log aggregation systems, backups, and third-party tools, and many engineers may have access to them. A secret written to a log can end up in far more places than the original data.
+
+Regulations such as **GDPR** and **PCI DSS** also place rules on how personal and payment data is stored, and logs are covered too.
+
+```text
+Bad (exposing full values):
+card_number=4111111111111111  password=hunter2  token=sk_live_abcd1234efgh5678
+```
+
+```text
+Good (redacted by the logger):
+card_number=****1111  password=[REDACTED]  token=[REDACTED]
+```
+
+The safest approach is to **redact sensitive fields in the logging library itself**. For example, the logger can mask any field named `password` or `token`, or show only the last four digits of a card number.
+
+That way, protection does not depend on every developer remembering it every time.
+
+<h1 id="8-avoid-noise">8. Avoid Noise</h1>
+
+More logs do not always mean better visibility.
+
+<h3 id="logging-inside-tight-loops">Logging Inside Tight Loops</h3>
+
+One common source of noise is logging inside tight loops. If a job processes one million records and logs each one at INFO level, you get one million lines that tell you very little.
+
+It is usually better to **log a summary**, such as how many records were processed, how many failed, and how long it took.
+
+```text
+Bad (one line per record):
+─────────────────────────────────────
+for (record in records) {  // 1,000,000 records
+    logger.info("Processing record " + record.id);
+    process(record);
+}
+
+Good (one summary):
+─────────────────────────────────────
+for (record in records) {
+    process(record);  // count successes and failures
+}
+logger.info("Import finished", processed=998812, failed=1188, duration_ms=81234);
+```
+
+<h3 id="logging-the-same-error-at-every-layer">
+  Logging the Same Error at Every Layer
+</h3>
+
+Another source of noise is logging the same error at every layer.
+
+```text
+Bad (one failure, three ERROR lines):
+─────────────────────────────────────
+PaymentRepository:  catch (e) { logger.error("Insert failed", e);  throw e; }
+PaymentService:     catch (e) { logger.error("Charge failed", e);  throw e; }
+PaymentController:  catch (e) { logger.error("Request failed", e); return 500; }
+
+Good (log once, where it is handled):
+─────────────────────────────────────
+PaymentRepository:  throws, adding context to the exception
+PaymentService:     throws
+PaymentController:  catch (e) { logger.error("Payment request failed", e); return 500; }
+```
+
+Suppose the database layer catches an exception, logs it, and rethrows it. The service layer catches it, logs it, and rethrows it. Then the controller logs it again. Now one failure appears as three errors, which makes error counts misleading.
+
+A good rule is to **log an error once, at the place where it is actually handled**.
+
+<h1 id="9-write-clear-messages">9. Write Clear Messages</h1>
+
+The message itself also matters. **Keep the message short and constant, and put the changing values into fields.**
+
+```text
+Bad (values joined into the message):
+─────────────────────────────────────
+logger.error("Charge of $" + amount + " for order " + orderId + " failed: " + err);
+→ "Charge of $49.99 for order 842 failed: timeout"
+→ "Charge of $12.00 for order 843 failed: card_declined"
+
+Good (constant message, values as fields):
+─────────────────────────────────────
+logger.error("Payment charge failed", order_id=orderId, amount=amount, error_type=err);
+→ {"message": "Payment charge failed", "order_id": "842", "amount": 49.99, "error_type": "timeout"}
+→ {"message": "Payment charge failed", "order_id": "843", "amount": 12.00, "error_type": "card_declined"}
+```
+
+For example, the message might always be `Payment charge failed`, with the order ID, amount, and error type stored as separate fields.
+
+This makes it easy to **count how often that exact event happens**, because every occurrence has the same message. If you build the message by joining strings together, every line looks different, and grouping them becomes much harder.
+
+<h1 id="10-logging-and-performance">10. Logging and Performance</h1>
+
+Logging is not free. Every log line uses **CPU** to format, **memory** to buffer, and **disk or network bandwidth** to write. In a high-traffic service, careless logging can noticeably slow down requests.
+
+<h3 id="asynchronous-logging">Asynchronous Logging</h3>
+
+One common fix is **asynchronous logging**. Instead of writing to disk or the network on the request thread, the application puts log entries into an **in-memory buffer**, and a **background thread** writes them out.
+
+This keeps slow disks or network hiccups from blocking user requests.
+
+The trade-off is that **entries still in the buffer can be lost if the process crashes**, and the buffer needs a policy for what happens when it fills up: block the caller, or drop entries (often dropping DEBUG and INFO first).
+
+<h3 id="do-not-build-messages-you-will-not-use">
+  Do Not Build Messages You Will Not Use
+</h3>
+
+Another fix is to avoid building expensive debug messages when debug logging is turned off. Most logging libraries check the level first, so a disabled debug message costs almost nothing, **as long as you do not compute its values in advance**.
+
+**Bad (always serializes, even when DEBUG is off):**
+
+```java
+logger.debug("Cart contents: " + expensiveSerialize(cart));
+```
+
+**Good (placeholder, no string building if DEBUG is off):**
+
+```java
+logger.debug("Cart contents: {}", cart);
+```
+
+**Better (Log4j 2 supplier: the expensive work runs only if DEBUG is on):**
+
+```java
+logger.debug("Cart contents: {}", () -> expensiveSerialize(cart));
+```
+
+To build intuition: at **10,000 requests per second**, even **0.1 ms** of extra logging work per request adds up to roughly **1 second of CPU time every second**.
+
+<h1 id="11-centralize-your-logs">11. Centralize Your Logs</h1>
+
+In modern deployments, logs should not stay on the machine that produced them. Containers are replaced constantly. When a container is removed, any log files stored inside it are gone.
+
+So the common pattern is:
+
+1. Applications write logs to **standard output**.
+2. A **log agent** running on each host, such as **Fluent Bit** or **Vector**, collects those logs and ships them to a central system.
+3. That system might be **Elasticsearch**, **Loki**, or a **managed logging service**.
+
+There, logs from every service are stored together, indexed, and searchable in one place.
+
+Writing to standard output also keeps the application simple. It does not need to know where logs end up, and it does not need to manage log files, rotation, or disk space.
+
+<h1 id="12-controlling-volume-and-cost">12. Controlling Volume and Cost</h1>
+
+As systems grow, log volume can grow into **terabytes per day**, and so does the bill. There are a few common ways to manage this.
+
+<h3 id="sampling">Sampling</h3>
+
+Keep every error and warning, but only a fraction of successful request logs, for example 10%.
+
+```java
+boolean keep = status >= 400 || random.nextDouble() < 0.10;
+if (keep) {
+    logger.info("Request completed", kv("route", route), kv("status", status), kv("duration_ms", ms));
+}
+```
+
+<h3 id="changing-log-levels-at-runtime">Changing Log Levels at Runtime</h3>
+
+Some systems let you raise a single service to DEBUG level for a short time **without redeploying**, and then lower it again. This gives you detail exactly when and where you need it, without paying for it all the time.
+
+<h3 id="retention-tiers">Retention Tiers</h3>
+
+Recent logs are kept in **fast, searchable storage** for a week or a month. Older logs are moved to **cheaper storage** such as object storage, or deleted based on your compliance requirements.
+
+| Log Type                | Hot (searchable) | Cold (object storage) | Reason                     |
+| ----------------------- | ---------------- | --------------------- | -------------------------- |
+| Debug logs              | 1-3 days         | none                  | Short-term investigation   |
+| Application logs        | 7-30 days        | up to 90 days         | Debugging recent issues    |
+| Access logs             | 30 days          | up to 1 year          | Traffic analysis, security |
+| Audit and security logs | 30-90 days       | 1-7 years             | Compliance requirements    |
+
+<h3 id="use-metrics-for-counting">Use Metrics for Counting</h3>
+
+Finally, do not use logs for things **metrics** handle better. If you want to know how many requests you serve per second, count them with a metric instead of writing a log line for each request and counting later.
+
+<h1 id="summary">Summary</h1>
+
+- Write **structured logs** with **consistent field names**, enforced by a shared logging library.
+- Use **log levels** that match how serious an event really is. If someone needs to act, it is an error.
+- Attach **context** and a **correlation ID** to every entry, so you can follow a request across services.
+- Log the **events that matter** at the boundaries of your system, keep **sensitive data** out with redaction in the logger, and **cut the noise** by logging summaries and logging each error once.
+- Keep messages **short and constant**, with changing values in fields.
+- Use **asynchronous logging** and avoid computing values for disabled log levels.
+- Send everything to a **central system**, with **sampling and retention** policies that keep costs in check.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

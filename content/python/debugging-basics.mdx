@@ -1,0 +1,434 @@
+---
+title: "Debugging Basics"
+readTime: "10 min read"
+lastUpdated: "June 6, 2026"
+description: "Debugging Basics explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="print-debugging-vs-real-debuggers">
+  print Debugging vs Real Debuggers
+</h1>
+
+`print` debugging is the universal first move. You add a `print(cart)` next to the line you suspect, rerun, and read the output. It works, it's free, and you can do it without leaving your editor. For a one-line typo in a `total` calculation, it's often the fastest way to find the bug.
+
+The problem with `print` debugging shows up when the bug is harder. You don't know which value you need to inspect until you've already added prints in the wrong places. You rerun, see the next confusing value, add more prints, rerun again. Each cycle costs you the time to restart the program, replay the failing scenario, and scroll through output. With anything stateful, like a shopping cart that mutates over many calls, prints accumulate into a wall of text where every interesting line looks the same as every other.
+
+A debugger inverts the loop. You stop the program once, at the suspicious line, and then you can ask it anything: print any variable, evaluate any expression, step forward one line at a time, jump up the call stack to see who called this function. The program holds still while you look around. You don't have to know in advance what to inspect.
+
+| Situation                                  | Use `print`          | Use a debugger                     |
+| ------------------------------------------ | -------------------- | ---------------------------------- |
+| Tiny script, one suspect line              | Yes                  | Overkill                           |
+| You know exactly what to look at           | Yes                  | Either works                       |
+| You don't know where the bug is            | Slow                 | Much faster                        |
+| Bug only happens with complex state        | Hard to read         | Built for this                     |
+| Code is in a library you can't easily edit | No good              | Set a breakpoint there             |
+| Production logs from a server              | Logging, not `print` | Post-mortem from a saved traceback |
+| Loop that runs 10,000 times                | Floods output        | Conditional breakpoint             |
+
+The honest answer is that experienced Python developers use both. `print` for fast checks, the debugger when the bug refuses to surrender to prints. The expensive mistake is staying with `print` debugging long after the bug has shown it deserves a debugger.
+
+<h1 id="the-breakpoint-builtin">The breakpoint() Builtin</h1>
+
+Before Python 3.7, dropping into the debugger meant typing `import pdb; pdb.set_trace()` at the line you cared about. That's ugly enough that people would forget to remove it, push it to a repo, and ship a debugger trap to production. PEP 553 fixed this with a one-line builtin:
+
+```python
+def apply_discount(cart_total: float, percent: float) -> float:
+    discount = cart_total * percent / 100
+    breakpoint()
+    return cart_total - discount
+```
+
+Run the program and execution pauses at `breakpoint()`. You get an interactive `(Pdb)` prompt where you can inspect everything in scope:
+
+```text
+> /Users/dev/shop/discount.py(3)apply_discount()
+-> discount = cart_total * percent / 100
+(Pdb) p cart_total
+99.95
+(Pdb) p percent
+10
+(Pdb) p discount
+9.995
+(Pdb) c
+```
+
+The `c` (continue) command resumes the program. The `p` (print) command shows the value of any expression you can name in the current scope.
+
+The clever part of `breakpoint()` is what happens under the hood. It looks up the `PYTHONBREAKPOINT` environment variable, defaults to `pdb.set_trace` if it's not set, and calls whatever that variable points to. That gives you three useful behaviors with no code changes:
+
+```text
+# Default: drops into pdb
+python shop.py
+
+# Use ipdb instead (after pip install ipdb)
+PYTHONBREAKPOINT=ipdb.set_trace python shop.py
+
+# Disable all breakpoints (for production or CI)
+PYTHONBREAKPOINT=0 python shop.py
+```
+
+Setting `PYTHONBREAKPOINT=0` is the trick that protects you from forgotten `breakpoint()` calls. The function becomes a no-op, the program runs straight through, and CI never hangs waiting for a prompt. Production environments often set this in their startup script as a safety net.
+
+You can also point it at a custom function. `PYTHONBREAKPOINT=mypkg.my_debugger` will import `mypkg` and call `my_debugger()` at every `breakpoint()`. Teams sometimes use this to route into web-based debuggers or to capture state for offline analysis.
+
+> **Cost:** `breakpoint()` has zero overhead when `PYTHONBREAKPOINT=0`. It's safe to leave a `breakpoint()` call in dev code if your production environment sets that variable, but the cleaner habit is to remove them before commit.
+
+<h1 id="core-pdb-commands">Core pdb Commands</h1>
+
+Once you're at the `(Pdb)` prompt, the program is paused and you control what happens next. `pdb` has about thirty commands. You only need a dozen for ninety percent of debugging work.
+
+| Command    | Short | What it does                                              |
+| ---------- | ----- | --------------------------------------------------------- |
+| `list`     | `l`   | Show 11 lines of source around the current line           |
+| `longlist` | `ll`  | Show the full source of the current function              |
+| `next`     | `n`   | Run the current line. Don't step into function calls      |
+| `step`     | `s`   | Run the current line. Step into any function calls        |
+| `continue` | `c`   | Run until the next breakpoint or program end              |
+| `return`   | `r`   | Run until the current function returns                    |
+| `until`    | `unt` | Run until a line number greater than the current one      |
+| `break`    | `b`   | Set a breakpoint (by line number, function, or condition) |
+| `clear`    | `cl`  | Remove a breakpoint by number                             |
+| `print`    | `p`   | Print the value of an expression                          |
+| `pp`       |       | Pretty-print (good for big dicts and lists)               |
+| `where`    | `w`   | Show the current call stack                               |
+| `up`       | `u`   | Move one frame up the stack (toward the caller)           |
+| `down`     | `d`   | Move one frame down (toward the current function)         |
+| `args`     | `a`   | Print the current function's arguments                    |
+| `!`        |       | Run any Python statement in the current scope             |
+| `quit`     | `q`   | Abort the program                                         |
+| `help`     | `h`   | List commands, or `h cmd` for one command                 |
+
+The split that confuses people first is `n` versus `s`. Both run the current line, but `n` treats a function call as a single step (you see the call complete, then stop at the next line in the current function), while `s` enters the function and stops at its first line. Use `n` when you trust the function you're calling. Use `s` when you suspect it.
+
+Here's a session walking through a buggy cart total. The code:
+
+```python
+# cart.py
+def line_total(price: float, quantity: int) -> float:
+    return price + quantity   # bug: should be price * quantity
+
+def cart_total(items: list[tuple[str, float, int]]) -> float:
+    total = 0.0
+    for name, price, quantity in items:
+        total += line_total(price, quantity)
+    return total
+
+if __name__ == "__main__":
+    cart = [
+        ("headphones", 59.99, 1),
+        ("cable", 9.99, 2),
+    ]
+    breakpoint()
+    print(f"Cart total: ${cart_total(cart):.2f}")
+```
+
+Run it:
+
+```text
+> /Users/dev/shop/cart.py(14)<module>()
+-> print(f"Cart total: ${cart_total(cart):.2f}")
+(Pdb) l
+  9         return total
+ 10
+ 11     if __name__ == "__main__":
+ 12         cart = [
+ 13             ("headphones", 59.99, 1),
+ 14  ->         ("cable", 9.99, 2),
+ 15         ]
+ 16         breakpoint()
+ 17  ->     print(f"Cart total: ${cart_total(cart):.2f}")
+(Pdb) s
+--Call--
+> /Users/dev/shop/cart.py(4)cart_total()
+-> def cart_total(items: list[tuple[str, float, int]]) -> float:
+(Pdb) n
+> /Users/dev/shop/cart.py(5)cart_total()
+-> total = 0.0
+(Pdb) n
+> /Users/dev/shop/cart.py(6)cart_total()
+-> for name, price, quantity in items:
+(Pdb) n
+> /Users/dev/shop/cart.py(7)cart_total()
+-> total += line_total(price, quantity)
+(Pdb) p name, price, quantity
+('headphones', 59.99, 1)
+(Pdb) s
+--Call--
+> /Users/dev/shop/cart.py(1)line_total()
+-> def line_total(price: float, quantity: int) -> float:
+(Pdb) n
+> /Users/dev/shop/cart.py(2)line_total()
+-> return price + quantity
+(Pdb) p price + quantity
+60.99
+(Pdb) p price * quantity
+59.99
+```
+
+At that last line, the bug is obvious. The function adds when it should multiply, so a single-quantity item produces the right answer by accident, but a quantity of 2 will not. Without the debugger, you'd be guessing where the bug lives. With it, you stepped from the outer call into the inner function and watched the wrong arithmetic happen.
+
+A few more habits that pay off:
+
+- `w` (where) shows the call stack. Use it to figure out who called the function you're stuck in. `u` and `d` walk up and down the stack so you can inspect the caller's variables.
+- `a` (args) prints the current function's arguments. Useful when you stepped in with `s` and want a quick reminder of what was passed.
+- `!` runs any Python in the current scope. `!cart.append(("milk", 3.49, 1))` mutates the live cart so you can keep debugging without restarting.
+- `pp` pretty-prints. `pp orders` on a list of fifty order dicts is a lot more readable than `p orders`.
+- `ll` (longlist) shows the entire current function rather than 11 lines. Use it when you've lost track of where you are.
+
+<h1 id="setting-breakpoints-from-inside-pdb">
+  Setting Breakpoints from Inside pdb
+</h1>
+
+Calling `breakpoint()` is the easiest way to enter the debugger. Once you're inside it, the `b` (break) command lets you set more breakpoints without editing the source.
+
+```text
+(Pdb) b cart.py:7
+Breakpoint 1 at /Users/dev/shop/cart.py:7
+(Pdb) b line_total
+Breakpoint 2 at /Users/dev/shop/cart.py:1
+(Pdb) b cart.py:7, quantity > 1
+Breakpoint 3 at /Users/dev/shop/cart.py:7
+```
+
+Three forms in three lines:
+
+1. `b cart.py:7` breaks at line 7 every time it runs.
+2. `b line_total` breaks at the first line of the function `line_total`.
+3. `b cart.py:7, quantity > 1` is a conditional breakpoint. It only pauses when the expression after the comma is true. This is the form that turns a hopeless "the bug only happens on item 4217" problem into a one-step investigation.
+
+`b` with no argument lists all current breakpoints. `cl 2` clears breakpoint 2. `disable 2` turns it off without removing it, and `enable 2` turns it back on.
+
+You can also attach commands to a breakpoint, so it does something automatically every time it hits:
+
+```text
+(Pdb) b line_total
+Breakpoint 1 at /Users/dev/shop/cart.py:1
+(Pdb) commands 1
+(com) p price, quantity
+(com) c
+(com) end
+```
+
+Now every time `line_total` is called, `pdb` prints `price, quantity` and continues without prompting. The result is a targeted trace, with only the values you want, without permanent edits to the source.
+
+<h1 id="post-mortem-debugging">Post-Mortem Debugging</h1>
+
+The bugs that hurt are the ones you can't reproduce on demand. The program crashed, you have a traceback, and you need to look around inside the crashed state. `pdb` has a post-mortem mode for exactly this.
+
+Three ways to use it:
+
+```text
+# Run a script and drop into pdb at the first uncaught exception.
+python -m pdb shop.py
+
+# Same idea, but only if the script crashes (interactive shell).
+python -c "import pdb, shop; pdb.run('shop.main()')"
+
+# After a crash in a REPL, inspect the last traceback.
+python
+>>> import shop
+>>> shop.main()
+Traceback (most recent call last):
+  ...
+ZeroDivisionError: division by zero
+>>> import pdb
+>>> pdb.pm()
+```
+
+`python -m pdb shop.py` is the workhorse. It loads the script but pauses before the first line, so you can set breakpoints anywhere with `b` and then `c` to run. If the script then raises an uncaught exception, you land at a `(Pdb)` prompt inside the failing frame with all local variables still alive.
+
+Inside your own code, you can install the same behavior with `sys.excepthook`:
+
+```python
+import sys
+import pdb
+
+def info(exc_type, value, tb):
+    pdb.post_mortem(tb)
+
+sys.excepthook = info
+```
+
+After that, any uncaught exception drops you straight into the debugger. This is a development-only trick. Don't ship it.
+
+`pdb.pm()` (short for "post-mortem") works on the last exception that left a traceback in `sys.last_traceback`. The REPL keeps it around after an interactive crash, so the workflow becomes: run the failing code, see the traceback, call `pdb.pm()`, look around.
+
+> **Cost:** Post-mortem debugging holds the entire stack of the crashed frame in memory, including every local variable and every reference they hold. For a script this is nothing. For a server processing big datasets, watch out: a held traceback can keep gigabytes alive.
+
+<h1 id="ipdb-pudb-and-the-pdb-improvements-in-313">
+  ipdb, pudb, and the pdb Improvements in 3.13
+</h1>
+
+The built-in `pdb` is plain. No syntax highlighting, no tab completion on Python expressions by default, no second window for variables. For long debugging sessions, the alternatives are worth knowing.
+
+`ipdb` is `pdb` running on top of IPython. After `pip install ipdb`, you get the same commands plus colored output, real tab completion, history across sessions, and IPython-style `?` for help on any object. Drop in with `import ipdb; ipdb.set_trace()` or wire up `PYTHONBREAKPOINT=ipdb.set_trace` so plain `breakpoint()` routes there. If you spend much time in `pdb`, `ipdb` is a small upgrade that pays off the first day.
+
+`pdb++` (the package is named `pdbpp`) replaces `pdb` outright. Same import path, same commands, but with sticky source display (the source window stays visible while you step), syntax highlighting, and smarter completion. It tends to be either loved or quietly removed depending on whether you like its defaults.
+
+`pudb` is the curses-based full-screen debugger. After `pip install pudb`, `import pudb; pudb.set_trace()` opens a TUI with separate panes for source, variables, breakpoints, and stack. It runs in a regular terminal, which makes it useful over SSH where a graphical IDE isn't available. The keybindings take a few minutes to learn, but for stepping through a long stack of frames it's the most readable of the terminal options.
+
+Python 3.13 brought a sizable upgrade to the built-in `pdb` itself. The two highlights:
+
+1. Tab completion now works for Python expressions, not just commands. `cart.` then Tab lists the attributes.
+2. Multi-line input is supported. You can paste a small block of Python and run it without stitching it into one line with semicolons.
+
+There's also `python -m pdb -m mypkg`, which runs a module under `pdb` the same way you'd run it under Python normally. Before 3.7, you had to find the module's file path yourself.
+
+| Tool              | Install             | Best for                                 |
+| ----------------- | ------------------- | ---------------------------------------- |
+| `pdb`             | Built in            | Quick checks, any machine                |
+| `ipdb`            | `pip install ipdb`  | Daily use, colors and completion         |
+| `pdb++`           | `pip install pdbpp` | Sticky source view, opinionated defaults |
+| `pudb`            | `pip install pudb`  | TUI over SSH, full-screen panes          |
+| VS Code / PyCharm | IDE feature         | Variable panes, click-to-set breakpoints |
+
+<h1 id="ide-debuggers">IDE Debuggers</h1>
+
+IDEs like VS Code and PyCharm wrap a debugger backend in a graphical interface. You click in the gutter to set a breakpoint, run the program in debug mode, and the editor pauses on the marked line with a panel showing every local variable, the call stack, watch expressions, and a console that runs in the same scope as the paused frame.
+
+The big advantages over a terminal debugger are visibility and discoverability. You see ten variables at once instead of typing `p` ten times. The stack is a clickable list, so jumping to the caller is one click rather than `w` followed by `u`. Stepping into a third-party library is a click on a button. Conditional breakpoints, hit counts, and log-point breakpoints (which print a message without pausing) are all configured through small forms instead of typed-in command syntax.
+
+Most modern IDE debuggers speak the Debug Adapter Protocol (DAP), a JSON-RPC wire format originally designed for VS Code. The IDE is the client, a debug adapter is the server, and the actual debugging library (`debugpy` for Python) is what drives the running program. The decoupling matters in practice: any editor that speaks DAP can debug Python with `debugpy`, including Neovim and Emacs. PyCharm has its own backend, but the user experience is similar.
+
+When IDE debugging beats `pdb`:
+
+- Long sessions where you want to see ten variables update as you step.
+- Debugging into a third-party library you didn't write, where source navigation in a terminal is painful.
+- Remote debugging a running server. Attach the IDE to a `debugpy` server in the container, set breakpoints, and step through.
+- Onboarding. New engineers tend to learn an IDE debugger faster than a typed-command one.
+
+When `pdb` still wins:
+
+- SSH sessions with no port forwarding.
+- One-off scripts where launching the IDE takes longer than the bug deserves.
+- CI failures. Drop a `breakpoint()` in a test, run the failing test locally, and you're inside the failure in seconds.
+
+There's no rule that says you have to pick one. Most experienced Python developers use the IDE debugger for complex bugs and `breakpoint()` for quick checks.
+
+<h1 id="reading-a-python-traceback">Reading a Python Traceback</h1>
+
+The traceback is the report Python prints when an uncaught exception kills the program. It's the most important piece of evidence you'll ever read about a Python bug, and the order it prints in is the opposite of what most people expect.
+
+Here's a small program that fails:
+
+```python
+def line_total(price: float, quantity: int) -> float:
+    return price * quantity
+
+def cart_total(items):
+    total = 0.0
+    for name, price, quantity in items:
+        total += line_total(price, quantity)
+    return total
+
+def main():
+    cart = [
+        ("headphones", 59.99, 1),
+        ("cable", "9.99", 2),
+    ]
+    print(f"Cart total: ${cart_total(cart):.2f}")
+
+main()
+```
+
+Running it produces:
+
+```text
+Traceback (most recent call last):
+  File "/Users/dev/shop/cart.py", line 16, in <module>
+    main()
+  File "/Users/dev/shop/cart.py", line 14, in main
+    print(f"Cart total: ${cart_total(cart):.2f}")
+                          ^^^^^^^^^^^^^^^^
+  File "/Users/dev/shop/cart.py", line 7, in cart_total
+    total += line_total(price, quantity)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/dev/shop/cart.py", line 2, in line_total
+    return price * quantity
+           ~~~~~~^~~~~~~~~~
+TypeError: can't multiply sequence by non-int of type 'float'
+```
+
+The order is oldest call at the top, most recent at the bottom. The exception itself is on the last line. The rule of thumb most experienced developers follow is read the last line first, then walk up the stack until you find a frame in your own code.
+
+In this traceback, the last line is the actual error: a `TypeError` trying to multiply a string by a float. The line above it shows the failing expression with carets pointing at `price * quantity`. The frame above shows that `line_total` was called from `cart_total`, which was called from `main`, which was called at module top level. The carets (added in Python 3.11) point at the exact subexpression that failed, which usually narrows the bug to one piece of one line. Here, the bug is that `("cable", "9.99", 2)` has a string price, and the multiply fails when that value reaches `line_total`.
+
+When one exception is raised while handling another, Python prints both, separated by a phrase:
+
+```text
+Traceback (most recent call last):
+  File "shop.py", line 3, in load
+    raise FileNotFoundError("orders.json")
+FileNotFoundError: orders.json
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "shop.py", line 8, in <module>
+    load()
+  File "shop.py", line 5, in load
+    raise RuntimeError("could not load orders") from None
+RuntimeError: could not load orders
+```
+
+Two phrases to watch for:
+
+- `During handling of the above exception, another exception occurred:` means the second exception was raised inside the `except` block of the first. The two are unrelated chains, but Python prints both because losing the original would hide context.
+- `The above exception was the direct cause of the following exception:` means the code explicitly chained with `raise NewError(...) from original`. The two exceptions are connected on purpose.
+
+Reading chains is the same skill: start at the bottom, walk up. The most recent exception is the one Python actually failed on. The earlier one tells you what triggered it.
+
+> **Cost:** Tracebacks hold references to every frame's local variables until they're garbage-collected. Keeping a traceback alive in a long-running process (assigning it to a module-level variable, for example) can leak large objects. Use `traceback.format_exc()` to get a string copy if you need to store it.
+
+<h1 id="debugging-strategies">Debugging Strategies</h1>
+
+The tools are only half the job. The other half is the strategy you use to apply them. A few habits that turn into hours saved:
+
+**Build a minimal reproduction.** If the bug shows up in a production-scale system, try to reproduce it with the smallest possible inputs. Strip away services, mocks, frameworks, fixtures, until you have the smallest program that still fails. The bug usually gets obvious somewhere in that stripping process. If it doesn't, you now have a tiny case that's easy to share and easy to debug.
+
+**Bisect the change.** If "it worked yesterday and broke today," let Git find the breaking commit for you:
+
+```text
+git bisect start
+git bisect bad HEAD
+git bisect good v1.2.0
+# git checks out a commit; you run your repro; you say `good` or `bad`
+# git keeps narrowing until it identifies the breaking commit
+```
+
+You can also bisect inside one file. Comment out half the function, run the failing case. If it still fails, the bug is in the other half. Repeat.
+
+**Read the error message first, twice, slowly.** A surprising amount of debugging time is wasted because the engineer started fixing the code before finishing reading the traceback. `KeyError: 'price'` is telling you the exact thing that went wrong. Believe it. Don't start by changing unrelated code.
+
+**Rubber-duck the code.** Explain what each line does, out loud, to a colleague or an actual rubber duck. The act of forcing yourself to put the program's behavior into words exposes the place where your mental model and the actual code disagree. That's usually the bug.
+
+**Form a hypothesis, then check it.** Don't randomly add `print` calls. Decide what you think is happening, predict what a specific variable should be at a specific line, then check. If you were right, you've ruled out a hypothesis. If you were wrong, you've found a real clue. Either way, you've made progress, which is more than blind printing gives you.
+
+**Know when to use `logging` instead.** Logging is the right answer when the program runs unattended (production, scheduled jobs, server processes) or when you need a record of behavior over time. `logging.debug("processing order %s", order.id)` left in the code costs almost nothing when the log level is INFO, and is invaluable when the bug reappears next month. Breakpoints win for interactive bugs you can reproduce on your laptop right now. Logs win for everything else.
+
+**Use `faulthandler` for segfaults.** If your Python code dies with no traceback (a segfault from a C extension, for example), `pdb` is no help; the interpreter is dead. `faulthandler` is a standard-library module that installs a signal handler to dump a Python traceback when the process crashes:
+
+```python
+import faulthandler
+faulthandler.enable()
+```
+
+You can also enable it from the command line with `python -X faulthandler script.py` or by setting `PYTHONFAULTHANDLER=1`. The output is less detailed than a normal traceback, but it points you at the Python line that triggered the crash, which is usually enough to find the offending C extension call.
+
+**`sys.settrace` for custom tracing.** For one-off needs that don't fit `pdb`, `sys.settrace(func)` installs a callback Python invokes for every executed line. It's the same mechanism `pdb` itself uses. Most engineers never reach for it, but it's there when you need to build a custom tracer, profiler, or coverage tool.
+
+<h1 id="a-debugging-decision-tree">A Debugging Decision Tree</h1>
+
+Here's the rough decision tree most experienced Python developers run through when something breaks:
+
+The tree isn't a strict procedure. It's a starting point for picking the tool that fits the shape of the bug, so you don't reflexively reach for `print` every time. The pattern that matters: reproduce first, then pick the tool that gives you the most information for the least friction.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,467 @@
+---
+title: "Working with Paths"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "Working with Paths explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="why-paths-are-tricky">Why Paths Are Tricky</h1>
+
+The naive approach is to glue strings together with whatever separator you happen to type:
+
+```python
+base = "exports"
+customer = "C-4821"
+filename = "orders.csv"
+
+path = base + "/" + customer + "/" + filename
+print(path)
+```
+
+On macOS and Linux that string works as a path. On Windows the native separator is `\`, and although most Windows APIs also accept `/`, mixing styles is fragile, especially when the path includes a drive letter or a UNC share. The same code can break when one of the components ends with a separator (`"exports/"`) or starts with one (`"/orders.csv"`).
+
+The standard library handles the platform differences. The `os.path` submodule (legacy, string-based) and `pathlib.Path` (modern, object-based) both pick the platform separator and handle the edge cases consistently. Whichever you use, the rule is the same: don't concatenate path strings by hand.
+
+The lesson uses `os.path` for most examples because that's the older API present in lots of existing code. `pathlib` does the same jobs with a friendlier interface and is the better choice for new code.
+
+<h1 id="absolute-vs-relative-paths">Absolute vs Relative Paths</h1>
+
+A path is **absolute** if it starts from the filesystem root: `/Users/ria/store/orders.csv` on macOS or Linux, `C:\Users\ria\store\orders.csv` on Windows. Anything else is **relative**, and the operating system resolves it against the current working directory.
+
+```python
+import os
+
+print(os.path.isabs("/Users/ria/store"))
+print(os.path.isabs("exports/orders.csv"))
+print(os.path.isabs("./orders.csv"))
+print(os.path.isabs("../store"))
+```
+
+`os.path.isabs(path)` returns `True` when the path is absolute and `False` otherwise. The check is purely textual; it doesn't touch the disk.
+
+Relative paths are convenient (`open("orders.csv")` is shorter than the full path), but they tie the program's behavior to wherever it was started. A relative path that works when you run a script from the project root fails when a scheduler launches the same script from `/`. Library code should prefer absolute paths, or build them on demand from a base directory the caller supplies.
+
+```python
+import os
+
+base = "/Users/ria/store"
+relative = "exports/orders.csv"
+absolute = os.path.join(base, relative)
+print(absolute)
+```
+
+The pattern is "take a known base directory plus a relative path, produce a full absolute path". That's what most application path handling looks like internally.
+
+<h1 id="the-current-working-directory">The Current Working Directory</h1>
+
+Every process has a current working directory. Relative paths in that process get resolved against it. Python exposes it through `os.getcwd()` and lets you change it with `os.chdir(path)`.
+
+```python
+import os
+
+print(os.getcwd())
+os.chdir("/tmp")
+print(os.getcwd())
+```
+
+Reading the working directory is cheap and usually fine. Changing it mid-program is risky because every relative path you touch after the call resolves against the new directory, and other code in the same process may have cached paths that assumed the old one. The rule of thumb: avoid `chdir` when possible. Build absolute paths instead.
+
+`os.chdir` is process-global state. Two threads racing through `chdir` calls can leave the working directory in whatever order the OS scheduler picks. For multi-threaded code, absolute paths are the only safe option.
+
+<h1 id="joining-paths-ospathjoin">Joining Paths: os.path.join</h1>
+
+`os.path.join(a, b, c, ...)` concatenates path components with the platform separator, handling the edge cases that hand-rolled string concatenation gets wrong.
+
+```python
+import os
+
+print(os.path.join("/Users/ria/store", "exports", "2024-Q4", "orders.csv"))
+print(os.path.join("store", "exports"))
+print(os.path.join("store/", "exports"))
+print(os.path.join("store", "/exports"))
+```
+
+Three behaviors stand out. First, the join handles a trailing slash on the left component without doubling it. Second, the join inserts the separator when one isn't present. Third: if a component starts with a separator, it's treated as a new absolute path and **everything before it is discarded**. The last line shows this: `/exports` is absolute, so `os.path.join("store", "/exports")` returns `/exports` and drops `store` entirely.
+
+That third behavior is the most common bug with `os.path.join`. It causes trouble when one of the components comes from user input or a config file that includes a leading slash:
+
+```python
+import os
+
+user_subpath = "/etc/passwd"  # came from user input
+print(os.path.join("/safe/exports", user_subpath))
+```
+
+If `user_subpath` is treated as a "subpath inside `/safe/exports`", the result is nothing of the sort. For paths built from untrusted input, validate the components first or use `pathlib.Path` (which gives the same result but at least makes the rule explicit by the slash operator's behavior).
+
+<h1 id="splitting-paths-split-splitext-basename-dirname">
+  Splitting Paths: split, splitext, basename, dirname
+</h1>
+
+The inverse operations break a path into pieces. Four functions cover almost every use:
+
+| Function              | Returns                                           | Example              |
+| --------------------- | ------------------------------------------------- | -------------------- |
+| `os.path.split(p)`    | `(head, tail)` where `tail` is the last component | `('/a/b', 'c.csv')`  |
+| `os.path.splitext(p)` | `(root, ext)` where `ext` includes the dot        | `('/a/b/c', '.csv')` |
+| `os.path.basename(p)` | Just the last component                           | `'c.csv'`            |
+| `os.path.dirname(p)`  | Everything before the last component              | `'/a/b'`             |
+
+```python
+import os
+
+path = "/Users/ria/store/exports/2024-Q4/orders.csv"
+
+print(os.path.split(path))
+print(os.path.splitext(path))
+print(os.path.basename(path))
+print(os.path.dirname(path))
+```
+
+`split` and `splitext` are the foundational ones; `basename` and `dirname` are shortcuts (`basename(p) == split(p)[1]`, `dirname(p) == split(p)[0]`).
+
+`splitext` is useful for grouping files by type. The extension includes the leading dot, and the "root" is everything up to (and not including) that dot:
+
+```python
+import os
+
+for name in ["banner.png", "promo.jpg", "notes.txt", "archive.tar.gz", "Makefile"]:
+    root, ext = os.path.splitext(name)
+    print(f"{name!r:>20}  root={root!r:<15}  ext={ext!r}")
+```
+
+For `archive.tar.gz`, only the final `.gz` is treated as the extension; the leading `.tar` stays in the root. Files without an extension produce an empty `ext` string. Hidden files on Unix (`.bashrc`) are handled the same way: `splitext(".bashrc")` returns `('.bashrc', '')` because a leading dot doesn't count as an extension separator.
+
+A common pattern is changing a file's extension while keeping its directory and name intact:
+
+```python
+import os
+
+source = "/Users/ria/store/exports/orders.csv"
+root, _ = os.path.splitext(source)
+target = root + ".json"
+print(target)
+```
+
+<h1 id="checking-whats-on-disk">Checking What's on Disk</h1>
+
+`os.path` has a small family of predicates that ask the OS whether a path corresponds to something real. Each one makes a `stat` system call internally and returns `False` (not an error) when the path doesn't exist.
+
+| Function            | Returns `True` when                                    |
+| ------------------- | ------------------------------------------------------ |
+| `os.path.exists(p)` | `p` is anything that exists (file, dir, symlink, FIFO) |
+| `os.path.isfile(p)` | `p` is a regular file                                  |
+| `os.path.isdir(p)`  | `p` is a directory                                     |
+| `os.path.islink(p)` | `p` is a symbolic link                                 |
+
+```python
+import os
+
+print(os.path.exists("/usr/bin"))
+print(os.path.isdir("/usr/bin"))
+print(os.path.isfile("/usr/bin"))
+print(os.path.exists("/this/does/not/exist"))
+```
+
+`isfile` and `isdir` follow symbolic links, so a symlink pointing to a file makes `isfile` return `True`. Use `islink` to check the link itself.
+
+The "look before you leap" pattern (check, then open) is convenient but races against other processes that might delete or replace the file between the check and the open. For most cases it's harmless; for security-sensitive code, prefer "try the operation and handle the exception" so the check and the use happen atomically.
+
+```python
+import os
+
+path = "exports/orders.csv"
+
+# Idiomatic "EAFP" form (easier to ask forgiveness than permission)
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        contents = f.read()
+except FileNotFoundError:
+    contents = ""
+
+# "LBYL" form (look before you leap) - shorter but susceptible to races
+if os.path.isfile(path):
+    with open(path, "r", encoding="utf-8") as f:
+        contents = f.read()
+else:
+    contents = ""
+```
+
+Both forms work for ordinary cases. The first is the Python convention because it's the only one that's correct in the presence of concurrent file activity.
+
+Each predicate is one `stat` system call. For a single check, that's microseconds. For multiple answers about the same path (size, mtime, is-file), call `os.stat(path)` once and read several attributes from the result; chaining `exists` then `getsize` then `getmtime` makes three calls when one will do.
+
+<h1 id="anchor-paths-home-current-directory-temp">
+  Anchor Paths: Home, Current Directory, Temp
+</h1>
+
+A few well-known directories show up in almost every program. Python gives you portable ways to find them.
+
+<h3 id="home-directory">Home Directory</h3>
+
+`os.path.expanduser(p)` expands a leading `~` (or `~user`) into the user's home directory. If the path doesn't start with `~`, it's returned unchanged.
+
+```python
+import os
+
+print(os.path.expanduser("~"))
+print(os.path.expanduser("~/store/exports/orders.csv"))
+print(os.path.expanduser("exports/orders.csv"))
+```
+
+The form `~ria` (other user's home) also works on Unix. On Windows the function looks up the home directory from the environment (`USERPROFILE` or the combination of `HOMEDRIVE` and `HOMEPATH`).
+
+Calling `expanduser` on every user-supplied path is safe: it's a no-op when there's no tilde, and it gives users the shorthand they expect from shells.
+
+<h3 id="current-directory">Current Directory</h3>
+
+`os.getcwd()` returns the current working directory as an absolute path. Use it sparingly, because it depends on where the process was started, but it's useful for log messages and for resolving relative paths explicitly:
+
+```python
+import os
+
+print(os.getcwd())
+```
+
+The current directory is also represented as `.` in path strings, and the parent directory as `..`. Both work inside `os.path.join`:
+
+```python
+import os
+
+print(os.path.join(".", "exports", "orders.csv"))
+print(os.path.join("..", "configs", "store.toml"))
+```
+
+These show up most often in command-line tools that follow shell conventions.
+
+<h3 id="temporary-directory">Temporary Directory</h3>
+
+For temporary files (intermediates, downloads, in-progress exports), use the platform's official temp directory. The standard way to get a path inside it is through the `tempfile` module. For quick lookups, two functions are useful:
+
+```python
+import tempfile
+import os
+
+print(tempfile.gettempdir())
+print(os.path.join(tempfile.gettempdir(), "store-exports"))
+```
+
+The temp directory differs per OS (`/tmp` on Linux, `%TEMP%` on Windows, a per-user folder on macOS). Reading the value through `tempfile.gettempdir()` is portable; hard-coding `/tmp` is not.
+
+`tempfile.gettempdir()` caches the result the first time it's called, so repeated lookups are essentially free. There's no need to cache it in your own code.
+
+<h1 id="resolving-and-normalizing-paths">Resolving and Normalizing Paths</h1>
+
+User-supplied or programmatically-built paths often need cleanup before they're useful. Several functions take a path and produce a more normalized version of it.
+
+<h3 id="ospathabspath">os.path.abspath</h3>
+
+`os.path.abspath(p)` makes the path absolute by prepending the current working directory if it's relative. It also collapses `..` and `.` segments. It does not check whether the path exists.
+
+```python
+import os
+
+print(os.path.abspath("orders/2024-Q4/../orders.csv"))
+print(os.path.abspath("./exports"))
+print(os.path.abspath("/already/absolute"))
+```
+
+The `..` segment is collapsed even when the path component it would skip doesn't exist on disk. That's a textual normalization, not a filesystem walk.
+
+<h3 id="ospathrealpath">os.path.realpath</h3>
+
+`os.path.realpath(p)` does everything `abspath` does and additionally resolves any symbolic links along the path, returning the canonical location of the underlying file.
+
+```python
+import os
+
+# Suppose /Users/ria/store/current is a symlink to /Users/ria/store/exports/2024
+print(os.path.abspath("/Users/ria/store/current/orders.csv"))
+print(os.path.realpath("/Users/ria/store/current/orders.csv"))
+```
+
+`abspath` keeps the symlink in place; `realpath` follows it to the real file. Use `realpath` for comparing paths for equality (because two textually different paths can resolve to the same file on disk) or to anchor a path to its true location.
+
+<h3 id="ospathnormpath">os.path.normpath</h3>
+
+`os.path.normpath(p)` collapses redundant separators and `.`/`..` segments without making the path absolute. It also converts forward slashes to backslashes on Windows.
+
+```python
+import os
+
+print(os.path.normpath("exports//2024//../orders.csv"))
+print(os.path.normpath("./exports/./orders/./"))
+```
+
+Use `normpath` for tidying up display strings or comparing paths textually. For "is this path absolute and unambiguous on disk?" use `abspath` or `realpath` instead.
+
+<h1 id="comparing-paths">Comparing Paths</h1>
+
+Comparing two paths with `==` works only if they're textually identical. Two paths that point to the same file but differ in formatting (trailing slash, redundant `./`, mixed-case drive letter on Windows) will not compare equal.
+
+```python
+import os
+
+a = "/Users/ria/store/exports/orders.csv"
+b = "/Users/ria/store/./exports/orders.csv"
+
+print(a == b)
+print(os.path.normpath(a) == os.path.normpath(b))
+print(os.path.realpath(a) == os.path.realpath(b))
+```
+
+For "do these paths look the same?" use `normpath`. For "do these paths point to the same file?" use `realpath` (or `os.path.samefile(a, b)`, which does the same comparison without you doing the resolving yourself):
+
+```python
+import os
+
+with open("/tmp/x.txt", "w") as f:
+    f.write("hi")
+os.symlink("/tmp/x.txt", "/tmp/x-link.txt") if not os.path.exists("/tmp/x-link.txt") else None
+
+print(os.path.samefile("/tmp/x.txt", "/tmp/x-link.txt"))
+```
+
+`samefile` raises `FileNotFoundError` if either path doesn't exist. That's a deliberate check: it's hard to ask "do these point to the same thing?" about a thing that isn't there.
+
+<h1 id="cross-platform-considerations">Cross-Platform Considerations</h1>
+
+The platform's separator is exposed as `os.sep`:
+
+```python
+import os
+
+print(os.sep)
+print(os.altsep)
+```
+
+On Windows, `os.sep` is `\\` (a backslash) and `os.altsep` is `/`. Most Windows APIs accept either, which is why hand-rolled `"a/b"` paths often work even on Windows. "Often" is not "always", and code that ships everywhere should let `os.path.join` (or `pathlib`) pick the separator.
+
+Other Windows-specific traps:
+
+- **Drive letters.** A Windows path can include a drive (`C:\Users\ria`). `os.path.splitdrive` separates the drive from the rest; on Unix it returns `('', path)`.
+- **Case sensitivity.** Unix filesystems are case-sensitive (`Orders.csv` and `orders.csv` are different files). Windows and macOS default filesystems are case-insensitive but case-preserving. Don't write code that relies on file names differing only in case to be distinct.
+- **Reserved names.** Windows reserves names like `CON`, `PRN`, `AUX`, `NUL`, `COM1` through `COM9`, and `LPT1` through `LPT9`. Creating files with those names fails, regardless of extension.
+- **Path length.** Classic Windows APIs cap path length at 260 characters. Modern Windows supports longer paths but only with a specific opt-in. When building deep directory trees on Windows, keep an eye on the total length.
+
+For most code, `os.path.join` and `pathlib` handle these details. Be aware they exist, and avoid hard-coding platform-specific assumptions.
+
+<h1 id="path-pitfalls-and-how-to-avoid-them">
+  Path Pitfalls and How to Avoid Them
+</h1>
+
+A summary of the mistakes this lesson covered, with the fix for each:
+
+| Mistake                                                           | Symptom                                        | Fix                                                       |
+| ----------------------------------------------------------------- | ---------------------------------------------- | --------------------------------------------------------- |
+| String concatenation: `base + "/" + name`                         | Breaks on Windows; wrong with trailing slashes | Use `os.path.join(base, name)` or `Path(base) / name`     |
+| Joining absolute component: `os.path.join("safe", "/etc/passwd")` | Earlier components discarded                   | Validate components; or use `pathlib.PurePath` rules      |
+| Hard-coded `/tmp` or `\Users`                                     | Breaks on other OS or in containers            | Use `tempfile.gettempdir()` and `os.path.expanduser("~")` |
+| Comparing paths with `==`                                         | Misses equivalent paths in different forms     | Use `os.path.normpath` or `os.path.samefile`              |
+| `os.path.exists` then `open`                                      | Race condition between check and use           | Use `try`/`except FileNotFoundError`                      |
+| Calling `os.chdir` in shared code                                 | Globally changes path resolution               | Build absolute paths instead                              |
+| Trusting `splitext` for double extensions                         | Treats `.tar.gz` as just `.gz`                 | Strip extensions explicitly if you need both              |
+
+The single biggest improvement most codebases can make is going from string concatenation to `os.path.join` (or, better, `pathlib.Path`). Most other path bugs are downstream of doing that one thing wrong.
+
+<h1 id="a-brief-preview-of-pathlib">A Brief Preview of pathlib</h1>
+
+`pathlib.Path` is the modern alternative to `os.path` strings. Here are the same operations side by side as a preview.
+
+```python
+import os
+from pathlib import Path
+
+# Building a path
+print(os.path.join("/Users/ria/store", "exports", "orders.csv"))
+print(Path("/Users/ria/store") / "exports" / "orders.csv")
+
+# Splitting a path
+path = "/Users/ria/store/exports/orders.csv"
+print(os.path.basename(path), os.path.dirname(path))
+p = Path(path)
+print(p.name, p.parent)
+
+# Changing the extension
+root, _ = os.path.splitext(path)
+print(root + ".json")
+print(p.with_suffix(".json"))
+
+# Checking existence
+print(os.path.isfile(path))
+print(p.is_file())
+```
+
+The `pathlib` versions are usually shorter, type-safe, and easier to read. The `os.path` versions remain useful for a few reasons: they appear in older codebases, they take string arguments that some libraries still require, and they're the right level of abstraction when paths are data (logs, config keys, manifest entries) rather than something to open.
+
+For new code, prefer `pathlib` unless something specifically needs strings. For existing code, leave `os.path` in place and convert when the surrounding code becomes awkward.
+
+<h1 id="quiz">Quiz</h1>
+
+<h1 id="quiz-questions">Quiz Questions</h1>
+
+**Question 1: Which approach is the most idiomatic way to build a path from separate components in new Python code?**
+
+- [x] Use pathlib.Path(base) / customer / filename.
+- [ ] Join strings with '/' because Python rewrites separators.
+- [ ] Use '+' and add os.sep between every component.
+- [ ] Change to the base folder, then use only filenames.
+
+**Question 2: What does os.path.isabs(path) determine?**
+
+- [x] Whether the path text starts from a filesystem root.
+- [ ] Whether the path exists and can currently be opened.
+- [ ] Whether all '..' parts have already been removed.
+- [ ] Whether the path was created with pathlib.Path.
+
+**Question 3: On a POSIX-style path system, what is the result of os.path.join('store', '/exports', 'orders.csv')?**
+
+- [ ] store/exports/orders.csv, because join removes extra slashes.
+- [x] /exports/orders.csv, because '/exports' resets the path.
+- [ ] store//exports/orders.csv, because join keeps all slashes.
+- [ ] A ValueError, because absolute parts are not allowed.
+
+**Question 4: Why is os.chdir(path) risky in larger programs?**
+
+- [x] It changes process-wide state used by all relative paths.
+- [ ] It permanently changes the user's shell directory.
+- [ ] It converts every existing Path object to a string.
+- [ ] It disables os.path.join until the process exits.
+
+**Question 5: Which statement about pathlib.Path is correct?**
+
+- [ ] Path objects are only wrappers around open file handles.
+- [ ] Path always checks that the file exists when created.
+- [x] Path supports the os.PathLike protocol and child paths.
+- [ ] Path requires using string concatenation for subfolders.
+
+**Question 6: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 7: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 8: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+<QuizCard />
+
+<CommentsSection />
+
+</LessonCard>

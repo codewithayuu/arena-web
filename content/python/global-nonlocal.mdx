@@ -1,0 +1,379 @@
+---
+title: "global & nonlocal Keywords"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "global & nonlocal explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="why-these-keywords-exist">Why These Keywords Exist</h1>
+
+The behavior they exist to override is simple: **assignment inside a function creates a local name**. Python decides what kind of name something is at compile time, by looking at whether any assignment to that name appears anywhere in the function body. If it does, the name is local for the entire function, including the lines before that assignment.
+
+Here's what that looks like in practice. Suppose the shop keeps a running count of orders at the module level, and a function bumps it.
+
+```python
+order_counter = 0
+
+def place_order():
+    order_counter = order_counter + 1
+    print(f"Order placed. Total so far: {order_counter}")
+
+place_order()
+```
+
+That error confuses everyone the first time. The module-level `order_counter` is clearly visible above, so why does Python complain? Because the line `order_counter = order_counter + 1` assigns to `order_counter` somewhere in the function, Python marked `order_counter` as a local for the whole function. When the right-hand side runs, the local hasn't been given a value yet, so the read fails.
+
+Reading without assigning works fine. Watch what happens if the function only reads:
+
+```python
+order_counter = 0
+
+def show_count():
+    print(f"Current count: {order_counter}")
+
+show_count()
+```
+
+No assignment, no local, no error. Python's scope lookup walks outward (local, then enclosing, then global, then built-in, that's the LEGB rule) and finds `order_counter` at the module level.
+
+So the rule is asymmetric. You can **read** an outer name without doing anything special. You can't **write** to an outer name without telling Python which scope you mean. That's the gap `global` and `nonlocal` fill.
+
+The diagram captures the decision Python makes at compile time for every name a function references. Most of the time the answer is the green branch on the left: no assignment, so the name is looked up via LEGB whenever you read it. When there is an assignment, the path splits three ways: `global` sends the binding all the way out to the module, `nonlocal` sends it to the nearest enclosing function, and the absence of either declaration leaves the name as a fresh local.
+
+<h1 id="the-global-keyword">The global Keyword</h1>
+
+`global x` is a declaration that tells Python: "inside this function, the name `x` refers to the module-level `x`, not a local one". You write it once, near the top of the function. From that point on, both reads and writes of `x` operate on the module-level binding.
+
+Here's the corrected counter example.
+
+```python
+order_counter = 0
+
+def place_order():
+    global order_counter
+    order_counter = order_counter + 1
+    print(f"Order placed. Total so far: {order_counter}")
+
+place_order()
+place_order()
+place_order()
+print(f"Final count: {order_counter}")
+```
+
+Each call to `place_order` rebinds the module-level `order_counter` to a new integer. The function and the module are looking at the same name. After three calls, the module-level value is `3`.
+
+The `global` declaration must come **before** any use of the name in the function body. Putting it after a use is a `SyntaxError`:
+
+```python
+order_counter = 0
+
+def place_order():
+    order_counter = order_counter + 1
+    global order_counter
+```
+
+Python is strict about this for a reason: the declaration affects every reference to the name in the whole function, so it has to appear before any reference for the rule to be unambiguous. The fix is to move `global order_counter` to the top of the function.
+
+You can declare several names on one line: `global order_counter, refund_counter`. You can also declare a name with `global` even if there's no current module-level binding; the first assignment will create one.
+
+```python
+def initialize_shop():
+    global shop_name
+    shop_name = "AlgoMart"
+
+initialize_shop()
+print(shop_name)
+```
+
+Before the call, `shop_name` didn't exist at the module level. After the call, it does, because the assignment inside `initialize_shop` went to the module thanks to the declaration.
+
+<h3 id="reading-the-module-level-value-without-global">
+  Reading the Module-Level Value Without global
+</h3>
+
+It's worth being explicit about an asymmetry that catches people. `global` is only needed for **assignment**. Reading a module-level value works without any declaration, because Python's LEGB lookup finds it for free.
+
+```python
+discount_rate = 0.10
+
+def apply_discount(price):
+    return price * (1 - discount_rate)
+
+print(apply_discount(29.99))
+```
+
+No `global discount_rate` anywhere. The function reads `discount_rate`, Python doesn't find a local with that name, walks outward, finds the module-level value, and uses it. This is the right pattern for **constants** and for any value that the function only reads.
+
+You'd only reach for `global` if you wanted to **rebind** `discount_rate`, for example to change the active discount rate on Black Friday. And even then, a function that mutates module state is something to think twice about.
+
+> **Cost:** A `global` read isn't free; the interpreter looks up the name in the module's namespace dictionary every time, which is slightly slower than a local read. For tight inner loops that reference a constant a lot, copying the constant into a local once at the top of the function is a common micro-optimization.
+
+<h3 id="mutating-without-global">Mutating Without global</h3>
+
+Here's a distinction that's worth getting right: assignment and mutation are different things. `global` is only needed when you **rebind** a name. If a module-level value is mutable (a list, a dict, a set, a custom object), you can mutate its contents from inside a function with no declaration at all.
+
+```python
+shipped_orders = []
+
+def mark_shipped(order_id):
+    shipped_orders.append(order_id)
+
+mark_shipped("ORD-1001")
+mark_shipped("ORD-1002")
+print(shipped_orders)
+```
+
+No `global shipped_orders`. The function never assigns to the name `shipped_orders`; it only reads the name to get the list, then calls `.append` on the list itself. The name still points at the same list object the whole time; the list's contents change. Python's local-versus-global rule only cares about assignments to the name, not about what you do to the object the name points at.
+
+If the function were to write `shipped_orders = shipped_orders + [order_id]` instead, that would be an assignment, and the same `UnboundLocalError` would come back. The two lines look similar but mean different things: `.append` mutates, `=` rebinds.
+
+<h1 id="the-nonlocal-keyword">The nonlocal Keyword</h1>
+
+`nonlocal x` is the cousin of `global`, but for **enclosing function** scopes instead of the module level. It tells Python: "inside this function, the name `x` refers to the nearest enclosing function's local `x`". `nonlocal` requires a nested function; if there's no enclosing function with that name, you'll get an error at compile time.
+
+The canonical use is a small factory function that produces another function with private state. Suppose you want a way to generate consecutive invoice numbers for an order workflow.
+
+```python
+def make_invoice_numbering(start=1):
+    next_num = start
+
+    def next_invoice():
+        nonlocal next_num
+        current = next_num
+        next_num = next_num + 1
+        return f"INV-{current:04d}"
+
+    return next_invoice
+
+generate = make_invoice_numbering()
+print(generate())
+print(generate())
+print(generate())
+
+# A second numbering sequence is independent of the first.
+generate_eu = make_invoice_numbering(start=500)
+print(generate_eu())
+print(generate())
+```
+
+The outer function `make_invoice_numbering` defines a local `next_num` and returns the inner function `next_invoice`. Inside `next_invoice`, `nonlocal next_num` tells Python that any assignment to `next_num` should rebind the outer function's local, not create a new inner local. So `next_num = next_num + 1` increments the outer value, and the next call sees the updated number.
+
+The factory is called twice, producing two independent inner functions, each with its own enclosing `next_num`. Calling one doesn't affect the other; that's why `generate_eu()` returns `INV-0500` while `generate()` keeps counting from where it left off.
+
+Without `nonlocal`, the inner function would be in the same trouble the earlier counter example was in:
+
+```python
+def make_invoice_numbering(start=1):
+    next_num = start
+
+    def next_invoice():
+        current = next_num
+        next_num = next_num + 1
+        return f"INV-{current:04d}"
+
+    return next_invoice
+
+generate = make_invoice_numbering()
+print(generate())
+```
+
+Same error, same cause: the inner function assigns to `next_num`, so Python made it local for the whole function, and the read on the line above the assignment fails. `nonlocal next_num` is the one-line fix.
+
+<h3 id="what-nonlocal-cannot-reach">What nonlocal Cannot Reach</h3>
+
+`nonlocal` only reaches into enclosing function scopes. Two things it can't reach are the module-level globals and Python's built-ins. Using `nonlocal` for a name that doesn't exist in any enclosing function is a compile-time `SyntaxError`.
+
+```python
+shop_total = 0
+
+def update_total(amount):
+    nonlocal shop_total
+    shop_total = shop_total + amount
+```
+
+`update_total` is a top-level function, not a nested one. There's no enclosing function whose local `shop_total` `nonlocal` could refer to. The module-level `shop_total` is not visible to `nonlocal`; that's `global`'s job. The fix here is `global shop_total`, not `nonlocal`.
+
+The same error fires when the enclosing function exists but doesn't have a local with that name:
+
+```python
+def outer():
+    def inner():
+        nonlocal missing_name
+        missing_name = 1
+    inner()
+
+outer()
+```
+
+`outer` doesn't define `missing_name`, so `inner` has nothing to bind `nonlocal` to. Python reports this at compile time, before the function ever runs. The fix is either to give `outer` a `missing_name` local first, or to drop the `nonlocal` declaration (in which case `inner` would just have its own local).
+
+<h3 id="how-far-nonlocal-reaches">How Far nonlocal Reaches</h3>
+
+When functions are nested more than two deep, `nonlocal` always binds to the **nearest** enclosing function that has a local with that name. It walks outward through enclosing function scopes only, and it stops at the first match.
+
+```python
+def outermost():
+    label = "outermost"
+
+    def middle():
+        label = "middle"
+
+        def innermost():
+            nonlocal label
+            label = "rewritten by innermost"
+
+        innermost()
+        print(f"middle sees: {label}")
+
+    middle()
+    print(f"outermost sees: {label}")
+
+outermost()
+```
+
+`innermost` declares `nonlocal label`. Python walks outward looking for an enclosing function with a local `label` and stops at `middle`, the first one it finds. The outer `outermost`'s `label` is untouched. There is no syntax for "skip the nearest enclosing scope and bind to the one above it"; if you need that, you usually restructure the code instead.
+
+The chain shows where each declaration lands. From `innermost`, a `nonlocal label` reaches the nearest function with a `label` local, which is `middle` (cyan). A `global label` would reach all the way out to the module's namespace (orange), skipping every function scope on the way.
+
+<h1 id="reading-vs-writing-outer-names">Reading vs Writing Outer Names</h1>
+
+A lot of the confusion around these keywords boils down to one question: when do you actually need a declaration? The short answer is: only when you're **rebinding** the name, not when you're reading it and not when you're mutating the object the name points at.
+
+The table puts the cases side by side.
+
+| Operation                            | Needs declaration? | Example                                  | Notes                           |
+| ------------------------------------ | ------------------ | ---------------------------------------- | ------------------------------- |
+| Read a module-level name             | No                 | `print(discount_rate)`                   | LEGB lookup finds it            |
+| Read an enclosing-function name      | No                 | `total + price` inside an inner function | LEGB lookup finds it            |
+| Mutate a mutable module-level object | No                 | `shipped_orders.append(...)`             | Name is read, object is mutated |
+| Mutate a mutable enclosing object    | No                 | `outer_cart.append(...)`                 | Same, in nested form            |
+| Rebind a module-level name           | Yes, `global`      | `order_counter = order_counter + 1`      | Without it: `UnboundLocalError` |
+| Rebind an enclosing-function name    | Yes, `nonlocal`    | `next_num = next_num + 1` inside inner   | Without it: `UnboundLocalError` |
+
+The four "no" rows are the ones beginners often over-declare. You'll see code that has `global` at the top of every function that touches a module-level name, even when the function only reads it. It works, but it's noise; `global` should be the signal that a function is going to write to the module's state, not a habit applied to every read.
+
+The two "yes" rows are the ones where leaving the declaration out is a real bug. The `UnboundLocalError` message Python prints points at the variable name, but the actual cause is the assignment a few lines below.
+
+One more case worth being explicit about: augmented assignment (`+=`, `-=`, `*=`, and friends) counts as assignment for the purposes of this rule. `order_counter += 1` is exactly as much an assignment as `order_counter = order_counter + 1`. Both need `global` (or `nonlocal`, depending on which scope you're targeting).
+
+```python
+order_counter = 0
+
+def place_order():
+    order_counter += 1   # still an assignment, still needs a declaration
+
+place_order()
+```
+
+The error is the same as before, even though `+= 1` looks superficially like an "increment" rather than an "assignment". Under the hood, Python reads `order_counter`, adds `1`, and rebinds the name. The rebinding is the part that triggers the local-name rule.
+
+<h1 id="common-errors">Common Errors</h1>
+
+Three error messages account for most of the `global`/`nonlocal` mistakes you'll see. Putting them next to each other makes them easier to recognize.
+
+**1. `UnboundLocalError` from a missing `global` or `nonlocal`.**
+
+```python
+processed = 0
+
+def increment():
+    processed = processed + 1
+
+increment()
+```
+
+Cause: the function has an assignment to `processed`, so `processed` is a local for the whole function, and the read on the right-hand side runs before the local has a value. Fix: `global processed` as the first line.
+
+**2. `SyntaxError: name 'x' is used prior to global declaration`.**
+
+```python
+processed = 0
+
+def increment():
+    processed = processed + 1
+    global processed
+```
+
+Cause: the `global` declaration appears after a use of the name. Python wants the declaration to come first, so the rule applies cleanly to every reference in the function. Fix: move the `global` line to the top.
+
+**3. `SyntaxError: no binding for nonlocal 'x' found`.**
+
+```python
+def increment():
+    nonlocal processed
+    processed = processed + 1
+```
+
+Cause: `nonlocal` is used in a function that has no enclosing function with a local `processed`. Maybe the function isn't nested at all, or maybe the enclosing function never created the name. Fix: if you meant the module-level value, use `global processed`. If you meant an enclosing function's local, define it in that enclosing function first.
+
+A subtler version of the third error happens when you split a function out and forget that `nonlocal` only sees **function** scopes, not classes. A method defined inside a class doesn't get `nonlocal` access to the class body's names.
+
+```python
+class Cart:
+    total = 0.0
+
+    def add(self, price):
+        nonlocal total
+        total += price
+```
+
+Class bodies don't count as enclosing function scopes for `nonlocal`. The fix in real code is to use `self.total` (an instance attribute), which is what classes are for in the first place.
+
+<h1 id="when-to-use-vs-avoid">When to Use vs Avoid</h1>
+
+Both keywords work, but using them is a stronger signal than most people realize. They say "this function reaches outside itself and changes state someone else can see". That's a real choice, and it has downsides.
+
+**The case against global mutable state.** A function that rebinds a module-level name is a function whose behavior depends on, and changes, things that aren't in its arguments or return value. Two consequences follow. First, you can't reason about the function by looking at just its signature; you have to know the current value of the module-level name. Second, two calls with the same arguments can return different results, depending on what other code has done to that name. That's harder to test, harder to debug, and harder to reuse.
+
+A typical alternative is to return the new value instead of mutating shared state:
+
+```python
+def increment_counter(counter):
+    return counter + 1
+
+order_counter = 0
+order_counter = increment_counter(order_counter)
+order_counter = increment_counter(order_counter)
+print(order_counter)
+```
+
+The function takes the current count as an argument and returns the next one. It doesn't touch any module-level name. Anyone reading `increment_counter` knows exactly what it does, and you could call it a million times from a million places without any of them interfering with each other. The caller is in charge of where the state lives.
+
+When a function genuinely needs shared mutable state that survives across calls, a class is usually a cleaner home for it than a module-level variable plus `global`:
+
+```python
+class OrderCounter:
+    def __init__(self):
+        self.count = 0
+
+    def place(self):
+        self.count += 1
+        return self.count
+
+counter = OrderCounter()
+counter.place()
+counter.place()
+counter.place()
+print(counter.count)
+```
+
+The state is now an instance attribute. The mutation is explicit (`self.count += 1`), the scope is clear (this counter, not all counters), and you can have several independent counters without them stepping on each other. Most code that reaches for `global` would be better off as a class.
+
+**Where `global` is actually fine.** Modules legitimately do have state: configuration values that get loaded once at startup, caches of expensive results, registries of plugins, the logging system's settings. For top-level initialization code that sets these up, `global` is the honest tool. Just make sure the rebinding happens during setup, not in the middle of a request flow.
+
+**The case for `nonlocal`.** `nonlocal` is harder to misuse than `global`, because it's scoped to a single outer function rather than to the whole module. The most common legitimate use is exactly the factory pattern shown earlier: an outer function builds some state, defines an inner function that operates on that state, and returns the inner function. The state is private to that pair; no other code can see it. That's a closure, and `nonlocal` is the bridge that lets a closure write to the state it captured.
+
+**Rules of thumb.**
+
+- If a function can compute its result from its arguments and return it, prefer that over mutating module state with `global`.
+- If you need shared mutable state across calls, a class with instance attributes is usually clearer than a module-level variable plus `global`.
+- `nonlocal` is fine inside the closure pattern (factory function returning an inner function that mutates captured state). Outside of that pattern, deeply nested writes through `nonlocal` are often a sign that the inner function should just be a method on a class.
+- Constants (values you only read, never rebind) need no declaration at all. Don't sprinkle `global` on read-only access.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

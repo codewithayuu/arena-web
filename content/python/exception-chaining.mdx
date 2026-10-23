@@ -1,0 +1,464 @@
+---
+title: "Exception Chaining (from)"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "Exception Chaining explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="the-problem-chaining-solves">The Problem Chaining Solves</h1>
+
+Domain code shouldn't expose internal storage details. If a product lookup is backed by a dict, a missing product shouldn't surface as a raw `KeyError` to the caller. The caller wants a `ProductNotFoundError`, not a generic `KeyError` that leaks the fact that a dict was involved at all.
+
+So you catch the low-level error and raise a higher-level one. That's good design. But it creates a new problem: the original error vanishes from the traceback, and now you can't tell why the lookup failed.
+
+```python
+class ProductNotFoundError(Exception):
+    pass
+
+def get_product(catalog, product_id):
+    try:
+        return catalog[product_id]
+    except KeyError:
+        raise ProductNotFoundError(f"product {product_id} not found")
+
+catalog = {101: "mouse", 102: "keyboard"}
+get_product(catalog, 999)
+```
+
+That output is the whole point of this chapter. Python shows both errors: the `KeyError` that triggered things, then the `ProductNotFoundError` that the caller actually sees. The bridge sentence in the middle, "During handling of the above exception, another exception occurred", is Python telling you "I caught one error and the handler raised another". You didn't ask for the chaining; Python did it for you.
+
+That's called **implicit chaining**. There's also **explicit chaining**, which you ask for with `raise ... from ...`. The two produce slightly different bridge sentences, expose different attributes, and have different defaults. The rest of this chapter is about that distinction.
+
+<h1 id="implicit-chaining-__context__">Implicit Chaining: __context__</h1>
+
+Whenever an exception is raised inside an `except` (or `finally`) block, Python attaches the exception currently being handled as the new exception's **context**. The attribute is called `__context__`, and it's set automatically. No syntax required.
+
+```python
+try:
+    {}["missing"]
+except KeyError:
+    raise RuntimeError("something else broke")
+```
+
+You can inspect `__context__` directly:
+
+```python
+try:
+    try:
+        {}["missing"]
+    except KeyError:
+        raise RuntimeError("something else broke")
+except RuntimeError as e:
+    print(type(e).__name__, "->", e)
+    print("context:", type(e.__context__).__name__, "->", e.__context__)
+```
+
+The outer `except` catches the `RuntimeError`, and the original `KeyError` sits on it as `__context__`. Python preserved the entire chain without any explicit syntax.
+
+This is useful when the second error is genuinely unrelated to the first. Maybe the handler tried to write to a log file and the disk was full. The disk error and the original `KeyError` happen in the same code path, and Python's "during handling" wording makes that relationship clear without claiming the disk error was caused by the dict lookup.
+
+But "during handling" is a weak relationship. It says "these happened in the same handler", not "this one caused that one". When the relationship is actually cause-and-effect, you want to upgrade to explicit chaining.
+
+<h1 id="explicit-chaining-raise-from">Explicit Chaining: raise ... from ...</h1>
+
+The `from` clause makes the link between two exceptions deliberate. You're saying: "this new error is being raised because of that old one". The original goes on the new exception as its **cause**: the attribute is `__cause__`.
+
+```python
+class ProductNotFoundError(Exception):
+    pass
+
+def get_product(catalog, product_id):
+    try:
+        return catalog[product_id]
+    except KeyError as key_error:
+        raise ProductNotFoundError(f"product {product_id} not found") from key_error
+
+catalog = {101: "mouse", 102: "keyboard"}
+get_product(catalog, 999)
+```
+
+Compare the bridge sentence to the implicit case:
+
+| Chaining                 | Bridge sentence                                                        | Attribute                                             |
+| ------------------------ | ---------------------------------------------------------------------- | ----------------------------------------------------- |
+| Implicit                 | "During handling of the above exception, another exception occurred:"  | `__context__`                                         |
+| Explicit (`from x`)      | "The above exception was the direct cause of the following exception:" | `__cause__`                                           |
+| Suppressed (`from None`) | (nothing; only the new exception is shown)                             | `__cause__` = `None`, `__suppress_context__` = `True` |
+
+The wording difference is real, not cosmetic. "Direct cause" tells the reader of the traceback that the missing key didn't just happen to be around; it's the reason the `ProductNotFoundError` exists at all. That extra clarity is what `from` buys you.
+
+The expression after `from` doesn't have to be the caught exception. It can be any exception object (or `None`, more on that below). But the common idiom is `from caught_exception`, naming the `except as ...` variable.
+
+```python
+class CartTotalError(Exception):
+    pass
+
+def cart_total(prices):
+    try:
+        return sum(prices)
+    except TypeError as type_error:
+        raise CartTotalError("cart contains non-numeric prices") from type_error
+
+cart_total([29.99, 14.99, "free"])
+```
+
+The `TypeError` from `sum` becomes the direct cause of the `CartTotalError`. A caller who handles `CartTotalError` doesn't need to know about `sum`, but a developer debugging a failure still sees the full story in the traceback.
+
+<h1 id="__cause__-vs-__context__">__cause__ vs __context__</h1>
+
+Both attributes live on every exception object. The difference comes down to who set them.
+
+- `__context__` is set by Python, automatically, whenever an exception is raised inside an `except` or `finally` block. It's the exception that was being handled at the time.
+- `__cause__` is set by you, explicitly, when you write `raise NewError(...) from original`. It's the exception you've declared to be the underlying reason.
+
+Both can be set on the same exception. In fact, when you write `from original`, Python sets `__cause__` to `original` AND sets `__context__` to whatever was being handled (which is usually the same object). It also sets a third attribute, `__suppress_context__`, which tells the traceback printer "don't bother showing the context because the cause is more informative".
+
+```python
+class ProductNotFoundError(Exception):
+    pass
+
+try:
+    try:
+        {101: "mouse"}[999]
+    except KeyError as key_error:
+        raise ProductNotFoundError("product 999 not found") from key_error
+except ProductNotFoundError as e:
+    print("error:", e)
+    print("__cause__:", repr(e.__cause__))
+    print("__context__:", repr(e.__context__))
+    print("__suppress_context__:", e.__suppress_context__)
+```
+
+Both attributes point to the same `KeyError`, and `__suppress_context__` is `True`, which is why the traceback uses the "direct cause" wording instead of "during handling". The cause wins because you set it.
+
+The Python docs describe `__cause__` as "the exception that caused this exception" and `__context__` as "the exception that was being handled when this exception was raised". One is a deliberate statement; the other is observational. They can also drift apart if you raise an exception with `from` pointing to something other than the active exception, but that's rare and usually a sign of weird code.
+
+> **Cost:** `__context__` is set even when you don't want it to be. If a handler does its own cleanup and that cleanup itself fails, the cleanup error gets the handler's exception as its `__context__`, and the traceback can become noisy. The `from None` syntax (covered next) is the way to clean that up.
+
+<h1 id="suppressing-the-chain-with-from-none">
+  Suppressing the Chain with from None
+</h1>
+
+Sometimes the original exception is genuine noise. The caller doesn't care that the catalog lookup happened to use a dict. They just want a clean error. The `from None` form does exactly that: it sets `__cause__` to `None` and `__suppress_context__` to `True`, which tells the traceback printer to skip the original entirely.
+
+```python
+class ProductNotFoundError(Exception):
+    pass
+
+def get_product(catalog, product_id):
+    try:
+        return catalog[product_id]
+    except KeyError:
+        raise ProductNotFoundError(f"product {product_id} not found") from None
+
+catalog = {101: "mouse", 102: "keyboard"}
+get_product(catalog, 999)
+```
+
+Clean. One traceback, no mention of the `KeyError`. The internal lookup detail is hidden, and the caller sees only the domain-level error.
+
+The original is still attached internally as `__context__`, but `__suppress_context__` is `True` so the printer skips it. You can still get to the underlying error programmatically if you really need it:
+
+```python
+try:
+    get_product({101: "mouse"}, 999)
+except ProductNotFoundError as e:
+    print("__cause__:", e.__cause__)
+    print("__context__:", e.__context__)
+    print("__suppress_context__:", e.__suppress_context__)
+```
+
+`__cause__` is `None` because that's what `from None` set it to. `__context__` is still the `KeyError` because Python attached it automatically. And `__suppress_context__` is `True`, which is the flag that hides it from the printed traceback.
+
+When should you use `from None`? When the lower-level error is purely an implementation detail and showing it would confuse the caller, leak details, or generate noise. A few examples:
+
+- A configuration parser catches a `json.JSONDecodeError` and raises a `ConfigError`. The JSON detail might be useful (`from json_error`), or it might be noise if the caller just wants "your config file is broken" without the line-and-column detail.
+- A product lookup catches `KeyError` from a dict and raises `ProductNotFoundError`. The dict is an implementation choice; the caller shouldn't know about it. `from None` is reasonable.
+- A payment service catches a `ConnectionError` from an HTTP client and raises `PaymentServiceUnavailable`. The connection error is the actual debugging information you want. Don't suppress it. Use `from connection_error`.
+
+The rule of thumb: suppress when the underlying error is noise or leaks implementation details, chain explicitly when it's debugging information.
+
+<h1 id="reading-a-chained-traceback">Reading a Chained Traceback</h1>
+
+Tracebacks read bottom-up in time but top-down in code. The exception at the bottom is what you actually see propagating; the one at the top is what kicked things off. When two exceptions are chained, you get two stack sections separated by a bridge sentence.
+
+Consider this code:
+
+```python
+class ProductNotFoundError(Exception):
+    pass
+
+class CartUpdateError(Exception):
+    pass
+
+def get_product(catalog, product_id):
+    try:
+        return catalog[product_id]
+    except KeyError as key_error:
+        raise ProductNotFoundError(f"product {product_id} not found") from key_error
+
+def add_to_cart(catalog, cart, product_id):
+    try:
+        product = get_product(catalog, product_id)
+    except ProductNotFoundError as not_found:
+        raise CartUpdateError(f"cannot add product {product_id} to cart") from not_found
+    cart.append(product)
+
+catalog = {101: "mouse", 102: "keyboard"}
+cart = []
+add_to_cart(catalog, cart, 999)
+```
+
+Three layers, two bridges. Read it like a story:
+
+1. **Top section:** `KeyError: 999`. This is what happened first, at the lowest level. A dict lookup missed.
+2. **Bridge:** "The above exception was the direct cause of the following exception". Someone caught the `KeyError` and declared it the cause of what's next.
+3. **Middle section:** `ProductNotFoundError: product 999 not found`. The domain error that wraps the `KeyError`.
+4. **Bridge:** Same wording. The `ProductNotFoundError` was then declared the cause of yet another error.
+5. **Bottom section:** `CartUpdateError: cannot add product 999 to cart`. The error that finally reached the top level and crashed the program.
+
+Each section is a full mini-traceback with file, line, and code. The exception at the very bottom is what the caller actually catches (or what crashes the program). Everything above it is debugging history.
+
+If the bridges had said "During handling of the above exception, another exception occurred" instead, the meaning would be different: same stack of errors, but the relationships would be implicit, not deliberate. That's still useful information; it just doesn't carry the "I meant for this to be the cause" signal.
+
+The diagram shows the three paths a handler can take when a `KeyError` happens during a catalog lookup. The starting error and the wrapper are fixed; the choice is in the middle. Each path produces a different `__cause__` / `__context__` / `__suppress_context__` combination, and each produces a different traceback. "Deliberate cause" is the most common and most useful for debugging.
+
+<h1 id="a-real-example-wrapping-keyerror-in-a-catalog-lookup">
+  A Real Example: Wrapping KeyError in a Catalog Lookup
+</h1>
+
+Here's a fuller version of the catalog example, with the wrapping done both ways so you can see the tradeoff. The catalog is backed by a dict, but the public API exposes only `ProductNotFoundError`.
+
+```python
+class ProductNotFoundError(Exception):
+    pass
+
+class Catalog:
+    def __init__(self, products):
+        self._products = dict(products)
+
+    def get(self, product_id):
+        try:
+            return self._products[product_id]
+        except KeyError as key_error:
+            raise ProductNotFoundError(
+                f"product {product_id} not found"
+            ) from key_error
+
+catalog = Catalog({101: "mouse", 102: "keyboard", 103: "hdmi cable"})
+
+try:
+    catalog.get(999)
+except ProductNotFoundError as e:
+    print("caught:", e)
+    print("underlying cause type:", type(e.__cause__).__name__)
+    print("underlying cause args:", e.__cause__.args)
+```
+
+The caller sees `ProductNotFoundError`, the domain-level error they're expected to handle. They never had to know about the dict. But if they want to debug, `__cause__` is right there with the original `KeyError` and the missing key.
+
+Now compare with `from None`:
+
+```python
+class Catalog:
+    def __init__(self, products):
+        self._products = dict(products)
+
+    def get(self, product_id):
+        try:
+            return self._products[product_id]
+        except KeyError:
+            raise ProductNotFoundError(
+                f"product {product_id} not found"
+            ) from None
+
+catalog = Catalog({101: "mouse", 102: "keyboard", 103: "hdmi cable"})
+catalog.get(999)
+```
+
+One traceback. No mention of the `KeyError`. The `Catalog`'s public API is cleaner because the dict-ness of the storage doesn't leak.
+
+Which is right? It depends on who's reading the traceback. For a library or framework where users shouldn't care about your storage choice, `from None` is fine. For internal application code where developers debug their own errors, `from key_error` is usually better because it leaves the trail visible.
+
+> **Cost:** Reaching into `__cause__` or `__context__` from a handler couples the caller to the wrapper's internals. If you find yourself writing `if isinstance(e.__cause__, KeyError):`, you've made the cause part of your public API, which defeats the point of wrapping in the first place. Use the chain for human readers (tracebacks, logs), not for programmatic branching.
+
+<h1 id="a-payment-example-connection-errors">
+  A Payment Example: Connection Errors
+</h1>
+
+For a payment service, the underlying connection error is the actual signal a developer needs. Hiding it would make on-call debugging harder. This is the case for explicit chaining:
+
+```python
+class PaymentServiceUnavailable(Exception):
+    pass
+
+class FakeHttpClient:
+    def post(self, url, payload):
+        # pretend the payment gateway is unreachable
+        raise ConnectionError("connection refused: payments.example.com:443")
+
+def charge(client, customer_id, amount):
+    try:
+        return client.post("/charge", {"customer_id": customer_id, "amount": amount})
+    except ConnectionError as connection_error:
+        raise PaymentServiceUnavailable(
+            f"could not charge ${amount:.2f} for customer {customer_id}"
+        ) from connection_error
+
+charge(FakeHttpClient(), customer_id=1, amount=49.99)
+```
+
+The caller catches `PaymentServiceUnavailable` and decides what to do (retry, queue, alert). The traceback preserves the underlying `ConnectionError` so an engineer reading the log knows which host failed and how. If this had used `from None`, on-call would have a domain error with no clue about which network thing broke.
+
+<h1 id="when-chaining-happens-without-from">
+  When Chaining Happens Without from
+</h1>
+
+The implicit chain catches a lot of bugs you didn't write. Even without `try`/`except`, any exception raised inside a `finally` clause or any second exception that escapes a handler picks up the active one as its context.
+
+```python
+def cart_total(prices):
+    try:
+        return sum(prices)
+    finally:
+        prices.clear()  # what if prices is None?
+
+cart_total(None)
+```
+
+Two unrelated errors, both linked because the `AttributeError` happened while the `TypeError` was active. The "during handling" bridge is Python warning you: hey, you were in the middle of one problem and another one happened. That's almost always a bug in the cleanup code, and the chain makes it visible. Without implicit chaining, you'd see only the `AttributeError`, and the `TypeError` would be lost.
+
+This is also the failure pattern when a `finally` block hides the real error. If `finally` raises, the original exception becomes the context of the new one. Python doesn't lose information; it just shifts which exception the caller sees as "the one that bubbled out". The original is still on `__context__` for anyone who looks.
+
+<h1 id="anti-patterns">Anti-Patterns</h1>
+
+Chaining is a tool, and like any tool, it can be misused. A few patterns to avoid:
+
+**1. Chaining for the sake of chaining.**
+
+```python
+def cart_total(prices):
+    try:
+        return sum(prices)
+    except Exception as e:
+        raise Exception("something went wrong") from e
+```
+
+Catching `Exception`, wrapping it in another `Exception`, and chaining the two adds nothing. The wrapper has no useful information, no domain meaning, and no narrower type for the caller to handle. Either let the original propagate, or wrap with an actual domain-specific class with a useful message. Generic wrapping is noise.
+
+**2. Suppressing chains when the user would want them.**
+
+```python
+def charge(client, customer_id, amount):
+    try:
+        return client.post("/charge", ...)
+    except ConnectionError:
+        raise PaymentServiceUnavailable("could not charge") from None
+```
+
+The on-call engineer wakes up at 3 a.m. with a `PaymentServiceUnavailable`, looks at the traceback, and sees nothing about the network. They have to ssh into the box, find the original logs, and reconstruct the connection failure by hand. Hiding the cause makes their job harder for no real benefit. `from None` is the wrong choice here.
+
+**3. Chaining to an unrelated exception.**
+
+```python
+try:
+    return catalog[product_id]
+except KeyError:
+    raise ProductNotFoundError("not found") from SomeOtherErrorObject
+```
+
+`from` accepts any exception, not just the active one. If you point `__cause__` at something the reader doesn't expect, the traceback gets confusing. The common idiom is `from caught_exception` (the one in `except as ...`), and deviations should be rare and well-justified.
+
+**4. Catching, wrapping, and then re-catching the wrapper just to inspect `__cause__`.**
+
+If you find yourself doing this:
+
+```python
+try:
+    catalog.get(product_id)
+except ProductNotFoundError as e:
+    if isinstance(e.__cause__, KeyError):
+        ...
+```
+
+You've made the cause part of your contract. The wrapping was supposed to hide the lower-level type; now you're branching on it anyway. Either don't wrap (let the caller catch `KeyError` directly), or give the wrapper enough information (`e.product_id`, `e.reason`) that callers don't need to dig into `__cause__`.
+
+The chain is for humans reading tracebacks and logs. It's not a structured-data channel for callers to inspect.
+
+<h1 id="why-chaining-helps-debugging">Why Chaining Helps Debugging</h1>
+
+A clean wrapper without a chain is a black hole. The caller sees `ProductNotFoundError: product 999 not found` and has no idea why. Was it a typo in the request? A stale cache? A race condition where another process deleted the product? Without the cause, you guess. With the cause, the traceback tells you "the dict lookup for 999 returned KeyError". That's one less mystery.
+
+The chain also helps when wrapping happens at multiple layers. A `KeyError` becomes a `ProductNotFoundError` in the data layer, which becomes a `CartUpdateError` in the cart layer, which might become an `HttpRequestFailed` in the API layer. Each layer wraps the previous one, and `from` keeps the trail intact. A traceback at the top shows all four errors in sequence, and you can read the failure from the user-visible symptom back to the root cause without grep-ing through logs.
+
+The cost is small: one `from key_error` per `raise`. The payoff is full provenance, every time.
+
+<h1 id="quiz">Quiz</h1>
+
+<h1 id="quiz-questions">Quiz Questions</h1>
+
+**Question 1: When a new exception is raised inside an except block without using from, what does Python do automatically?**
+
+- [x] It stores the active exception in the new exception's **context**.
+- [ ] It stores the active exception in the new exception's **cause**.
+- [ ] It replaces the original traceback with the new traceback.
+- [ ] It converts both exceptions into one ExceptionGroup object.
+
+**Question 2: Why is raise ProductNotFoundError(...) from key_error usually better than raising ProductNotFoundError(...) alone after catching KeyError?**
+
+- [ ] It prevents the KeyError from being created in the first place.
+- [ ] It makes ProductNotFoundError inherit from KeyError at runtime.
+- [x] It preserves the cause while exposing a domain-specific error.
+- [ ] It makes the caller catch both exceptions in one except clause.
+
+**Question 3: Which statement best describes raise NewError(...) from old_error?**
+
+- [x] It sets **cause** to old_error and suppresses context display.
+- [ ] It sets **context** to old_error and clears **cause**.
+- [ ] It changes old_error's class to match NewError.
+- [ ] It reraises old_error with a new message attached.
+
+**Question 4: What is the main effect of using raise RuntimeError('failed') from None inside an except block?**
+
+- [x] The earlier exception is omitted from the printed traceback.
+- [ ] The earlier exception is deleted from memory immediately.
+- [ ] The new exception becomes a subclass of the earlier one.
+- [ ] The except block stops handling BaseException subclasses.
+
+**Question 5: Inside an except ValueError as value_error block, code raises RuntimeError('failed') from OSError('disk'). What are the context and cause of the RuntimeError?**
+
+- [x] **context** is the ValueError; **cause** is the OSError.
+- [ ] **context** is the OSError; **cause** is the ValueError.
+- [ ] Both **context** and **cause** refer to the OSError.
+- [ ] Both attributes are cleared because the cause differs.
+
+**Question 6: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 7: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 8: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+<QuizCard />
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,474 @@
+---
+title: "Thread Lifecycle"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Thread Lifecycle explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="the-six-states">The Six States</h1>
+
+Java models a thread's life as a finite-state machine with exactly six states. They're defined in the enum `java.lang.Thread.State`, and every running thread is in one of them at any given instant.
+
+| State           | Meaning                                                                                      |
+| --------------- | -------------------------------------------------------------------------------------------- |
+| `NEW`           | The `Thread` object exists, but `start()` hasn't been called yet.                            |
+| `RUNNABLE`      | The thread is either running on a CPU or ready to run, waiting for the scheduler.            |
+| `BLOCKED`       | The thread is waiting to acquire a monitor lock to enter or re-enter a `synchronized` block. |
+| `WAITING`       | The thread is waiting indefinitely for another thread to wake it up.                         |
+| `TIMED_WAITING` | The thread is waiting for a bounded amount of time.                                          |
+| `TERMINATED`    | The thread has finished its `run()` method (normally or due to an uncaught exception).       |
+
+That's the whole set. There's no "paused", no "suspended", no "sleeping" as a separate state. Sleeping is one of several reasons a thread might be in `TIMED_WAITING`. Acquiring a `synchronized` lock that someone else holds is the only thing that puts a thread in `BLOCKED`. Everything else that looks like "waiting" lands in `WAITING` or `TIMED_WAITING`.
+
+The state machine at a glance:
+
+The arrows that matter most in real debugging are the ones into `BLOCKED` and `WAITING`. A web server with a thread pool full of `BLOCKED` threads usually means lock contention. A thread pool full of `WAITING` threads usually means everyone is waiting for a result that nobody is producing. The difference between those two situations comes down to which state the threads are in, which is why being precise about the states matters.
+
+One thing the diagram doesn't show: transitions in and out of `NEW` and `TERMINATED` happen only once per thread. A thread is `NEW` until `start()` is called, and once `start()` is called it never returns to `NEW`. The same goes for `TERMINATED`: once `run()` exits, the thread is done forever. Calling `start()` again on a terminated thread throws `IllegalThreadStateException`.
+
+<h1 id="new-the-thread-object-exists">NEW: The Thread Object Exists</h1>
+
+A thread enters `NEW` the moment its `Thread` object is constructed. The OS-level thread that will eventually run the code hasn't been created yet. The JVM has a `Thread` instance, a `Runnable` (or a subclass's `run` method) it will eventually execute, and nothing else.
+
+```java
+public class NewState {
+    public static void main(String[] args) {
+        Thread worker = new Thread(() -> {
+            System.out.println("Picking the next order from the queue");
+        }, "order-worker");
+
+        System.out.println("State right after construction: " + worker.getState());
+    }
+}
+```
+
+The lambda body never runs because we never call `start()`. The `Thread` object sits in memory in the `NEW` state until the program exits. Calling methods on it like `setName` or `setPriority` is fine, but the only transition out of `NEW` is `start()`.
+
+A common mistake is to call `run()` instead of `start()`. That doesn't transition the thread anywhere, because it invokes the `run` method on whatever thread is doing the calling, the same way any normal method call works.
+
+**What's wrong with this code?**
+
+```java
+Thread worker = new Thread(() -> System.out.println(Thread.currentThread().getName()));
+worker.run(); // prints "main", not "Thread-0"
+```
+
+**Fix:**
+
+```java
+Thread worker = new Thread(() -> System.out.println(Thread.currentThread().getName()));
+worker.start(); // prints "Thread-0", on a real new thread
+```
+
+`run()` is a method. It runs on whatever thread invokes it. `start()` is what tells the JVM "create a new OS thread, schedule it, and have that thread call `run()` for you." Until `start()` is called, the worker stays in `NEW` and the OS knows nothing about it.
+
+<h1 id="runnable-running-or-ready-to-run">RUNNABLE: Running or Ready to Run</h1>
+
+`RUNNABLE` is the state of any thread that's actively doing work or is willing to do work. Calling `start()` on a `NEW` thread transitions it here, and from this point onward, every state change goes through `RUNNABLE` on its way back to running code.
+
+A key detail the name hides: `RUNNABLE` doesn't mean "running right now". It means "the JVM considers this thread eligible to run, and the OS scheduler will give it CPU time when it can". A machine with four CPU cores and forty `RUNNABLE` threads has thirty-six of them sitting in OS-level run queues waiting their turn. All forty are in Java's `RUNNABLE` state.
+
+```java
+public class RunnableState {
+    public static void main(String[] args) throws InterruptedException {
+        Thread worker = new Thread(() -> {
+            long total = 0;
+            for (int i = 0; i < 100_000_000; i++) {
+                total += i;
+            }
+            System.out.println("Sum computed: " + total);
+        }, "order-summer");
+
+        worker.start();
+
+        // Give the worker a moment to start its loop
+        Thread.sleep(50);
+        System.out.println("State while looping: " + worker.getState());
+
+        worker.join();
+        System.out.println("State after run() returned: " + worker.getState());
+    }
+}
+```
+
+While the worker is grinding through that big loop, `getState()` reports `RUNNABLE`. The thread is either holding a CPU core or sitting in a run queue waiting for one. Java doesn't distinguish between the two, because from the JVM's point of view, both are "able to run". The OS scheduler handles the fine-grained distinction; Java collapses both into one state.
+
+Why does Java collapse "running" and "ready to run" into one state? Because the distinction changes from microsecond to microsecond, and exposing it would be both expensive (the JVM would have to query the OS frequently) and not very useful (by the time you read the state, it would already be stale). Lumping them together gives you a more stable answer.
+
+`getState()` is cheap: it reads a JVM-internal field. The value you see is a snapshot; the thread may move to a different state the instant you read it. Don't rely on `getState()` for synchronization.
+
+<h1 id="blocked-waiting-for-a-monitor-lock">
+  BLOCKED: Waiting for a Monitor Lock
+</h1>
+
+A thread enters `BLOCKED` for exactly one reason: it tried to enter a `synchronized` block or method, and another thread is currently holding the monitor for that block. The thread is parked at the door of the `synchronized` region, unable to proceed until the current holder lets go.
+
+```java
+public class BlockedState {
+    private static final Object inventoryLock = new Object();
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread holder = new Thread(() -> {
+            synchronized (inventoryLock) {
+                try {
+                    Thread.sleep(1000); // hold the lock for a while
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }, "inventory-holder");
+
+        Thread contender = new Thread(() -> {
+            synchronized (inventoryLock) {
+                System.out.println("Contender got the lock");
+            }
+        }, "inventory-contender");
+
+        holder.start();
+        Thread.sleep(50); // let the holder grab the lock first
+        contender.start();
+        Thread.sleep(50); // let the contender hit the synchronized block
+
+        System.out.println("Holder state: " + holder.getState());
+        System.out.println("Contender state: " + contender.getState());
+
+        holder.join();
+        contender.join();
+    }
+}
+```
+
+The holder is inside `Thread.sleep(1000)`, so it's in `TIMED_WAITING` while it holds the lock. The contender is parked at `synchronized (inventoryLock)` because the holder hasn't released the monitor yet, so it shows up as `BLOCKED`. When the holder's sleep ends and it exits the synchronized block, the lock is released, the contender transitions back to `RUNNABLE`, gets scheduled, and runs its body.
+
+`BLOCKED` is narrower than it might appear. Several things that feel like "the thread is waiting for something" aren't `BLOCKED`:
+
+- A thread inside `Object.wait()` is in `WAITING` (or `TIMED_WAITING` with a timeout), not `BLOCKED`, even though `wait()` is called from inside a `synchronized` block.
+- A thread waiting on a `java.util.concurrent.locks.ReentrantLock` is in `WAITING` (when calling `lock.lockInterruptibly()`) or `TIMED_WAITING` (with `tryLock(timeout)`), not `BLOCKED`. The `BLOCKED` state is reserved for the old monitor-based locking with `synchronized`.
+- A thread that called `LockSupport.park()` is in `WAITING`. `LockSupport` is the building block underneath the `java.util.concurrent` locks, and the JVM treats parking as waiting, not as monitor contention.
+
+The reason for the distinction is that `BLOCKED` is what the JVM reports when it can clearly point at "this thread is waiting for monitor X, currently held by thread Y". That's useful information for a debugger or a thread dump. Monitor ownership is tracked in the JVM, so it can name the owner. For other forms of waiting, the JVM doesn't necessarily know what's keeping the thread parked, so it reports `WAITING`.
+
+A thread bouncing in and out of `BLOCKED` under heavy contention pays a real performance cost. The OS scheduler has to park and unpark it, and on a busy multi-core machine that involves cache coherence traffic. If you see a thread dump where most threads are `BLOCKED` on the same lock, that's a strong signal the lock is a bottleneck.
+
+<h1 id="waiting-indefinite-wait-for-another-thread">
+  WAITING: Indefinite Wait for Another Thread
+</h1>
+
+A thread is `WAITING` when it has voluntarily given up its place in the run queue and is waiting for another thread to take a specific action that will release it. The defining feature of `WAITING` is that no clock is involved: the thread will sit there indefinitely until the right wake-up call arrives or it's interrupted.
+
+Three method calls can put a thread in `WAITING`:
+
+| Call                 | What wakes it up                                                   |
+| -------------------- | ------------------------------------------------------------------ |
+| `Object.wait()`      | `notify()` or `notifyAll()` on the same monitor, or `interrupt()`. |
+| `Thread.join()`      | The thread you joined on finishes, or `interrupt()`.               |
+| `LockSupport.park()` | `LockSupport.unpark(thisThread)`, or `interrupt()`.                |
+
+A worker that joins on a producer thread to wait for it to finish picking orders:
+
+```java
+public class WaitingState {
+    public static void main(String[] args) throws InterruptedException {
+        Thread producer = new Thread(() -> {
+            try {
+                Thread.sleep(500);
+                System.out.println("Producer finished picking 100 orders");
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "order-producer");
+
+        Thread waiter = new Thread(() -> {
+            try {
+                producer.join(); // wait indefinitely for producer to finish
+                System.out.println("Waiter unblocked, processing orders");
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "order-waiter");
+
+        producer.start();
+        waiter.start();
+
+        Thread.sleep(100); // let both threads settle into their roles
+        System.out.println("Producer state: " + producer.getState());
+        System.out.println("Waiter state: " + waiter.getState());
+
+        producer.join();
+        waiter.join();
+    }
+}
+```
+
+The producer is in `TIMED_WAITING` because it called `Thread.sleep(500)`, which has a built-in clock. The waiter is in `WAITING` because it called `producer.join()` with no timeout, which says "park me until the producer is done, no matter how long that takes." When the producer's sleep ends and its `run` method returns, the waiter is released and prints its line.
+
+The design choice here's that `WAITING` is a deliberate "I don't know when this will end" state. The JVM can't tell you how much longer the thread will wait, because there's no upper bound. This is why thread dumps showing many `WAITING` threads need context: they might all be waiting on a queue with nothing in it, in which case the system is idle, or they might all be waiting for a producer that has crashed, in which case the system is stuck.
+
+The path through `WAITING` is one-way until something wakes the thread up. The wake-up arrow is the part that matters: if the producer never finishes and nobody interrupts the waiter, the waiter is stuck in `WAITING` forever.
+
+For lifecycle purposes, the only thing to remember is: `wait()` causes the calling thread to transition from `RUNNABLE` to `WAITING` (or `TIMED_WAITING` if a timeout is given), and a matching `notify()` or `notifyAll()` from another thread transitions it back.
+
+<h1 id="timed_waiting-bounded-wait">TIMED_WAITING: Bounded Wait</h1>
+
+`TIMED_WAITING` is `WAITING` with a clock. The thread has parked itself, but it will wake up automatically after a specified duration, even if nothing else happens. This is the state of any thread that has called a timed-wait method.
+
+| Call                              | What wakes it up                                       |
+| --------------------------------- | ------------------------------------------------------ |
+| `Thread.sleep(ms)`                | Timeout, or `interrupt()`.                             |
+| `Object.wait(ms)`                 | `notify()`, `notifyAll()`, timeout, or `interrupt()`.  |
+| `Thread.join(ms)`                 | The joined thread finishes, timeout, or `interrupt()`. |
+| `LockSupport.parkNanos(ns)`       | `unpark()`, timeout, or `interrupt()`.                 |
+| `LockSupport.parkUntil(deadline)` | `unpark()`, deadline reached, or `interrupt()`.        |
+
+A retry worker that sleeps between attempts to grab the next order from a flaky queue:
+
+```java
+public class TimedWaitingState {
+    public static void main(String[] args) throws InterruptedException {
+        Thread retryWorker = new Thread(() -> {
+            for (int attempt = 1; attempt <= 3; attempt++) {
+                System.out.println("Attempt " + attempt + " to fetch next order");
+                try {
+                    Thread.sleep(300); // back off before retrying
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+            System.out.println("Done retrying");
+        }, "retry-worker");
+
+        retryWorker.start();
+
+        Thread.sleep(100); // let the worker hit its first sleep
+        System.out.println("Worker state during sleep: " + retryWorker.getState());
+
+        retryWorker.join();
+        System.out.println("Worker state after run() returned: " + retryWorker.getState());
+    }
+}
+```
+
+The first thing the worker does is print its attempt message and then call `Thread.sleep(300)`. While inside that sleep, it's in `TIMED_WAITING`. After 300 milliseconds, the sleep returns, the worker prints the next attempt, sleeps again, and so on. Each sleep is a brief excursion into `TIMED_WAITING` and back to `RUNNABLE`.
+
+`Thread.sleep` is one of the most common ways to land in `TIMED_WAITING`, but it's not the only one. A thread in a thread pool that calls `queue.poll(5, TimeUnit.SECONDS)` to fetch the next order from a `BlockingQueue` is also in `TIMED_WAITING` for those five seconds, because `poll(timeout, unit)` is implemented on top of timed parking. So is a thread that calls `future.get(2, TimeUnit.SECONDS)` waiting for a result.
+
+The difference between `WAITING` and `TIMED_WAITING` in a thread dump tells you something subtle: a `WAITING` thread is potentially stuck forever and needs a wake-up signal. A `TIMED_WAITING` thread is on a clock and will release itself eventually. When you see a thread pool where every worker is in `TIMED_WAITING` on a queue, that's usually healthy: they're all idle, waiting for work to arrive, and they'll wake up periodically to check.
+
+<h1 id="terminated-the-thread-is-done">TERMINATED: The Thread Is Done</h1>
+
+A thread enters `TERMINATED` when its `run` method returns, either normally (the method body finished) or because an uncaught exception escaped from it. Once a thread is `TERMINATED`, it stays that way. It can't be restarted, and any call to `start()` on a terminated `Thread` object throws `IllegalThreadStateException`.
+
+```java
+public class TerminatedState {
+    public static void main(String[] args) throws InterruptedException {
+        Thread worker = new Thread(() -> {
+            System.out.println("Picking the next order");
+        }, "single-shot-worker");
+
+        worker.start();
+        worker.join(); // wait for it to finish
+
+        System.out.println("State after run() returned: " + worker.getState());
+
+        try {
+            worker.start(); // attempt to restart
+        } catch (IllegalThreadStateException e) {
+            System.out.println("Cannot restart: " + e.getClass().getSimpleName());
+        }
+    }
+}
+```
+
+The thread did its single line of work, returned from `run`, and transitioned to `TERMINATED`. Calling `join` afterward is fine (it returns immediately because the thread is already done). Calling `start` on a terminated thread throws because `start` is only legal on a `NEW` thread.
+
+The "exception escapes from run" case is worth a quick look:
+
+```java
+public class TerminatedByException {
+    public static void main(String[] args) throws InterruptedException {
+        Thread worker = new Thread(() -> {
+            throw new RuntimeException("queue is empty");
+        }, "exception-worker");
+
+        worker.setUncaughtExceptionHandler((t, e) ->
+            System.out.println("Caught in handler: " + e.getMessage()));
+
+        worker.start();
+        worker.join();
+
+        System.out.println("State after exception: " + worker.getState());
+    }
+}
+```
+
+The thread threw `RuntimeException`. Nothing inside the worker caught it, so it propagated out of `run`. The JVM caught it at the boundary, handed it to the uncaught-exception handler we registered, and then transitioned the thread to `TERMINATED`. From Java's lifecycle point of view, "ran to completion" and "died by exception" both end in the same state. The handler is the way to find out which happened.
+
+A `Thread` object that has terminated still uses some memory until it's garbage-collected. The OS-level thread, however, is released as soon as the thread terminates. Holding references to many terminated `Thread` objects (for example, in a list you never clear) can leak Java memory but won't leak OS threads.
+
+<h1 id="reading-state-at-runtime">Reading State at Runtime</h1>
+
+`Thread.getState()` returns a `Thread.State` enum value, the same six values listed at the top of this lesson. You can call it on any `Thread` object, including the current thread, to find out where it stands.
+
+```java
+public class ReadingState {
+    public static void main(String[] args) throws InterruptedException {
+        Thread worker = new Thread(() -> {
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "inspectable");
+
+        System.out.println("Before start: " + worker.getState());
+
+        worker.start();
+        Thread.sleep(50); // let the worker enter sleep
+        System.out.println("During sleep: " + worker.getState());
+
+        worker.join();
+        System.out.println("After join: " + worker.getState());
+    }
+}
+```
+
+Three calls to `getState`, three different answers, all reflecting the thread's actual lifecycle position at the moment the call was made. The first call returns `NEW` because the worker hasn't been started. The second returns `TIMED_WAITING` because the worker has hit its sleep. The third returns `TERMINATED` because the worker's `run` has returned.
+
+The honest caveat: by the time you read the state, the thread might have moved on. State is a snapshot, not a guarantee. If your worker is bouncing between `RUNNABLE` and `BLOCKED` many times per second, a single call to `getState` will return whatever state it happened to be in at that exact moment, which might not be representative. Production debugging therefore usually relies on thread dumps (full snapshots of every thread's state and stack at once) rather than polling `getState` in a loop.
+
+Where `getState` is useful is in tests and small debugging programs. To confirm that a thread enters `BLOCKED` when it hits a contended lock, start two threads and check the second one's state. To verify that an idle worker is in `WAITING`, not eating CPU, read its state. For those purposes, `getState` works well.
+
+A common pattern in tests is to wait until a thread reaches an expected state:
+
+```java
+public class WaitForState {
+    public static void main(String[] args) throws InterruptedException {
+        Thread worker = new Thread(() -> {
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "sleeper");
+
+        worker.start();
+
+        while (worker.getState() != Thread.State.TIMED_WAITING) {
+            Thread.sleep(1); // poll until the worker hits its sleep
+        }
+        System.out.println("Worker has reached TIMED_WAITING");
+
+        worker.interrupt();
+        worker.join();
+    }
+}
+```
+
+The main thread starts the worker and then polls until the worker's state is `TIMED_WAITING`. That guarantees the worker has entered its sleep before main proceeds to interrupt it. Without the poll, main might call `interrupt` before the worker has hit `sleep`, which would behave differently. Outside of tests, polling like this is usually a code smell because better primitives (`CountDownLatch`, `CyclicBarrier`, `CompletableFuture`) don't burn CPU cycles checking a state.
+
+Polling `getState` in a tight loop is a busy-wait. Even with the 1ms sleep above, you're doing work that proper coordination primitives handle without polling. Use this pattern for tests and small experiments; use `CountDownLatch` or similar in real code.
+
+<h1 id="blocked-vs-waiting-a-closer-look">BLOCKED vs WAITING: A Closer Look</h1>
+
+These two states are easy to confuse, since both feel like "waiting for something." A side-by-side breakdown that gets at the actual difference.
+
+| Aspect                      | `BLOCKED`                                                | `WAITING`                                                       |
+| --------------------------- | -------------------------------------------------------- | --------------------------------------------------------------- |
+| Cause                       | Trying to enter a `synchronized` block someone else owns | Called `wait()`, `join()`, or `LockSupport.park()` (no timeout) |
+| What releases it            | The current holder exits the `synchronized` block        | Another thread calls `notify`/`notifyAll`/`unpark`, or finishes |
+| Owned by a specific thread? | Yes, the monitor has one current owner                   | Not necessarily; the waiting thread may be waiting on a queue   |
+| Visible in a thread dump?   | Yes, with the owning thread named                        | Yes, with the parking reason (e.g., "parking to wait for ...")  |
+| Used by `ReentrantLock`?    | No                                                       | Yes                                                             |
+| Used by `synchronized`?     | Yes                                                      | Only via `Object.wait` inside a `synchronized` block            |
+
+The clearest way to remember the rule: `BLOCKED` is "I am at the door of a `synchronized` block and someone else is inside." Everything else that looks like waiting is `WAITING` or `TIMED_WAITING`.
+
+This matters because thread dumps name them differently and modern debugging tools color them differently. A thread dump showing thirty threads all `BLOCKED` on the same monitor is a clear signal: there's a hot `synchronized` section, and that's where the contention is. A thread dump showing thirty threads all `WAITING` on a `LinkedBlockingQueue` is a different signal: the workers are idle, no work is arriving.
+
+The reason `ReentrantLock.lock()` puts the thread in `WAITING` instead of `BLOCKED` traces back to how `ReentrantLock` is built. Internally, it uses `LockSupport.park()` to suspend the thread, and the JVM reports `park` as `WAITING` (or `TIMED_WAITING` with a timeout). The `BLOCKED` state is reserved for the original monitor protocol that backs `synchronized`. Nothing is inherently better or worse about either state; they're labels the JVM uses to describe what kind of suspension is happening.
+
+The diagram lines up the four common ways a thread leaves `RUNNABLE` and which state it lands in. Only the first branch (synchronized contention) reaches `BLOCKED`. The `ReentrantLock` branch lands in `WAITING` despite being a "the lock is held by someone else" situation, which is the subtle part of `java.util.concurrent`.
+
+<h1 id="java-states-vs-os-states">Java States vs OS States</h1>
+
+The six Java states are a JVM abstraction. The OS underneath has its own scheduler with its own state model, and those models don't line up one-to-one. The most important mismatch is around `RUNNABLE`.
+
+A thread that Java labels `RUNNABLE` might be in any of these OS-level states:
+
+- **Running on a CPU.** The OS scheduler picked it and gave it a core.
+- **Ready, sitting in a run queue.** The OS is willing to schedule it but is currently running something else on every available core.
+- **Blocked on I/O.** This is the surprising one. A thread reading from a socket or a file is, from the OS's view, suspended waiting for data to arrive. From Java's view, it's still `RUNNABLE`. The JVM doesn't have a separate "blocked on I/O" state, because I/O calls are made through normal `read`/`write` syscalls and the JVM doesn't get a notification when they block.
+
+That last bullet is the surprising one. If you write a server that does `socket.getInputStream().read()` and the client never sends any bytes, your reader thread will sit at the `read` call forever. Java's `Thread.getState()` will report `RUNNABLE` the whole time, even though the OS has parked the thread waiting for data. The reason: `RUNNABLE` for Java means "not in any of the other five states", and "blocked on a syscall" doesn't match any of them.
+
+The diagram lines up the two views. Same code, same instant in time, different labels. Both are accurate from their own level. When you're reading a thread dump and you see hundreds of threads in `RUNNABLE` that look like they're stuck on socket reads, this is why: the JVM has no separate state for I/O blocking, so they all show as `RUNNABLE`.
+
+The fix in modern code is usually to use non-blocking I/O (NIO, or in Java 21+, virtual threads) so that the I/O wait is explicit and doesn't tie up an OS thread. For lifecycle purposes, the rule is: `RUNNABLE` is the JVM's catch-all for "not in another state", and "blocked on a syscall" is one of the things it catches.
+
+Beyond I/O, there are smaller mismatches. A `Thread.yield()` call asks the OS to consider giving someone else a turn, but the thread stays `RUNNABLE` from Java's view. A thread that the OS has just preempted in favor of another process is still `RUNNABLE` from Java's view. The Java state model is intentionally coarser than the OS state model, because finer-grained tracking would be expensive and the JVM doesn't always have the information it would need.
+
+A thread dump that shows many `RUNNABLE` threads isn't necessarily a sign of high CPU usage. Some of those threads may be parked in syscalls. Cross-check with OS-level tools (`top`, `ps`, `jstack` with `-l`) when the picture doesn't match the CPU graph.
+
+<h1 id="a-full-lifecycle-example">A Full Lifecycle Example</h1>
+
+A single program that walks one worker through several states, printing each transition. The worker imitates a small e-commerce flow: it waits to be told to start, sleeps briefly to simulate a network call, tries to enter a shared inventory section, and then finishes.
+
+```java
+public class FullLifecycle {
+
+    private static final Object inventoryLock = new Object();
+
+    public static void main(String[] args) throws InterruptedException {
+
+        Thread holder = new Thread(() -> {
+            synchronized (inventoryLock) {
+                try {
+                    Thread.sleep(400);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }, "inventory-holder");
+
+        Thread worker = new Thread(() -> {
+            try {
+                Thread.sleep(100); // simulate a network call
+                synchronized (inventoryLock) {
+                    System.out.println("Worker entered the inventory section");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "order-worker");
+
+        System.out.println("1. Before start: " + worker.getState());
+
+        holder.start();
+        Thread.sleep(20); // let holder grab the lock
+
+        worker.start();
+        Thread.sleep(20); // let worker hit its sleep
+        System.out.println("2. During sleep: " + worker.getState());
+
+        Thread.sleep(150); // let worker reach the synchronized block
+        System.out.println("3. At synchronized block: " + worker.getState());
+
+        holder.join();
+        worker.join();
+        System.out.println("4. After run() returned: " + worker.getState());
+    }
+}
+```
+
+Four readings of the worker's state, four different values, each one accurate at its moment. The worker started in `NEW`, transitioned to `RUNNABLE` on `start()`, immediately entered `TIMED_WAITING` for its 100ms sleep, came back to `RUNNABLE`, hit the `synchronized` block that the holder still owned and went into `BLOCKED`, eventually got the lock when the holder's sleep ended and the holder released the monitor, finished its body, and transitioned to `TERMINATED`.
+
+You could trace any well-behaved thread the same way: each transition is one of the arrows in the state machine, and `getState` lets you peek at which state the thread is in at any specific instant. In real systems with hundreds of threads, you don't poll like this; you take a thread dump (with `jstack` or a profiler) and read the same information for every thread at once. The underlying state model is the one you just walked through.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

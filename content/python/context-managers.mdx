@@ -1,0 +1,328 @@
+---
+title: "Context Managers"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "Context Managers explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="the-problem-cleanup-in-the-presence-of-exceptions">
+  The Problem: Cleanup in the Presence of Exceptions
+</h1>
+
+Here's the naive way to write an order to a log file. It looks fine until you imagine what happens when something inside the block fails.
+
+```python
+log = open("orders.log", "w")
+log.write("order 1001 placed\n")
+log.write("order 1002 placed\n")
+log.close()
+```
+
+This works on the happy path. The file gets opened, two lines get written, and `close()` runs. But if anything between the `open()` and the `close()` raises an exception, the `close()` call never executes. The file handle stays open until the garbage collector eventually reclaims it, which is non-deterministic. On some systems, writes might not even hit disk because the buffer wasn't flushed.
+
+Try this version that simulates a failure mid-write:
+
+```python
+log = open("orders.log", "w")
+log.write("order 1001 placed\n")
+raise RuntimeError("payment system crashed")
+log.close()
+```
+
+The exception propagates and `log.close()` is dead code. The file handle leaks. In a long-running program that does this repeatedly, you eventually hit the operating system's per-process file descriptor limit and everything grinds to a halt.
+
+The textbook fix is `try/finally`:
+
+```python
+log = open("orders.log", "w")
+try:
+    log.write("order 1001 placed\n")
+    raise RuntimeError("payment system crashed")
+finally:
+    log.close()
+    print("file closed")
+```
+
+`finally` runs whether the `try` block exits normally or by exception, so `close()` always happens. The exception still propagates after the cleanup, which is what we want; the cleanup wasn't supposed to swallow the failure, just to release the resource on the way out.
+
+This pattern is so common that Python has dedicated syntax for it: the `with` statement.
+
+<h1 id="the-with-statement-cleanup-without-the-ceremony">
+  The with Statement: Cleanup Without the Ceremony
+</h1>
+
+The `with` statement turns the `try/finally` pattern into a single line of setup and a guaranteed teardown when the block exits.
+
+```python
+with open("orders.log", "w") as log:
+    log.write("order 1001 placed\n")
+    log.write("order 1002 placed\n")
+```
+
+That's the whole program. No explicit `close()`. When the block ends (normally or by exception), Python calls `log.close()` for you. The file is guaranteed to be flushed and closed by the time control leaves the `with` block.
+
+The syntax has three parts:
+
+| Part                      | Role                                              |
+| ------------------------- | ------------------------------------------------- |
+| `with`                    | Keyword that starts the block                     |
+| `open("orders.log", "w")` | Expression that returns a context manager         |
+| `as log`                  | Binds the value returned by `__enter__` to a name |
+
+The `as` clause is optional. When you don't need a reference to the resource (some context managers only matter for their side effects), you can omit it:
+
+```python
+import threading
+
+lock = threading.Lock()
+
+with lock:
+    print("inside critical section")
+print("outside critical section")
+```
+
+Entering the `with` block acquires the lock; leaving it releases the lock. We don't need an `as` binding because `lock.__enter__()` doesn't return anything useful here; the lock object itself is already in scope.
+
+The same exception-safety guarantee applies. If a thread holding the lock crashes mid-block, the lock is still released on the way out, so other threads aren't stuck waiting forever.
+
+<h1 id="same-cleanup-with-exceptions">Same Cleanup, With Exceptions</h1>
+
+The whole reason `with` is in this section is its behavior when an exception fires inside the block. Watch what happens when we fail mid-write:
+
+```python
+with open("orders.log", "w") as log:
+    log.write("order 1001 placed\n")
+    raise RuntimeError("payment system crashed")
+```
+
+The traceback shows the exception propagating, exactly as it did with `try/finally`. But the file did get closed. You can verify this by checking that the partial content was flushed to disk:
+
+```python
+try:
+    with open("orders.log", "w") as log:
+        log.write("order 1001 placed\n")
+        raise RuntimeError("payment system crashed")
+except RuntimeError:
+    pass
+
+with open("orders.log", "r") as log:
+    print(log.read())
+```
+
+The first `with` block opened the file, wrote one line, then failed. Python ran the equivalent of `log.close()` before letting the exception propagate, which flushed the buffer to disk. The second `with` block reads the file back and confirms the line is there. Without `with` (or `try/finally`), the write would have been stranded in the buffer and possibly lost.
+
+The flow diagram below shows the two paths through a `with` block:
+
+The diagram shows that `__exit__` always runs. The only branch is whether the body raised, and whether the manager decided to suppress the exception. Most context managers (including the file object) return `None` from `__exit__`, which Python treats as "don't suppress, let the exception keep going". So in everyday code, `with` gives you guaranteed cleanup and unchanged exception propagation.
+
+<h1 id="the-context-manager-protocol-a-quick-look">
+  The Context Manager Protocol (A Quick Look)
+</h1>
+
+`with` works on any object that implements two dunder methods:
+
+| Method                                           | When it runs                   | What it does                                                                                       |
+| ------------------------------------------------ | ------------------------------ | -------------------------------------------------------------------------------------------------- |
+| `__enter__(self)`                                | At the top of the `with` block | Returns the value bound to the `as` name                                                           |
+| `__exit__(self, exc_type, exc_value, traceback)` | When the block exits           | Releases the resource; returns `True` to suppress an exception, `False`/`None` to let it propagate |
+
+That pair is the entire protocol. When Python sees `with expr as name:`, it does roughly this under the hood:
+
+```python
+manager = expr
+name = manager.__enter__()
+try:
+    # block body runs here
+    pass
+except:
+    if not manager.__exit__(*sys.exc_info()):
+        raise
+else:
+    manager.__exit__(None, None, None)
+```
+
+The three arguments to `__exit__` carry information about an exception when one is in flight: the exception's type, its instance, and its traceback object. When the block exits normally, all three are `None`. The return value decides whether the exception (if any) is swallowed; a truthy return value tells Python "I handled it, don't re-raise".
+
+You won't write `__enter__` and `__exit__` yourself in this lesson. For now, knowing the names of the two methods and what they do is enough to understand how `with` makes cleanup exception-safe.
+
+File objects implement this protocol, which is why `open()` works with `with`. So does `threading.Lock`, `threading.RLock`, `decimal.localcontext`, `socket.socket`, and many database connection objects. Anywhere you see "the X object can be used as a context manager" in the docs, that means it has `__enter__` and `__exit__`, so you can pass it to `with`.
+
+<h1 id="multiple-context-managers-in-one-with">
+  Multiple Context Managers in One with
+</h1>
+
+It's common to manage two resources in the same block. You can stack them with a comma:
+
+```python
+with open("catalog_in.txt", "w") as source, open("catalog_out.txt", "w") as dest:
+    source.write("Wireless Mouse,29.99\n")
+    source.write("USB Cable,9.99\n")
+    dest.write("backup of catalog\n")
+```
+
+Both files are opened on entry. Both are closed on exit, in reverse order: `dest.close()` first, then `source.close()`. If `dest`'s `open()` call fails after `source` was already opened, Python still closes `source` before propagating the error. So even the partial-setup case is safe.
+
+This comma form is equivalent to nesting `with` blocks one inside another:
+
+```python
+with open("catalog_in.txt", "w") as source:
+    with open("catalog_out.txt", "w") as dest:
+        source.write("Wireless Mouse,29.99\n")
+        source.write("USB Cable,9.99\n")
+        dest.write("backup of catalog\n")
+```
+
+Both versions produce identical behavior. The comma form is preferred when you have two or three managers because it keeps indentation flat. Nest only when one manager genuinely depends on a value from another:
+
+```python
+with open("orders.log") as log_file:
+    with open(f"backup_{log_file.readline().strip()}.log", "w") as backup:
+        backup.write("backup created\n")
+```
+
+Here the second `open()` uses data read from the first file, so it has to be a nested `with`, not a comma. Most of the time you don't need this; reach for the comma form by default and only nest when you must.
+
+For longer chains (Python 3.10 and later), you can wrap the managers in parentheses to break across multiple lines:
+
+```python
+with (
+    open("orders.log") as orders,
+    open("customers.log") as customers,
+    open("products.log") as products,
+):
+    print(orders.readline())
+    print(customers.readline())
+    print(products.readline())
+```
+
+This parenthesized form is purely cosmetic. It's the same as a single comma-separated list, just easier to read when you have four or five managers.
+
+> **Cost:** Each context manager added to a `with` adds a layer of setup and teardown. For three files it's negligible, but acquiring a database connection or a network socket is heavier. If you only need a resource for part of the block, open it later (in a nested `with`) rather than for the entire outer block.
+
+<h1 id="what-happens-inside-__exit__-when-an-exception-fires">
+  What Happens Inside __exit__ When an Exception Fires
+</h1>
+
+When the body of a `with` block raises, Python catches the exception just long enough to call `__exit__(exc_type, exc_value, traceback)`. The manager has three options:
+
+1. Return `False` (or `None`, or nothing): cleanup runs, then the exception keeps propagating. This is what `file.__exit__` does.
+2. Return `True`: cleanup runs, and Python swallows the exception. Control resumes on the statement after the `with` block.
+3. Raise a new exception: cleanup runs, the original exception is replaced by the new one, and the new one propagates. The original is usually preserved as the `__context__` of the new one.
+
+The vast majority of context managers go with option 1. File objects, locks, database connections, sockets: all of them propagate exceptions by default. Suppressing exceptions silently is risky, and most resources have no business deciding whether a caller's error should be swallowed.
+
+Option 2 exists for a reason though, and Python ships one ready-made example: `contextlib.suppress`. We'll look at it next.
+
+<h1 id="contextlibsuppress-a-context-manager-for-quiet-exceptions">
+  contextlib.suppress: A Context Manager for Quiet Exceptions
+</h1>
+
+`contextlib.suppress` is a context manager whose only job is to swallow specific exceptions raised inside its block. Think of it as a more readable form of `try/except SomeError: pass`.
+
+```python
+from contextlib import suppress
+import os
+
+with suppress(FileNotFoundError):
+    os.remove("orders.log")
+
+print("done")
+```
+
+If `orders.log` exists, `os.remove` deletes it and the block ends normally. If it doesn't exist, `os.remove` raises `FileNotFoundError`, and `suppress` swallows it silently. Either way, the program prints `done` and keeps going. There's no need for a `try/except` block or a pre-check with `os.path.exists`.
+
+You can suppress multiple exception types in the same block:
+
+```python
+from contextlib import suppress
+
+cart_quantities = {"mouse": 2, "cable": "lots"}
+
+with suppress(KeyError, ValueError):
+    total = int(cart_quantities["keyboard"])
+    print(f"keyboard total: {total}")
+
+print("after the block")
+```
+
+Looking up `"keyboard"` raises `KeyError`, which `suppress` catches. The block exits silently and execution continues. Had the lookup succeeded with the value `"lots"`, the `int()` call would have raised `ValueError`, which `suppress` would also have caught.
+
+Use `suppress` for genuinely uninteresting errors, where "the thing wasn't there" or "the parse didn't match" really is fine. Don't use it as a shortcut to ignore exceptions you should be handling; suppressing real bugs makes them harder to find. The `contextlib` module has plenty of other useful tools (`closing`, `redirect_stdout`, `ExitStack`).
+
+> **Cost:** `with suppress(SomeError)` and `try/except SomeError: pass` do the same thing at the same speed for a single statement. `suppress` is mostly a readability win, not a performance one. Reach for it when the body is a one-liner and the alternative would be three lines of try/except for no benefit.
+
+<h1 id="with-vs-tryfinally-when-to-choose-which">
+  with vs try/finally: When to Choose Which
+</h1>
+
+Most of the time, `with` is the right choice when the resource you're managing has a context manager interface. It's shorter, it can't be forgotten, and the cleanup happens whether the block exits normally or by exception. `try/finally` is the right choice when the cleanup logic doesn't belong to a single object, or when the object you're working with doesn't expose `__enter__` and `__exit__`.
+
+The two are exactly equivalent for the common case:
+
+```python
+# with form
+with open("orders.log", "w") as log:
+    log.write("order 1001\n")
+
+# try/finally form
+log = open("orders.log", "w")
+try:
+    log.write("order 1001\n")
+finally:
+    log.close()
+```
+
+Same behavior, same exception safety, same number of system calls. The `with` form is shorter and removes a class of bugs (forgetting the `close()` call, mistakenly putting the open inside the `try` so a failure to open is mishandled).
+
+`try/finally` is the better fit when the cleanup involves several unrelated steps, when there's no natural object to hang `__enter__/__exit__` off, or when the cleanup depends on something the body computed:
+
+```python
+import time
+
+start = time.perf_counter()
+try:
+    process_orders()
+finally:
+    elapsed = time.perf_counter() - start
+    print(f"took {elapsed:.2f}s")
+```
+
+Could you wrap this in a context manager? Yes. For a one-off like this, `try/finally` is fine.
+
+The decision tree is short:
+
+| Situation                                                    | Use                             |
+| ------------------------------------------------------------ | ------------------------------- |
+| Object exposes `__enter__/__exit__` (file, lock, connection) | `with`                          |
+| You're writing the same `try/finally` pattern repeatedly     | Build a custom context manager  |
+| Cleanup is one-off, ad-hoc, or doesn't fit an object         | `try/finally`                   |
+| You need to suppress a specific exception                    | `with suppress(ExceptionType):` |
+
+In practice, the moment you find yourself writing `try` followed by a single resource cleanup in `finally`, check whether the resource has a context manager interface. It almost always does, and the `with` version is unambiguously better.
+
+<h1 id="a-brief-catalog-of-built-in-context-managers">
+  A Brief Catalog of Built-in Context Managers
+</h1>
+
+You don't have to write context managers yourself to benefit from `with`. The standard library is full of objects that already implement the protocol. A short tour of the ones worth knowing right now:
+
+- `open()` returns a file object, which closes itself on exit. The canonical example.
+- `threading.Lock()` and `threading.RLock()` acquire on enter, release on exit. Used to protect shared state across threads.
+- `decimal.localcontext()` switches to a temporary decimal context (precision, rounding mode) and restores the previous one on exit.
+- `socket.socket()` closes the socket on exit. Useful for network code that should release the port even on failure.
+- `tempfile.TemporaryDirectory()` creates a temp directory on enter and deletes it (with its contents) on exit.
+- `contextlib.suppress(ExcType)` swallows the named exception types if they fire inside the block.
+
+For database libraries, the connection objects from `sqlite3`, `psycopg`, and most others are context managers, but the semantics differ from files: entering doesn't open a new connection, and exiting commits the transaction on success or rolls back on exception. Read your driver's docs before assuming a connection's `with` behavior matches a file's.
+
+Beyond the built-ins, the `contextlib` module ships helpers like `contextlib.closing`, `contextlib.ExitStack`, and the `@contextmanager` decorator that let you make any object or function work with `with`, even when its author didn't define `__enter__` and `__exit__`. The point is that the protocol is everywhere; recognizing it is half the work.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

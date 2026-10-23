@@ -1,0 +1,329 @@
+---
+title: "eval & exec (Use with Caution)"
+readTime: "10 min read"
+lastUpdated: "June 6, 2026"
+description: "eval & exec explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="what-eval-does">What eval Does</h1>
+
+`eval` takes a single Python expression as a string, evaluates it, and returns the result. Expressions are the things that produce a value: arithmetic, function calls, comparisons, lookups. Statements like `if`, `for`, `def`, or assignment are not expressions and won't work in `eval`.
+
+```python
+result = eval("2 + 3 * 4")
+print(result)
+print(type(result))
+```
+
+The string `"2 + 3 * 4"` is parsed as a Python expression, evaluated, and the integer `14` comes back. You can reference variables that exist in the surrounding scope.
+
+```python
+discount_pct = 15
+price = 200
+
+discounted = eval("price * (1 - discount_pct / 100)")
+print(f"Final price: ${discounted:.2f}")
+```
+
+`eval` saw the names `price` and `discount_pct` in the enclosing scope and looked them up. The full signature is `eval(expression, globals=None, locals=None)`, where you can pass dictionaries to override which names `eval` can see. That knob is where most "secure eval" attempts go wrong.
+
+If you hand `eval` something that isn't an expression, it raises `SyntaxError`.
+
+```python
+eval("x = 10")
+```
+
+Assignment is a statement, not an expression, so `eval` rejects it. For statements, you need `exec`.
+
+<h1 id="what-exec-does">What exec Does</h1>
+
+`exec` runs one or more Python statements from a string. It does not return a value. Whatever the code produces stays inside the namespace `exec` ran against.
+
+```python
+code = """
+product = "Wireless Mouse"
+price = 29.99
+print(f"{product}: ${price}")
+"""
+
+result = exec(code)
+print(f"exec returned: {result}")
+```
+
+Two things to notice. First, `exec` prints from inside the string because the `print` call ran. Second, `exec` itself returned `None`, even though the code set variables. If you want to keep those variables around, give `exec` an explicit namespace dictionary and read from it afterward.
+
+```python
+namespace = {}
+exec("product = 'Wireless Mouse'\nprice = 29.99", namespace)
+
+print(namespace["product"])
+print(namespace["price"])
+```
+
+The namespace dictionary is now the place where the executed code's variables live. You can pull them out by key. Note that `exec` also adds a `__builtins__` entry to that dictionary automatically; that's normal.
+
+Like `eval`, `exec` accepts `globals` and `locals` arguments. The signature is `exec(code, globals=None, locals=None)`. When both default to `None`, the code runs in the current scope, which is rarely what you want and a frequent source of confusion when `exec`-defined variables don't appear inside functions.
+
+> **Cost:** Both `eval` and `exec` parse and compile the source string every single call. If you run the same string in a loop, that compile cost dominates. Use `compile()` to do the work once.
+
+<h1 id="caching-with-compile">Caching with compile</h1>
+
+When `eval` or `exec` runs, Python parses the source string and turns it into a code object before executing it. The parsing and compilation are the slow part. For one-shot calls it doesn't matter. For hot paths, it adds up fast.
+
+`compile(source, filename, mode)` does that work once and gives you a code object you can hand to `eval` or `exec` repeatedly.
+
+| Mode       | What it accepts                | Used with                  |
+| ---------- | ------------------------------ | -------------------------- |
+| `"eval"`   | A single expression            | `eval`                     |
+| `"exec"`   | One or more statements         | `exec`                     |
+| `"single"` | A single interactive statement | `exec`, REPL-like behavior |
+
+The `filename` argument is purely a label that shows up in tracebacks. Pass something descriptive like `"<discount-rule>"` so errors are traceable.
+
+```python
+import time
+
+expression = "price * quantity * (1 - discount)"
+code = compile(expression, "<discount-rule>", "eval")
+
+scope = {"price": 29.99, "quantity": 3, "discount": 0.10}
+
+start = time.perf_counter()
+for _ in range(100_000):
+    eval(expression, scope)
+str_elapsed = time.perf_counter() - start
+
+start = time.perf_counter()
+for _ in range(100_000):
+    eval(code, scope)
+code_elapsed = time.perf_counter() - start
+
+print(f"String form: {str_elapsed:.3f} s")
+print(f"Compiled:    {code_elapsed:.3f} s")
+print(f"Speedup:     {str_elapsed / code_elapsed:.1f}x")
+```
+
+Roughly a 5x speedup on this tiny expression, and the gap widens for longer code. If you're running the same template repeatedly (for example, applying a customer-defined formula to every row of an order table), compile it once outside the loop and reuse the code object inside.
+
+> **Cost:** `compile()` is not free either. Compiling once and reusing thousands of times is a clear win. Compiling fresh on every call is the same cost as calling `eval` on the string.
+
+<h1 id="why-untrusted-input-is-dangerous">Why Untrusted Input Is Dangerous</h1>
+
+Here is the part you cannot skip. If any part of the string passed to `eval` or `exec` comes from outside your program (a user form, a config file, a network request, even an environment variable a less-trusted process might touch), you have a remote code execution vulnerability.
+
+A naive discount-rule evaluator looks innocent.
+
+```python
+def apply_discount(rule: str, price: float) -> float:
+    return eval(rule, {"price": price})
+
+print(apply_discount("price * 0.9", 100))
+```
+
+Then someone passes in a different "rule".
+
+```python
+apply_discount("__import__('os').system('rm -rf /tmp/orders')", 100)
+```
+
+That string is also a valid Python expression. It imports the `os` module and runs a shell command. If the program runs with permission to delete the orders directory, the orders directory is gone. The same trick can read environment variables, exfiltrate secrets, open network connections, or anything else the process can do.
+
+It doesn't matter how short the input looks or how harmless the surrounding feature seems. An expression is an expression. Python will happily evaluate any of it.
+
+<h1 id="the-sandboxing-trap">The Sandboxing Trap</h1>
+
+The standard suggestion is "just restrict the globals and locals you pass in". The idea is to hide builtins like `__import__` and `open`. It looks like this:
+
+```python
+def sandboxed_eval(expression: str, price: float) -> float:
+    safe_globals = {"__builtins__": {}}
+    safe_locals = {"price": price}
+    return eval(expression, safe_globals, safe_locals)
+
+print(sandboxed_eval("price * 0.9", 100))
+```
+
+This feels safe. It is not. Python objects carry references to their classes, and classes carry references to their parent classes and their subclasses. From any object, you can walk back up to `object` and from there see every class loaded into the interpreter. That includes things you wanted to hide.
+
+```python
+safe_globals = {"__builtins__": {}}
+attack = "().__class__.__base__.__subclasses__()"
+loaded_classes = eval(attack, safe_globals)
+print(f"Found {len(loaded_classes)} classes")
+print(loaded_classes[:3])
+```
+
+From this list, an attacker walks to a class that wraps file I/O, subprocess, or code execution, and uses it. There are public proof-of-concept payloads that, given a "restricted" `eval`, read arbitrary files or execute shell commands in fewer than 100 characters. The Python community has spent decades trying to plug these holes and the answer keeps coming back the same: you cannot safely run untrusted Python code in a Python interpreter that runs your own code too. Process isolation, OS sandboxes, or WebAssembly are real answers. Dictionary tricks are not.
+
+The takeaway: **passing restricted `globals` to `eval` does not make it safe for untrusted input.** Treat that pattern as a code smell on its own.
+
+<h1 id="the-right-tool-astliteral_eval">The Right Tool: ast.literal_eval</h1>
+
+A lot of the time, people reach for `eval` because they want to parse a string into a Python data structure. A config file might store a list. A database column might hold a dict. A test fixture might want a tuple.
+
+For that exact case, the standard library ships `ast.literal_eval`. It parses the same syntax as `eval` for literal data structures only: numbers, strings, tuples, lists, dicts, sets, booleans, and `None`. It refuses anything else (function calls, attribute access, operators beyond unary `+`/`-`, names). That's exactly the safety guarantee you want.
+
+```python
+import ast
+
+raw = "{'product': 'Wireless Mouse', 'price': 29.99, 'in_stock': True}"
+data = ast.literal_eval(raw)
+
+print(data)
+print(type(data))
+print(data["price"])
+```
+
+Feed it the attack string from earlier and it refuses, cleanly.
+
+```python
+import ast
+
+ast.literal_eval("__import__('os').system('echo hacked')")
+```
+
+It also accepts the same numeric, string, and container literal syntax Python source files use, so you can store nested structures and round-trip them.
+
+```python
+import ast
+
+stored = "[(1, 'Wireless Mouse', 29.99), (2, 'USB Cable', 9.99), (3, 'Charger', 14.99)]"
+products = ast.literal_eval(stored)
+
+for product_id, name, price in products:
+    print(f"{product_id}: {name} - ${price}")
+```
+
+For anything that looks like "parse Python literal data from a string", `ast.literal_eval` is the answer. For data you control end-to-end, JSON via the `json` module is usually even better because it's a standard interchange format that other languages can read too. Reach for `ast.literal_eval` when the source genuinely contains Python literals (tuples, sets, single-quoted keys) that JSON can't represent.
+
+<h1 id="comparison-table">Comparison Table</h1>
+
+| Function              | Accepts                                                                                               | Returns                                    | Safe for untrusted input?        | Typical use                                                                   |
+| --------------------- | ----------------------------------------------------------------------------------------------------- | ------------------------------------------ | -------------------------------- | ----------------------------------------------------------------------------- |
+| `eval(expr)`          | A single expression as a string                                                                       | The expression's value                     | No, even with restricted globals | REPL prompts, trusted dynamic config, formula evaluation in trusted contexts  |
+| `exec(code)`          | One or more statements as a string                                                                    | `None` (state lives in the namespace dict) | No, even with restricted globals | Code generation, plugin loading from trusted sources, dynamic class building  |
+| `ast.literal_eval(s)` | A string containing a Python literal (numbers, strings, tuples, lists, dicts, sets, booleans, `None`) | The parsed Python value                    | Yes                              | Parsing literal data from config files, database columns, logs, or user input |
+
+If you remember nothing else from this lesson, remember the last row.
+
+<h1 id="cleaner-alternatives">Cleaner Alternatives</h1>
+
+A lot of "I need eval" turns out, on inspection, to be a structural problem the language already solves. Before reaching for `eval` or `exec`, check whether one of these patterns fits.
+
+**Dispatch dictionary.** When you want to pick a function by name, map names to functions in a dict.
+
+```python
+def percent_discount(price: float) -> float:
+    return price * 0.9
+
+def flat_discount(price: float) -> float:
+    return price - 5
+
+def bulk_discount(price: float) -> float:
+    return price * 0.7
+
+discounts = {
+    "percent": percent_discount,
+    "flat":    flat_discount,
+    "bulk":    bulk_discount,
+}
+
+rule_name = "percent"
+final_price = discounts[rule_name](100)
+print(f"Final: ${final_price:.2f}")
+```
+
+The dispatch dict is faster (no parsing) and safer (the user can only pick from keys you defined).
+
+**`getattr` for method lookup.** When the "name" maps to a method on an object, use `getattr` instead of building `"obj.method()"` and calling `eval`.
+
+```python
+class Cart:
+    def add(self, item: str) -> str:
+        return f"Added {item}"
+
+    def remove(self, item: str) -> str:
+        return f"Removed {item}"
+
+cart = Cart()
+action = "add"
+print(getattr(cart, action)("Wireless Mouse"))
+```
+
+**`operator` module for arithmetic.** If you wanted to evaluate things like `price + tax` or `qty * unit_price` driven by a config, the `operator` module has named functions for every operator. Combine with the dispatch dict pattern.
+
+**`json.loads` for data interchange.** If the strings come from a database column, a config file you control, or another service, JSON is usually the right format. It's faster than `ast.literal_eval`, has tooling in every language, and is unambiguously safe.
+
+The rule of thumb: any time you're tempted to write `eval(name + "(" + arg + ")")`, stop. There's almost always a cleaner way using ordinary Python.
+
+<h1 id="when-eval-and-exec-are-actually-fine">
+  When eval and exec Are Actually Fine
+</h1>
+
+This lesson is heavy on "don't", but there are genuine uses. The common thread: the code being evaluated is trusted (you wrote it, or it comes from a source you fully control), and the alternative is significantly more painful.
+
+- **REPLs and notebooks.** Tools like IPython, Jupyter, and `python -i` are built on top of `compile` + `exec`. They evaluate code the user typed because that's the entire point. The boundary is "the user is the trust boundary".
+- **Templating and code generation.** Frameworks that generate Python code from a schema (like the `dataclasses` module, which builds `__init__` strings and `exec`s them) use `exec` in a controlled way on strings the framework itself constructed.
+- **Dynamic config in trusted contexts.** A build system that lets developers write small Python expressions in a config file, run on the developer's own machine, is a reasonable use. The trust boundary is the developer's filesystem.
+- **Plugin systems with trusted source.** If plugins are first-party code shipped with the application, `exec` may be the right tool to load them dynamically. Plugins that come from third parties need real sandboxing (subprocess, container, WebAssembly), not `exec`.
+- **Debuggers and profilers.** Tools like `pdb` evaluate user expressions in the context of a stopped frame. Same trust model as the REPL.
+
+If your case doesn't look like one of those, default to "use `ast.literal_eval`, a dispatch dict, or JSON" instead.
+
+<h1 id="a-safer-discount-rule-example">A Safer Discount-Rule Example</h1>
+
+Tying the lesson together. A store wants to let internal admins define product-level discount rules. The naive version is unsafe. The safer version uses `ast.literal_eval` to parse structured data and a dispatch dict to pick the discount logic.
+
+```python
+import ast
+
+DISCOUNT_RULES = {
+    "percent_off":  lambda price, value: price * (1 - value / 100),
+    "flat_off":     lambda price, value: max(price - value, 0),
+    "fixed_price":  lambda price, value: value,
+}
+
+def apply_rule(rule_str: str, price: float) -> float:
+    rule = ast.literal_eval(rule_str)
+
+    if not isinstance(rule, dict) or "type" not in rule or "value" not in rule:
+        raise ValueError("rule must be a dict with 'type' and 'value'")
+
+    if rule["type"] not in DISCOUNT_RULES:
+        raise ValueError(f"unknown discount type: {rule['type']!r}")
+
+    return DISCOUNT_RULES[rule["type"]](price, rule["value"])
+
+print(apply_rule("{'type': 'percent_off', 'value': 15}", 200))
+print(apply_rule("{'type': 'flat_off', 'value': 50}", 200))
+print(apply_rule("{'type': 'fixed_price', 'value': 99}", 200))
+```
+
+Now the configuration format is structured data (which `ast.literal_eval` parses safely), and the actual computation is plain Python that you wrote and reviewed. An attacker who tries to inject `"__import__('os').system('...')"` into the rule string gets a `ValueError` from `ast.literal_eval`, not code execution.
+
+```python
+apply_rule("__import__('os').system('echo hacked')", 200)
+```
+
+That's the shape most "I need eval" problems take when you look at them carefully: parse data with `ast.literal_eval` (or JSON), pick behavior with a dispatch dict, do the actual work in real Python code.
+
+<h1 id="the-honest-opinion">The Honest Opinion</h1>
+
+For application code, treat `eval` and `exec` as restricted tools. The default answer is "don't". If you're reaching for them, ask:
+
+1. Is the input fully under my control, or does it cross a trust boundary?
+2. Could I represent this as data (JSON, a dict, an enum) instead of code?
+3. Could a dispatch dict, `getattr`, or `operator` give me the same behavior?
+4. If I still need to parse Python-ish data, can `ast.literal_eval` do it?
+
+If after all that you still need real `eval` or `exec`, you're probably writing a REPL, a debugger, a code generator, or something similar. Those are valid uses. Most application code is not one of them.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

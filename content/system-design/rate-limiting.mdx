@@ -1,0 +1,1651 @@
+---
+title: "Rate Limiting"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Rate Limiting explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+One noisy tenant should not make the API slow for everyone else.
+
+If tenant `acme` accidentally starts polling `GET /orders` thousands of times per second, the system should stop most of that traffic near the edge instead of letting it overwhelm the order service and database.
+
+<h3 id="preserving-fairness">Preserving Fairness</h3>
+
+Rate limits help divide capacity across users, tenants, plans, regions, or API keys.
+
+A free plan might get `60 requests per minute`. An enterprise plan might get `5,000 requests per minute`. Internal services may have separate limits tied to the capacity they are allowed to consume.
+
+<h3 id="controlling-cost">Controlling Cost</h3>
+
+Some requests are much more expensive than others.
+
+One `POST /generate-report` request may scan millions of rows. One LLM request with a huge prompt may cost more than hundreds of small metadata reads. Treating every request as equal is often wrong.
+
+<h3 id="reducing-retry-storms">Reducing Retry Storms</h3>
+
+When a dependency is slow, clients often retry. If every retry is allowed right away, the system can turn a small incident into a much larger one.
+
+Rate limits, retry budgets, and backoff rules keep failures from multiplying.
+
+<h3 id="making-api-behavior-explicit">Making API Behavior Explicit</h3>
+
+Clear limits are part of the API contract. Clients can pace themselves, batch work, cache responses, and avoid unnecessary errors.
+
+<h1 id="2-what-should-be-limited">2. What Should Be Limited?</h1>
+
+The first design decision is the unit of work.
+
+| Limit Type            | Example                                   | When It Helps                                      |
+| --------------------- | ----------------------------------------- | -------------------------------------------------- |
+| **Request count**     | `100 requests / minute`                   | Simple APIs where requests have similar cost       |
+| **Weighted requests** | Search costs `5`, metadata read costs `1` | Endpoints have different backend cost              |
+| **Bytes**             | `100 MB uploaded / hour`                  | Upload, export, or media-heavy APIs                |
+| **Concurrency**       | `10 active requests`                      | Expensive or long-running operations               |
+| **Queue depth**       | `1,000 pending jobs`                      | Async workers and background processing            |
+| **Tokens**            | `1M input tokens / day`                   | AI inference and embedding APIs                    |
+| **Money budget**      | `$50 model spend / day`                   | Multi-model AI systems with variable provider cost |
+
+Request count is easy to explain, but it is often too blunt. Real systems usually combine a few limits. For an AI chat API, you might limit requests per minute per user, active generations per organization, input tokens per minute per model family, daily spend per workspace, and tool calls that reach outside systems.
+
+The rule of thumb is simple: limit the resource that can actually run out.
+
+<h1 id="3-where-rate-limits-are-enforced">3. Where Rate Limits Are Enforced</h1>
+
+Rate limiting can happen at several layers.
+
+Each layer has a different job.
+
+| Layer                           | Good For                                                    | Weakness                                               |
+| ------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------ |
+| **Client SDK**                  | Pacing well-behaved clients                                 | Cannot protect against buggy or hostile clients        |
+| **CDN / WAF**                   | IP-level abuse, bot traffic, broad edge rules               | Limited knowledge of signed-in users and business cost |
+| **API gateway**                 | User, tenant, API key, route, and plan limits               | May not know deep domain cost                          |
+| **Service**                     | Domain-specific limits and expensive operation guards       | Load has already reached the service                   |
+| **Worker / dependency wrapper** | Protecting queues, third-party APIs, model pools, databases | Too late to stop most API traffic early                |
+
+The best systems use layers. The edge blocks obvious abuse. The gateway enforces API policy. Services protect expensive business operations. Workers protect the systems they call.
+
+<h1 id="4-core-concepts">4. Core Concepts</h1>
+
+Every rate limiter needs a few pieces of state.
+
+<h3 id="key">Key</h3>
+
+The key identifies who or what is being limited. Common keys include IP address, user ID, organization or tenant ID, API key, route, model name, or a combination such as `tenant_id + endpoint + model`.
+
+Choose keys carefully. IP-only limits can hurt many real users who share one IP, and attackers can often move across many IPs. User-only limits can miss traffic before login. Tenant-level limits often protect shared capacity better than only per-user limits.
+
+<h3 id="limit">Limit</h3>
+
+The limit defines how much work is allowed. Typical limits look like `100 requests per minute`, `10 concurrent exports`, `1,000 write operations per hour`, or `2 million tokens per day`.
+
+<h3 id="window">Window</h3>
+
+The window is the time period used for the decision. Windows can be per second, per minute, per hour, or a rolling 24 hours. Short windows protect immediate capacity. Long windows are better for quota or pricing rules.
+
+<h3 id="decision">Decision</h3>
+
+For each request, the limiter returns one of three outcomes: allow, reject, or sometimes delay. Most API gateways reject immediately when the limit is exceeded. Some internal systems queue work or drop lower-priority work instead.
+
+<h3 id="the-decision-flow-for-one-request">
+  The Decision Flow for One Request
+</h3>
+
+Those four pieces come together the same way on every request, no matter which algorithm sits underneath:
+
+1. **Derive the key.** Pull the identifying values from the request, for example `tenant_id + endpoint`, and build the limiter key `acme:/api/search`.
+2. **Load the state for that key.** Read the current counter or bucket for the key from the store, often Redis. A first-ever request for a key starts from an empty or full state depending on the algorithm.
+3. **Evaluate against the limit.** The algorithm decides whether this request fits: is the window counter below 100, or does the bucket have at least one token?
+4. **Return a decision and update state.** If it fits, allow the request and record it by incrementing the counter or removing a token. If it does not fit, reject it before doing expensive work, or queue it if the system is designed to wait.
+5. **Attach headers.** Either way, the response carries the limit, how much is left, and when it resets, so the client can back off.
+
+A concrete allow: a request to `/api/search` for tenant `acme` derives the key `acme:/api/search`, the store shows `87/100` for the current minute, 87 is below 100, so the limiter allows it, increments to `88`, and returns `X-RateLimit-Remaining: 12`. The first request after the counter reaches `100` is rejected with `429` until the window resets.
+
+<h1 id="5-rate-limiting-algorithms">5. Rate Limiting Algorithms</h1>
+
+There is no single best algorithm. Each one makes a different tradeoff between accuracy, memory use, burst handling, and operational complexity.
+
+The code examples below are small single-process versions for learning. In production, the same updates usually happen inside one safe datastore operation, a gateway plugin, a local limiter, or a dedicated rate-limit service.
+
+<h3 id="fixed-window-counter">Fixed Window Counter</h3>
+
+The fixed window counter is the simplest approach. It splits time into fixed buckets and counts requests in the current bucket.
+
+Example policy:
+
+```plaintext
+Limit: 100 requests per minute
+Window: 12:00:00 - 12:00:59
+```
+
+If the counter reaches `100`, new requests are rejected until the next minute starts.
+
+<h4 id="how-it-works">How It Works</h4>
+
+1. Compute the current window from the timestamp.
+2. Increment a counter for `key + window`.
+3. Allow the request if the counter is within the limit.
+4. Expire the counter after the window ends.
+
+<h4 id="example">Example</h4>
+
+Here is what the limiter's state might look like for one user partway through a window, just below the limit.
+
+```plaintext
+Key: user:42:/api/search
+Window: 2026-05-25T12:00
+Counter: 87 / 100
+Decision: allow
+```
+
+<h4 id="code-example">Code Example</h4>
+
+The implementation below tracks a counter per key and window, increments it on each request, and rejects once the count passes the limit.
+
+```java
+import java.util.HashMap;
+import java.util.Map;
+
+class FixedWindowLimiter {
+    private final int limit;
+    private final int windowSeconds;
+    private final Map<String, Integer> counts;
+
+    FixedWindowLimiter(int limit, int windowSeconds) {
+        this.limit = limit;
+        this.windowSeconds = windowSeconds;
+        this.counts = new HashMap<>();
+    }
+
+    boolean allow(String key, Double now) {
+        double current = now == null ? System.currentTimeMillis() / 1000.0 : now;
+        int window = (int) (current / windowSeconds);
+        String counterKey = key + "#" + window;
+
+        int count = counts.getOrDefault(counterKey, 0) + 1;
+        counts.put(counterKey, count);
+
+        // Production implementations should expire old window keys.
+        return count <= limit;
+    }
+}
+```
+
+```python
+import time
+
+class FixedWindowLimiter:
+    def __init__(self, limit, window_seconds):
+        self.limit = limit
+        self.window_seconds = window_seconds
+        self.counts = {}
+
+    def allow(self, key, now=None):
+        now = time.time() if now is None else now
+        window = int(now // self.window_seconds)
+        counter_key = (key, window)
+
+        count = self.counts.get(counter_key, 0) + 1
+        self.counts[counter_key] = count
+
+        # Production implementations should expire old window keys.
+        return count <= self.limit
+```
+
+```cpp
+#include <unordered_map>
+#include <string>
+#include <chrono>
+
+class FixedWindowLimiter {
+private:
+    int limit;
+    int windowSeconds;
+    std::unordered_map<std::string, int> counts;
+
+public:
+    FixedWindowLimiter(int limit, int windowSeconds) : limit(limit), windowSeconds(windowSeconds) {}
+
+    bool allow(const std::string& key, std::optional<double> now = std::nullopt) {
+        double current = now.has_value()
+            ? *now
+            : std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+        int window = static_cast<int>(current / windowSeconds);
+        std::string counterKey = key + "#" + std::to_string(window);
+
+        int count = counts[counterKey] + 1;
+        counts[counterKey] = count;
+
+        // Production implementations should expire old window keys.
+        return count <= limit;
+    }
+};
+```
+
+```go
+package main
+
+import (
+	"strconv"
+	"time"
+)
+
+type FixedWindowLimiter struct {
+	limit         int
+	windowSeconds int
+	counts        map[string]int
+}
+
+func NewFixedWindowLimiter(limit, windowSeconds int) *FixedWindowLimiter {
+	return &FixedWindowLimiter{
+		limit:         limit,
+		windowSeconds: windowSeconds,
+		counts:        make(map[string]int),
+	}
+}
+
+func (f *FixedWindowLimiter) allow(key string, now *float64) bool {
+	current := float64(time.Now().UnixNano()) / 1e9
+	if now != nil {
+		current = *now
+	}
+	window := int(current / float64(f.windowSeconds))
+	counterKey := key + "#" + strconv.Itoa(window)
+
+	count := f.counts[counterKey] + 1
+	f.counts[counterKey] = count
+
+	// Production implementations should expire old window keys.
+	return count <= f.limit
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+
+class FixedWindowLimiter
+{
+    private readonly int limit;
+    private readonly int windowSeconds;
+    private readonly Dictionary<string, int> counts;
+
+    public FixedWindowLimiter(int limit, int windowSeconds)
+    {
+        this.limit = limit;
+        this.windowSeconds = windowSeconds;
+        this.counts = new Dictionary<string, int>();
+    }
+
+    public bool allow(string key, double? now = null)
+    {
+        double current = now ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
+        int window = (int)(current / windowSeconds);
+        string counterKey = key + "#" + window;
+
+        int count = counts.TryGetValue(counterKey, out int existing) ? existing + 1 : 1;
+        counts[counterKey] = count;
+
+        // Production implementations should expire old window keys.
+        return count <= limit;
+    }
+}
+```
+
+```typescript
+class FixedWindowLimiter {
+  private readonly limit: number;
+  private readonly windowSeconds: number;
+  private readonly counts: Map<string, number>;
+
+  constructor(limit: number, windowSeconds: number) {
+    this.limit = limit;
+    this.windowSeconds = windowSeconds;
+    this.counts = new Map<string, number>();
+  }
+
+  allow(key: string, now: number | null = null): boolean {
+    const current = now === null ? Date.now() / 1000.0 : now;
+    const window = Math.floor(current / this.windowSeconds);
+    const counterKey = key + "#" + window;
+
+    const count = (this.counts.get(counterKey) ?? 0) + 1;
+    this.counts.set(counterKey, count);
+
+    // Production implementations should expire old window keys.
+    return count <= this.limit;
+  }
+}
+```
+
+Use fixed windows when the limit is simple and brief bursts around the edge of a window are acceptable.
+
+<h3 id="sliding-window-log">Sliding Window Log</h3>
+
+The sliding window log stores the timestamp of each request. For every new request, it only counts timestamps that are still inside the rolling window.
+
+Example:
+
+```plaintext
+Limit: 100 requests in any rolling 60-second period
+```
+
+<h4 id="how-it-works">How It Works</h4>
+
+1. Store request timestamps for the key.
+2. Remove timestamps older than the window.
+3. Count the remaining timestamps.
+4. Allow the request if the count is below the limit.
+5. Add the new timestamp if allowed.
+
+<h4 id="code-example">Code Example</h4>
+
+This limiter keeps a list of timestamps per key, drops old timestamps, and allows the request only when the remaining count is still under the limit.
+
+```java
+import java.util.*;
+
+class SlidingWindowLogLimiter {
+    private final int limit;
+    private final long windowSeconds;
+    private final Map<String, Deque<Double>> events;
+
+    public SlidingWindowLogLimiter(int limit, long windowSeconds) {
+        this.limit = limit;
+        this.windowSeconds = windowSeconds;
+        this.events = new HashMap<>();
+    }
+
+    public boolean allow(String key, Double now) {
+        double current = now == null ? System.currentTimeMillis() / 1000.0 : now;
+        double cutoff = current - windowSeconds;
+        Deque<Double> timestamps = events.computeIfAbsent(key, k -> new ArrayDeque<>());
+
+        while (!timestamps.isEmpty() && timestamps.peekFirst() <= cutoff) {
+            timestamps.pollFirst();
+        }
+
+        if (timestamps.size() >= limit) {
+            return false;
+        }
+
+        timestamps.addLast(current);
+        return true;
+    }
+}
+```
+
+```python
+import time
+from collections import defaultdict, deque
+
+class SlidingWindowLogLimiter:
+    def __init__(self, limit, window_seconds):
+        self.limit = limit
+        self.window_seconds = window_seconds
+        self.events = defaultdict(deque)
+
+    def allow(self, key, now=None):
+        now = time.time() if now is None else now
+        cutoff = now - self.window_seconds
+        timestamps = self.events[key]
+
+        while timestamps and timestamps[0] <= cutoff:
+            timestamps.popleft()
+
+        if len(timestamps) >= self.limit:
+            return False
+
+        timestamps.append(now)
+        return True
+```
+
+```cpp
+#include <bits/stdc++.h>
+using namespace std;
+
+class SlidingWindowLogLimiter {
+    int limit;
+    long long windowSeconds;
+    unordered_map<string, deque<double>> events;
+
+public:
+    SlidingWindowLogLimiter(int limit, long long windowSeconds) {
+        this->limit = limit;
+        this->windowSeconds = windowSeconds;
+    }
+
+    bool allow(string key, optional<double> now) {
+        double current = now.has_value() ? *now : chrono::duration<double>(chrono::system_clock::now().time_since_epoch()).count();
+        double cutoff = current - windowSeconds;
+        deque<double>& timestamps = events[key];
+
+        while (!timestamps.empty() && timestamps.front() <= cutoff) {
+            timestamps.pop_front();
+        }
+
+        if ((int)timestamps.size() >= limit) {
+            return false;
+        }
+
+        timestamps.push_back(current);
+        return true;
+    }
+};
+```
+
+```go
+type SlidingWindowLogLimiter struct {
+	limit         int
+	windowSeconds int64
+	events        map[string][]float64
+}
+
+func NewSlidingWindowLogLimiter(limit int, windowSeconds int64) *SlidingWindowLogLimiter {
+	return &SlidingWindowLogLimiter{
+		limit:         limit,
+		windowSeconds: windowSeconds,
+		events:        make(map[string][]float64),
+	}
+}
+
+func (s *SlidingWindowLogLimiter) Allow(key string, now *float64) bool {
+	current := float64(time.Now().UnixNano()) / 1e9
+	if now != nil {
+		current = *now
+	}
+	cutoff := current - float64(s.windowSeconds)
+	timestamps := s.events[key]
+
+	i := 0
+	for i < len(timestamps) && timestamps[i] <= cutoff {
+		i++
+	}
+	timestamps = timestamps[i:]
+
+	if len(timestamps) >= s.limit {
+		s.events[key] = timestamps
+		return false
+	}
+
+	timestamps = append(timestamps, current)
+	s.events[key] = timestamps
+	return true
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+
+class SlidingWindowLogLimiter {
+    private readonly int limit;
+    private readonly long windowSeconds;
+    private readonly Dictionary<string, Queue<double>> events;
+
+    public SlidingWindowLogLimiter(int limit, long windowSeconds) {
+        this.limit = limit;
+        this.windowSeconds = windowSeconds;
+        this.events = new Dictionary<string, Queue<double>>();
+    }
+
+    public bool Allow(string key, double? now) {
+        double current = now ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
+        double cutoff = current - windowSeconds;
+        if (!events.TryGetValue(key, out Queue<double> timestamps)) {
+            timestamps = new Queue<double>();
+            events[key] = timestamps;
+        }
+
+        while (timestamps.Count > 0 && timestamps.Peek() <= cutoff) {
+            timestamps.Dequeue();
+        }
+
+        if (timestamps.Count >= limit) {
+            return false;
+        }
+
+        timestamps.Enqueue(current);
+        return true;
+    }
+}
+```
+
+```typescript
+class SlidingWindowLogLimiter {
+  private limit: number;
+  private windowSeconds: number;
+  private events: Map<string, number[]>;
+
+  constructor(limit: number, windowSeconds: number) {
+    this.limit = limit;
+    this.windowSeconds = windowSeconds;
+    this.events = new Map();
+  }
+
+  allow(key: string, now?: number): boolean {
+    const current = now === undefined ? Date.now() / 1000.0 : now;
+    const cutoff = current - this.windowSeconds;
+    let timestamps = this.events.get(key);
+    if (timestamps === undefined) {
+      timestamps = [];
+      this.events.set(key, timestamps);
+    }
+
+    while (timestamps.length > 0 && timestamps[0] <= cutoff) {
+      timestamps.shift();
+    }
+
+    if (timestamps.length >= this.limit) {
+      return false;
+    }
+
+    timestamps.push(current);
+    return true;
+  }
+}
+```
+
+Use sliding logs when accuracy matters and each key has modest traffic, such as password reset attempts or sensitive account operations.
+
+<h3 id="sliding-window-counter">Sliding Window Counter</h3>
+
+The sliding window counter gives you a rolling-window estimate without storing every timestamp.
+
+It keeps two counts: the current fixed window and the previous fixed window. Then it counts only the part of the previous window that still overlaps the last `60` seconds.
+
+Example:
+
+```plaintext
+Limit: 100 requests per minute
+Previous window count: 80
+Current window count: 30
+Current window elapsed: 25%
+
+Estimated count = 80 * 75% + 30 = 90
+Decision: allow
+```
+
+The `75%` comes from the overlap. If 25% of the current minute has passed, then 75% of the previous minute is still inside the last 60 seconds.
+
+<h4 id="code-example">Code Example</h4>
+
+The code below stores only the current and previous window counts per key, then uses the overlap to estimate the rolling total.
+
+```java
+import java.util.HashMap;
+import java.util.Map;
+
+class SlidingWindowCounterLimiter {
+    private final int limit;
+    private final int windowSeconds;
+    private final Map<String, State> state;
+
+    private static class State {
+        double currentStart;
+        int previousCount;
+        int currentCount;
+
+        State(double currentStart, int previousCount, int currentCount) {
+            this.currentStart = currentStart;
+            this.previousCount = previousCount;
+            this.currentCount = currentCount;
+        }
+    }
+
+    public SlidingWindowCounterLimiter(int limit, int windowSeconds) {
+        this.limit = limit;
+        this.windowSeconds = windowSeconds;
+        this.state = new HashMap<>();
+    }
+
+    public boolean allow(String key) {
+        return allow(key, System.currentTimeMillis() / 1000.0);
+    }
+
+    public boolean allow(String key, double now) {
+        double windowStart = now - (now % windowSeconds);
+
+        State s = state.getOrDefault(key, new State(windowStart, 0, 0));
+
+        if (windowStart > s.currentStart) {
+            int windowsPassed = (int) ((windowStart - s.currentStart) / windowSeconds);
+            s.previousCount = windowsPassed == 1 ? s.currentCount : 0;
+            s.currentCount = 0;
+            s.currentStart = windowStart;
+        }
+
+        double elapsed = now - s.currentStart;
+        double previousWeight = ((double) windowSeconds - elapsed) / windowSeconds;
+        double estimatedCount = s.previousCount * previousWeight + s.currentCount;
+
+        if (estimatedCount + 1 > limit) {
+            state.put(key, s);
+            return false;
+        }
+
+        s.currentCount += 1;
+        state.put(key, s);
+        return true;
+    }
+}
+```
+
+```python
+import time
+
+class SlidingWindowCounterLimiter:
+    def __init__(self, limit, window_seconds):
+        self.limit = limit
+        self.window_seconds = window_seconds
+        self.state = {}
+
+    def allow(self, key, now=None):
+        now = time.time() if now is None else now
+        window_start = now - (now % self.window_seconds)
+
+        current_start, previous_count, current_count = self.state.get(
+            key,
+            (window_start, 0, 0),
+        )
+
+        if window_start > current_start:
+            windows_passed = int((window_start - current_start) // self.window_seconds)
+            previous_count = current_count if windows_passed == 1 else 0
+            current_count = 0
+            current_start = window_start
+
+        elapsed = now - current_start
+        previous_weight = (self.window_seconds - elapsed) / self.window_seconds
+        estimated_count = previous_count * previous_weight + current_count
+
+        if estimated_count + 1 > self.limit:
+            self.state[key] = (current_start, previous_count, current_count)
+            return False
+
+        current_count += 1
+        self.state[key] = (current_start, previous_count, current_count)
+        return True
+```
+
+```cpp
+#include <unordered_map>
+#include <string>
+
+class SlidingWindowCounterLimiter {
+private:
+    int limit;
+    int windowSeconds;
+    struct State {
+        double currentStart;
+        int previousCount;
+        int currentCount;
+    };
+    std::unordered_map<std::string, State> state;
+
+public:
+    SlidingWindowCounterLimiter(int limit, int windowSeconds)
+        : limit(limit), windowSeconds(windowSeconds) {}
+
+    bool allow(const std::string& key) {
+        return allow(key, std::time(nullptr));
+    }
+
+    bool allow(const std::string& key, double now) {
+        double windowStart = now - std::fmod(now, windowSeconds);
+
+        State s = state.count(key) ? state[key] : State{windowStart, 0, 0};
+
+        if (windowStart > s.currentStart) {
+            int windowsPassed = (int)((windowStart - s.currentStart) / windowSeconds);
+            s.previousCount = windowsPassed == 1 ? s.currentCount : 0;
+            s.currentCount = 0;
+            s.currentStart = windowStart;
+        }
+
+        double elapsed = now - s.currentStart;
+        double previousWeight = ((double)windowSeconds - elapsed) / windowSeconds;
+        double estimatedCount = s.previousCount * previousWeight + s.currentCount;
+
+        if (estimatedCount + 1 > limit) {
+            state[key] = s;
+            return false;
+        }
+
+        s.currentCount += 1;
+        state[key] = s;
+        return true;
+    }
+};
+```
+
+```go
+type SlidingWindowCounterLimiter struct {
+	limit        int
+	windowSeconds int
+	state        map[string]*state
+}
+
+type state struct {
+	currentStart  float64
+	previousCount int
+	currentCount  int
+}
+
+func NewSlidingWindowCounterLimiter(limit int, windowSeconds int) *SlidingWindowCounterLimiter {
+	return &SlidingWindowCounterLimiter{
+		limit:        limit,
+		windowSeconds: windowSeconds,
+		state:        make(map[string]*state),
+	}
+}
+
+func (l *SlidingWindowCounterLimiter) allow(key string) bool {
+	return l.allowWithNow(key, float64(time.Now().UnixNano())/1e9)
+}
+
+func (l *SlidingWindowCounterLimiter) allowWithNow(key string, now float64) bool {
+	windowStart := now - math.Mod(now, float64(l.windowSeconds))
+
+	s, ok := l.state[key]
+	if !ok {
+		s = &state{currentStart: windowStart}
+	}
+
+	if windowStart > s.currentStart {
+		windowsPassed := int((windowStart - s.currentStart) / float64(l.windowSeconds))
+		if windowsPassed == 1 {
+			s.previousCount = s.currentCount
+		} else {
+			s.previousCount = 0
+		}
+		s.currentCount = 0
+		s.currentStart = windowStart
+	}
+
+	elapsed := now - s.currentStart
+	previousWeight := (float64(l.windowSeconds) - elapsed) / float64(l.windowSeconds)
+	estimatedCount := float64(s.previousCount)*previousWeight + float64(s.currentCount)
+
+	if estimatedCount+1 > float64(l.limit) {
+		l.state[key] = s
+		return false
+	}
+
+	s.currentCount++
+	l.state[key] = s
+	return true
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+
+class SlidingWindowCounterLimiter
+{
+    private readonly int limit;
+    private readonly int windowSeconds;
+    private readonly Dictionary<string, State> state;
+
+    private class State
+    {
+        public double currentStart;
+        public int previousCount;
+        public int currentCount;
+
+        public State(double currentStart, int previousCount, int currentCount)
+        {
+            this.currentStart = currentStart;
+            this.previousCount = previousCount;
+            this.currentCount = currentCount;
+        }
+    }
+
+    public SlidingWindowCounterLimiter(int limit, int windowSeconds)
+    {
+        this.limit = limit;
+        this.windowSeconds = windowSeconds;
+        this.state = new Dictionary<string, State>();
+    }
+
+    public bool allow(string key)
+    {
+        return allow(key, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0);
+    }
+
+    public bool allow(string key, double now)
+    {
+        double windowStart = now - (now % windowSeconds);
+
+        if (!state.TryGetValue(key, out State s))
+        {
+            s = new State(windowStart, 0, 0);
+        }
+
+        if (windowStart > s.currentStart)
+        {
+            int windowsPassed = (int)((windowStart - s.currentStart) / windowSeconds);
+            s.previousCount = windowsPassed == 1 ? s.currentCount : 0;
+            s.currentCount = 0;
+            s.currentStart = windowStart;
+        }
+
+        double elapsed = now - s.currentStart;
+        double previousWeight = ((double)windowSeconds - elapsed) / windowSeconds;
+        double estimatedCount = s.previousCount * previousWeight + s.currentCount;
+
+        if (estimatedCount + 1 > limit)
+        {
+            state[key] = s;
+            return false;
+        }
+
+        s.currentCount += 1;
+        state[key] = s;
+        return true;
+    }
+}
+```
+
+```typescript
+class SlidingWindowCounterLimiter {
+  private readonly limit: number;
+  private readonly windowSeconds: number;
+  private readonly state: Map<string, State>;
+
+  constructor(limit: number, windowSeconds: number) {
+    this.limit = limit;
+    this.windowSeconds = windowSeconds;
+    this.state = new Map();
+  }
+
+  allow(key: string): boolean {
+    return this.allowWithNow(key, Date.now() / 1000.0);
+  }
+
+  allowWithNow(key: string, now: number): boolean {
+    const windowStart = now - (now % this.windowSeconds);
+
+    let s = this.state.get(key);
+    if (!s) {
+      s = { currentStart: windowStart, previousCount: 0, currentCount: 0 };
+    }
+
+    if (windowStart > s.currentStart) {
+      const windowsPassed = Math.floor(
+        (windowStart - s.currentStart) / this.windowSeconds,
+      );
+      s.previousCount = windowsPassed === 1 ? s.currentCount : 0;
+      s.currentCount = 0;
+      s.currentStart = windowStart;
+    }
+
+    const elapsed = now - s.currentStart;
+    const previousWeight = (this.windowSeconds - elapsed) / this.windowSeconds;
+    const estimatedCount = s.previousCount * previousWeight + s.currentCount;
+
+    if (estimatedCount + 1 > this.limit) {
+      this.state.set(key, s);
+      return false;
+    }
+
+    s.currentCount += 1;
+    this.state.set(key, s);
+    return true;
+  }
+}
+
+interface State {
+  currentStart: number;
+  previousCount: number;
+  currentCount: number;
+}
+```
+
+Use sliding window counters when you need smoother behavior than fixed windows without storing every request timestamp.
+
+<h3 id="token-bucket">Token Bucket</h3>
+
+The token bucket algorithm allows controlled bursts.
+
+Think of the bucket as saved permission to make requests. Tokens refill at a steady rate up to a maximum size. Each request spends one or more tokens. If the bucket has enough tokens, the request is allowed. If not, the request is rejected or delayed.
+
+Example:
+
+```plaintext
+Refill rate: 10 tokens per second
+Bucket size: 100 tokens
+Request cost: 1 token
+```
+
+This lets a client send up to `100` requests after being idle, then continue at about `10 requests per second`.
+
+<h4 id="code-example">Code Example</h4>
+
+The implementation refills tokens based on how much time has passed since the last request, then allows the call only if there are enough tokens to spend.
+
+```java
+class TokenBucketLimiter {
+    private final double capacity;
+    private final double refillRate;
+    private final java.util.HashMap<String, Bucket> buckets = new java.util.HashMap<>();
+
+    private static class Bucket {
+        double tokens;
+        double lastRefill;
+
+        Bucket(double tokens, double lastRefill) {
+            this.tokens = tokens;
+            this.lastRefill = lastRefill;
+        }
+    }
+
+    public TokenBucketLimiter(double capacity, double refillRatePerSecond) {
+        this.capacity = capacity;
+        this.refillRate = refillRatePerSecond;
+    }
+
+    public boolean allow(String key) {
+        return allow(key, 1, -1);
+    }
+
+    public boolean allow(String key, double cost, Double now) {
+        double current = (now == null) ? System.nanoTime() / 1e9 : now;
+        Bucket bucket = buckets.getOrDefault(key, new Bucket(capacity, current));
+
+        double elapsed = Math.max(0, current - bucket.lastRefill);
+        double tokens = Math.min(capacity, bucket.tokens + elapsed * refillRate);
+
+        if (tokens < cost) {
+            buckets.put(key, new Bucket(tokens, current));
+            return false;
+        }
+
+        tokens -= cost;
+        buckets.put(key, new Bucket(tokens, current));
+        return true;
+    }
+}
+```
+
+```python
+import time
+
+class TokenBucketLimiter:
+    def __init__(self, capacity, refill_rate_per_second):
+        self.capacity = capacity
+        self.refill_rate = refill_rate_per_second
+        self.buckets = {}
+
+    def allow(self, key, cost=1, now=None):
+        now = time.monotonic() if now is None else now
+        tokens, last_refill = self.buckets.get(key, (self.capacity, now))
+
+        elapsed = max(0, now - last_refill)
+        tokens = min(self.capacity, tokens + elapsed * self.refill_rate)
+
+        if tokens < cost:
+            self.buckets[key] = (tokens, now)
+            return False
+
+        tokens -= cost
+        self.buckets[key] = (tokens, now)
+        return True
+```
+
+```cpp
+class TokenBucketLimiter {
+private:
+    double capacity;
+    double refillRate;
+    std::unordered_map<std::string, std::pair<double, double>> buckets;
+
+public:
+    TokenBucketLimiter(double capacity, double refillRatePerSecond)
+        : capacity(capacity), refillRate(refillRatePerSecond) {}
+
+    bool allow(const std::string& key) {
+        return allow(key, 1, -1);
+    }
+
+    bool allow(const std::string& key, double cost, double now) {
+        double current = (now < 0) ? std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() : now;
+        auto it = buckets.find(key);
+        double tokens = capacity;
+        double lastRefill = current;
+        if (it != buckets.end()) {
+            tokens = it->second.first;
+            lastRefill = it->second.second;
+        }
+
+        double elapsed = std::max(0.0, current - lastRefill);
+        tokens = std::min(capacity, tokens + elapsed * refillRate);
+
+        if (tokens < cost) {
+            buckets[key] = {tokens, current};
+            return false;
+        }
+
+        tokens -= cost;
+        buckets[key] = {tokens, current};
+        return true;
+    }
+};
+```
+
+```go
+type TokenBucketLimiter struct {
+	capacity   float64
+	refillRate float64
+	buckets    map[string]*Bucket
+}
+
+type Bucket struct {
+	tokens     float64
+	lastRefill float64
+}
+
+func NewTokenBucketLimiter(capacity, refillRatePerSecond float64) *TokenBucketLimiter {
+	return &TokenBucketLimiter{
+		capacity:   capacity,
+		refillRate: refillRatePerSecond,
+		buckets:    make(map[string]*Bucket),
+	}
+}
+
+func (t *TokenBucketLimiter) Allow(key string) bool {
+	return t.AllowCost(key, 1, -1)
+}
+
+func (t *TokenBucketLimiter) AllowCost(key string, cost, now float64) bool {
+	current := now
+	if now < 0 {
+		current = float64(time.Now().UnixNano()) / 1e9
+	}
+	bucket, ok := t.buckets[key]
+	if !ok {
+		bucket = &Bucket{tokens: t.capacity, lastRefill: current}
+	}
+
+	elapsed := math.Max(0, current-bucket.lastRefill)
+	tokens := math.Min(t.capacity, bucket.tokens+elapsed*t.refillRate)
+
+	if tokens < cost {
+		t.buckets[key] = &Bucket{tokens: tokens, lastRefill: current}
+		return false
+	}
+
+	tokens -= cost
+	t.buckets[key] = &Bucket{tokens: tokens, lastRefill: current}
+	return true
+}
+```
+
+```csharp
+class TokenBucketLimiter
+{
+    private readonly double capacity;
+    private readonly double refillRate;
+    private readonly System.Collections.Generic.Dictionary<string, Bucket> buckets = new System.Collections.Generic.Dictionary<string, Bucket>();
+
+    private class Bucket
+    {
+        public double Tokens;
+        public double LastRefill;
+
+        public Bucket(double tokens, double lastRefill)
+        {
+            Tokens = tokens;
+            LastRefill = lastRefill;
+        }
+    }
+
+    public TokenBucketLimiter(double capacity, double refillRatePerSecond)
+    {
+        this.capacity = capacity;
+        this.refillRate = refillRatePerSecond;
+    }
+
+    public bool allow(string key)
+    {
+        return allow(key, 1, -1);
+    }
+
+    public bool allow(string key, double cost, double now)
+    {
+        double current = (now < 0) ? System.Diagnostics.Stopwatch.GetTimestamp() / (double)System.Diagnostics.Stopwatch.Frequency : now;
+        Bucket bucket;
+        if (!buckets.TryGetValue(key, out bucket))
+        {
+            bucket = new Bucket(capacity, current);
+        }
+
+        double elapsed = System.Math.Max(0, current - bucket.LastRefill);
+        double tokens = System.Math.Min(capacity, bucket.Tokens + elapsed * refillRate);
+
+        if (tokens < cost)
+        {
+            buckets[key] = new Bucket(tokens, current);
+            return false;
+        }
+
+        tokens -= cost;
+        buckets[key] = new Bucket(tokens, current);
+        return true;
+    }
+}
+```
+
+```typescript
+class TokenBucketLimiter {
+  private readonly capacity: number;
+  private readonly refillRate: number;
+  private readonly buckets: Map<
+    string,
+    { tokens: number; lastRefill: number }
+  > = new Map();
+
+  constructor(capacity: number, refillRatePerSecond: number) {
+    this.capacity = capacity;
+    this.refillRate = refillRatePerSecond;
+  }
+
+  allow(key: string): boolean {
+    return this.allowCost(key, 1, -1);
+  }
+
+  allowCost(key: string, cost: number, now: number): boolean {
+    const current = now < 0 ? Date.now() / 1000 : now;
+    const bucket = this.buckets.get(key) ?? {
+      tokens: this.capacity,
+      lastRefill: current,
+    };
+
+    const elapsed = Math.max(0, current - bucket.lastRefill);
+    let tokens = Math.min(
+      this.capacity,
+      bucket.tokens + elapsed * this.refillRate,
+    );
+
+    if (tokens < cost) {
+      this.buckets.set(key, { tokens, lastRefill: current });
+      return false;
+    }
+
+    tokens -= cost;
+    this.buckets.set(key, { tokens, lastRefill: current });
+    return true;
+  }
+}
+```
+
+Use token buckets for public APIs where short bursts are fine, but long-running traffic must stay within a steady average rate.
+
+<h3 id="leaky-bucket">Leaky Bucket</h3>
+
+The leaky bucket algorithm smooths traffic by letting work leave at a constant rate.
+
+Think of it as a small queue. Requests enter the bucket. Work leaves the bucket at a fixed pace. If the bucket is full, new requests are rejected.
+
+<h4 id="code-example">Code Example</h4>
+
+The code models the bucket as a queue that drains at a fixed interval. It allows a request only when there is room left in the queue.
+
+```java
+import java.util.*;
+
+class LeakyBucketLimiter {
+    private final int capacity;
+    private final double interval;
+    private final Map<String, Deque<Double>> queues;
+
+    public LeakyBucketLimiter(int capacity, double leakRatePerSecond) {
+        this.capacity = capacity;
+        this.interval = 1.0 / leakRatePerSecond;
+        this.queues = new HashMap<>();
+    }
+
+    public boolean allow(String key, Double now) {
+        double current = now == null ? System.nanoTime() / 1_000_000_000.0 : now;
+        Deque<Double> queue = queues.computeIfAbsent(key, k -> new ArrayDeque<>());
+
+        while (!queue.isEmpty() && queue.peekFirst() <= current) {
+            queue.pollFirst();
+        }
+
+        if (queue.size() >= capacity) {
+            return false;
+        }
+
+        double lastScheduled = queue.isEmpty() ? current : queue.peekLast();
+        queue.addLast(Math.max(current, lastScheduled) + interval);
+        return true;
+    }
+}
+```
+
+```python
+import time
+from collections import defaultdict, deque
+
+class LeakyBucketLimiter:
+    def __init__(self, capacity, leak_rate_per_second):
+        self.capacity = capacity
+        self.interval = 1.0 / leak_rate_per_second
+        self.queues = defaultdict(deque)
+
+    def allow(self, key, now=None):
+        now = time.monotonic() if now is None else now
+        queue = self.queues[key]
+
+        while queue and queue[0] <= now:
+            queue.popleft()
+
+        if len(queue) >= self.capacity:
+            return False
+
+        last_scheduled = queue[-1] if queue else now
+        queue.append(max(now, last_scheduled) + self.interval)
+        return True
+```
+
+```cpp
+#include <bits/stdc++.h>
+using namespace std;
+
+class LeakyBucketLimiter {
+    int capacity;
+    double interval;
+    unordered_map<string, deque<double>> queues;
+
+public:
+    LeakyBucketLimiter(int capacity, double leakRatePerSecond) {
+        this->capacity = capacity;
+        this->interval = 1.0 / leakRatePerSecond;
+    }
+
+    bool allow(const string& key, optional<double> now) {
+        double current = now.has_value() ? *now : chrono::duration<double>(chrono::steady_clock::now().time_since_epoch()).count();
+        deque<double>& queue = queues[key];
+
+        while (!queue.empty() && queue.front() <= current) {
+            queue.pop_front();
+        }
+
+        if ((int)queue.size() >= capacity) {
+            return false;
+        }
+
+        double lastScheduled = queue.empty() ? current : queue.back();
+        queue.push_back(max(current, lastScheduled) + interval);
+        return true;
+    }
+};
+```
+
+```go
+type LeakyBucketLimiter struct {
+	capacity int
+	interval float64
+	queues   map[string][]float64
+}
+
+func NewLeakyBucketLimiter(capacity int, leakRatePerSecond float64) *LeakyBucketLimiter {
+	return &LeakyBucketLimiter{
+		capacity: capacity,
+		interval: 1.0 / leakRatePerSecond,
+		queues:   make(map[string][]float64),
+	}
+}
+
+func (l *LeakyBucketLimiter) allow(key string, now *float64) bool {
+	current := 0.0
+	if now == nil {
+		current = float64(timeNow()) / 1_000_000_000.0
+	} else {
+		current = *now
+	}
+	queue := l.queues[key]
+
+	for len(queue) > 0 && queue[0] <= current {
+		queue = queue[1:]
+	}
+
+	if len(queue) >= l.capacity {
+		l.queues[key] = queue
+		return false
+	}
+
+	lastScheduled := current
+	if len(queue) > 0 {
+		lastScheduled = queue[len(queue)-1]
+	}
+	queue = append(queue, mathMax(current, lastScheduled)+l.interval)
+	l.queues[key] = queue
+	return true
+}
+
+func mathMax(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func timeNow() int64 {
+	return timeNowNano()
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+
+class LeakyBucketLimiter
+{
+    private readonly int capacity;
+    private readonly double interval;
+    private readonly Dictionary<string, Queue<double>> queues;
+
+    public LeakyBucketLimiter(int capacity, double leakRatePerSecond)
+    {
+        this.capacity = capacity;
+        this.interval = 1.0 / leakRatePerSecond;
+        this.queues = new Dictionary<string, Queue<double>>();
+    }
+
+    public bool allow(string key, double? now)
+    {
+        double current = now ?? (DateTime.UtcNow - DateTime.UnixEpoch).TotalSeconds;
+        if (!queues.TryGetValue(key, out Queue<double> queue))
+        {
+            queue = new Queue<double>();
+            queues[key] = queue;
+        }
+
+        while (queue.Count > 0 && queue.Peek() <= current)
+        {
+            queue.Dequeue();
+        }
+
+        if (queue.Count >= capacity)
+        {
+            return false;
+        }
+
+        double lastScheduled = queue.Count == 0 ? current : GetLast(queue);
+        queue.Enqueue(Math.Max(current, lastScheduled) + interval);
+        return true;
+    }
+
+    private static double GetLast(Queue<double> queue)
+    {
+        double last = 0;
+        foreach (double value in queue)
+        {
+            last = value;
+        }
+        return last;
+    }
+}
+```
+
+```typescript
+class LeakyBucketLimiter {
+  private capacity: number;
+  private interval: number;
+  private queues: Map<string, number[]>;
+
+  constructor(capacity: number, leakRatePerSecond: number) {
+    this.capacity = capacity;
+    this.interval = 1.0 / leakRatePerSecond;
+    this.queues = new Map();
+  }
+
+  allow(key: string, now?: number): boolean {
+    const current = now === undefined ? Date.now() / 1000.0 : now;
+    let queue = this.queues.get(key);
+    if (queue === undefined) {
+      queue = [];
+      this.queues.set(key, queue);
+    }
+
+    while (queue.length > 0 && queue[0] <= current) {
+      queue.shift();
+    }
+
+    if (queue.length >= this.capacity) {
+      return false;
+    }
+
+    const lastScheduled =
+      queue.length === 0 ? current : queue[queue.length - 1];
+    queue.push(Math.max(current, lastScheduled) + this.interval);
+    return true;
+  }
+}
+```
+
+The example above uses a non-blocking style: each accepted request reserves a future slot, and the limiter rejects when too many slots are waiting. Another version would make the caller wait until the next slot is available. Both are called "leaky bucket" in practice; choose the one that fits whether your stack can pause callers.
+
+Use leaky buckets when smooth traffic matters more than allowing bursts, especially in front of fragile services or third-party APIs.
+
+<h3 id="tracing-a-burst-through-the-algorithms">
+  Tracing a Burst Through the Algorithms
+</h3>
+
+The differences between these algorithms are easiest to see by sending the same traffic through each one. Take a limit of `100 requests per minute`. Now imagine a client sends 80 requests in the last second of one minute, then another 80 in the first second of the next minute. That is 160 requests in about two seconds.
+
+- **Fixed window** counts per calendar minute. The first 80 fall in the `12:00` bucket (80/100, allowed) and the next 80 fall in the `12:01` bucket (80/100, allowed). All 160 get through in about two seconds, even though the policy sounds like 100 per minute. This is the boundary burst: a fixed window can pass up to twice the limit around a window edge.
+- **Sliding window counter** blends the two buckets by their overlap. One second into `12:01`, its estimate still includes almost all of the previous minute's 80 requests, so the running estimate is near 160 and it starts rejecting partway through the second burst. The boundary burst is smoothed out.
+- **Token bucket** with capacity 100 and a refill of 100 tokens per minute allows the first 80 by spending 80 tokens, leaving 20. One second later only about 1.6 tokens have refilled, so roughly the next 21 requests are allowed and the rest are rejected until more tokens build up. The bucket allows a controlled burst, then enforces the average rate.
+
+Same traffic, three different answers: fixed window lets all 160 through, while the sliding counter and token bucket hold the client closer to the intended 100. That is why boundary bursts matter when you pick an algorithm.
+
+<h1 id="6-choosing-an-algorithm">6. Choosing an Algorithm</h1>
+
+Each algorithm balances accuracy, memory, and burst handling differently. No single one wins everywhere. Use this table as a practical starting point.
+
+| Algorithm           | Accuracy          | Memory      | Burst Behavior           | Good Fit                        |
+| ------------------- | ----------------- | ----------- | ------------------------ | ------------------------------- |
+| **Fixed window**    | Low at boundaries | Low         | Allows boundary bursts   | Simple quotas                   |
+| **Sliding log**     | High              | High        | Strict rolling limit     | Low-volume sensitive operations |
+| **Sliding counter** | Medium-high       | Low         | Smooths boundary bursts  | General API limits              |
+| **Token bucket**    | Medium            | Low         | Allows configured bursts | Public APIs and weighted limits |
+| **Leaky bucket**    | Medium            | Queue-sized | Smooths traffic          | Protecting fragile systems      |
+
+As a default:
+
+- Use token bucket for most per-user or per-API-key request limits.
+- Use sliding window counter when boundary bursts are a real problem.
+- Use sliding window log for sensitive, low-volume security controls.
+- Use fixed window for simple quota enforcement.
+- Use leaky bucket when the system behind the limiter needs a steady flow.
+
+<h1 id="7-distributed-rate-limiting">7. Distributed Rate Limiting</h1>
+
+Rate limiting becomes harder when traffic is handled by many gateway or service instances.
+
+If each instance keeps only its own counters, a client can go over the real limit by spreading requests across instances.
+
+```plaintext
+Limit: 100 requests per minute
+Gateway instances: 10
+Local limit per instance: 100
+Actual possible traffic: 1,000 requests per minute
+```
+
+That means the instances need some way to agree on the count.
+
+<h3 id="centralized-counter-store">Centralized Counter Store</h3>
+
+Store counters in Redis, Memcached, DynamoDB, FoundationDB, or another fast shared system.
+
+The limiter must update counters safely so two requests cannot both sneak through at the same time. A common Redis implementation uses `INCR` plus `EXPIRE` for fixed windows, or Lua scripts for token buckets and sliding counters.
+
+The tradeoff is latency and availability. Every request may need a network call to the limiter store.
+
+<h3 id="local-limiters-with-periodic-sync">
+  Local Limiters With Periodic Sync
+</h3>
+
+Each node gets a local budget and periodically syncs with a central service.
+
+This reduces latency and avoids depending on a central store for every request, but the global limit becomes an estimate. It works well when small overages are acceptable.
+
+<h3 id="sharded-limiters">Sharded Limiters</h3>
+
+Route each rate-limit key to a specific shard.
+
+This can scale well, but very busy tenants or popular API keys can overload one shard. You may need to split busy keys, change limits dynamically, or give large tenants special handling.
+
+<h3 id="multi-region-limits">Multi-Region Limits</h3>
+
+Global limits across regions are expensive to enforce exactly. Asking regions to coordinate on every request adds latency and can fail when regions cannot talk to each other. Common approaches are to enforce per-region limits and accept small differences, give each region part of a global budget, pin each tenant to a home region, or use strict global limits only for costly operations.
+
+Exact global rate limiting is rarely worth the operational cost for ordinary request counts. It may be worth it for money, quota, abuse, or operations with legal or compliance requirements.
+
+<h1 id="8-failure-modes">8. Failure Modes</h1>
+
+Rate limiters sit on the request path, so their failure behavior matters.
+
+<h3 id="race-conditions">Race Conditions</h3>
+
+The check and increment must happen as one safe operation.
+
+This is wrong:
+
+```plaintext
+1. Read current count.
+2. If count < limit, allow.
+3. Increment count.
+```
+
+Two requests can read the same count and both pass. Use one safe update operation or a transaction.
+
+<h3 id="missing-expiration">Missing Expiration</h3>
+
+Counters need expiration times. Without them, every user, route, and window key stays in memory forever.
+
+<h3 id="hot-keys">Hot Keys</h3>
+
+Large tenants, popular API keys, or many users behind the same IP can create hot keys. A single counter can become the bottleneck.
+
+Plan separately for many small keys and a few very busy keys.
+
+<h3 id="clock-skew">Clock Skew</h3>
+
+Algorithms based on wall-clock time can behave strangely when nodes disagree about time.
+
+Prefer time from the limiter store when possible. For local elapsed-time calculations, use a clock that only moves forward.
+
+<h3 id="fail-open-vs-fail-closed">Fail Open vs Fail Closed</h3>
+
+If the limiter store is unavailable, should requests be allowed?
+
+There is no universal answer.
+
+- For public read APIs, allowing requests may preserve availability.
+- For login attempts, payment operations, expensive AI calls, or abuse controls, rejecting requests or using a small local emergency budget may be safer.
+
+Make this decision on purpose. Do not let random timeout behavior decide it for you.
+
+<h3 id="retry-storms">Retry Storms</h3>
+
+A rejected request can create more traffic if clients retry immediately.
+
+Return clear retry information and design clients to wait longer between retries, with a little randomness so they do not all retry at the same moment.
+
+<h1 id="9-http-responses-and-headers">9. HTTP Responses and Headers</h1>
+
+When an HTTP client exceeds a limit, return `429 Too Many Requests`.
+
+Include a response body that explains the limit in a stable format clients can parse.
+
+Example:
+
+```plaintext
+HTTP/1.1 429 Too Many Requests
+Retry-After: 30
+Content-Type: application/json
+
+{
+  "error": "rate_limit_exceeded",
+  "message": "Too many requests for this API key.",
+  "limit": 100,
+  "window_seconds": 60,
+  "retry_after_seconds": 30
+}
+```
+
+The `Retry-After` header tells the client how long to wait before trying again.
+
+Many APIs also return headers that describe the limit. Newer HTTP guidance defines structured fields named `RateLimit` and `RateLimit-Policy`, but exact syntax can vary by platform and version:
+
+```plaintext
+RateLimit-Policy: "burst";q=100;w=60
+RateLimit: "burst";r=0;t=30
+```
+
+Many production APIs still use simpler `RateLimit-*` fields:
+
+```plaintext
+RateLimit-Limit: 100
+RateLimit-Remaining: 0
+RateLimit-Reset: 30
+```
+
+Older APIs may use `X-RateLimit-*` variants.
+
+Header conventions still vary across platforms. Document exactly what your API sends, what each value means, whether failed requests count, and whether limits are per user, tenant, route, API key, or some combination.
+
+Clients should treat headers as helpful guidance, not a promise that nothing will change. Servers may lower limits during incidents, deploy new policies, or drop load for reasons outside the normal quota window.
+
+<h1 id="10-rate-limiting-and-ai-systems">10. Rate Limiting and AI Systems</h1>
+
+AI workloads make rate limiting more complicated because request count does not tell you much about cost.
+
+Two requests can have wildly different costs:
+
+- A short classification call with 200 input tokens.
+- A chat request with 200,000 input tokens, retrieval, tool calls, and a long streamed answer.
+
+Useful AI rate limits often include input tokens per minute, output tokens per minute, active generations, requests per model pool, tool calls per user, vector search queries per tenant, daily or monthly spend, and model allowlists by plan.
+
+Streaming also changes behavior. A request may be accepted quickly but hold a connection and model slot for a long time. Limit both start rate and active streaming requests.
+
+Do not log full prompts or responses just to debug rate limits. Track token counts, model, tenant, request ID, and policy decision. Keep sensitive content out of logs by default.
+
+<h1 id="11-practical-design-checklist">11. Practical Design Checklist</h1>
+
+Before adding a rate limit, answer these questions:
+
+1. What resource are we protecting?
+2. What key identifies the caller or tenant?
+3. Is the limit based on request count, cost, concurrency, bytes, tokens, or money?
+4. What happens when the limit is exceeded?
+5. Are retries safe for this endpoint?
+6. Should failed requests count?
+7. Is the limit global, regional, or local to one service?
+8. What happens if the limiter store is down?
+9. What headers and errors will clients receive?
+10. What dashboards and alerts show rate-limit decisions?
+
+Rate limits should be visible in dashboards and alerts. Track allowed requests, rejected requests, limiter latency, hot keys, store errors, and the tenants or API keys that hit limits most often.
+
+<h1 id="summary">Summary</h1>
+
+Rate limiting protects shared capacity by deciding how much work each caller can send. The right unit is not always request count; tokens, cost, bytes, concurrency, or weighted requests often match the real bottleneck better.
+
+Token bucket is a strong default for public APIs because it allows short bursts while controlling the long-term rate. Fixed windows are simple but can allow bursts at window boundaries. Sliding logs are accurate but expensive.
+
+Distributed rate limiting adds a few important decisions: update counters safely, decide what happens when the limiter fails, and plan for hot keys and multi-region differences. For HTTP APIs, return `429 Too Many Requests`, include `Retry-After` when it helps the caller, and document the rate-limit headers clearly.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

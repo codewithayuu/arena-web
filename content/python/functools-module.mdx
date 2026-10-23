@@ -1,0 +1,556 @@
+---
+title: "functools Module"
+readTime: "10 min read"
+lastUpdated: "June 6, 2026"
+description: "functools Module explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="memoization-with-cache-and-lru_cache">
+  Memoization with @cache and @lru_cache
+</h1>
+
+A function that does expensive work for the same inputs every time wastes effort. Memoization is the technique of storing each result so repeat calls return the cached value instead of recomputing. `functools` ships two decorators for this.
+
+The simpler one is `@cache` (added in Python 3.9). It caches every unique argument combination with no limit.
+
+```python
+from functools import cache
+
+@cache
+def shipping_cost(weight_kg, zone):
+    print(f"computing for {weight_kg}kg to zone {zone}")
+    return round(5.00 + weight_kg * 0.50 + zone * 1.25, 2)
+
+print(shipping_cost(2.5, 3))
+print(shipping_cost(2.5, 3))
+print(shipping_cost(1.0, 1))
+print(shipping_cost(2.5, 3))
+```
+
+The "computing" message prints only for unique argument combinations. The first call to `shipping_cost(2.5, 3)` computes and stores. The second and fourth calls with the same arguments return the cached value without re-running the body. The third call has different arguments, so it computes a new result and stores that too.
+
+The older and more configurable version is `@lru_cache(maxsize=N)`. LRU stands for "least recently used", which is the eviction strategy: when the cache fills up, the entry that was used least recently gets discarded to make room for a new one.
+
+```python
+from functools import lru_cache
+
+@lru_cache(maxsize=128)
+def shipping_cost(weight_kg, zone):
+    return round(5.00 + weight_kg * 0.50 + zone * 1.25, 2)
+
+print(shipping_cost(2.5, 3))
+print(shipping_cost(2.5, 3))
+print(shipping_cost.cache_info())
+```
+
+`cache_info()` is a method that any `lru_cache`-decorated function provides. It returns a named tuple with four fields: how many calls hit the cache, how many missed, the maximum size, and how many entries are currently stored. This is the standard way to check whether the cache is paying off; a cache with zero hits is overhead.
+
+```python
+from functools import lru_cache
+
+@lru_cache(maxsize=128)
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+print(fibonacci(30))
+print(fibonacci.cache_info())
+```
+
+Without the cache, `fibonacci(30)` would make over two million recursive calls because of the overlapping subproblems. With the cache, each unique `n` is computed once and reused, bringing the call count down to one per value. The hit/miss ratio tells the whole story.
+
+The cache can be cleared manually with `cache_clear()`, which is useful in tests or when underlying data has changed:
+
+```python
+from functools import lru_cache
+
+@lru_cache(maxsize=128)
+def lookup(product_id):
+    return product_id.upper()
+
+lookup("sku-1")
+lookup("sku-2")
+print(lookup.cache_info())
+
+lookup.cache_clear()
+print(lookup.cache_info())
+```
+
+The difference between `@cache` and `@lru_cache` is the `maxsize`. `@cache` is `@lru_cache(maxsize=None)`: unbounded, never evicts. `@lru_cache` with a number sets a ceiling and evicts the least recently used entry when the ceiling is reached. For most cases, `@cache` is fine; use `@lru_cache(maxsize=...)` when the input space is large enough that an unbounded cache would grow without limit.
+
+One important constraint: **arguments have to be hashable**. The cache uses the arguments as dict keys, so lists, dicts, and sets don't work directly. Tuples, strings, numbers, and frozensets are fine.
+
+```python
+from functools import cache
+
+@cache
+def cart_total(prices):
+    return sum(prices)
+
+# This works because the argument is a tuple.
+print(cart_total((29.99, 14.99, 9.99)))
+
+# This fails because lists aren't hashable.
+print(cart_total([29.99, 14.99, 9.99]))
+```
+
+The error message is the standard Python "unhashable type" complaint. The fix is to pass a tuple (`(29.99, 14.99, 9.99)`) instead of a list, or to redesign the function to accept individual arguments with `*args`. To cache a function that takes a list, convert it: `cart_total(tuple(prices))`.
+
+Cache lookups are O(1) on the size of the cache (it's a dict internally). The cost per call is one hash and one dict lookup, plus the overhead of building the cache key from the arguments. For functions that do non-trivial work, the cache is essentially free. For trivial functions, the cache can be slower than running the body, because the hash and lookup cost more than the function. Profile before assuming the cache helps.
+
+<h1 id="wraps-preserving-function-identity">
+  @wraps: Preserving Function Identity
+</h1>
+
+The decorators lesson introduced `@wraps`. It's in `functools` because it's a tool for writing decorators, but a quick recap here covers it for completeness.
+
+A decorator wraps a function in another function. Without help, the wrapper takes over the wrapped function's identity: its name, its docstring, its module, its qualified name. `@wraps(func)` copies those attributes from `func` onto the wrapper, so the result looks like the original from any introspection tool.
+
+```python
+from functools import wraps
+
+def announce(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        print(f"calling {func.__name__}")
+        return func(*args, **kwargs)
+    return wrapper
+
+@announce
+def cart_total(prices):
+    """Sum the prices in the cart."""
+    return sum(prices)
+
+print(cart_total.__name__)
+print(cart_total.__doc__)
+print(cart_total.__wrapped__)
+```
+
+The first two lines confirm that the wrapped function looks like the original. The third line is a useful detail: `@wraps` also sets `__wrapped__` on the wrapper, which points back to the original undecorated function. That's the way to call past the wrapper when needed (in tests, for example, or to bypass a cache as in the quick check above).
+
+Always use `@wraps` inside any decorator. The decorators lesson covers the rule and the consequences of forgetting; `functools.wraps` is the tool that does it.
+
+<h1 id="partial-binding-arguments-ahead-of-time">
+  partial: Binding Arguments Ahead of Time
+</h1>
+
+`functools.partial` creates a new function from an existing one with some of its arguments already filled in. The new function needs only the remaining arguments. It's the standard way to specialize a general-purpose function for a specific use without writing a whole new function definition.
+
+```python
+from functools import partial
+
+def shipping_cost(weight_kg, zone, express=False):
+    base = 5.00 + weight_kg * 0.50 + zone * 1.25
+    if express:
+        base += 10.00
+    return round(base, 2)
+
+# Build specialized versions.
+zone_1_shipping = partial(shipping_cost, zone=1)
+express_zone_3 = partial(shipping_cost, zone=3, express=True)
+
+print(zone_1_shipping(2.5))
+print(express_zone_3(2.5))
+print(express_zone_3(weight_kg=1.0))
+```
+
+`partial(shipping_cost, zone=1)` returns a new callable that behaves like `shipping_cost` with `zone=1` already supplied. Calling `zone_1_shipping(2.5)` is equivalent to calling `shipping_cost(2.5, zone=1)`. The same pattern works for any combination of positional and keyword arguments; the partial captures whatever it's given.
+
+Positional arguments can also be bound:
+
+```python
+from functools import partial
+
+def price_with_tax(price, tax_rate, discount=0.0):
+    return round(price * (1 - discount) * (1 + tax_rate), 2)
+
+# Bind the tax rate by keyword to be explicit.
+ca_price = partial(price_with_tax, tax_rate=0.0725)
+ny_price = partial(price_with_tax, tax_rate=0.04)
+
+print(ca_price(100))
+print(ny_price(100, discount=0.1))
+```
+
+Two specialized pricing functions built from one general one. The original `price_with_tax` is unchanged; `ca_price` and `ny_price` are new callables that supply different tax rates by default.
+
+The classic use case for `partial` is **callbacks and higher-order functions**: passing a function to another function (a sort key, a button handler, a map callback) when the target function needs extra arguments the receiver doesn't know about.
+
+```python
+from functools import partial
+
+products = [
+    {"name": "Wireless Mouse", "price": 29.99, "rating": 4.5},
+    {"name": "USB Cable", "price": 4.99, "rating": 4.8},
+    {"name": "HDMI Cable", "price": 14.99, "rating": 4.6},
+    {"name": "Webcam", "price": 89.99, "rating": 4.2},
+]
+
+def sort_key(product, by):
+    return product[by]
+
+# Sort by price.
+by_price = sorted(products, key=partial(sort_key, by="price"))
+for p in by_price:
+    print(f"{p['name']}: ${p['price']}")
+
+print()
+
+# Sort by rating.
+by_rating = sorted(products, key=partial(sort_key, by="rating"), reverse=True)
+for p in by_rating:
+    print(f"{p['name']}: {p['rating']}")
+```
+
+`sorted` expects `key` to be a one-argument function that takes a product and returns the value to sort on. `sort_key` takes two arguments. `partial(sort_key, by="price")` produces a one-argument function with `by="price"` baked in, which is what `sorted` needs.
+
+The same can be done with a lambda (`key=lambda p: p["price"]`) or with the standard `operator.itemgetter("price")`. For a single use, the lambda is shorter. For a reusable pattern across many calls, `partial` keeps the function named and reusable.
+
+A `partial` object is callable like any function, with three useful attributes: `.func` is the wrapped function, `.args` is the tuple of bound positional arguments, and `.keywords` is the dict of bound keyword arguments.
+
+```python
+from functools import partial
+
+def greet(greeting, name, punctuation="!"):
+    return f"{greeting}, {name}{punctuation}"
+
+hello = partial(greet, "Hello", punctuation=".")
+print(hello.func)
+print(hello.args)
+print(hello.keywords)
+print(hello("alice"))
+```
+
+The introspection attributes are mostly useful for debugging and for code that needs to know what arguments are already bound. Day-to-day, the partial is called like a function and the internals don't matter.
+
+<h1 id="reduce-folding-a-sequence">reduce: Folding a Sequence</h1>
+
+`functools.reduce` repeatedly applies a two-argument function to a sequence, accumulating a single result. It's the standard "fold" operation from functional programming.
+
+Here's the brief version. The shape is `reduce(func, iterable, initial=...)`: it takes the first two elements (or the initial value plus the first element), applies `func` to them, then applies `func` to that result and the next element, and so on.
+
+```python
+from functools import reduce
+
+prices = [29.99, 14.99, 9.99, 49.99]
+
+# Sum prices: equivalent to sum(prices).
+total = reduce(lambda a, b: a + b, prices)
+print(total)
+
+# Find max price: equivalent to max(prices).
+biggest = reduce(lambda a, b: a if a > b else b, prices)
+print(biggest)
+
+# With an initial value.
+total_with_tax = reduce(lambda a, b: a + b, prices, 100)
+print(total_with_tax)
+```
+
+Most of what `reduce` can do is better expressed with the built-in `sum`, `max`, `min`, or `any`/`all`. `reduce` fits when the operation isn't covered by a built-in and isn't a simple comprehension: combining nested dicts, building a custom accumulator, applying a chain of transformations.
+
+```python
+from functools import reduce
+
+# Merge a list of dicts, later keys winning.
+configs = [
+    {"timeout": 10, "retries": 3},
+    {"timeout": 30, "log_level": "INFO"},
+    {"retries": 5, "log_level": "DEBUG"},
+]
+
+merged = reduce(lambda a, b: {**a, **b}, configs)
+print(merged)
+```
+
+Three dicts merged into one, with each later dict overwriting earlier keys. `reduce` runs the merge function pairwise across the list.
+
+<h1 id="cached_property-lazy-instance-attributes">
+  @cached_property: Lazy Instance Attributes
+</h1>
+
+`@cached_property` (added in Python 3.8) is like `@property` but the result is computed once and stored on the instance, so subsequent accesses return the cached value without re-running the method. Use it when an instance has an expensive-to-compute value that doesn't change for that instance's lifetime.
+
+```python
+from functools import cached_property
+
+class Cart:
+    def __init__(self, items):
+        self.items = items
+
+    @cached_property
+    def total(self):
+        print(f"computing total for cart with {len(self.items)} items")
+        return sum(item["price"] for item in self.items)
+
+cart = Cart([
+    {"name": "Wireless Mouse", "price": 29.99},
+    {"name": "USB Cable", "price": 4.99},
+    {"name": "HDMI Cable", "price": 14.99},
+])
+
+print(cart.total)
+print(cart.total)
+print(cart.total)
+```
+
+The "computing" line prints once. The first access runs the method and stores the result as an attribute on `cart`. The second and third accesses read the attribute. Compared to plain `@property`, which would re-run the method on every access, `@cached_property` trades a small amount of memory (one attribute per instance) for one-time computation.
+
+The cache lives on the instance, not on the class. Two different `Cart` instances each compute their own total once:
+
+```python
+from functools import cached_property
+
+class Cart:
+    def __init__(self, items):
+        self.items = items
+
+    @cached_property
+    def total(self):
+        print(f"computing total")
+        return sum(item["price"] for item in self.items)
+
+a = Cart([{"name": "Mouse", "price": 29.99}])
+b = Cart([{"name": "Cable", "price": 4.99}])
+
+print(a.total)
+print(b.total)
+print(a.total)
+print(b.total)
+```
+
+Each instance computes its total exactly once. The two caches are independent.
+
+One catch: because the cache is stored on the instance, the instance has to allow attribute assignment. Classes that use `__slots__` to restrict attributes can't use `@cached_property` unless `__slots__` includes the property name explicitly. That's a niche concern for most code, but the error message ("object has no attribute") looks unrelated to the cache.
+
+To invalidate the cache, delete the attribute:
+
+```python
+from functools import cached_property
+
+class Cart:
+    def __init__(self, items):
+        self.items = items
+
+    @cached_property
+    def total(self):
+        print("computing total")
+        return sum(item["price"] for item in self.items)
+
+cart = Cart([{"name": "Mouse", "price": 29.99}])
+print(cart.total)
+print(cart.total)
+
+# Items changed; invalidate the cache.
+cart.items.append({"name": "Cable", "price": 4.99})
+del cart.total
+print(cart.total)
+```
+
+The `del cart.total` removes the cached attribute. The next access re-runs the method and stores the new result. Forgetting to invalidate after mutating the underlying data leaves the cached value stale, the classic caching bug.
+
+First access does the full computation plus one attribute assignment. Subsequent accesses are one attribute read, which is among the fastest operations Python has. The memory cost is one attribute per instance per cached property. For a cart with a few cached properties, this is invisible.
+
+The diagram contrasts the two paths. The first access runs the method and stores the result. Every later access skips the method entirely and reads the stored attribute. The cache lives in the same dict that holds every other instance attribute, so reads are fast.
+
+<h1 id="singledispatch-function-overloading-by-type">
+  @singledispatch: Function Overloading by Type
+</h1>
+
+Python doesn't have function overloading the way some other languages do; `def add(int, int)` and `def add(str, str)` can't coexist as two separate functions in the same scope. `@singledispatch` is the standard-library workaround: it allows registering multiple implementations of a function, one per argument type, and Python picks the right one at call time based on the type of the first argument.
+
+```python
+from functools import singledispatch
+
+@singledispatch
+def format_value(value):
+    return f"unknown: {value!r}"
+
+@format_value.register(int)
+def _(value):
+    return f"int: {value:d}"
+
+@format_value.register(float)
+def _(value):
+    return f"price: ${value:.2f}"
+
+@format_value.register(str)
+def _(value):
+    return f"text: {value!r}"
+
+@format_value.register(list)
+def _(value):
+    return f"list of {len(value)} items"
+
+print(format_value(42))
+print(format_value(29.99))
+print(format_value("Wireless Mouse"))
+print(format_value(["Mouse", "Cable"]))
+print(format_value({"name": "Alice"}))
+```
+
+The `@singledispatch` decorator turns `format_value` into a dispatcher. The base implementation (the one decorated with `@singledispatch` itself) handles any type that doesn't have a more specific registration. Each `@format_value.register(SomeType)` registers a specialized implementation for that type. At call time, Python looks at the type of the first argument and picks the matching implementation.
+
+The convention is to name the registered implementations `_` because the name isn't used (Python looks them up through the dispatcher, not by name). Some codebases use descriptive names instead; both work.
+
+Subclasses inherit the registration. A registration for `list` doesn't match a `tuple` (it falls through to the base), but any custom class that inherits from `list` matches the `list` registration.
+
+```python
+from functools import singledispatch
+
+@singledispatch
+def describe(value):
+    return f"generic: {value}"
+
+@describe.register(list)
+def _(value):
+    return f"list with {len(value)} items"
+
+class FancyList(list):
+    pass
+
+print(describe([1, 2, 3]))
+print(describe(FancyList([1, 2, 3])))
+print(describe((1, 2, 3)))
+```
+
+`FancyList` is a subclass of `list`, so it matches the `list` registration. The tuple doesn't match any registered type, so it falls through to the generic implementation.
+
+`@singledispatch` only dispatches on the **first** argument. For dispatch on multiple types, a different tool is needed (multipledispatch is a third-party library, or a custom dispatcher). Most cases that look like they need multiple dispatch can be reformulated to dispatch on one type.
+
+A common use case is serialization: converting different Python objects to a JSON-friendly form, where each type has its own conversion rule.
+
+```python
+from functools import singledispatch
+from datetime import datetime
+
+@singledispatch
+def to_json(value):
+    raise TypeError(f"can't serialize {type(value).__name__}")
+
+@to_json.register(int)
+@to_json.register(float)
+@to_json.register(str)
+@to_json.register(bool)
+def _(value):
+    return value
+
+@to_json.register(datetime)
+def _(value):
+    return value.isoformat()
+
+@to_json.register(list)
+def _(value):
+    return [to_json(item) for item in value]
+
+@to_json.register(dict)
+def _(value):
+    return {k: to_json(v) for k, v in value.items()}
+
+order = {
+    "id": "ORD-42",
+    "placed_at": datetime(2024, 6, 1, 10, 30),
+    "items": ["Wireless Mouse", "USB Cable"],
+    "total": 34.98,
+}
+print(to_json(order))
+```
+
+Each registration handles one type. The list and dict implementations recurse through their contents, calling `to_json` on each element so the dispatcher picks the right rule per item. The base function raises an error for any type that doesn't have a rule, which is a useful default: failing fast beats serializing something incorrectly.
+
+Dispatch is roughly one MRO walk per call, which is fast but not free. For a function called once per request, the cost is invisible. For a function called inside a tight loop over heterogeneous data, dispatch can add up; benchmark before assuming `@singledispatch` fits hot paths.
+
+<h1 id="total_ordering-filling-in-comparison-methods">
+  @total_ordering: Filling in Comparison Methods
+</h1>
+
+A class that defines `__eq__` and one ordering method (like `__lt__`) can get the rest of the ordering methods automatically with `@total_ordering`. The decorator inspects the class, finds the methods defined, and supplies the missing ones (`__le__`, `__gt__`, `__ge__`, and any of the others if a different one was defined).
+
+Without `@total_ordering`, all six methods would be needed to support every comparison. With it, two methods suffice and the decorator handles the rest.
+
+```python
+from functools import total_ordering
+
+@total_ordering
+class Product:
+    def __init__(self, name, price):
+        self.name = name
+        self.price = price
+
+    def __eq__(self, other):
+        if not isinstance(other, Product):
+            return NotImplemented
+        return self.price == other.price
+
+    def __lt__(self, other):
+        if not isinstance(other, Product):
+            return NotImplemented
+        return self.price < other.price
+
+    def __repr__(self):
+        return f"Product({self.name!r}, {self.price})"
+
+mouse = Product("Wireless Mouse", 29.99)
+cable = Product("USB Cable", 4.99)
+hdmi = Product("HDMI Cable", 14.99)
+
+print(mouse > cable)
+print(cable <= hdmi)
+print(hdmi >= mouse)
+print(sorted([mouse, cable, hdmi]))
+```
+
+The `Product` class defines `__eq__` and `__lt__` only. `@total_ordering` fills in `__le__` (less than or equal), `__gt__` (greater than), and `__ge__` (greater than or equal) automatically, derived from the two provided. The `>`, `<=`, and `>=` operators in the example all work, and `sorted` uses the comparison methods to put the products in price order.
+
+The trade-off is performance. The synthesized methods aren't as fast as hand-written ones, because they call `__eq__` and `__lt__` together to produce their answer. For most code this doesn't matter; for code that sorts huge lists of these objects in a tight loop, writing the methods directly is faster.
+
+The decorator also has a documented gotcha: if `__eq__` returns `NotImplemented` for unknown types (the convention), `@total_ordering` propagates that through the synthesized methods. That's the desired behavior. Omitting the `isinstance` check in `__eq__` and accidentally returning `False` for unknown types leads to strange behavior when comparing with unrelated objects. The example above does the check correctly.
+
+For new code that needs comparison support, `dataclasses` with `order=True` is often a better fit; it generates the methods at class definition time without the runtime indirection. Use `@total_ordering` when dataclasses aren't an option, or when a custom `__eq__` and `__lt__` doesn't fit the dataclass shape.
+
+<h1 id="gotchas-to-remember">Gotchas to Remember</h1>
+
+A few things go wrong when using `functools` for the first time.
+
+**Caches grow forever without `maxsize`.** `@cache` and `@lru_cache(maxsize=None)` never evict. If the input space is unbounded (per-user data, per-request IDs), the cache will grow without limit and eventually consume all available memory. Use `@lru_cache(maxsize=N)` with a sensible `N` for any function whose input space could be large.
+
+**Arguments must be hashable.** Lists, sets, and dicts can't be cache keys, so a function with one of those arguments will raise `TypeError: unhashable type` on every call. The workaround is to convert lists to tuples and dicts to frozensets of items before passing them in, or to redesign the function to take individual arguments.
+
+**Caches don't expire.** If the function's underlying data changes (a database row gets updated, a file gets rewritten), the cached value is stale until the cache is cleared or the entry is evicted. Stale cache reads are a classic source of "but it works on my machine" bugs.
+
+**`@cached_property` needs a writable instance.** Classes with `__slots__` that don't include the property name will reject the attribute assignment, and the cache can't store its value. Either include the property name in `__slots__` or use plain `@property` instead.
+
+**`partial` doesn't deeply specialize.** `partial(func, x=10)` doesn't make a function that has `x=10` as a default; it makes a new callable that always passes `x=10` to `func`. Overriding with a positional argument may collide if the function's parameter list lets `x` be positional.
+
+**`@singledispatch` looks at the first argument only.** For a method on a class (with `self` as the first argument), use `@singledispatchmethod` instead, which dispatches on the second argument because the first is the instance.
+
+```python
+# Common mistake: passing a list to a cached function.
+from functools import cache
+
+@cache
+def cart_size(items):
+    return len(items)
+
+# This works.
+print(cart_size(("Mouse", "Cable")))
+
+# This crashes.
+try:
+    print(cart_size(["Mouse", "Cable"]))
+except TypeError as exc:
+    print(f"TypeError: {exc}")
+```
+
+The tuple works because tuples are hashable; the list doesn't because lists aren't. This is the most common cache error, and it always comes down to the same root cause: the cache uses the arguments as a dict key, and dict keys have to be hashable.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

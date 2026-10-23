@@ -1,0 +1,551 @@
+---
+title: "SQLAlchemy"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "SQLAlchemy explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+SQLAlchemy is the most widely used database toolkit in the Python ecosystem. It's two libraries packaged together: Core, a SQL expression language that builds queries from Python objects without writing a string, and ORM, an object-relational mapper that sits on top of Core and maps rows to instances of Python classes. This lesson covers the parts of SQLAlchemy that come up in any serious project: setting up an engine, defining models, running queries with the 2.0-style API, working with sessions, modeling relationships, controlling how related objects load, and where Alembic fits in for migrations.
+
+<h1 id="the-two-layers-core-and-orm">The two layers: Core and ORM</h1>
+
+SQLAlchemy is organized as two stacked APIs, and which one fits depends on what's being built.
+
+The Core layer is the SQL Expression Language. Tables and columns are declared as Python objects, then queries are built by combining them with operators and helper functions. The result of a Core query is a row of values, much like the raw driver returns. Core is what most reporting code, migration scripts, and high-performance data pipelines use. It's also what the ORM uses internally to build the SQL it emits.
+
+The ORM layer sits on top of Core. Classes are declared whose attributes correspond to columns, and queries return instances of those classes. The ORM tracks loaded objects, detects attribute changes, manages a session, and translates the whole picture into the same Core expressions a developer could have written by hand. It costs a bit more memory and a bit more complexity, and in exchange it provides objects with named attributes, relationships, and change tracking.
+
+The diagram clears up a common confusion. Core can be used without the ORM, but the ORM cannot be used without Core: every ORM query bottoms out in Core expressions. In practice, most applications use the ORM for everyday CRUD and drop down to Core for reporting queries and bulk operations.
+
+<h1 id="installing-and-connecting">Installing and connecting</h1>
+
+SQLAlchemy 2.0 is the current major version, and the syntax in this lesson assumes 2.0 throughout. Install it with `pip install sqlalchemy`. For Postgres add `psycopg2-binary` (or `psycopg`), for MySQL add `pymysql` or `mysqlclient`. SQLite needs no extra driver because it ships with Python.
+
+The connection starts with `create_engine`. The engine is a pool of database connections plus the dialect (the part that knows how to talk to a specific database).
+
+```python
+from sqlalchemy import create_engine
+
+# In-memory SQLite, useful for tests
+engine = create_engine("sqlite:///:memory:", echo=False)
+
+# File-backed SQLite
+file_engine = create_engine("sqlite:///shop.db")
+
+# PostgreSQL
+# pg_engine = create_engine("postgresql+psycopg2://user:pw@localhost/shop")
+
+# MySQL
+# mysql_engine = create_engine("mysql+pymysql://user:pw@localhost/shop")
+```
+
+The URL string is the connection target. The `dialect+driver` prefix tells SQLAlchemy which dialect to use (`sqlite`, `postgresql`, `mysql`) and which driver to use under it (`psycopg2`, `pymysql`). The rest of the URL is standard `user:password@host:port/database` with optional query parameters.
+
+`echo=True` is the most useful debugging knob. It prints every SQL statement SQLAlchemy issues, with the bound parameters, to stdout. Turn it on while learning or debugging a slow page; turn it off in production.
+
+Engines are pools, not connections. Creating one is cheap; creating one per request is wasteful. The standard pattern is one engine per process, defined at module level, used across the whole application.
+
+<h1 id="defining-models-with-declarativebase">
+  Defining models with DeclarativeBase
+</h1>
+
+SQLAlchemy 2.0 uses a typed declarative style: subclass `DeclarativeBase`, annotate columns with `Mapped[...]`, and use `mapped_column` for column metadata. The result is a class that serves as both the schema definition and the type returned by queries.
+
+```python
+from sqlalchemy import create_engine, String, Float, Integer
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+class Base(DeclarativeBase):
+    pass
+
+class Product(Base):
+    __tablename__ = "products"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    price: Mapped[float] = mapped_column(Float, nullable=False)
+    stock: Mapped[int] = mapped_column(Integer, default=0)
+
+engine = create_engine("sqlite:///:memory:")
+Base.metadata.create_all(engine)
+print("Tables created:", list(Base.metadata.tables))
+```
+
+Each piece serves a role. `__tablename__` sets the SQL table name; without it, SQLAlchemy can't map the class. The `Mapped[int]` annotation tells SQLAlchemy the Python type, which gets used both for type hints and for inferring the SQL type when possible. `mapped_column` carries the column metadata: the SQL type, whether the column is the primary key, whether nulls are allowed, defaults, foreign keys.
+
+`Base.metadata.create_all(engine)` walks every subclass of `Base` and issues `CREATE TABLE IF NOT EXISTS` statements. This is fine for development and tests; for production, use Alembic (covered later in this lesson).
+
+The same definition works across SQLite, Postgres, and MySQL because SQLAlchemy translates the column types to each dialect. `String` becomes `VARCHAR` on Postgres, `TEXT` on SQLite. `Integer` becomes `INTEGER` on SQLite, `INT` on Postgres. The model is written once.
+
+<h1 id="sessions-and-the-unit-of-work">Sessions and the unit of work</h1>
+
+A `Session` is the unit-of-work container. It holds a database connection, tracks new objects you added, detects changes on loaded objects, and emits all the right SQL when you commit.
+
+```python
+from sqlalchemy.orm import Session
+
+with Session(engine) as session:
+    mug = Product(name="Ceramic Mug", price=14.99, stock=80)
+    notebook = Product(name="Notebook", price=4.99, stock=120)
+    session.add_all([mug, notebook])
+    session.commit()
+
+    print(mug.id, notebook.id)
+```
+
+Inside the `with` block, `add_all` told the session "these are new objects, track them." Then `commit` flushed the pending inserts to the database, assigned the auto-generated primary keys back to the Python objects, and committed the transaction. After the commit, `mug.id` and `notebook.id` are populated because SQLAlchemy round-tripped them through the database.
+
+The `with` statement matters. It calls `session.close()` at the end, which returns the connection to the pool. Without it, connections leak, which is the kind of bug that surfaces under sustained load. The context manager makes the cleanup automatic.
+
+Flush versus commit is the next piece of vocabulary. A flush sends pending SQL to the database but doesn't end the transaction; a commit flushes and ends the transaction (so other sessions can see the changes). The session auto-flushes before queries that might depend on the pending changes, so explicit `flush` calls are rare. The two times they're needed are when a generated primary key is required before commit (`session.flush()` populates `mug.id` without committing) and during debugging.
+
+The diagram captures the timing. New objects sit in a pending bucket until flush. Flush sends the SQL but doesn't end the transaction. Commit finishes the unit of work. Queries trigger an auto-flush, so reads stay consistent with pending writes.
+
+<h1 id="querying-the-20-style">Querying: the 2.0 style</h1>
+
+SQLAlchemy 1.x and 2.0 support two query styles. The 1.x style (`session.query(Model)`) still works but is in maintenance mode. The 2.0 style (`select(Model)` with `session.scalars` or `session.execute`) is the recommended form for new code, and it's the style used here.
+
+```python
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+with Session(engine) as session:
+    session.add_all([
+        Product(name="Ceramic Mug", price=14.99, stock=80),
+        Product(name="Notebook", price=4.99, stock=120),
+        Product(name="Pen", price=1.50, stock=200),
+        Product(name="Headphones", price=99.99, stock=15),
+    ])
+    session.commit()
+
+    stmt = select(Product).where(Product.price < 20).order_by(Product.price)
+    cheap_products = session.scalars(stmt).all()
+    for product in cheap_products:
+        print(product.name, product.price)
+```
+
+Each piece has a role. `select(Product)` starts a statement that returns `Product` instances. `.where(Product.price < 20)` adds a filter; the `Product.price < 20` expression is a SQL expression, not a Python comparison, because `Product.price` is a column descriptor. `.order_by(Product.price)` adds an `ORDER BY`. `session.scalars(stmt)` runs the statement and returns the first column of each row (the `Product` instance); `.all()` collects them into a list.
+
+The 2.0 style separates "build a statement" from "run it." That separation is useful because statements can be composed, passed around, and extended with filters dynamically without running them prematurely. A common pattern is a function that returns a statement, which the caller then runs or further composes.
+
+```python
+def cheap_products_stmt(max_price: float):
+    return select(Product).where(Product.price < max_price).order_by(Product.price)
+
+with Session(engine) as session:
+    stmt = cheap_products_stmt(10.00).limit(2)
+    for product in session.scalars(stmt):
+        print(product.name)
+```
+
+The function returned a statement; the caller added `.limit(2)` before running it. Statements are immutable in 2.0, so each chained call returns a new statement. Statements can be built up step by step without earlier callers seeing later modifications.
+
+<h1 id="filtering-joining-and-grouping">Filtering, joining, and grouping</h1>
+
+The query language covers the same ground as SQL, expressed as method chains.
+
+```python
+from sqlalchemy import select, func
+
+with Session(engine) as session:
+    # WHERE multiple conditions
+    stmt = (
+        select(Product)
+        .where(Product.price > 5)
+        .where(Product.stock > 0)
+    )
+    for product in session.scalars(stmt):
+        print(product.name)
+```
+
+Multiple `.where()` calls combine with `AND`. For `OR`, use `sqlalchemy.or_`. For inequalities, comparison operators on column objects produce the corresponding SQL: `Product.price > 5` becomes `products.price > 5`.
+
+Aggregations use `func`, which is a namespace that proxies to whatever the database supports.
+
+```python
+from sqlalchemy import select, func
+
+with Session(engine) as session:
+    stmt = select(
+        func.count(Product.id).label("count"),
+        func.sum(Product.stock).label("total_stock"),
+        func.avg(Product.price).label("avg_price"),
+    )
+    row = session.execute(stmt).one()
+    print(row.count, row.total_stock, round(row.avg_price, 2))
+```
+
+The call switches from `session.scalars` to `session.execute`. When the `SELECT` returns multiple columns (instead of one entity), `execute` returns rows with named attributes corresponding to the labels. `func.count(Product.id).label("count")` becomes `count(products.id) AS count` in SQL, and the row exposes `row.count`.
+
+`GROUP BY` follows the same pattern:
+
+```python
+from sqlalchemy import select, func
+
+with Session(engine) as session:
+    session.add_all([
+        Product(name="Mug", price=14.99, stock=80),  # category-less for now
+    ])
+    session.commit()
+
+    stmt = (
+        select(Product.name, func.count(Product.id))
+        .group_by(Product.name)
+        .having(func.count(Product.id) > 0)
+    )
+    for row in session.execute(stmt):
+        print(row[0], row[1])
+```
+
+The same chain pattern covers the rest of the SQL surface: `.join()` for joins, `.limit()` and `.offset()` for paging, `.distinct()` for deduplication, `.with_only_columns()` for narrowing the projection. Every method returns a new statement, so chains are safe to refactor and reuse.
+
+<h1 id="relationships-one-to-many">Relationships: one-to-many</h1>
+
+Most real schemas have multiple tables. A `Customer` has many `Order`s. An `Order` has many `OrderItem`s. SQLAlchemy models these connections with foreign keys at the column level and `relationship` at the class level.
+
+```python
+from sqlalchemy import create_engine, String, Float, Integer, ForeignKey
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, Session
+from typing import List
+
+class Base(DeclarativeBase):
+    pass
+
+class Customer(Base):
+    __tablename__ = "customers"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    email: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+
+    orders: Mapped[List["Order"]] = relationship(back_populates="customer")
+
+class Order(Base):
+    __tablename__ = "orders"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    customer_id: Mapped[int] = mapped_column(ForeignKey("customers.id"))
+    total: Mapped[float] = mapped_column(Float)
+    status: Mapped[str] = mapped_column(String, default="placed")
+
+    customer: Mapped["Customer"] = relationship(back_populates="orders")
+
+engine = create_engine("sqlite:///:memory:")
+Base.metadata.create_all(engine)
+
+with Session(engine) as session:
+    asha = Customer(name="Asha", email="asha@shop.com")
+    asha.orders = [
+        Order(total=49.99, status="placed"),
+        Order(total=19.99, status="shipped"),
+    ]
+    session.add(asha)
+    session.commit()
+
+    for order in asha.orders:
+        print(order.id, order.total, order.status)
+```
+
+Three pieces tie the relationship together. The `ForeignKey("customers.id")` on `Order.customer_id` is the database-level link. The `relationship` on both sides is the Python-level link: `Customer.orders` is a list of `Order` instances, and `Order.customer` is the `Customer` who placed it. `back_populates` tells SQLAlchemy these two relationships are the two ends of the same connection, so assigning to one updates the other automatically.
+
+The example does something useful at commit time. The code never set `customer_id` on the orders, but the commit succeeded with the right foreign key. The session noticed that the orders were attached to a customer, that the customer is new, that the customer's ID isn't known yet, so it inserted the customer first, captured the generated ID, and then inserted the orders with that ID as the foreign key. The cascading is what makes relationships convenient to work with.
+
+The same flow works the other way. Loading an order, accessing `order.customer`, mutating it, and committing updates the customer row. Setting `order.customer = some_other_customer` reassigns the foreign key. The Python attribute is the SQL relationship.
+
+<h1 id="many-to-many-products-and-tags">Many-to-many: products and tags</h1>
+
+A many-to-many relationship needs a third table, the "association table," whose rows are pairs of foreign keys. SQLAlchemy expresses this with a `Table` plus `relationship(secondary=...)`.
+
+```python
+from sqlalchemy import Table, Column, Integer, ForeignKey, create_engine, String
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, Session
+from typing import List
+
+class Base(DeclarativeBase):
+    pass
+
+product_tags = Table(
+    "product_tags",
+    Base.metadata,
+    Column("product_id", ForeignKey("products.id"), primary_key=True),
+    Column("tag_id", ForeignKey("tags.id"), primary_key=True),
+)
+
+class Product(Base):
+    __tablename__ = "products"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String)
+    tags: Mapped[List["Tag"]] = relationship(secondary=product_tags, back_populates="products")
+
+class Tag(Base):
+    __tablename__ = "tags"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    label: Mapped[str] = mapped_column(String, unique=True)
+    products: Mapped[List["Product"]] = relationship(secondary=product_tags, back_populates="tags")
+
+engine = create_engine("sqlite:///:memory:")
+Base.metadata.create_all(engine)
+
+with Session(engine) as session:
+    sale = Tag(label="sale")
+    new = Tag(label="new")
+    mug = Product(name="Ceramic Mug", tags=[sale, new])
+    session.add(mug)
+    session.commit()
+
+    print([tag.label for tag in mug.tags])
+    print([product.name for product in sale.products])
+```
+
+The `product_tags` table doesn't need a model class because it's a join table with no extra columns. The two `relationship` declarations point at it via `secondary=product_tags`, and SQLAlchemy handles the join logic. Adding a tag to a product's `tags` list inserts a row in `product_tags`; removing it deletes a row.
+
+When the association table has extra columns (a `created_at` timestamp on the tag-product link, for example), a model class is required, and the relationship is configured slightly differently. The SQLAlchemy docs cover that pattern under "association object."
+
+<h1 id="loading-strategies-lazy-joined-selectin">
+  Loading strategies: lazy, joined, selectin
+</h1>
+
+Relationships have a loading strategy that decides when the related rows arrive. The default is "lazy," which means the related rows aren't fetched until the attribute is accessed. That's convenient for one-off loads and expensive in loops, because each access in a loop issues another query (the N+1 problem).
+
+SQLAlchemy provides three main strategies, each with a use case.
+
+| Strategy         | What it does                                                    | When to use                                                    |
+| ---------------- | --------------------------------------------------------------- | -------------------------------------------------------------- |
+| `lazy` (default) | Fetches related rows on first access                            | One-off loads, when you may not access the relationship        |
+| `joined`         | Fetches related rows in a `LEFT OUTER JOIN` on the same query   | Small, single-row relationships; loading one parent's children |
+| `selectin`       | Fetches related rows in a second query with `WHERE id IN (...)` | Loading many parents' children; avoiding cartesian explosions  |
+
+Opt into the eager strategies per query with `options(selectinload(Customer.orders))` or `options(joinedload(Customer.orders))`:
+
+```python
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
+
+with Session(engine) as session:
+    stmt = (
+        select(Customer)
+        .options(selectinload(Customer.orders))
+    )
+    customers = session.scalars(stmt).all()
+    for customer in customers:
+        # No extra query here; orders were loaded with the customers.
+        print(customer.name, len(customer.orders))
+```
+
+The `selectinload` strategy issues two queries: one for the customers, one for the orders with `WHERE customer_id IN (1, 2, 3, ...)`. Two queries to load 100 customers and all their orders. Without it, the same loop would issue 101 queries.
+
+`joinedload` is the alternative when the relationship is small and one query is preferable to two:
+
+```python
+from sqlalchemy.orm import joinedload
+
+stmt = select(Customer).options(joinedload(Customer.orders))
+```
+
+The trade-off: a join produces a Cartesian product, so loading 100 customers with 10 orders each yields 1,000 rows of which 900 are duplicates of the customer side. SQLAlchemy deduplicates in Python, but the rows still travel across the network. For small relationships (one-to-one, or short lists), this is fine. For long lists, `selectinload` is usually faster.
+
+The third strategy worth knowing is "raise on access": setting `lazy="raise"` on the relationship turns accidental lazy loads into errors, which is a useful way to catch N+1 bugs in tests.
+
+N+1 isn't a SQLAlchemy quirk, it's the default behavior across ORMs. The fix is the same everywhere: ask the ORM for the related rows up front. SQLAlchemy's `selectinload` is the standard default for one-to-many relationships unless there's a specific reason to use `joinedload`.
+
+<h1 id="inserts-updates-and-bulk-operations">
+  Inserts, updates, and bulk operations
+</h1>
+
+Single inserts and updates go through the unit of work: build, add or modify, commit. For larger batches, three options exist, in order of decreasing ORM involvement.
+
+The first option is `add_all` plus commit. Same as `add`, but takes an iterable. The session tracks each object, runs `INSERT`s at commit time, and populates primary keys back.
+
+```python
+with Session(engine) as session:
+    products = [
+        Product(name=f"Product {i}", price=float(i), stock=10)
+        for i in range(1, 101)
+    ]
+    session.add_all(products)
+    session.commit()
+```
+
+The session issues 100 INSERT statements (or one per batch, depending on the driver). For 100 rows that's fine. For 100,000 rows, the bookkeeping cost adds up.
+
+The second option is `session.execute` with a Core `insert` statement and a list of dicts. This skips the ORM's per-object tracking and issues a single bulk `INSERT`.
+
+```python
+from sqlalchemy import insert
+
+with Session(engine) as session:
+    session.execute(
+        insert(Product),
+        [{"name": f"Bulk {i}", "price": float(i), "stock": 5} for i in range(1, 1001)],
+    )
+    session.commit()
+```
+
+A thousand rows in one statement. The trade-off is that the objects aren't in the session afterward; they would need to be queried back to use them as ORM instances. That's a fine trade for "load this CSV into the database."
+
+The third option is the `Core` layer directly, bypassing the session entirely:
+
+```python
+from sqlalchemy import insert
+
+with engine.begin() as conn:
+    conn.execute(
+        insert(Product),
+        [{"name": f"Direct {i}", "price": float(i), "stock": 5} for i in range(1, 1001)],
+    )
+```
+
+`engine.begin()` opens a transaction at the connection level. There's no session, no identity map, no change tracking. For pure data-loading tools that don't care about objects, this is the lightest-weight option.
+
+Updates have the same trio. `loaded.attribute = value; session.commit()` for one row. `session.execute(update(Product).where(...).values(...))` for a bulk update inside a session. `engine.begin()` plus a Core `update` for the lightest path.
+
+<h1 id="migrations-with-alembic">Migrations with Alembic</h1>
+
+Schemas change over the life of a project, and editing models without migrating the database leaves the two out of sync. Alembic is SQLAlchemy's official migration tool. It generates Python migration files from the diff between the models and the live schema, and applies them in order.
+
+The skeleton of an Alembic workflow:
+
+```text
+1. alembic init alembic     -> sets up the alembic/ directory.
+2. Edit alembic.ini to point at the database URL.
+3. Edit alembic/env.py to import your Base.metadata.
+4. alembic revision --autogenerate -m "add product description"
+   -> generates alembic/versions/{hash}_add_product_description.py
+5. Review the generated file; auto-generate is not perfect for renames.
+6. alembic upgrade head     -> applies pending migrations.
+7. alembic downgrade -1     -> rolls back one migration.
+```
+
+A generated migration looks like:
+
+```python
+# alembic/versions/3a1b2c4d_add_product_description.py
+"""add product description
+
+Revision ID: 3a1b2c4d
+Revises: 7e8f9a0b
+Create Date: 2026-04-15 12:00:00
+"""
+import sqlalchemy as sa
+from alembic import op
+
+revision = "3a1b2c4d"
+down_revision = "7e8f9a0b"
+
+def upgrade():
+    op.add_column(
+        "products",
+        sa.Column("description", sa.String(), nullable=True),
+    )
+
+def downgrade():
+    op.drop_column("products", "description")
+```
+
+The `upgrade` function applies the change; `downgrade` reverses it. The version hashes form a chain (each migration knows which migration precedes it), so Alembic can move forward and backward through the history. Production deploys run `alembic upgrade head` as part of the rollout, after the code that depends on the new schema is in place but before it's serving requests.
+
+The workflow above is enough to use Alembic on a project. The official Alembic docs cover the nuances: data migrations (not just schema), branches, offline mode for environments without database access.
+
+<h1 id="when-sqlalchemy-is-overkill-and-when-it-fits">
+  When SQLAlchemy is overkill, and when it fits
+</h1>
+
+SQLAlchemy fits when the application has multiple related tables, when schema portability matters, when complex queries appear in the codebase, or when the team wants the safety of typed model classes. It scales from a 50-line script up to a multi-million-line monolith. Codebases at Meta, Yelp, Reddit, and many others use SQLAlchemy as the data layer.
+
+SQLAlchemy is overkill for a one-off script that touches a single table and runs ten lines of SQL. The investment in setting up a `Base`, defining a model, and learning sessions exceeds the savings. Use `sqlite3` directly, or use SQLAlchemy Core without the ORM if the dialect and the connection pool are needed but not the object mapping.
+
+The middle ground, "CRUD on a few tables without learning Sessions deeply," is well served by Peewee, SQLModel, or Tortoise. They're easier to learn, and the code is shorter. SQLAlchemy rewards investment; the lighter ORMs reward simplicity. Pick based on the project's size and complexity.
+
+<h1 id="putting-it-together-a-small-request-handler">
+  Putting it together: a small request handler
+</h1>
+
+A realistic shape of an endpoint that lists a customer's recent orders, drawing on everything in this lesson:
+
+```python
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload, Session
+
+def get_recent_orders(session: Session, customer_id: int, limit: int = 10):
+    stmt = (
+        select(Order)
+        .where(Order.customer_id == customer_id)
+        .where(Order.status != "cancelled")
+        .order_by(Order.id.desc())
+        .limit(limit)
+        .options(selectinload(Order.customer))
+    )
+    return session.scalars(stmt).all()
+
+with Session(engine) as session:
+    orders = get_recent_orders(session, customer_id=1, limit=5)
+    for order in orders:
+        print(order.id, order.total, order.customer.name)
+```
+
+The function takes a `Session` instead of building its own, which makes it easier to test and reuse. The query filters, orders, limits, and eager-loads the customer in one statement, so the print loop doesn't trigger any extra queries. The same pattern scales to dozens of endpoints with minor changes to the filters and the load options.
+
+<h1 id="quiz">Quiz</h1>
+
+<h1 id="quiz-questions">Quiz Questions</h1>
+
+**Question 1: Which statement best describes SQLAlchemy Core and ORM?**
+
+- [x] Core builds SQL expressions; ORM maps rows to objects and tracks changes.
+- [ ] Core is only for SQLite; ORM is only for PostgreSQL and MySQL.
+- [ ] Core requires raw SQL strings; ORM avoids SQL by not using Core.
+- [ ] Core manages Python objects; ORM returns only tuples and dictionaries.
+
+**Question 2: In a typical web application, how should a SQLAlchemy Engine usually be created?**
+
+- [x] Create one Engine per process and reuse it across requests.
+- [ ] Create a fresh Engine for every query to avoid shared state.
+- [ ] Create one Engine inside each model class definition.
+- [ ] Create a new Engine only after every transaction commits.
+
+**Question 3: What role do Mapped[...] and mapped_column() play in SQLAlchemy 2.0 declarative models?**
+
+- [x] They declare ORM-mapped attributes and column metadata.
+- [ ] They force Python to check database types at runtime.
+- [ ] They replace the need for a table name on the class.
+- [ ] They automatically create migrations for schema changes.
+
+**Question 4: Which statement about Session.flush() and Session.commit() is correct?**
+
+- [x] flush sends pending SQL; commit finalizes the transaction.
+- [ ] flush commits the transaction; commit only closes the Session.
+- [ ] flush discards pending objects; commit restores them later.
+- [ ] flush runs SELECT only; commit is required before INSERT.
+
+**Question 5: Where does Alembic fit in a SQLAlchemy project?**
+
+- [x] It versions schema changes and applies migrations over time.
+- [ ] It replaces Session for everyday object persistence.
+- [ ] It turns ORM models into JSON responses automatically.
+- [ ] It pools database connections for all supported dialects.
+
+**Question 6: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 7: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 8: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+<QuizCard />
+
+<CommentsSection />
+
+</LessonCard>

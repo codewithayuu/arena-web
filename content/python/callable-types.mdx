@@ -1,0 +1,627 @@
+---
+title: "Callable Types"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "Callable Types explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="the-callable-shape">The Callable Shape</h1>
+
+The annotation form is `Callable[[arg_types], return_type]`. The argument types live in a bracketed list (even if there's only one), and the return type follows after the inner bracket closes. The whole thing reads "a callable that takes these arguments and returns this".
+
+```python
+from typing import Callable
+
+def apply_discount(price: float, rule: Callable[[float], float]) -> float:
+    return rule(price)
+
+def ten_percent_off(price: float) -> float:
+    return price * 0.9
+
+def flat_five_off(price: float) -> float:
+    return max(0.0, price - 5.0)
+
+print(f"{apply_discount(29.99, ten_percent_off):.2f}")
+print(f"{apply_discount(29.99, flat_five_off):.2f}")
+print(f"{apply_discount(29.99, lambda p: p * 0.75):.2f}")
+```
+
+The `rule` parameter is any callable that takes a `float` and returns a `float`. The three calls pass three different shapes of callable: two named functions and one lambda. All three match the signature, so the type checker accepts every call site.
+
+A quick reference for the common shapes:
+
+| Annotation                   | What it accepts                           |
+| ---------------------------- | ----------------------------------------- |
+| `Callable[[], int]`          | No arguments, returns `int`               |
+| `Callable[[float], float]`   | One `float`, returns `float`              |
+| `Callable[[str, int], bool]` | Two arguments, returns `bool`             |
+| `Callable[[str], None]`      | One argument, returns nothing useful      |
+| `Callable[..., int]`         | Any arguments, returns `int`              |
+| `Callable[..., Any]`         | Any arguments, any return (use sparingly) |
+
+The empty inner bracket in `Callable[[], int]` is required. Writing `Callable[int]` is a syntax error in this position, because the first slot is always the argument list.
+
+One subtle point: the annotation describes the **call shape**, not whether the value is literally a function. A class with a `__call__` method, a bound method, a `functools.partial` object, even a lambda, all satisfy `Callable[...]` if their call signature matches. The `__call__` and `Protocol` sections later in the lesson cover this.
+
+<h1 id="typing-higher-order-functions">Typing Higher-Order Functions</h1>
+
+A higher-order function is one that takes a function as an argument or returns one. Python's standard library is full of them, and writing one is the most common reason to use `Callable`.
+
+A small order-pricing utility lets the caller plug in a custom rounding rule:
+
+```python
+from typing import Callable
+import math
+
+def cart_total(
+    prices: list[float],
+    round_rule: Callable[[float], float],
+) -> float:
+    return sum(round_rule(p) for p in prices)
+
+def round_up(price: float) -> float:
+    return math.ceil(price * 100) / 100
+
+def round_to_99(price: float) -> float:
+    return math.floor(price) + 0.99
+
+cart = [29.99, 14.50, 9.95]
+print(f"{cart_total(cart, round_up):.2f}")
+print(f"{cart_total(cart, round_to_99):.2f}")
+print(f"{cart_total(cart, lambda p: round(p)):.2f}")
+```
+
+The function describes the rule's shape (`float -> float`) once. Every plug-in rule has to match, and the checker enforces that match at the call site. A rule with the wrong signature surfaces an error in the editor before the test suite runs.
+
+The same idea scales to filtering and mapping. Built-ins like `filter` and `map` are themselves higher-order, and their typed signatures look like this conceptually:
+
+```python
+from typing import Callable, Iterable
+
+def keep_in_stock(
+    products: Iterable[dict[str, int | str]],
+    predicate: Callable[[dict[str, int | str]], bool],
+) -> list[dict[str, int | str]]:
+    return [p for p in products if predicate(p)]
+
+def transform_prices(
+    products: Iterable[dict[str, int | str | float]],
+    transform: Callable[[float], float],
+) -> list[dict[str, int | str | float]]:
+    result = []
+    for p in products:
+        new = dict(p)
+        new["price"] = transform(float(p["price"]))
+        result.append(new)
+    return result
+
+catalog = [
+    {"name": "Wireless Mouse", "price": 29.99, "stock": 12},
+    {"name": "USB Cable", "price": 4.99, "stock": 0},
+    {"name": "HDMI Cable", "price": 14.99, "stock": 8},
+]
+
+in_stock = keep_in_stock(catalog, lambda p: int(p["stock"]) > 0)
+discounted = transform_prices(in_stock, lambda price: price * 0.9)
+
+for product in discounted:
+    print(f"{product['name']}: ${product['price']:.2f}")
+```
+
+`keep_in_stock` takes any predicate that maps a product dict to a `bool`. `transform_prices` takes a `float -> float` rule. The lambdas at the call site fit the declared shapes, so the checker accepts both.
+
+Calling a Python function has real overhead, more than an inline expression. For a list of ten or even a thousand items this is irrelevant. Inside tight loops that run millions of times, the per-call cost of `predicate(item)` can dominate. Profile before refactoring.
+
+<h1 id="bare-callable-and-callable-with-ellipsis">
+  Bare Callable and Callable with Ellipsis
+</h1>
+
+Sometimes the signature is irrelevant. The only requirement is "this value is callable". Two forms cover that case, and they say slightly different things.
+
+`Callable` on its own (with no subscript) means "anything that can be called". The checker treats it as a callable with an unknown signature, which is roughly the same as `Callable[..., Any]`. All type information about arguments and return value is lost.
+
+```python
+from typing import Callable
+
+def run_once(fn: Callable) -> None:
+    fn()
+
+def announce_sale() -> None:
+    print("Flash sale: 20% off everything")
+
+run_once(announce_sale)
+```
+
+Bare `Callable` is fine when the callable's behavior is genuinely unknown or irrelevant. It appears in plugin registries, generic event dispatchers, and decorator scaffolding.
+
+`Callable[..., R]` (with the literal ellipsis `...`) is a small step up. It says "any arguments, but the return type is known". The return-type check is preserved but the argument check is waived.
+
+```python
+from typing import Callable
+
+def log_result(fn: Callable[..., int], *args: object, **kwargs: object) -> int:
+    result = fn(*args, **kwargs)
+    print(f"{fn.__name__} returned {result}")
+    return result
+
+def items_in_cart(customer_id: int) -> int:
+    carts = {1: 3, 2: 7, 42: 12}
+    return carts.get(customer_id, 0)
+
+def stock_for(product: str, warehouse: str) -> int:
+    inventories = {("Wireless Mouse", "east"): 14, ("USB Cable", "west"): 3}
+    return inventories.get((product, warehouse), 0)
+
+log_result(items_in_cart, 42)
+log_result(stock_for, "Wireless Mouse", "east")
+```
+
+The two callables have different argument shapes, but both return `int`. `Callable[..., int]` accepts either. The checker still verifies that whatever `log_result` returns is an `int`.
+
+When are these escape hatches appropriate?
+
+| Intent                      | Form                  | Cost                                |
+| --------------------------- | --------------------- | ----------------------------------- |
+| Anything callable           | `Callable`            | No argument or return type checking |
+| Any signature, known return | `Callable[..., R]`    | No argument checking                |
+| Exact signature             | `Callable[[A, B], R]` | Full checking                       |
+| Decorator-style passthrough | `ParamSpec`           | Full checking, generic over args    |
+
+The rule of thumb: be as specific as possible. The whole reason to write a type annotation is to give the checker something to check. `Callable[..., Any]` is usually a sign that the function's contract with the callable could be tighter.
+
+<h1 id="typing-callbacks-and-event-handlers">
+  Typing Callbacks and Event Handlers
+</h1>
+
+Callbacks are a common use case for `Callable` annotations. Anywhere code says "call me back when X happens", a `Callable` annotation describes the expected handler shape.
+
+A small order-event dispatcher makes the pattern concrete:
+
+```python
+from typing import Callable
+
+OrderHandler = Callable[[int, str], None]
+
+class OrderDispatcher:
+    def __init__(self) -> None:
+        self._handlers: dict[str, list[OrderHandler]] = {}
+
+    def on(self, event: str, handler: OrderHandler) -> None:
+        self._handlers.setdefault(event, []).append(handler)
+
+    def emit(self, event: str, order_id: int, status: str) -> None:
+        for handler in self._handlers.get(event, []):
+            handler(order_id, status)
+
+def send_email(order_id: int, status: str) -> None:
+    print(f"Email: order {order_id} is now {status}")
+
+def write_audit_log(order_id: int, status: str) -> None:
+    print(f"Audit log: order {order_id} -> {status}")
+
+dispatcher = OrderDispatcher()
+dispatcher.on("status_change", send_email)
+dispatcher.on("status_change", write_audit_log)
+
+dispatcher.emit("status_change", 1042, "shipped")
+```
+
+Two design choices to call out. First, the `OrderHandler` type alias makes the signature reusable. Three different parts of the file (the field, the parameter, and the registered functions) all share one name, so a change in one place ripples cleanly. Second, the dispatcher's `_handlers` dict is typed `dict[str, list[OrderHandler]]`, which tells the checker that every value in the list has the same call shape.
+
+A common variation is a handler that returns a value the caller can act on, like a middleware-style filter:
+
+```python
+from typing import Callable
+
+OrderFilter = Callable[[dict[str, object]], dict[str, object] | None]
+
+def run_filters(order: dict[str, object], filters: list[OrderFilter]) -> dict[str, object] | None:
+    current = order
+    for f in filters:
+        result = f(current)
+        if result is None:
+            return None
+        current = result
+    return current
+
+def reject_empty_cart(order: dict[str, object]) -> dict[str, object] | None:
+    items = order.get("items", [])
+    if isinstance(items, list) and len(items) == 0:
+        return None
+    return order
+
+def add_shipping_estimate(order: dict[str, object]) -> dict[str, object] | None:
+    new = dict(order)
+    new["shipping_eta_days"] = 3
+    return new
+
+order = {"id": 1042, "items": ["Wireless Mouse", "USB Cable"]}
+print(run_filters(order, [reject_empty_cart, add_shipping_estimate]))
+
+empty = {"id": 1043, "items": []}
+print(run_filters(empty, [reject_empty_cart, add_shipping_estimate]))
+```
+
+Each filter is a `Callable[[dict[str, object]], dict[str, object] | None]`. Returning `None` means "stop the chain". The annotation captures both the success and the short-circuit cases in one line.
+
+The diagram shows the fan-out shape. `emit` looks up registered handlers for the event name and calls each one in turn. Every handler shares the same `Callable[[int, str], None]` signature, which allows the dispatcher to store them in one list and call them uniformly.
+
+<h1 id="function-factories">Function Factories</h1>
+
+A function that returns another function is a function factory. The return annotation is a `Callable[...]` describing the shape of the returned function.
+
+```python
+from typing import Callable
+
+def make_percent_discount(rate: float) -> Callable[[float], float]:
+    def apply(price: float) -> float:
+        return price * (1 - rate)
+    return apply
+
+def make_flat_discount(amount: float) -> Callable[[float], float]:
+    def apply(price: float) -> float:
+        return max(0.0, price - amount)
+    return apply
+
+ten_off = make_percent_discount(0.10)
+fiver = make_flat_discount(5.0)
+
+print(f"{ten_off(29.99):.2f}")
+print(f"{fiver(29.99):.2f}")
+print(f"{ten_off(8.99):.2f}")
+```
+
+The factory's return type is `Callable[[float], float]`. Callers know exactly what comes back without reading the body. The closure captures `rate` or `amount` from the enclosing scope, and the returned function is an ordinary `float -> float` callable.
+
+Factories build small, reusable strategies without dragging a class hierarchy along. A common pattern is a registry of factories keyed by name:
+
+```python
+from typing import Callable
+
+DiscountFactory = Callable[[float], Callable[[float], float]]
+
+REGISTRY: dict[str, DiscountFactory] = {
+    "percent": make_percent_discount,
+    "flat": make_flat_discount,
+}
+
+def build_discount(kind: str, value: float) -> Callable[[float], float]:
+    factory = REGISTRY[kind]
+    return factory(value)
+
+summer_sale = build_discount("percent", 0.25)
+print(f"{summer_sale(99.99):.2f}")
+```
+
+The `DiscountFactory` alias is a callable that returns a callable. Reading the annotation left to right: "given a `float`, return a callable that maps a `float` to a `float`." The nested shape is verbose, but it's accurate, and the alias keeps the rest of the code readable.
+
+<h1 id="typing-decorators-with-paramspec">Typing Decorators with ParamSpec</h1>
+
+A decorator is a function that takes a function and returns one. The hard part of typing decorators is preserving the wrapped function's signature so callers still see the right argument types and return type.
+
+The naive approach uses `Callable[..., Any]` and loses all type information:
+
+```python
+from typing import Callable, Any
+
+def log_calls(fn: Callable[..., Any]) -> Callable[..., Any]:
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        print(f"Calling {fn.__name__}")
+        result = fn(*args, **kwargs)
+        print(f"-> {result}")
+        return result
+    return wrapper
+
+@log_calls
+def order_total(price: float, quantity: int) -> float:
+    return price * quantity
+
+# The checker now thinks order_total accepts and returns Any.
+# We lost the (float, int) -> float signature.
+print(order_total(9.99, 3))
+```
+
+This works at runtime, but a type checker now thinks `order_total` accepts any arguments and returns `Any`. A caller who writes `order_total("nope")` gets no static error. The annotation has erased the very information that made type hints useful.
+
+`ParamSpec`, added in Python 3.10 (PEP 612), fixes this. It's a special kind of type variable that captures a callable's argument signature as one unit, so the wrapper can replay it.
+
+```python
+from typing import Callable, ParamSpec, TypeVar
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+def log_calls(fn: Callable[P, R]) -> Callable[P, R]:
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        print(f"Calling {fn.__name__}")
+        result = fn(*args, **kwargs)
+        print(f"-> {result}")
+        return result
+    return wrapper
+
+@log_calls
+def order_total(price: float, quantity: int) -> float:
+    return price * quantity
+
+@log_calls
+def find_product(product_id: int) -> str:
+    catalog = {1: "Wireless Mouse", 2: "USB Cable"}
+    return catalog.get(product_id, "unknown")
+
+print(order_total(9.99, 3))
+print(find_product(1))
+```
+
+`P` is the `ParamSpec`. `P.args` is the tuple of positional arguments and `P.kwargs` is the dict of keyword arguments. `R` is a regular `TypeVar` that captures the return type. The decorator's signature now says: "take a callable with some parameter spec `P` returning `R`, and return a callable with the same `P` returning the same `R`."
+
+After applying `@log_calls`, `order_total` keeps its `(float, int) -> float` signature. A call like `order_total("nope")` triggers a static type error, exactly as it would without the decorator. The wrapper inherits the wrapped function's argument types and return type instead of erasing them.
+
+`ParamSpec` is well-suited to wrappers that change the return type but preserve the arguments. A caching decorator that wraps the result in a small dataclass, for instance:
+
+```python
+from dataclasses import dataclass
+from typing import Callable, ParamSpec, TypeVar
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+@dataclass
+class Cached:
+    value: object
+    hits: int
+
+def memoize(fn: Callable[P, R]) -> Callable[P, Cached]:
+    cache: dict[tuple, R] = {}
+    hit_counts: dict[tuple, int] = {}
+
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> Cached:
+        key = (args, tuple(sorted(kwargs.items())))
+        if key not in cache:
+            cache[key] = fn(*args, **kwargs)
+            hit_counts[key] = 0
+        hit_counts[key] += 1
+        return Cached(value=cache[key], hits=hit_counts[key])
+
+    return wrapper
+
+@memoize
+def shipping_quote(weight: float, country: str) -> float:
+    rate = 2.5 if country == "US" else 4.0
+    return weight * rate
+
+print(shipping_quote(2.5, "US"))
+print(shipping_quote(2.5, "US"))
+print(shipping_quote(2.5, "UK"))
+```
+
+The wrapped `shipping_quote` is now `Callable[[float, str], Cached]`. The argument signature is preserved exactly, and the return type changes from `float` to `Cached`. The checker still rejects bad call sites like `shipping_quote("nope")`.
+
+`ParamSpec` requires Python 3.10 or later. For older versions, the `typing_extensions` package backports it. A project targeting 3.9 should install `typing_extensions` and import from there instead.
+
+<h1 id="callable-class-instances-and-__call__">
+  Callable Class Instances and __call__
+</h1>
+
+Any object with a `__call__` method is callable. The instance can be passed anywhere a `Callable` is expected, and the type checker treats it like a function.
+
+```python
+from typing import Callable
+
+class PercentDiscount:
+    def __init__(self, rate: float) -> None:
+        self.rate = rate
+
+    def __call__(self, price: float) -> float:
+        return price * (1 - self.rate)
+
+def apply_to_cart(prices: list[float], rule: Callable[[float], float]) -> list[float]:
+    return [rule(p) for p in prices]
+
+ten_off = PercentDiscount(0.10)
+twenty_off = PercentDiscount(0.20)
+
+print(apply_to_cart([29.99, 14.99, 9.99], ten_off))
+print(apply_to_cart([29.99, 14.99, 9.99], twenty_off))
+print(ten_off(50.0))
+```
+
+`PercentDiscount` instances are callables. The `__call__` method has the signature `(self, price: float) -> float`, and the checker treats an instance as `Callable[[float], float]` (the implicit `self` is bound and drops out of the public shape). `apply_to_cart` accepts either a function, a lambda, or a `PercentDiscount` instance interchangeably.
+
+Why use a class instead of a plain function? State. A class instance can hold configuration, accumulate counts, lazy-load resources, or expose introspection methods. A closure-based factory does the same job for simple cases; a class is preferable when methods like `reset()`, `__repr__()`, or inspectable attributes are required.
+
+```python
+from typing import Callable
+
+class RateLimitedDiscount:
+    def __init__(self, rate: float, max_uses: int) -> None:
+        self.rate = rate
+        self.max_uses = max_uses
+        self.used = 0
+
+    def __call__(self, price: float) -> float:
+        if self.used >= self.max_uses:
+            return price
+        self.used += 1
+        return price * (1 - self.rate)
+
+    def remaining(self) -> int:
+        return self.max_uses - self.used
+
+coupon = RateLimitedDiscount(0.50, max_uses=2)
+print(f"{coupon(100.0):.2f}, remaining: {coupon.remaining()}")
+print(f"{coupon(100.0):.2f}, remaining: {coupon.remaining()}")
+print(f"{coupon(100.0):.2f}, remaining: {coupon.remaining()}")
+```
+
+The first two calls apply the discount and decrement the remaining count. The third call has no uses left, so the price passes through unchanged. The `remaining()` method exposes the state for the caller to read. None of this is possible with a plain function without resorting to global state or mutable defaults, both of which are worse choices.
+
+The instance still satisfies `Callable[[float], float]` for any function that takes one, so the same `apply_to_cart` from earlier accepts it without changes.
+
+<h1 id="protocols-for-callables-with-structure">
+  Protocols for Callables with Structure
+</h1>
+
+`Callable` describes a single signature. For a callable that also has attributes, or one whose signature needs a name for documentation, or one with overloaded forms, `Protocol` with a `__call__` method covers the gap.
+
+A `Protocol` is a structural type: anything with the right shape satisfies it, no inheritance required. When the protocol declares a `__call__`, instances of any class that defines a matching `__call__` qualify as members.
+
+```python
+from typing import Protocol
+
+class DiscountRule(Protocol):
+    name: str
+
+    def __call__(self, price: float) -> float: ...
+
+class PercentDiscount:
+    name = "percent"
+
+    def __init__(self, rate: float) -> None:
+        self.rate = rate
+
+    def __call__(self, price: float) -> float:
+        return price * (1 - self.rate)
+
+class FlatDiscount:
+    name = "flat"
+
+    def __init__(self, amount: float) -> None:
+        self.amount = amount
+
+    def __call__(self, price: float) -> float:
+        return max(0.0, price - self.amount)
+
+def describe_and_apply(rule: DiscountRule, price: float) -> None:
+    new_price = rule(price)
+    print(f"[{rule.name}] {price:.2f} -> {new_price:.2f}")
+
+describe_and_apply(PercentDiscount(0.15), 49.99)
+describe_and_apply(FlatDiscount(5.0), 49.99)
+```
+
+`DiscountRule` is a protocol that says "must be callable as `(price: float) -> float` and must have a `name` attribute". Neither `PercentDiscount` nor `FlatDiscount` inherits from `DiscountRule`, but both satisfy the protocol structurally. `describe_and_apply` can rely on both the call and the attribute.
+
+A plain `Callable[[float], float]` annotation can't express the `name` requirement. That's the niche `Protocol` fills: callable shape plus structure.
+
+The diagram shows the structural-typing relationship. Neither concrete class inherits from `DiscountRule`. Both have the right shape, so both qualify automatically. The function that uses the protocol is indifferent to which class produced the value.
+
+Protocols also work for a callable with keyword-only parameters or overloads, both of which are hard to express in a single `Callable[...]` annotation:
+
+```python
+from typing import Protocol
+
+class SearchFn(Protocol):
+    def __call__(self, query: str, *, limit: int = 10) -> list[str]: ...
+
+def run_search(fn: SearchFn, query: str) -> None:
+    results = fn(query, limit=3)
+    for r in results:
+        print(r)
+
+def product_search(query: str, *, limit: int = 10) -> list[str]:
+    catalog = ["Wireless Mouse", "USB Cable", "HDMI Cable", "Webcam", "Charger"]
+    matches = [p for p in catalog if query.lower() in p.lower()]
+    return matches[:limit]
+
+run_search(product_search, "cable")
+```
+
+`Callable[[str], list[str]]` can't say "and there's a keyword-only `limit` with a default of 10". A `Protocol` with a `__call__` method can, because protocol bodies are normal function declarations and accept every parameter form Python supports.
+
+The trade-off is verbosity. For a simple `(float) -> float` rule, `Callable[[float], float]` is shorter and clearer. Use a `Protocol` when the signature has structure that doesn't fit the `Callable[[args], return]` mold, or when the callable also needs attributes.
+
+<h1 id="common-patterns">Common Patterns</h1>
+
+A few `Callable`-shaped patterns come up often.
+
+**Strategy registry.** A dict that maps a string key to a callable. The dispatch function selects the strategy at runtime based on a tag.
+
+```python
+from typing import Callable
+
+PaymentHandler = Callable[[float], str]
+
+def charge_card(amount: float) -> str:
+    return f"Charged ${amount:.2f} to card"
+
+def charge_wallet(amount: float) -> str:
+    return f"Deducted ${amount:.2f} from wallet"
+
+def charge_cash(amount: float) -> str:
+    return f"Received ${amount:.2f} cash"
+
+HANDLERS: dict[str, PaymentHandler] = {
+    "card": charge_card,
+    "wallet": charge_wallet,
+    "cash": charge_cash,
+}
+
+def process_payment(method: str, amount: float) -> str:
+    if method not in HANDLERS:
+        raise ValueError(f"unknown method: {method}")
+    return HANDLERS[method](amount)
+
+print(process_payment("card", 29.99))
+print(process_payment("wallet", 14.50))
+```
+
+The `PaymentHandler` alias gives the registry a clear, named type. Adding a new payment method means writing one function and adding one entry to the dict.
+
+**Late-bound callback.** A function that stores a callback and runs it later when some condition is met.
+
+```python
+from typing import Callable
+
+class OnceReady:
+    def __init__(self) -> None:
+        self._callbacks: list[Callable[[], None]] = []
+        self._ready = False
+
+    def ready(self) -> None:
+        self._ready = True
+        for cb in self._callbacks:
+            cb()
+        self._callbacks.clear()
+
+    def when_ready(self, cb: Callable[[], None]) -> None:
+        if self._ready:
+            cb()
+        else:
+            self._callbacks.append(cb)
+
+inventory = OnceReady()
+inventory.when_ready(lambda: print("Inventory loaded, starting checkout"))
+inventory.when_ready(lambda: print("Inventory loaded, refreshing prices"))
+inventory.ready()
+```
+
+Each callback is a `Callable[[], None]`. The class stores any number of them and fires them in order when `ready()` is called.
+
+**Partial application.** `functools.partial` builds a new callable with some arguments pre-filled. The result is still callable, and the type checker treats it as one if you annotate it explicitly.
+
+```python
+from functools import partial
+from typing import Callable
+
+def shipping_cost(weight: float, country: str, expedited: bool) -> float:
+    base = weight * (2.5 if country == "US" else 4.0)
+    return base + 9.99 if expedited else base
+
+us_standard: Callable[[float], float] = partial(shipping_cost, country="US", expedited=False)
+uk_express: Callable[[float], float] = partial(shipping_cost, country="UK", expedited=True)
+
+print(f"{us_standard(2.5):.2f}")
+print(f"{uk_express(2.5):.2f}")
+```
+
+The annotation on `us_standard` tells the checker what the result looks like after partial application. Without that annotation, `partial` returns a `functools.partial` object whose call shape isn't always inferrable to the checker.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,595 @@
+---
+title: "PreparedStatement"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "PreparedStatement explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="why-preparedstatement-exists">Why PreparedStatement Exists</h1>
+
+Two reasons, in order of importance: safety and speed.
+
+The safety reason is that `PreparedStatement` separates code from data. The SQL template is sent to the database once, the values are sent separately, and the database treats them as values no matter what characters they contain. A user who types `'; DROP TABLE products; --` into a search box ends up searching for a product literally named that, instead of running a second statement. The database never parses the user's input as SQL.
+
+The speed reason is that databases cache query plans by template. When you reuse the same `PreparedStatement` for 1000 inserts, the database parses and plans the query once and then executes it 1000 times with different values. With `Statement` and string concatenation, every row gets its own unique SQL text and the planner does the same work over and over.
+
+Here is the vulnerable version side by side with the fixed version. Both look up a product by name in our e-commerce database.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class VulnerableSearch {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            try (Statement setup = conn.createStatement()) {
+                setup.execute("CREATE TABLE products (id INT PRIMARY KEY, name VARCHAR(100), price DECIMAL(10,2))");
+                setup.execute("INSERT INTO products VALUES (1, 'Laptop', 999.00)");
+                setup.execute("INSERT INTO products VALUES (2, 'Headphones', 79.00)");
+            }
+
+            String userInput = "Laptop' OR '1'='1";
+            String sql = "SELECT name, price FROM products WHERE name = '" + userInput + "'";
+
+            try (Statement stmt = conn.createStatement();
+                 ResultSet rs = stmt.executeQuery(sql)) {
+                while (rs.next()) {
+                    System.out.println(rs.getString("name") + " $" + rs.getBigDecimal("price"));
+                }
+            }
+        }
+    }
+}
+```
+
+The `WHERE` clause turned into `WHERE name = 'Laptop' OR '1'='1'`, which matches every row. Nothing about that input looked dangerous in isolation; the danger came from the string concatenation. Now the parameterized version:
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class SafeSearch {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            try (Statement setup = conn.createStatement()) {
+                setup.execute("CREATE TABLE products (id INT PRIMARY KEY, name VARCHAR(100), price DECIMAL(10,2))");
+                setup.execute("INSERT INTO products VALUES (1, 'Laptop', 999.00)");
+                setup.execute("INSERT INTO products VALUES (2, 'Headphones', 79.00)");
+            }
+
+            String userInput = "Laptop' OR '1'='1";
+            String sql = "SELECT name, price FROM products WHERE name = ?";
+
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setString(1, userInput);
+                try (ResultSet rs = ps.executeQuery()) {
+                    int count = 0;
+                    while (rs.next()) {
+                        System.out.println(rs.getString("name") + " $" + rs.getBigDecimal("price"));
+                        count++;
+                    }
+                    System.out.println("matched " + count + " rows");
+                }
+            }
+        }
+    }
+}
+```
+
+The query searches for a product literally named `Laptop' OR '1'='1`, finds nothing, and returns zero rows. The exact same input that wrecked the first program is harmless to the second. The fix is one method call: `prepareStatement` instead of `createStatement`, and `setString` instead of string concatenation.
+
+The diagram shows the structural difference. With `Statement`, the SQL string the database receives is whatever your code built, including any malicious fragments the user supplied. With `PreparedStatement`, the SQL template and the values travel as separate pieces, and the database fills the placeholders in a way that cannot change the query's structure.
+
+Every `Statement.execute` call forces the database to re-parse and re-plan a fresh SQL string. A reused `PreparedStatement` parses and plans once and then executes the cached plan repeatedly. For workloads that run the same shape of query thousands of times, this is a meaningful gain on top of the safety benefit.
+
+<h1 id="placeholders-and-parameter-index">Placeholders and Parameter Index</h1>
+
+A `PreparedStatement` uses `?` characters in the SQL template to mark spots where values go. Each `?` is a parameter, and parameters are numbered starting at 1, not 0. You assign values with setter methods that take the index and the value.
+
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class FirstPreparedStatement {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            try (Statement setup = conn.createStatement()) {
+                setup.execute("CREATE TABLE products (id INT PRIMARY KEY, name VARCHAR(100), price DECIMAL(10,2), stock INT)");
+                setup.execute("INSERT INTO products VALUES (1, 'Laptop', 999.00, 5)");
+                setup.execute("INSERT INTO products VALUES (2, 'Headphones', 79.00, 50)");
+                setup.execute("INSERT INTO products VALUES (3, 'Mouse', 19.00, 200)");
+            }
+
+            String sql = "SELECT name, price FROM products WHERE price < ? AND stock > ?";
+
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setBigDecimal(1, new java.math.BigDecimal("100.00"));
+                ps.setInt(2, 10);
+
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        System.out.println(rs.getString("name") + " $" + rs.getBigDecimal("price"));
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+The first `?` is parameter 1, bound to the price ceiling. The second `?` is parameter 2, bound to the minimum stock. The database substitutes those values when it runs the prepared plan. The order in the SQL is the order of the indexes; the names of the columns play no part.
+
+One gotcha: a `?` only stands in for a value, never for a column name, table name, or SQL keyword. You cannot write `SELECT ? FROM products` and bind `"name"` to choose the column at runtime. The same goes for `ORDER BY ?` and `WHERE ? > 10`. If you need a dynamic column or table, build that part of the SQL yourself from a fixed allowlist, and use `?` only for the actual values.
+
+You also cannot put `?` inside a string literal. The SQL `WHERE name = '?'` searches for the literal character `?`, not for a parameter. The placeholder lives outside quotes because the database adds the quoting when it binds the value.
+
+**What's wrong with this code?**
+
+```java
+String sql = "SELECT * FROM products WHERE category = '?'";
+try (PreparedStatement ps = conn.prepareStatement(sql)) {
+    ps.setString(1, "Electronics");
+    ps.executeQuery();
+}
+```
+
+The `?` inside the quotes is a literal question mark, not a placeholder. `prepareStatement` sees zero parameters, and `setString(1, ...)` throws `SQLException: Parameter index out of range`.
+
+**Fix:**
+
+```java
+String sql = "SELECT * FROM products WHERE category = ?";
+try (PreparedStatement ps = conn.prepareStatement(sql)) {
+    ps.setString(1, "Electronics");
+    ps.executeQuery();
+}
+```
+
+The placeholder lives outside quotes. The JDBC driver wraps the value in proper quoting when it binds it.
+
+<h1 id="setter-methods">Setter Methods</h1>
+
+Each Java type has its own setter on `PreparedStatement`. Pick the one that matches the column's SQL type. If you use the wrong setter, the driver will often convert for you, but some conversions either fail or change the value silently, so it's better to match deliberately.
+
+| Setter                | Java Type            | Typical SQL Column        |
+| --------------------- | -------------------- | ------------------------- |
+| `setString(i, s)`     | `String`             | `VARCHAR`, `CHAR`, `TEXT` |
+| `setInt(i, n)`        | `int`                | `INT`, `INTEGER`          |
+| `setLong(i, n)`       | `long`               | `BIGINT`                  |
+| `setShort(i, n)`      | `short`              | `SMALLINT`                |
+| `setDouble(i, x)`     | `double`             | `DOUBLE`, `FLOAT`         |
+| `setFloat(i, x)`      | `float`              | `REAL`                    |
+| `setBigDecimal(i, b)` | `BigDecimal`         | `DECIMAL`, `NUMERIC`      |
+| `setBoolean(i, b)`    | `boolean`            | `BOOLEAN`, `BIT`          |
+| `setDate(i, d)`       | `java.sql.Date`      | `DATE`                    |
+| `setTime(i, t)`       | `java.sql.Time`      | `TIME`                    |
+| `setTimestamp(i, t)`  | `java.sql.Timestamp` | `TIMESTAMP`               |
+| `setBytes(i, b)`      | `byte[]`             | `BINARY`, `VARBINARY`     |
+| `setObject(i, o)`     | `Object`             | Any (driver picks)        |
+| `setNull(i, type)`    | (none)               | Any nullable column       |
+
+For money values, use `setBigDecimal` against a `DECIMAL` column. Using `setDouble` works but introduces floating-point rounding that you do not want in a price or a total. For timestamps with date and time together, prefer `setTimestamp` over `setDate`; the latter drops the time-of-day part.
+
+Here is a customer insert that exercises a handful of these setters at once.
+
+```java
+import java.math.BigDecimal;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.Statement;
+import java.sql.Timestamp;
+
+public class InsertCustomer {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            try (Statement setup = conn.createStatement()) {
+                setup.execute("""
+                    CREATE TABLE customers (
+                        id INT PRIMARY KEY,
+                        name VARCHAR(100),
+                        email VARCHAR(200),
+                        store_credit DECIMAL(10,2),
+                        is_active BOOLEAN,
+                        signed_up_at TIMESTAMP
+                    )
+                """);
+            }
+
+            String sql = "INSERT INTO customers (id, name, email, store_credit, is_active, signed_up_at) "
+                       + "VALUES (?, ?, ?, ?, ?, ?)";
+
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setInt(1, 1001);
+                ps.setString(2, "Priya Sharma");
+                ps.setString(3, "priya@example.com");
+                ps.setBigDecimal(4, new BigDecimal("25.00"));
+                ps.setBoolean(5, true);
+                ps.setTimestamp(6, Timestamp.valueOf("2026-01-15 09:30:00"));
+
+                int rows = ps.executeUpdate();
+                System.out.println("inserted " + rows + " row");
+            }
+
+            try (Statement check = conn.createStatement();
+                 var rs = check.executeQuery("SELECT name, store_credit FROM customers WHERE id = 1001")) {
+                rs.next();
+                System.out.println(rs.getString("name") + " has $" + rs.getBigDecimal("store_credit") + " store credit");
+            }
+        }
+    }
+}
+```
+
+`executeUpdate` returns the row count for `INSERT`, `UPDATE`, and `DELETE`. `executeQuery` is for `SELECT` and returns a `ResultSet`. Calling the wrong one throws an exception: `executeUpdate` on a `SELECT` complains that the statement returned rows, and `executeQuery` on an `INSERT` complains that it did not.
+
+For null values, you cannot pass `null` to a setter that takes a primitive (`setInt`, `setDouble`, etc.) because there is no such thing as a null `int`. Use `setNull` with the SQL type constant from `java.sql.Types`:
+
+```java
+ps.setNull(4, java.sql.Types.DECIMAL);
+```
+
+That inserts a SQL `NULL` into the column. For reference types like `String`, you can pass `null` directly to `setString` and the driver translates it to SQL `NULL`, but using `setNull` everywhere is more explicit and avoids surprises with edge-case drivers.
+
+<h1 id="reusing-one-preparedstatement-for-many-calls">
+  Reusing One PreparedStatement for Many Calls
+</h1>
+
+A prepared statement is a long-lived object. You can set parameters, execute, set new parameters, execute again, and keep going. The query plan is parsed once and reused across every execution.
+
+This pattern shows up any time you have a loop that runs the same query for many inputs: insert all rows from a list, update stock for every product in a cart, look up details for every order id. Build the statement once outside the loop and reuse it inside.
+
+```java
+import java.math.BigDecimal;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.Statement;
+
+public class ReusePreparedStatement {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            try (Statement setup = conn.createStatement()) {
+                setup.execute("CREATE TABLE products (id INT PRIMARY KEY, name VARCHAR(100), price DECIMAL(10,2))");
+            }
+
+            String[] names = { "Laptop", "Headphones", "Mouse", "Keyboard" };
+            BigDecimal[] prices = {
+                new BigDecimal("999.00"),
+                new BigDecimal("79.00"),
+                new BigDecimal("19.00"),
+                new BigDecimal("49.00")
+            };
+
+            String sql = "INSERT INTO products (id, name, price) VALUES (?, ?, ?)";
+
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                for (int i = 0; i < names.length; i++) {
+                    ps.setInt(1, i + 1);
+                    ps.setString(2, names[i]);
+                    ps.setBigDecimal(3, prices[i]);
+                    ps.executeUpdate();
+                }
+            }
+
+            try (Statement check = conn.createStatement();
+                 var rs = check.executeQuery("SELECT COUNT(*) FROM products")) {
+                rs.next();
+                System.out.println("rows: " + rs.getInt(1));
+            }
+        }
+    }
+}
+```
+
+One `prepareStatement` call, four executions. Each iteration sets the three parameters and calls `executeUpdate`. The driver does not need to re-parse the SQL between executions; it just rebinds and runs.
+
+The setters are sticky between executions. If you forget to set parameter 2 on the second iteration, it keeps the value from the first iteration. That sounds convenient until you have a partial update that silently uses leftover state, so make a habit of setting every parameter on every iteration. If you want to clear all parameters back to "unbound," call `ps.clearParameters()`, but it is simpler to just set them all.
+
+Each `executeUpdate` is still a round trip to the database. Four executions equal four round trips even though only one parse happened. To collapse those round trips into one, you batch.
+
+**What's wrong with this code?**
+
+```java
+String sql = "INSERT INTO products (id, name) VALUES (?, ?)";
+for (int i = 0; i < 4; i++) {
+    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+        ps.setInt(1, i + 1);
+        ps.setString(2, "Product " + i);
+        ps.executeUpdate();
+    }
+}
+```
+
+The `prepareStatement` call is inside the loop, so the JDBC driver may send a parse request to the database for every iteration. The whole point of `PreparedStatement` is parse once, execute many. Pull the `prepareStatement` call outside the loop.
+
+**Fix:**
+
+```java
+String sql = "INSERT INTO products (id, name) VALUES (?, ?)";
+try (PreparedStatement ps = conn.prepareStatement(sql)) {
+    for (int i = 0; i < 4; i++) {
+        ps.setInt(1, i + 1);
+        ps.setString(2, "Product " + i);
+        ps.executeUpdate();
+    }
+}
+```
+
+One parse, four executions. The same statement object is reused across the loop.
+
+<h1 id="batch-inserts">Batch Inserts</h1>
+
+Reusing one prepared statement avoids re-parsing, but each `executeUpdate` is still a round trip across the network to the database. For 1000 inserts that means 1000 round trips. Batching collapses those round trips into a small number of large ones.
+
+You queue up parameter sets with `addBatch()` and then send the whole queue with `executeBatch()`. The database executes every queued statement in order and returns an array of row counts, one per statement.
+
+```java
+import java.math.BigDecimal;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.Statement;
+
+public class BatchInsertProducts {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            try (Statement setup = conn.createStatement()) {
+                setup.execute("CREATE TABLE products (id INT PRIMARY KEY, name VARCHAR(100), price DECIMAL(10,2))");
+            }
+
+            String sql = "INSERT INTO products (id, name, price) VALUES (?, ?, ?)";
+
+            int total = 1000;
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                for (int i = 1; i <= total; i++) {
+                    ps.setInt(1, i);
+                    ps.setString(2, "Product " + i);
+                    ps.setBigDecimal(3, new BigDecimal("9.99").add(new BigDecimal(i)));
+                    ps.addBatch();
+                }
+                int[] counts = ps.executeBatch();
+                System.out.println("batch executed " + counts.length + " statements");
+            }
+
+            try (Statement check = conn.createStatement();
+                 var rs = check.executeQuery("SELECT COUNT(*) FROM products")) {
+                rs.next();
+                System.out.println("rows in table: " + rs.getInt(1));
+            }
+        }
+    }
+}
+```
+
+The loop builds up 1000 parameter sets in memory on the driver side, then `executeBatch` ships them to the database in one large request (or a handful of large requests, depending on driver configuration). The database executes them as one logical unit and returns a row-count array of length 1000.
+
+1000 individual `executeUpdate` calls cost 1000 round trips, often hundreds of milliseconds to several seconds depending on network latency. The same 1000 inserts via `addBatch` plus one `executeBatch` typically finish in tens of milliseconds. The ratio gets worse the further your app sits from the database. Batch every bulk insert, update, or delete.
+
+For very large batches, do not let the in-memory queue grow without bound. Flush every few thousand rows so that a 10-million-row import does not balloon driver memory. The pattern is to call `executeBatch()` inside the loop on every Nth iteration and again at the end for the leftovers.
+
+```java
+import java.math.BigDecimal;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.Statement;
+
+public class ChunkedBatch {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            try (Statement setup = conn.createStatement()) {
+                setup.execute("CREATE TABLE reviews (id INT PRIMARY KEY, product_id INT, rating INT, comment VARCHAR(500))");
+            }
+
+            String sql = "INSERT INTO reviews (id, product_id, rating, comment) VALUES (?, ?, ?, ?)";
+            int total = 5000;
+            int chunkSize = 500;
+            int chunks = 0;
+
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                for (int i = 1; i <= total; i++) {
+                    ps.setInt(1, i);
+                    ps.setInt(2, (i % 100) + 1);
+                    ps.setInt(3, (i % 5) + 1);
+                    ps.setString(4, "Review number " + i);
+                    ps.addBatch();
+
+                    if (i % chunkSize == 0) {
+                        ps.executeBatch();
+                        chunks++;
+                    }
+                }
+                ps.executeBatch();  // Flush leftovers (none here since 5000 % 500 == 0).
+            }
+
+            System.out.println("flushed " + chunks + " chunks of " + chunkSize);
+
+            try (Statement check = conn.createStatement();
+                 var rs = check.executeQuery("SELECT COUNT(*) FROM reviews")) {
+                rs.next();
+                System.out.println("rows: " + rs.getInt(1));
+            }
+        }
+    }
+}
+```
+
+Ten round trips instead of 5000, with a steady memory ceiling. The final `executeBatch` after the loop catches any rows that did not fill a full chunk; here the math works out exactly, but in real code the input size rarely divides evenly.
+
+The diagram shows where the savings come from. The work the database does per row is roughly the same in both paths; what changes is how many trips the driver makes across the network. On a one-millisecond local link the gap is hard to feel. On a cross-region link of 30 ms, the same 1000 inserts go from 30 seconds to under a second.
+
+There is one wrinkle: if any statement in a batch fails, the driver throws `BatchUpdateException`, and what happens to the rows that came before the failure depends on whether you wrapped the batch in a transaction. Without an explicit transaction, some rows may have committed and some may not. With a transaction, you can roll the whole batch back. For bulk loads that need all-or-nothing behavior, run the batch inside a transaction.
+
+<h1 id="retrieving-auto-generated-keys">Retrieving Auto-Generated Keys</h1>
+
+When you insert a row with an auto-incremented primary key, you usually need the generated id to link the row to other tables. A new order needs its id to attach line items; a new customer needs its id to record an address. JDBC lets you ask for those generated keys back as part of the insert.
+
+The trick is two parts. First, pass `Statement.RETURN_GENERATED_KEYS` to `prepareStatement`. Second, after `executeUpdate`, call `getGeneratedKeys()` to get a small result set with the keys.
+
+```java
+import java.math.BigDecimal;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.Statement;
+import java.sql.Timestamp;
+
+public class GeneratedKeysExample {
+    public static void main(String[] args) throws Exception {
+        try (Connection conn = DriverManager.getConnection("jdbc:h2:mem:shop;DB_CLOSE_DELAY=-1")) {
+            try (Statement setup = conn.createStatement()) {
+                setup.execute("""
+                    CREATE TABLE orders (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        customer_id INT,
+                        total DECIMAL(10,2),
+                        placed_at TIMESTAMP
+                    )
+                """);
+                setup.execute("""
+                    CREATE TABLE order_items (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        order_id INT,
+                        product_id INT,
+                        quantity INT
+                    )
+                """);
+            }
+
+            String orderSql = "INSERT INTO orders (customer_id, total, placed_at) VALUES (?, ?, ?)";
+
+            long orderId;
+            try (PreparedStatement ps = conn.prepareStatement(orderSql, Statement.RETURN_GENERATED_KEYS)) {
+                ps.setInt(1, 1001);
+                ps.setBigDecimal(2, new BigDecimal("178.00"));
+                ps.setTimestamp(3, Timestamp.valueOf("2026-05-13 14:00:00"));
+                ps.executeUpdate();
+
+                try (ResultSet keys = ps.getGeneratedKeys()) {
+                    if (!keys.next()) {
+                        throw new IllegalStateException("no generated key");
+                    }
+                    orderId = keys.getLong(1);
+                }
+            }
+            System.out.println("new order id: " + orderId);
+
+            String itemSql = "INSERT INTO order_items (order_id, product_id, quantity) VALUES (?, ?, ?)";
+            try (PreparedStatement ps = conn.prepareStatement(itemSql)) {
+                ps.setLong(1, orderId);
+                ps.setInt(2, 2);
+                ps.setInt(3, 2);
+                ps.addBatch();
+
+                ps.setLong(1, orderId);
+                ps.setInt(2, 3);
+                ps.setInt(3, 1);
+                ps.addBatch();
+
+                ps.executeBatch();
+            }
+
+            try (Statement check = conn.createStatement();
+                 ResultSet rs = check.executeQuery(
+                     "SELECT COUNT(*) FROM order_items WHERE order_id = " + orderId)) {
+                rs.next();
+                System.out.println("items attached: " + rs.getInt(1));
+            }
+        }
+    }
+}
+```
+
+The order insert returned the generated id as `1`. We then used that id as a foreign key when inserting the two line items. Without `RETURN_GENERATED_KEYS`, `getGeneratedKeys()` returns an empty result set even on a table with an auto-increment column, because the driver does not automatically ask the database for the new keys; you have to opt in.
+
+If you batch multiple inserts and request generated keys, the result set returned by `getGeneratedKeys()` contains one row per inserted row, in the order the rows were added. Walk through it with `next()` just like any other result set.
+
+The sequence shows the round trip. The flag tells the driver to ask the database for the new keys as part of the insert response, so no second query is needed. Without the flag, you would have to run a separate `SELECT MAX(id)` or call a database-specific function, both of which are slower and race-prone.
+
+<h1 id="query-plan-caching">Query Plan Caching</h1>
+
+The performance side of `PreparedStatement` goes beyond skipping a parse. Most database engines maintain a server-side cache of plans keyed by the SQL template. When the same template comes in repeatedly, the database hits the cache instead of redoing the analysis.
+
+For a complex query with joins, subqueries, and an `ORDER BY` over indexed columns, the planner's work can be a meaningful share of the per-execution cost. A web app that runs the same product-search query thousands of times a minute, with different `?` parameters, lets the database cache the plan once and amortize it across every call.
+
+The driver-side picture has two pieces. The JDBC driver caches the parsed SQL template so it does not have to re-tokenize on the client. The database caches the plan keyed by that template. Reusing the same `PreparedStatement` object also reuses the server-side handle, so even the bind-and-execute message is smaller than rebuilding the full statement.
+
+A trivial query like `SELECT id FROM products WHERE name = ?` may only save a few microseconds of parse per call. A complex multi-join report query can save milliseconds per call. Either way, the savings compound over a workload that runs the same shape of query at high frequency.
+
+The catch is that the cache is keyed by exact text. `WHERE id = ?` and `WHERE id = ?` are the same template. `WHERE id IN (?, ?, ?)` and `WHERE id IN (?, ?, ?, ?)` are different templates, because the number of placeholders differs. If your application builds `IN` clauses with a variable number of values, you end up with a different plan per arity, and the cache fills up with similar plans. The common fix is to round the number of placeholders up to a small set of fixed sizes (5, 10, 50) and pad the values with duplicates, or to use a temporary table for very long lists.
+
+<h1 id="common-mistakes">Common Mistakes</h1>
+
+A handful of `PreparedStatement` mistakes show up over and over.
+
+**Forgetting to set a parameter.** If you have three `?` placeholders and only call `setString(1, ...)` and `setString(2, ...)`, `executeUpdate` throws `SQLException` complaining about an unset parameter. The setters do not have defaults; an unbound parameter is an error.
+
+```java
+String sql = "INSERT INTO products (id, name, price) VALUES (?, ?, ?)";
+try (PreparedStatement ps = conn.prepareStatement(sql)) {
+    ps.setInt(1, 1);
+    ps.setString(2, "Laptop");
+    // Forgot ps.setBigDecimal(3, ...);
+    ps.executeUpdate();  // SQLException: Parameter "#3" is not set
+}
+```
+
+The fix is mechanical: set every parameter in the template, every execution.
+
+**Off-by-one on the index.** Parameter indexes start at 1, not 0. `setString(0, ...)` throws `SQLException: Invalid value 0 for parameter index`. Coming from arrays and lists where indexes start at 0, this is easy to slip on.
+
+```java
+ps.setString(0, "Laptop");   // Wrong. Indexes start at 1.
+ps.setString(1, "Laptop");   // Correct.
+```
+
+**Wrong setter for the column type.** Using `setString` to set an `INT` column sometimes works because the driver parses the string, but it bypasses type checking and can break on locale-specific number formats. Pick the setter that matches the column type. If you're not sure, look at the schema or use `setObject`, which lets the driver choose, accepting a small loss of clarity in exchange.
+
+**Placeholders inside string literals.** `'?'` inside the SQL is a literal question mark, not a parameter. The driver sees zero parameters and `setString(1, ...)` fails. Keep `?` outside any quotes; the driver handles the quoting itself when it binds the value.
+
+```java
+String wrong = "SELECT * FROM products WHERE name = '?'";   // Literal '?'.
+String right = "SELECT * FROM products WHERE name = ?";     // Placeholder.
+```
+
+**Placeholders for identifiers.** You cannot bind a column name, table name, or SQL keyword. The driver only substitutes values. If you need a dynamic column name, build that part of the query string from a fixed allowlist of safe identifiers, then use `?` only for the actual values.
+
+```java
+// Will not work; ? cannot stand in for a column.
+String wrong = "SELECT * FROM products ORDER BY ?";
+
+// Validate against an allowlist, then concatenate the column name.
+Set<String> allowed = Set.of("name", "price", "stock");
+String column = allowed.contains(userColumn) ? userColumn : "name";
+String right = "SELECT * FROM products ORDER BY " + column + " LIMIT ?";
+```
+
+The allowlist keeps the dynamic part safe because the user's input is compared against a fixed set instead of being passed through to the SQL parser.
+
+**Mixing types.** Setting a `LocalDate` with `setObject(i, localDate)` works on modern drivers because of JDBC 4.2's `java.time` support, but `setDate(i, localDate)` does not compile because `setDate` expects `java.sql.Date`. The conversion goes through `Date.valueOf(localDate)`.
+
+```java
+import java.time.LocalDate;
+// ...
+ps.setDate(1, java.sql.Date.valueOf(LocalDate.of(2026, 5, 13)));
+// Or, on JDBC 4.2+:
+ps.setObject(1, LocalDate.of(2026, 5, 13));
+```
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

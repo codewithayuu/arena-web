@@ -1,0 +1,792 @@
+---
+title: "File Channels"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "File Channels explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="what-a-filechannel-is">What a FileChannel Is</h1>
+
+A `FileChannel` is an open connection to a file that supports reading, writing, and random-access positioning. It lives in `java.nio.channels` and was added in Java 1.4 as part of the original NIO release. Unlike a `FileInputStream` or `FileOutputStream`, which are one-direction byte pipes, a channel sits over the file like a cursor: the cursor moves anywhere, reads or writes at that spot, and the file's size is queryable.
+
+The simplest way to obtain a channel is `FileChannel.open(Path, OpenOption...)`. The open options come from `java.nio.file.StandardOpenOption` and they're the same ones used by `Files.newInputStream` and friends. Common ones:
+
+| Option              | Effect                                                                |
+| ------------------- | --------------------------------------------------------------------- |
+| `READ`              | Open for reading. Required if you plan to read.                       |
+| `WRITE`             | Open for writing. Required if you plan to write.                      |
+| `CREATE`            | Create the file if it doesn't exist. Requires `WRITE`.                |
+| `CREATE_NEW`        | Create only if absent; fail if it exists. Atomic creation.            |
+| `APPEND`            | Writes go to the end of the file. Implies `WRITE`.                    |
+| `TRUNCATE_EXISTING` | If the file exists, set its length to zero on open. Requires `WRITE`. |
+| `DSYNC` / `SYNC`    | Every write is flushed to disk before returning. Slow but durable.    |
+
+A minimal open-and-close example. The chapter's running theme is an online store, so the file holds part of a small catalog.
+
+```java
+import java.nio.channels.FileChannel;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+public class OpenChannel {
+    public static void main(String[] args) throws Exception {
+        Path catalog = Path.of("catalog.bin");
+
+        try (FileChannel channel = FileChannel.open(
+                catalog,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE,
+                StandardOpenOption.READ)) {
+            System.out.println("Opened: " + catalog.toAbsolutePath());
+            System.out.println("Size: " + channel.size() + " bytes");
+            System.out.println("Position: " + channel.position());
+        }
+    }
+}
+```
+
+The channel is `AutoCloseable`, so try-with-resources fits. `size()` returns the current file length in bytes. `position()` returns the current cursor offset, which starts at `0` and moves as reads or writes happen.
+
+A `FileChannel` can also come from an existing stream by calling `getChannel()` on a `FileInputStream`, `FileOutputStream`, or `RandomAccessFile`. That's mostly useful when adapting older code. For new code, `FileChannel.open(Path, OpenOption...)` is the recommended path because the open options are explicit and the API is cleaner.
+
+`FileChannel` is thread-safe at the channel level: multiple threads can call `read(ByteBuffer, position)` and `write(ByteBuffer, position)` concurrently because those calls take an explicit position. The single-argument `read(ByteBuffer)` and `write(ByteBuffer)` advance the channel's internal position and serialize against each other, so they're safe but won't run truly in parallel.
+
+`FileChannel.open` is a real system call. Opening a channel in a hot loop is wasteful; open once, do the I/O, close. The same applies to closing: every close flushes OS buffers, so avoid closing and reopening between writes that could share a channel.
+
+<h1 id="reading-with-a-bytebuffer">Reading With a ByteBuffer</h1>
+
+A `FileChannel` doesn't deal in `byte[]` or strings. It reads and writes through a `ByteBuffer`. The buffer is the staging area: the channel pulls bytes off disk and into the buffer, and application code pulls bytes out of the buffer to do something useful with them. The NIO overview lesson introduced the `position`, `limit`, and `capacity` model; this section uses it.
+
+The basic read sequence is:
+
+1. Allocate a `ByteBuffer` of some size.
+2. Call `channel.read(buffer)`. The channel writes bytes into the buffer starting at `buffer.position()` and advances both the buffer's position and the channel's position by the number of bytes read.
+3. Call `buffer.flip()` to prepare the buffer for reading: this sets `limit = position` and resets `position = 0`.
+4. Drain the buffer (`buffer.get()`, `buffer.array()`, etc.).
+5. Call `buffer.clear()` to reuse the buffer for the next read.
+
+A small program that writes a short file using the `Files` API, then reads it back through a channel and a 16-byte buffer:
+
+```java
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+public class ReadCatalog {
+    public static void main(String[] args) throws Exception {
+        Path catalog = Path.of("catalog.txt");
+        Files.writeString(catalog, "Notebook,Pen,Eraser");
+
+        try (FileChannel channel = FileChannel.open(catalog, StandardOpenOption.READ)) {
+            ByteBuffer buffer = ByteBuffer.allocate(16);
+            StringBuilder result = new StringBuilder();
+
+            int bytesRead;
+            while ((bytesRead = channel.read(buffer)) > 0) {
+                buffer.flip();
+                byte[] chunk = new byte[bytesRead];
+                buffer.get(chunk);
+                result.append(new String(chunk, StandardCharsets.UTF_8));
+                buffer.clear();
+            }
+
+            System.out.println("Read: " + result);
+        }
+
+        Files.deleteIfExists(catalog);
+    }
+}
+```
+
+The file is `19` bytes and the buffer is `16` bytes, so the loop runs twice: the first `read` returns `16` and the second returns `3`. When the file is exhausted, `read` returns `-1`, the loop ends, and the catalog is parsed. The `flip()` and `clear()` pair is the heart of buffer reuse: `flip` switches the buffer from "I just filled it" to "I'm about to drain it", and `clear` switches it back.
+
+A visual breakdown of `flip()`:
+
+The buffer's `position` is the next index that will be read or written. `limit` is the first index that's off-limits. `flip` sets `limit` to where `position` is now (so reads can't go past the data) and resets `position` to `0` (so reads start at the front). `clear` resets `position` to `0` and `limit` to `capacity`, ready for another write into the buffer.
+
+Forgetting `flip()` is a common channel bug. Without it, the buffer's `position` is at the end of the just-read data, and a subsequent `get` either reads garbage from beyond the data or returns nothing because `position == limit`.
+
+`ByteBuffer.allocate(n)` creates a buffer on the JVM heap; the channel may have to copy bytes from a kernel buffer into the heap buffer. `ByteBuffer.allocateDirect(n)` creates a buffer in native memory, which the kernel can read or write into directly. Direct buffers are slower to allocate but faster for large transfers and for `transferTo` zero-copy operations.
+
+<h1 id="writing-with-a-bytebuffer">Writing With a ByteBuffer</h1>
+
+Writing is the mirror image. Fill a buffer with bytes to send to the file, call `flip()` to prepare it for draining, and pass it to `channel.write`. The channel pulls bytes out of the buffer starting at `buffer.position()` and advances both positions.
+
+```java
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+public class WriteCatalog {
+    public static void main(String[] args) throws Exception {
+        Path catalog = Path.of("catalog.txt");
+
+        try (FileChannel channel = FileChannel.open(
+                catalog,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE,
+                StandardOpenOption.TRUNCATE_EXISTING)) {
+
+            byte[] payload = "Notebook,Pen,Eraser".getBytes(StandardCharsets.UTF_8);
+            ByteBuffer buffer = ByteBuffer.wrap(payload);
+
+            int written = channel.write(buffer);
+            System.out.println("Bytes written: " + written);
+            System.out.println("File size: " + channel.size());
+        }
+
+        System.out.println("On disk: " + Files.readString(catalog));
+        Files.deleteIfExists(catalog);
+    }
+}
+```
+
+`ByteBuffer.wrap(byte[])` creates a buffer that uses the array as its backing store. Its `position` starts at `0` and `limit` is set to the array length, so the buffer is already in "ready to drain" state, which means no `flip` is needed. Building the buffer with `allocate` and `put` instead requires `flip` before calling `write`.
+
+One gotcha: `channel.write` may not consume the whole buffer in one call, especially with sockets but occasionally with files too (large writes, full disk, slow storage). The reliable pattern is a loop:
+
+```java
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+public class WriteCatalogLoop {
+    public static void main(String[] args) throws Exception {
+        Path catalog = Path.of("catalog.txt");
+
+        try (FileChannel channel = FileChannel.open(
+                catalog,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE,
+                StandardOpenOption.TRUNCATE_EXISTING)) {
+
+            ByteBuffer buffer = ByteBuffer.wrap(
+                    "Notebook,Pen,Eraser".getBytes(StandardCharsets.UTF_8));
+
+            while (buffer.hasRemaining()) {
+                channel.write(buffer);
+            }
+
+            System.out.println("Done. Size: " + channel.size());
+        }
+
+        Files.deleteIfExists(catalog);
+    }
+}
+```
+
+`buffer.hasRemaining()` returns `true` as long as `position < limit`. The loop keeps calling `write` until the buffer is drained. For local files this loop almost always runs once, but for non-blocking I/O or sockets the loop is essential. It's worth keeping as a habit.
+
+To append rather than overwrite, open with `StandardOpenOption.APPEND`. The channel's writes then go to the end of the file regardless of where `position()` says it is. This is the channel equivalent of opening a log file in append mode.
+
+<h1 id="positioning-random-access-in-a-file">
+  Positioning: Random Access in a File
+</h1>
+
+A `FileChannel` is not a one-way pipe. The cursor can move anywhere in the file to read or write from there. There are two ways to do it.
+
+The first is to modify the channel's internal position with `position(long)` before a read or write. The second is to pass an explicit position to `read(ByteBuffer, long)` or `write(ByteBuffer, long)`, which leaves the channel's internal position alone. The explicit-position form is also the thread-safe one, since concurrent positional reads on the same channel don't step on each other.
+
+```java
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+public class RandomAccess {
+    public static void main(String[] args) throws Exception {
+        Path catalog = Path.of("catalog.txt");
+        Files.writeString(catalog, "Notebook,Pen,Eraser");
+
+        try (FileChannel channel = FileChannel.open(catalog, StandardOpenOption.READ)) {
+            System.out.println("File size: " + channel.size());
+
+            // Read 3 bytes starting at offset 9 (after "Notebook,")
+            ByteBuffer buffer = ByteBuffer.allocate(3);
+            int read = channel.read(buffer, 9);
+
+            buffer.flip();
+            byte[] data = new byte[read];
+            buffer.get(data);
+            System.out.println("At offset 9: " + new String(data, StandardCharsets.UTF_8));
+            System.out.println("Channel position after positional read: " + channel.position());
+        }
+
+        Files.deleteIfExists(catalog);
+    }
+}
+```
+
+The file is `"Notebook,Pen,Eraser"`. Offset `9` is the `P` in `Pen` (count from `0`: `N=0, o=1, ..., ,=8, P=9`). The positional `read` pulls three bytes starting there. The channel's `position()` is still `0` after the call: positional reads don't move the cursor.
+
+`truncate(long)` cuts the file to a given size. If the file is longer than the size passed, the extra bytes are discarded. If it's shorter, `truncate` does nothing. This is handy for overwriting the start of a file and discarding the tail.
+
+```java
+import java.nio.channels.FileChannel;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+public class TruncateCatalog {
+    public static void main(String[] args) throws Exception {
+        Path catalog = Path.of("catalog.txt");
+        Files.writeString(catalog, "Notebook,Pen,Eraser");
+
+        try (FileChannel channel = FileChannel.open(catalog, StandardOpenOption.WRITE)) {
+            System.out.println("Before: " + channel.size());
+            channel.truncate(8);
+            System.out.println("After:  " + channel.size());
+        }
+
+        System.out.println("Contents: " + Files.readString(catalog));
+        Files.deleteIfExists(catalog);
+    }
+}
+```
+
+`truncate(8)` cuts the file to its first eight bytes, leaving just `"Notebook"`. Combine `truncate` with `position(0)` to safely rewrite a file from scratch using the same channel.
+
+A common use case: appending order events at a known offset. If a file format has a header with the count of records, the count at offset `0` can be updated after appending each record without rewriting the whole file.
+
+```java
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.Files;
+
+public class AppendAtEnd {
+    public static void main(String[] args) throws Exception {
+        Path orders = Path.of("orders.bin");
+
+        try (FileChannel channel = FileChannel.open(
+                orders,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.READ,
+                StandardOpenOption.WRITE)) {
+
+            // Header is 4 bytes: an int count of orders, starts at 0
+            channel.write(ByteBuffer.allocate(4).putInt(0).flip());
+
+            // Each order is one int order ID
+            int[] newOrders = { 1001, 1002, 1003 };
+            for (int id : newOrders) {
+                ByteBuffer entry = ByteBuffer.allocate(4).putInt(id).flip();
+                channel.position(channel.size());     // jump to end
+                channel.write(entry);
+            }
+
+            // Update the header count at offset 0
+            ByteBuffer header = ByteBuffer.allocate(4).putInt(newOrders.length).flip();
+            channel.write(header, 0);
+
+            // Verify
+            ByteBuffer check = ByteBuffer.allocate(4);
+            channel.read(check, 0);
+            check.flip();
+            System.out.println("Header count: " + check.getInt());
+            System.out.println("File size: " + channel.size());
+        }
+
+        Files.deleteIfExists(orders);
+    }
+}
+```
+
+The header lives at offset `0` and gets updated in place using the positional `write` form. The order entries are appended by jumping to `channel.size()` each time. The file ends up being `4` bytes of header plus `3 x 4 = 12` bytes of order IDs, for `16` total. The positional `write` doesn't move the channel's cursor, so the next append still goes to the end.
+
+<h1 id="force-flushing-data-to-disk">force(): Flushing Data to Disk</h1>
+
+When `channel.write(buffer)` returns, the bytes have been handed to the OS. They have not necessarily been written to disk. The OS holds them in a kernel buffer (the page cache) and flushes them later in the background. For most workloads this is fine: it's fast, and a clean shutdown flushes everything. For workloads that need durability after every operation (databases, financial logs, anything where a power cut shouldn't lose the last record), the OS needs to be asked to push the bytes to physical storage.
+
+`channel.force(boolean metaData)` does that. It maps to the underlying OS call (`fsync` on Linux, `FlushFileBuffers` on Windows). The `boolean` argument controls whether file metadata (modification time, ACLs) is also flushed:
+
+| Call           | What gets flushed       | Cost            |
+| -------------- | ----------------------- | --------------- |
+| `force(false)` | File data only          | Cheaper         |
+| `force(true)`  | File data plus metadata | Slightly slower |
+
+```java
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+public class DurableWrite {
+    public static void main(String[] args) throws Exception {
+        Path orders = Path.of("orders.log");
+
+        try (FileChannel channel = FileChannel.open(
+                orders,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE,
+                StandardOpenOption.APPEND)) {
+
+            ByteBuffer entry = ByteBuffer.wrap(
+                    "ORDER 1001 PLACED\n".getBytes(StandardCharsets.UTF_8));
+            channel.write(entry);
+
+            // Without force, the bytes might still be in OS page cache.
+            // force(false) flushes data; metadata flush is rarely needed for append-only logs.
+            channel.force(false);
+
+
+
+            System.out.println("Order recorded durably.");
+        }
+
+        Files.deleteIfExists(orders);
+    }
+}
+```
+
+`force(false)` is the right default for most append-only logs. The file's modification time is metadata; a few seconds of lag is usually fine. Use `force(true)` when the file's mtime or size needs to be visible to crash recovery.
+
+`force()` is a real `fsync`, which on a spinning disk can take several milliseconds and on an SSD a fraction of a millisecond. Calling it after every tiny write throttles throughput hard. Batch writes when possible, then force once.
+
+There's a related option, `StandardOpenOption.SYNC` and `StandardOpenOption.DSYNC`, which makes every write behave as if `force` had been called after it. `SYNC` flushes data and metadata; `DSYNC` flushes data only. Both are appropriate for transactional log files, but they make every single write call slow, so the explicit `force()` approach gives finer control.
+
+<h1 id="zero-copy-transfers-with-transferto">
+  Zero-Copy Transfers With transferTo
+</h1>
+
+Copying one file to another the naive way looks like this: read bytes from the source channel into a buffer, then write those bytes from the buffer to the destination channel. The bytes travel from disk into the kernel's page cache, get copied into the JVM buffer (which may itself be a copy into Java heap), get copied back into the destination's kernel buffer, and finally land on disk. Two trips through user space, four copies in total for a typical setup.
+
+`transferTo` short-circuits that. The signature is:
+
+```text
+public abstract long transferTo(long position, long count, WritableByteChannel target)
+```
+
+On Linux it uses `sendfile`, which copies bytes directly from one kernel buffer to another without ever bringing them into user space. The data never enters the JVM. On Windows it uses `TransmitFile`. On platforms that don't have a kernel-level shortcut, the JDK falls back to a buffer-loop internally, so the call still works but doesn't save copies.
+
+The two paths compared:
+
+The red box in the naive path is the user-space round trip paid on every byte. `transferTo` removes it entirely on supported platforms, which saves CPU and roughly doubles throughput for large copies.
+
+A program that copies a product-catalog dump from one file to another:
+
+```java
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+public class CopyCatalog {
+    public static void main(String[] args) throws Exception {
+        Path source = Path.of("catalog-source.bin");
+        Path target = Path.of("catalog-target.bin");
+
+        // Build a small source file so the example runs
+        StringBuilder body = new StringBuilder();
+        for (int i = 1; i <= 1000; i++) {
+            body.append("PROD-").append(i).append(",Notebook,4.99\n");
+        }
+        Files.writeString(source, body.toString());
+
+        try (FileChannel in  = FileChannel.open(source, StandardOpenOption.READ);
+             FileChannel out = FileChannel.open(
+                     target,
+                     StandardOpenOption.CREATE,
+                     StandardOpenOption.WRITE,
+                     StandardOpenOption.TRUNCATE_EXISTING)) {
+
+            long size = in.size();
+            long transferred = 0;
+            while (transferred < size) {
+                transferred += in.transferTo(transferred, size - transferred, out);
+            }
+
+            System.out.println("Copied " + transferred + " bytes");
+            System.out.println("Source size: " + in.size());
+            System.out.println("Target size: " + out.size());
+        }
+
+        Files.deleteIfExists(source);
+        Files.deleteIfExists(target);
+    }
+}
+```
+
+A few things worth noting. `transferTo` returns the number of bytes actually transferred, which can be less than the count requested. The loop keeps calling until everything is moved. The maximum bytes transferred in one call is platform-dependent; on Linux there's a historical `sendfile` cap of around `2 GB` per call, so big-file copies always need the loop.
+
+`transferFrom` is the mirror operation: it pulls bytes from a source `ReadableByteChannel` into the current channel at a given position. It's the same idea with the roles swapped.
+
+`transferTo` is roughly 2x the throughput of a naive read/write loop for large copies on Linux because it removes the user-space copy. For files smaller than a few KB the gain is invisible. For a 1 GB clickstream dump the gain shows up clearly on a flame graph.
+
+<h1 id="memory-mapped-files">Memory-Mapped Files</h1>
+
+A memory-mapped file is a file that the OS has mapped into a process's address space. Once mapped, reading from a region of memory reads from the file, and writing to that memory eventually writes to the file. There's no `read()` or `write()` call per byte; memory access is the only interface, and the kernel transparently faults pages in from disk and writes dirty pages back later.
+
+`FileChannel.map(MapMode, long position, long size)` returns a `MappedByteBuffer`. The map modes are:
+
+| Mode         | Effect                                                                       |
+| ------------ | ---------------------------------------------------------------------------- |
+| `READ_ONLY`  | Buffer is read-only. Writes to it throw `ReadOnlyBufferException`.           |
+| `READ_WRITE` | Reads and writes go to the file. Writes are eventually flushed to disk.      |
+| `PRIVATE`    | Copy-on-write. Writes are visible only to this process and not saved to disk |
+
+The standout use case is random access into a very large file. With a `10 GB` orders archive, reading records at specific offsets by mapping it and indexing into the buffer is dramatically simpler than seeking and reading manually.
+
+Application code sees a `MappedByteBuffer` that behaves like any other `ByteBuffer`. Underneath, the buffer's addresses are virtual memory entries that the kernel resolves to pages in the page cache. On a page miss, the kernel reads the relevant page from disk transparently. The JVM never copies the data; it reads bytes directly from memory.
+
+A small example that memory-maps a binary orders file for random-access lookup:
+
+```java
+import java.nio.ByteBuffer;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileChannel.MapMode;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+public class MappedOrders {
+    public static void main(String[] args) throws Exception {
+        Path orders = Path.of("orders.bin");
+
+        // Build a file where each record is 12 bytes: int orderId, int customerId, int amountCents
+        try (FileChannel channel = FileChannel.open(
+                orders,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE,
+                StandardOpenOption.TRUNCATE_EXISTING)) {
+            ByteBuffer buffer = ByteBuffer.allocate(12 * 5);
+            for (int i = 0; i < 5; i++) {
+                buffer.putInt(1000 + i);   // orderId
+                buffer.putInt(2000 + i);   // customerId
+                buffer.putInt((i + 1) * 999); // amount in cents
+            }
+            buffer.flip();
+            channel.write(buffer);
+        }
+
+        // Map and do random-access reads
+        try (FileChannel channel = FileChannel.open(orders, StandardOpenOption.READ)) {
+            MappedByteBuffer map = channel.map(MapMode.READ_ONLY, 0, channel.size());
+
+            // Look up the 4th record (index 3) directly
+            int recordIndex = 3;
+            int offset = recordIndex * 12;
+            int orderId    = map.getInt(offset);
+            int customerId = map.getInt(offset + 4);
+            int amount     = map.getInt(offset + 8);
+
+            System.out.println("Order: "    + orderId);
+            System.out.println("Customer: " + customerId);
+            System.out.println("Amount: $"  + amount / 100.0);
+        }
+
+        Files.deleteIfExists(orders);
+    }
+}
+```
+
+The fourth record sits at offset `3 * 12 = 36`. `getInt(36)` reads the order ID, `getInt(40)` the customer ID, `getInt(44)` the amount. No buffer juggling, no positional reads, no loop. The map call itself is cheap because the OS just sets up the address translation; pages are only loaded from disk when you actually touch them.
+
+For read-write maps the picture is the same with one caveat: changes are not guaranteed to hit disk until you call `MappedByteBuffer.force()`. The kernel writes dirty pages back on its own schedule unless you ask for an explicit flush.
+
+A real-world example: keeping a small in-place counter at a known offset in a stats file.
+
+```java
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileChannel.MapMode;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+public class MappedCounter {
+    public static void main(String[] args) throws Exception {
+        Path stats = Path.of("stats.bin");
+
+        // Initialize the file with 8 bytes of zero (one long counter)
+        try (FileChannel channel = FileChannel.open(
+                stats,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE,
+                StandardOpenOption.TRUNCATE_EXISTING)) {
+            channel.write(java.nio.ByteBuffer.allocate(8));
+        }
+
+        try (FileChannel channel = FileChannel.open(
+                stats,
+                StandardOpenOption.READ,
+                StandardOpenOption.WRITE)) {
+
+            MappedByteBuffer map = channel.map(MapMode.READ_WRITE, 0, 8);
+
+            // Increment the counter three times
+            for (int i = 0; i < 3; i++) {
+                long current = map.getLong(0);
+                map.putLong(0, current + 1);
+            }
+            map.force();
+
+            System.out.println("Counter on disk: " + map.getLong(0));
+        }
+
+        Files.deleteIfExists(stats);
+    }
+}
+```
+
+Each `getLong(0)` and `putLong(0, ...)` reads or writes eight bytes directly to mapped memory. The `force()` at the end makes sure those bytes are on disk before the program continues. Without `force`, the value is in the page cache but a power cut could lose it.
+
+There's one rough edge with `MappedByteBuffer`: there is no public, portable way to unmap a buffer before its `MappedByteBuffer` object is garbage-collected. The mapping holds the file open from the OS's perspective, which on Windows prevents the file from being deleted until GC catches up. Recent JDKs added internal cleanup APIs, but the safe rule is: don't memory-map a file that needs to be deleted or renamed inside the same process unless GC timing is acceptable.
+
+`MappedByteBuffer` allocation is essentially free at map time; the kernel only sets up the page table entries. The real cost is the first read of each page, which faults the page in from disk. For sequential scans, the OS prefetches pages and the cost is hidden. For purely random access into a huge file, expect one disk seek per page that's not already cached.
+
+<h1 id="file-locking">File Locking</h1>
+
+When two processes share a file, coordination is needed. Java NIO offers OS-level file locks through `FileChannel.lock()` and `tryLock()`. These map to platform-level locking primitives: `fcntl` on Unix, `LockFileEx` on Windows.
+
+A lock can be either shared or exclusive. A shared lock means "reading is in progress, others may read but no one may write." An exclusive lock means "this is being changed, no one else may read or write." Both kinds are acquired on a region of the file (offset and length), not the file as a whole, though the whole file can be locked by passing `0` and `Long.MAX_VALUE`.
+
+Multiple shared locks on the same region coexist. A shared lock and an exclusive lock on the same region are incompatible: whichever arrives second waits or fails. The same applies to two exclusive locks.
+
+The API has two flavors:
+
+| Method                                     | Behavior                                                               |
+| ------------------------------------------ | ---------------------------------------------------------------------- |
+| `lock()` / `lock(pos, size, shared)`       | Blocks until the lock is granted.                                      |
+| `tryLock()` / `tryLock(pos, size, shared)` | Returns `null` immediately if the lock isn't available. Doesn't block. |
+
+The returned `FileLock` is itself `AutoCloseable`. Use try-with-resources to make sure the lock is released even on exceptions.
+
+```java
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+public class InventoryLock {
+    public static void main(String[] args) throws Exception {
+        Path inventory = Path.of("inventory.dat");
+        Files.writeString(inventory, "STOCK=100\n");
+
+        try (FileChannel channel = FileChannel.open(
+                inventory,
+                StandardOpenOption.READ,
+                StandardOpenOption.WRITE)) {
+
+            // Lock the whole file exclusively
+            try (FileLock lock = channel.lock()) {
+                System.out.println("Lock acquired. Shared: " + lock.isShared());
+
+                // Adjust stock under the lock
+                ByteBuffer payload = ByteBuffer.wrap(
+                        "STOCK= 95\n".getBytes(StandardCharsets.UTF_8));
+                channel.position(0);
+                channel.write(payload);
+                channel.force(false);
+
+                System.out.println("Stock adjusted. New contents:");
+                System.out.println(Files.readString(inventory));
+            }
+            System.out.println("Lock released.");
+        }
+
+        Files.deleteIfExists(inventory);
+    }
+}
+```
+
+The `lock()` call returns an exclusive lock by default. The inventory write happens between the lock acquisition and its release. Any other process that opens this file and tries to lock the same region will either block on `lock()` or get `null` from `tryLock()`, depending on which one it calls.
+
+There's one important caveat with file locks: on Unix systems, they're _advisory_ by default. They only block other processes that themselves use the same locking API. A process that ignores locking and just calls `write()` will not be stopped. On Windows the locks are _mandatory_: the OS itself refuses to allow conflicting access. Cross-platform code should treat the API as advisory and design protocols where all participants honor the lock.
+
+A second caveat: file locks are held by the JVM as a whole, not by the thread. Within one JVM, two threads using the same channel will both see "lock granted" even though only one of them is the real holder. For intra-JVM coordination, use `java.util.concurrent.locks` or `synchronized`. `FileLock` is for inter-process coordination.
+
+Use `tryLock()` for doing something else if the lock isn't free, like backing off and retrying, or skipping this iteration:
+
+```java
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+public class TryLockExample {
+    public static void main(String[] args) throws Exception {
+        Path inventory = Path.of("inventory.dat");
+        Files.writeString(inventory, "STOCK=100\n");
+
+        try (FileChannel channel = FileChannel.open(
+                inventory, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+
+            FileLock lock = channel.tryLock();
+            if (lock == null) {
+                System.out.println("Someone else holds the lock. Skipping this run.");
+                return;
+            }
+            try {
+                System.out.println("Got the lock. Doing work...");
+                // Do exclusive work here
+            } finally {
+                lock.release();
+            }
+        }
+
+        Files.deleteIfExists(inventory);
+    }
+}
+```
+
+When no one else is holding the lock, `tryLock` returns it immediately. When another holder exists, it returns `null` and the calling code can pick a different strategy instead of stalling.
+
+<h1 id="asynchronousfilechannel-brief">AsynchronousFileChannel (Brief)</h1>
+
+`FileChannel` is synchronous: every read or write blocks the calling thread until the OS returns. For most file I/O that's fine, because file operations are usually fast enough that one blocked thread per request is acceptable.
+
+For truly non-blocking file I/O, NIO.2 added `AsynchronousFileChannel`. The shape mirrors `FileChannel`, but the read and write methods return a `Future<Integer>` (or accept a `CompletionHandler`) instead of returning the byte count directly. Internally, the JDK runs the I/O on a thread pool and signals completion through the future or handler.
+
+```java
+import java.nio.ByteBuffer;
+import java.nio.channels.AsynchronousFileChannel;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.concurrent.Future;
+
+public class AsyncReadExample {
+    public static void main(String[] args) throws Exception {
+        Path catalog = Path.of("catalog.txt");
+        Files.writeString(catalog, "Notebook,Pen,Eraser");
+
+        try (AsynchronousFileChannel channel = AsynchronousFileChannel.open(
+                catalog, StandardOpenOption.READ)) {
+
+            ByteBuffer buffer = ByteBuffer.allocate(64);
+            Future<Integer> result = channel.read(buffer, 0);
+
+            // Could do other work here while the read is in flight
+            int bytesRead = result.get();   // block and wait
+
+            buffer.flip();
+            byte[] data = new byte[bytesRead];
+            buffer.get(data);
+            System.out.println("Read async: " + new String(data));
+        }
+
+        Files.deleteIfExists(catalog);
+    }
+}
+```
+
+For most file workloads, synchronous `FileChannel` plus a sensible thread pool is simpler and usually just as fast. `AsynchronousFileChannel` is well-suited to scenarios where many concurrent file operations are needed from one thread without blocking. Production-grade async I/O frameworks (Netty, server-side databases) use it; everyday application code rarely needs it.
+
+<h1 id="when-to-use-filechannel-vs-files">When to Use FileChannel vs Files</h1>
+
+It's tempting to use `FileChannel` for everything once it's available. It isn't always appropriate. The `Files` API handles most everyday file work with fewer moving parts.
+
+Use the `Files` API for:
+
+- Reading a config file or a small JSON document (`Files.readString`).
+- Writing a small file in one shot (`Files.writeString`).
+- Streaming lines of a text file (`Files.lines`).
+- Copying or moving files when throughput tuning doesn't matter (`Files.copy`).
+- Anything where the file is small enough to comfortably fit in a `String` or `byte[]`.
+
+Use `FileChannel` when:
+
+- Moving lots of bytes is needed with zero-copy (`transferTo`).
+- Random access in the middle of a file is required without re-reading from the start.
+- OS-level file locking is needed for inter-process coordination.
+- Precise control over flushing and durability is required (`force`).
+- Memory-mapping a file gives fast random access into a large dataset.
+- A file too big to fit in memory is being processed and buffer size needs explicit control.
+
+| Task                                        | Use                                  |
+| ------------------------------------------- | ------------------------------------ |
+| Read a 2 KB config file                     | `Files.readString`                   |
+| Write 100 KB of JSON                        | `Files.writeString`                  |
+| Stream a 5 GB log file line by line         | `Files.lines` (with a `try-with`)    |
+| Copy a 4 GB media file                      | `FileChannel.transferTo`             |
+| Random-access reads into a 50 GB archive    | `FileChannel.map`                    |
+| Atomic stock update from multiple processes | `FileChannel.lock`                   |
+| Durable append to a financial log           | `FileChannel.write` + `force(false)` |
+| Update a counter at a known offset          | `FileChannel.write(buffer, offset)`  |
+
+A useful default: start with the `Files` API. Switch to `FileChannel` only when there's a concrete reason from the second list. Channels offer more control at the price of more code; spending that price on a 10 KB JSON file is bad economics.
+
+<h1 id="common-pitfalls">Common Pitfalls</h1>
+
+Five common channel bugs, with what each one looks like and how to avoid it.
+
+**Forgetting to `flip()` between fill and drain.** The buffer's `position` ends up where "data to keep coming" would be expected, not where "data to be read from" would be expected. The fix is muscle memory: after `put` calls, always `flip` before `write`; after `read` from the channel, always `flip` before `get`.
+
+**Sharing a `ByteBuffer` across threads.** A `ByteBuffer` is not thread-safe. Two threads taking turns with `put`, `flip`, `get`, `clear` on the same buffer will corrupt each other's positions. Either give each thread its own buffer, or synchronize access. The positional `read(buffer, position)` and `write(buffer, position)` variants are concurrency-safe at the channel level, but they still need exclusive access to the buffer they take.
+
+**Calling `force()` after every write.** This produces terrible throughput. Each `force()` is an `fsync`. On spinning disks, a few hundred per second is the realistic ceiling. Batch the writes, then call `force` once per batch or at a controlled cadence.
+
+**Memory-mapping a file that needs to be deleted.** On Windows the mapping holds the file open from the OS's point of view, so `Files.delete(path)` may fail with "file in use." The JDK has no portable, public way to unmap before GC. The workarounds: avoid deleting from the same JVM that mapped the file, or pin to a specific JDK and use the internal cleanup API.
+
+**Mistaking `FileLock` for in-JVM synchronization.** `FileLock` coordinates _between processes_. Within one JVM, two threads acquiring locks through different channels on the same file region will hit `OverlappingFileLockException`, not block-and-wait. For threads inside one JVM, use `synchronized` or `java.util.concurrent.locks`.
+
+A small example of the right pattern for one process writing a checksum over a large file:
+
+```java
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.zip.CRC32;
+
+public class FileChecksum {
+    public static void main(String[] args) throws Exception {
+        Path log = Path.of("clickstream.log");
+
+        StringBuilder body = new StringBuilder();
+        for (int i = 0; i < 1000; i++) {
+            body.append("click ").append(i).append(",user=").append(i % 50).append("\n");
+        }
+        Files.writeString(log, body.toString());
+
+        CRC32 crc = new CRC32();
+        try (FileChannel channel = FileChannel.open(log, StandardOpenOption.READ)) {
+            ByteBuffer buffer = ByteBuffer.allocate(4096);
+
+            while (channel.read(buffer) > 0) {
+                buffer.flip();
+                crc.update(buffer);
+                buffer.clear();
+            }
+        }
+
+        System.out.println("CRC32: " + Long.toHexString(crc.getValue()));
+        Files.deleteIfExists(log);
+    }
+}
+```
+
+A 4 KB buffer is reused for the whole file, `flip` happens between fill and drain, `clear` resets the buffer between iterations, the channel is closed via try-with-resources, and the file is deleted at the end. None of the pitfalls above apply, and the code scales the same way for a 4 KB file or a 4 GB file because the buffer doesn't grow.
+
+A 4-8 KB buffer is the sweet spot for most file scans. Tiny buffers (`64` bytes) make too many syscalls. Huge buffers (`16 MB`) waste memory and cause GC pressure if reallocated per read. Match the buffer size to the OS page size or a small multiple of it.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

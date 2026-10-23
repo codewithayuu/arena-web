@@ -1,0 +1,628 @@
+---
+title: "requests Library"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "requests Library explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="installing-and-the-first-call">Installing and the First Call</h1>
+
+`requests` isn't in the standard library. Install it with pip:
+
+```text
+pip install requests
+```
+
+The simplest call is a one-liner.
+
+```python
+import requests
+
+response = requests.get("https://httpbin.org/get")
+print(response.status_code)
+print(response.json()["url"])
+```
+
+That's the entire API for a basic call. No `Request` object, no `urlopen`, no manual encoding, no `read().decode()`. `requests.get` returns a `Response`, and `response.json()` parses the body as JSON. Compared with the equivalent `urllib.request` code, this is the same call in a quarter of the lines.
+
+The library's tagline, "HTTP for Humans," is earned. The defaults are sensible (it sets a reasonable `User-Agent`, follows redirects, accepts gzip compression). The error model is forgiving (a response object is returned even on 404, instead of an exception). Common patterns get one-liner support.
+
+<h1 id="the-verb-functions">The Verb Functions</h1>
+
+`requests` exposes one function per HTTP method, all with the same shape: positional URL, keyword arguments for everything else.
+
+| Function                     | Method    | Typical Use                            |
+| ---------------------------- | --------- | -------------------------------------- |
+| `requests.get(url, ...)`     | `GET`     | Read a resource                        |
+| `requests.post(url, ...)`    | `POST`    | Create a resource or trigger an action |
+| `requests.put(url, ...)`     | `PUT`     | Replace a resource                     |
+| `requests.patch(url, ...)`   | `PATCH`   | Update part of a resource              |
+| `requests.delete(url, ...)`  | `DELETE`  | Remove a resource                      |
+| `requests.head(url, ...)`    | `HEAD`    | Get only headers, no body              |
+| `requests.options(url, ...)` | `OPTIONS` | Ask what methods the server supports   |
+
+All seven return a `Response` object. Internally they all call `requests.request(method, url, ...)`, so anything possible with the verb functions is also possible generically.
+
+```python
+import requests
+
+r1 = requests.get("https://httpbin.org/get")
+r2 = requests.post("https://httpbin.org/post", json={"qty": 2})
+r3 = requests.delete("https://httpbin.org/delete")
+
+print(r1.status_code, r2.status_code, r3.status_code)
+```
+
+Each call is independent. `requests` opens a TCP connection, sends the request, reads the response, and closes the connection. For more than a few calls in a row to the same host, this gets expensive, which is what `Session` solves further down.
+
+<h1 id="sending-parameters-params-data-json-files">
+  Sending Parameters: params, data, json, files
+</h1>
+
+The library uses four keyword arguments to cover the four common ways to attach data to a request. Picking the matching one is most of the work.
+
+| Argument | Where the data goes             | Content-Type                        | Example use                  |
+| -------- | ------------------------------- | ----------------------------------- | ---------------------------- |
+| `params` | Query string in the URL         | n/a                                 | Filtering, paging on a `GET` |
+| `data`   | Request body, form-encoded      | `application/x-www-form-urlencoded` | HTML form submissions        |
+| `json`   | Request body, JSON-encoded      | `application/json`                  | Modern API calls             |
+| `files`  | Request body, multipart-encoded | `multipart/form-data`               | File uploads                 |
+
+<h3 id="params-for-query-strings">params for Query Strings</h3>
+
+`params` accepts a dict (or a list of pairs) and appends it to the URL as a query string. `requests` handles percent-encoding.
+
+```python
+import requests
+
+r = requests.get(
+    "https://httpbin.org/get",
+    params={
+        "category": "audio gear",
+        "max_price": 100,
+        "in_stock": True,
+    },
+)
+
+print(r.url)
+print(r.json()["args"])
+```
+
+The space in `"audio gear"` got encoded as `+`, the `&` joins keys, and the server received the parameters as strings. Booleans come through as the strings `"True"` and `"False"` because HTTP only carries text; if the server expects lowercase `true`/`false`, convert before sending.
+
+For a parameter that should appear multiple times (`?tag=sale&tag=new`), pass a list:
+
+```python
+import requests
+
+r = requests.get(
+    "https://httpbin.org/get",
+    params={"tag": ["sale", "new"]},
+)
+print(r.url)
+```
+
+<h3 id="data-for-form-submissions">data for Form Submissions</h3>
+
+`data` accepts a dict and form-encodes it as the body. The library sets `Content-Type: application/x-www-form-urlencoded` automatically.
+
+```python
+import requests
+
+r = requests.post(
+    "https://httpbin.org/post",
+    data={"name": "ria", "email": "ria@example.com"},
+)
+
+print(r.json()["form"])
+print(r.request.headers["Content-Type"])
+```
+
+This is the format an HTML form sends by default. It's not the matching choice for modern APIs, which almost always want JSON, but it is what some older services expect. `data` also accepts a string or bytes if the server wants a custom body format; in that case, set `Content-Type` manually.
+
+<h3 id="json-for-json-bodies">json for JSON Bodies</h3>
+
+`json` is the modern default. Pass a Python object, the library serialises it with `json.dumps`, sets `Content-Type: application/json`, and sends it.
+
+```python
+import requests
+
+payload = {
+    "customer_id": 1,
+    "items": [
+        {"product_id": 101, "qty": 2},
+        {"product_id": 103, "qty": 1},
+    ],
+}
+
+r = requests.post("https://httpbin.org/post", json=payload)
+
+print(r.json()["json"])
+```
+
+This one keyword replaces about ten lines of `urllib.request` code (dump, encode, build the `Request`, set the header, pass `method="POST"`). It's a major reason most code uses `requests`.
+
+Use `json=` or `data=`, never both. They go in the same place (the body), and `requests` raises an error if both are passed.
+
+<h3 id="files-for-uploads">files for Uploads</h3>
+
+`files` accepts a dict mapping field names to file-like objects (or tuples with more detail). It builds a `multipart/form-data` body, which is the format browsers use for forms with file inputs.
+
+```python
+import requests
+
+# product_photo.jpg sits in the current directory
+with open("product_photo.jpg", "rb") as photo:
+    r = requests.post(
+        "https://httpbin.org/post",
+        data={"product_id": "101", "alt_text": "wireless mouse, top view"},
+        files={"photo": photo},
+    )
+
+print(r.status_code)
+print(list(r.json()["files"].keys()))
+print(r.json()["form"])
+```
+
+Opening the file in binary mode (`"rb"`) is important. The library reads bytes from it and stitches them into the multipart body. `files` and `data` can be mixed in the same call to send fields alongside the upload. For control over filename and content type, pass a tuple: `files={"photo": ("front.jpg", photo, "image/jpeg")}`.
+
+<h1 id="inspecting-the-response">Inspecting the Response</h1>
+
+The `Response` object exposes everything about the response, including the request that produced it.
+
+| Attribute / Method | Returns             | Notes                                   |
+| ------------------ | ------------------- | --------------------------------------- |
+| `r.status_code`    | `int`               | HTTP status code (200, 404, etc.)       |
+| `r.ok`             | `bool`              | `True` for any status under 400         |
+| `r.reason`         | `str`               | Status text (`"OK"`, `"Not Found"`)     |
+| `r.headers`        | dict-like           | Case-insensitive response headers       |
+| `r.text`           | `str`               | Body decoded as text                    |
+| `r.content`        | `bytes`             | Raw body bytes                          |
+| `r.json()`         | object              | Parsed JSON body                        |
+| `r.encoding`       | `str`               | Encoding `requests` chose for `r.text`  |
+| `r.url`            | `str`               | Final URL (after redirects)             |
+| `r.elapsed`        | `timedelta`         | How long the request took               |
+| `r.cookies`        | `RequestsCookieJar` | Cookies the server set                  |
+| `r.request`        | `PreparedRequest`   | The request that produced this response |
+| `r.history`        | list                | Earlier responses if redirects happened |
+
+```python
+import requests
+
+r = requests.get("https://httpbin.org/json")
+
+print(r.status_code, r.reason)
+print(r.headers["Content-Type"])
+print(type(r.text).__name__, len(r.text), "chars")
+print(type(r.content).__name__, len(r.content), "bytes")
+data = r.json()
+print(data["slideshow"]["title"])
+print(r.elapsed)
+```
+
+`r.text` is the body as a string, decoded with the encoding `requests` determined from the `Content-Type` header (or sniffed from the bytes if the header didn't say). `r.content` is the raw bytes, the right choice for binary payloads (images, files). `r.json()` is a shortcut for `json.loads(r.text)` with better error messages.
+
+`r.elapsed` is the round-trip time. Useful for logging slow calls without setting up a separate timer.
+
+`r.text` triggers a decode every time it's read. For very large responses, decode once into a variable rather than reading `r.text` repeatedly.
+
+<h1 id="handling-errors">Handling Errors</h1>
+
+`requests` deliberately doesn't raise on HTTP errors. A 404 response is still a response: the object is returned, `status_code` is `404`, and the body is whatever the server sent. The calling code decides whether that's an error worth raising.
+
+Two patterns cover almost every use case.
+
+<h3 id="check-status_code-explicitly">Check status_code explicitly</h3>
+
+```python
+import requests
+
+r = requests.get("https://httpbin.org/status/404")
+
+if r.status_code == 404:
+    print("not found")
+elif r.ok:
+    print("got it:", r.json())
+else:
+    print(f"unexpected {r.status_code}: {r.text[:100]}")
+```
+
+This is the matching style when 4xx responses are part of the normal flow (a missing product, a not-yet-existing order), and should be handled as data, not exceptions.
+
+<h3 id="use-raise_for_status">Use raise_for_status</h3>
+
+When any error response should halt the call, `raise_for_status()` turns 4xx and 5xx into exceptions. It does nothing for 2xx.
+
+```python
+import requests
+from requests.exceptions import HTTPError
+
+try:
+    r = requests.get("https://httpbin.org/status/500")
+    r.raise_for_status()
+except HTTPError as e:
+    print(f"http error: {e}")
+```
+
+The exception's `response` attribute holds the same `Response` object, so the body and headers remain accessible inside the `except` block.
+
+A common pattern is to call `raise_for_status()` right after the request and let the exception propagate where it can be handled centrally.
+
+<h3 id="network-level-errors">Network-level Errors</h3>
+
+Connection problems (DNS failure, timeout, TLS errors) raise different exceptions, all subclasses of `requests.exceptions.RequestException`:
+
+| Exception          | When                                                 |
+| ------------------ | ---------------------------------------------------- |
+| `Timeout`          | Request exceeded the timeout                         |
+| `ConnectionError`  | Couldn't connect at all (DNS, refused, network gone) |
+| `TooManyRedirects` | Followed too many redirects                          |
+| `SSLError`         | TLS handshake failed                                 |
+| `HTTPError`        | Raised by `raise_for_status()` for 4xx/5xx           |
+
+`RequestException` is the parent of them all. Catching it catches everything `requests` raises.
+
+```python
+import requests
+from requests.exceptions import RequestException
+
+try:
+    r = requests.get("https://no-such-domain-12345.example", timeout=5)
+except RequestException as e:
+    print(f"request failed: {type(e).__name__}: {e}")
+```
+
+<h1 id="headers-and-auth">Headers and Auth</h1>
+
+Headers go in a `headers` dict. Any name is allowed; `requests` doesn't restrict them.
+
+```python
+import requests
+
+r = requests.get(
+    "https://httpbin.org/headers",
+    headers={
+        "Accept": "application/json",
+        "User-Agent": "shop-sync/1.0",
+        "X-Trace-Id": "abc-123",
+    },
+)
+
+print(r.json()["headers"]["User-Agent"])
+print(r.json()["headers"]["X-Trace-Id"])
+```
+
+`requests` adds some headers automatically (`Accept-Encoding`, `Accept`, `User-Agent` if not set, `Connection`). Anything passed in `headers` overrides the defaults.
+
+<h3 id="bearer-tokens">Bearer Tokens</h3>
+
+For Bearer auth, set the `Authorization` header directly.
+
+```python
+import requests
+
+token = "abc123def456"
+r = requests.get(
+    "https://httpbin.org/bearer",
+    headers={"Authorization": f"Bearer {token}"},
+)
+print(r.status_code)
+print(r.json())
+```
+
+This is the most common auth pattern for modern APIs. The token is opaque to the client; the server knows what it means.
+
+<h3 id="basic-auth">Basic Auth</h3>
+
+Basic auth has a dedicated argument. Pass a tuple of `(username, password)` to `auth`.
+
+```python
+import requests
+
+r = requests.get(
+    "https://httpbin.org/basic-auth/alex/s3cret!",
+    auth=("alex", "s3cret!"),
+)
+print(r.status_code)
+print(r.json())
+```
+
+`requests` constructs the `Authorization: Basic <base64>` header automatically. For more control or different auth schemes, the `requests.auth` module has `HTTPBasicAuth`, `HTTPDigestAuth`, and an extensible base class.
+
+```python
+from requests.auth import HTTPBasicAuth
+import requests
+
+r = requests.get(
+    "https://httpbin.org/basic-auth/alex/s3cret!",
+    auth=HTTPBasicAuth("alex", "s3cret!"),
+)
+print(r.status_code)
+```
+
+`HTTPBasicAuth` does the same as the tuple form. The class-based form is useful for defining a custom auth scheme; subclass `AuthBase` and override `__call__` to mutate the prepared request before it's sent.
+
+<h1 id="timeouts-always-set-them">Timeouts (Always Set Them)</h1>
+
+By default, `requests` has no timeout. A request will wait forever if the server stops responding. This is the library's most common source of production hangs, and the docs say so directly.
+
+```python
+import requests
+
+r = requests.get("https://httpbin.org/delay/2", timeout=5)
+print(r.status_code)
+```
+
+`timeout=5` means "fail if the whole exchange takes more than 5 seconds." A tuple `(connect_timeout, read_timeout)` controls each phase separately:
+
+```python
+r = requests.get(url, timeout=(3, 10))
+```
+
+3 seconds to establish the connection, 10 seconds between bytes once the server starts sending. This is useful for slow servers when fast failure on unreachable hosts is also a goal.
+
+Forgetting timeouts is a common cause of "everything got slow at 3am" incidents. A single hanging downstream service ties up workers until they're all stuck. Set a timeout on every call.
+
+A timeout exceeded raises `requests.exceptions.Timeout`, which is a subclass of `RequestException`.
+
+<h1 id="sessions-connection-reuse-and-shared-state">
+  Sessions: Connection Reuse and Shared State
+</h1>
+
+Calling `requests.get` repeatedly creates a fresh connection every time. For more than a couple of requests to the same host, that overhead adds up. The fix is `requests.Session`.
+
+```python
+import requests
+
+with requests.Session() as session:
+    session.headers.update({
+        "Authorization": "Bearer abc123def456",
+        "Accept": "application/json",
+        "User-Agent": "shop-sync/1.0",
+    })
+    session.timeout = 5
+
+    r1 = session.get("https://httpbin.org/get")
+    r2 = session.get("https://httpbin.org/headers")
+    r3 = session.get("https://httpbin.org/cookies/set/track/abc")
+    r4 = session.get("https://httpbin.org/cookies")
+
+print(r1.status_code, r2.status_code, r3.status_code, r4.status_code)
+print(r4.json())
+```
+
+A `Session` does three things:
+
+1. **Reuses TCP connections** to the same host. The TLS handshake happens once, not four times. For repeated calls to the same API this is a big win.
+2. **Shares headers, auth, and other defaults** across requests. Set them on the session, every request inherits them.
+3. **Persists cookies** automatically. The fourth call here sees the cookie set by the third, because the session stored it.
+
+Use a session for more than two or three calls to the same service. Performance and code clarity both improve.
+
+Without a session, each request pays a fresh TCP and TLS handshake, often 50-100ms of overhead before any data flows. Ten calls to the same host with a session is roughly half a second faster than ten one-shot calls.
+
+The `with requests.Session() as session:` pattern is the idiomatic way to use one, ensuring the underlying connection pool is closed at the end. For longer-lived sessions (a background worker, a class instance), create the session once and reuse it across many calls.
+
+<h1 id="retries-with-httpadapter">Retries with HTTPAdapter</h1>
+
+Real APIs fail sometimes. A 503, a temporary timeout, a network blip. Retrying transient errors with backoff is something most production code wants. `requests` doesn't retry by default; wire it up through `HTTPAdapter` and `urllib3.Retry`.
+
+```python
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=1.0,           # wait 1s, 2s, 4s between retries
+    status_forcelist=[502, 503, 504],
+    allowed_methods=["GET", "POST"],
+)
+
+adapter = HTTPAdapter(max_retries=retry_strategy)
+session = requests.Session()
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+
+r = session.get("https://httpbin.org/status/503", timeout=10)
+print(r.status_code)
+```
+
+Walking through the configuration: `total=3` is the maximum number of retries. `backoff_factor=1.0` means wait `1 * 2 ** (retry_number - 1)` seconds between attempts: 1, 2, 4 seconds. `status_forcelist=[502, 503, 504]` tells `Retry` which status codes count as transient. `allowed_methods` controls which HTTP methods are eligible; the default excludes `POST` because POSTing twice can create duplicates, but `POST` can be included if the endpoint is idempotent.
+
+Even with retries on, the final response after all attempts is what the caller sees. If the server returns 503 four times, the caller gets a 503 response, not an exception. Combine with `raise_for_status()` for the eventual failure to raise.
+
+Retries amplify load. A downstream failing because it's overwhelmed gets worse from retries without backoff. Exponential backoff (1, 2, 4, 8...) lets the system recover. Add jitter for high-volume callers to avoid all clients retrying in lockstep.
+
+A second option: `Retry(respect_retry_after_header=True, ...)` reads the `Retry-After` response header (often sent with 429 or 503) and waits that long instead of the backoff formula. This is the polite way to handle rate limits.
+
+<h1 id="cookies">Cookies</h1>
+
+Cookies are first-class in `requests`. They can be read off a response, sent on a request, or managed automatically by a session.
+
+```python
+import requests
+
+r = requests.get("https://httpbin.org/cookies/set/session_id/abc123")
+print(r.cookies["session_id"])
+
+# Send a cookie on the next request
+r2 = requests.get(
+    "https://httpbin.org/cookies",
+    cookies={"track": "xyz"},
+)
+print(r2.json())
+```
+
+For multi-request flows, let a `Session` handle cookies automatically:
+
+```python
+import requests
+
+with requests.Session() as session:
+    # The server sets a cookie on this request.
+    session.get("https://httpbin.org/cookies/set/session_id/abc123")
+
+    # The session stores it and sends it on the next call.
+    r = session.get("https://httpbin.org/cookies")
+
+print(r.json())
+```
+
+This is the browser-cookie-jar model, but inside a Python session instead of a browser.
+
+<h1 id="streaming-large-responses">Streaming Large Responses</h1>
+
+`r.content` and `r.text` load the entire body into memory. For a 10 MB JSON response, that's fine. For a 10 GB download, it's not. The `stream=True` parameter delays the body read so the response can be iterated in chunks.
+
+```python
+import requests
+
+with requests.get("https://httpbin.org/stream-bytes/10240", stream=True) as r:
+    r.raise_for_status()
+    total = 0
+    for chunk in r.iter_content(chunk_size=1024):
+        total += len(chunk)
+    print(f"received {total} bytes in chunks")
+```
+
+`iter_content` yields up to `chunk_size` bytes per iteration. `iter_lines` is similar but yields one decoded line at a time, useful for streaming JSON Lines or log responses. The `with` block matters here: streaming keeps the connection open until the response is closed, so the context manager ensures it always gets closed.
+
+For uploads of large files, pass a file-like object directly as `data`. `requests` reads it in chunks rather than loading the whole thing into memory.
+
+<h1 id="inspecting-the-sent-request">Inspecting the Sent Request</h1>
+
+Sometimes the request `requests` built needs to be inspected before sending. The `Response.request` attribute holds a `PreparedRequest`, the post-build version of the call.
+
+```python
+import requests
+
+r = requests.post(
+    "https://httpbin.org/post",
+    json={"product_id": 101, "qty": 2},
+    headers={"X-Trace-Id": "abc-123"},
+)
+
+req = r.request
+print(req.method, req.url)
+print(req.headers["Content-Type"])
+print(req.headers["X-Trace-Id"])
+print(req.body)
+```
+
+This is invaluable for debugging. When the server complains and the cause is unclear, `r.request` shows the final method, URL, headers, and body that went on the wire.
+
+<h1 id="the-async-alternative-httpx">The Async Alternative: httpx</h1>
+
+`requests` is synchronous. Each call blocks the calling thread until the response is ready. That's fine for scripts and most server code, but it's a problem inside an `asyncio` event loop. Calling `requests.get` from an async function freezes the loop until the response arrives.
+
+The modern alternative is `httpx`. It has an API very similar to `requests` and also supports async/await.
+
+```python
+import asyncio
+import httpx
+
+async def fetch_prices():
+    async with httpx.AsyncClient() as client:
+        responses = await asyncio.gather(
+            client.get("https://httpbin.org/get?product_id=101"),
+            client.get("https://httpbin.org/get?product_id=102"),
+            client.get("https://httpbin.org/get?product_id=103"),
+        )
+    for r in responses:
+        print(r.status_code, r.json()["args"])
+
+asyncio.run(fetch_prices())
+```
+
+Three calls run concurrently on a single event loop. With `requests`, the same code would issue them one after the other.
+
+When to pick which:
+
+| Use                                       | Library                                |
+| ----------------------------------------- | -------------------------------------- |
+| Scripts, CLI tools, sync application code | `requests` (mature, universally known) |
+| Inside an async server (FastAPI, aiohttp) | `httpx` (sync or async)                |
+| HTTP/2 required                           | `httpx` (`requests` is HTTP/1.1 only)  |
+| Mixing sync and async code                | `httpx` (same API for both)            |
+
+`httpx`'s sync API is a near drop-in for `requests`, so a project can adopt it gradually. For brand new code that might go async later, starting with `httpx` is a reasonable choice. For everything else, `requests` is the safer default because of its broad familiarity.
+
+<h1 id="putting-it-together-a-real-ish-api-client">
+  Putting It Together: A Real-ish API Client
+</h1>
+
+The pieces fit together in a small client class that wraps a shop's product API. It uses a session for connection reuse, sets default headers including auth, has timeouts, retries on transient errors, and raises `HTTPError` for unrecoverable problems.
+
+```python
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+class ShopClient:
+    def __init__(self, base_url, token, timeout=5):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "shop-sync/1.0",
+        })
+
+        retry = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[502, 503, 504],
+            allowed_methods=["GET", "PUT", "DELETE"],
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+
+    def get_product(self, product_id):
+        r = self.session.get(
+            f"{self.base_url}/products/{product_id}",
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def create_order(self, customer_id, items):
+        r = self.session.post(
+            f"{self.base_url}/orders",
+            json={"customer_id": customer_id, "items": items},
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def close(self):
+        self.session.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+# Usage (with a real shop API)
+# with ShopClient("https://shop.example.com/api", token="abc123") as client:
+#     product = client.get_product(101)
+#     order = client.create_order(1, [{"product_id": 101, "qty": 2}])
+```
+
+The class wraps a `Session` (for connection reuse), sets default headers once (so each method doesn't repeat them), configures retries on transient errors, applies a timeout consistently, and calls `raise_for_status` so callers see exceptions on failure rather than having to check every status code. It's also a context manager, so the session closes cleanly when the client is done.
+
+This is the pattern most production HTTP client code in Python ends up with. The `requests` library makes it short enough to write inline; a larger framework isn't usually needed on top.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

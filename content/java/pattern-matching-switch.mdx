@@ -1,0 +1,570 @@
+---
+title: "Pattern Matching for switch (Java 21)"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Pattern Matching for switch (Java 21) explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+Pattern matching for `switch` collapses long `if/else instanceof` chains into a single, readable block that the compiler can also reason about. It was previewed across several releases and standardized in Java 21, so a Java 21 (or later) compiler is required for what's in this lesson. We'll cover type patterns in `case` labels, guards with `when`, the explicit `case null` label, record deconstruction patterns, how sealed hierarchies turn `switch` into an exhaustive statement the compiler checks, and the dominance rules that decide which `case` wins when two patterns overlap.
+
+<h1 id="why-pattern-matching-for-switch-exists">
+  Why Pattern Matching for switch Exists
+</h1>
+
+Before Java 21, type-based dispatch in Java meant writing an `if/else instanceof` ladder. Consider an e-commerce example with three discount kinds: a percent-off discount, a fixed-amount discount, and a "buy one get one" discount. Each is represented by its own class, and a single method computes the final price given a discount.
+
+```java
+class PercentOffDiscount {
+    private final int percent;
+    public PercentOffDiscount(int percent) { this.percent = percent; }
+    public int getPercent() { return percent; }
+}
+
+class FixedAmountDiscount {
+    private final double amount;
+    public FixedAmountDiscount(double amount) { this.amount = amount; }
+    public double getAmount() { return amount; }
+}
+
+class BogoDiscount {
+    // Buy one get one free, no fields needed
+}
+
+public class OldStyleDispatch {
+    static double finalPrice(double price, Object discount) {
+        if (discount instanceof PercentOffDiscount) {
+            PercentOffDiscount p = (PercentOffDiscount) discount;
+            return price * (100 - p.getPercent()) / 100.0;
+        } else if (discount instanceof FixedAmountDiscount) {
+            FixedAmountDiscount f = (FixedAmountDiscount) discount;
+            return Math.max(0, price - f.getAmount());
+        } else if (discount instanceof BogoDiscount) {
+            return price; // pay full price for one item, the second is free
+        } else if (discount == null) {
+            return price;
+        } else {
+            throw new IllegalArgumentException("Unknown discount type");
+        }
+    }
+
+    public static void main(String[] args) {
+        System.out.println(finalPrice(100.0, new PercentOffDiscount(20)));
+        System.out.println(finalPrice(100.0, new FixedAmountDiscount(15)));
+        System.out.println(finalPrice(100.0, new BogoDiscount()));
+        System.out.println(finalPrice(100.0, null));
+    }
+}
+```
+
+This works, but it has three problems. The cast is duplicated on every branch. Nothing prevents forgetting a discount type when adding a new one. And `null` has to be handled with a special branch outside the `instanceof` chain, because `null instanceof X` is always `false`.
+
+Pattern matching for `switch` cleans all of this up:
+
+```java
+public class NewStyleDispatch {
+    static double finalPrice(double price, Object discount) {
+        return switch (discount) {
+            case PercentOffDiscount p -> price * (100 - p.getPercent()) / 100.0;
+            case FixedAmountDiscount f -> Math.max(0, price - f.getAmount());
+            case BogoDiscount b       -> price;
+            case null                 -> price;
+            default                   -> throw new IllegalArgumentException("Unknown discount");
+        };
+    }
+
+    public static void main(String[] args) {
+        System.out.println(finalPrice(100.0, new PercentOffDiscount(20)));
+        System.out.println(finalPrice(100.0, new FixedAmountDiscount(15)));
+        System.out.println(finalPrice(100.0, new BogoDiscount()));
+        System.out.println(finalPrice(100.0, null));
+    }
+}
+```
+
+Compile with Java 21 or later: `javac --release 21 NewStyleDispatch.java`. No casts, no separate `null` branch outside the dispatch, and with sealed types the compiler can enforce that every case is covered.
+
+Here's the transformation visually.
+
+The diagram is the headline of the lesson: moving from a brittle, manual chain to a structured form the compiler helps keep correct.
+
+<h1 id="type-patterns-in-case-labels">Type Patterns in case Labels</h1>
+
+The simplest new feature is the **type pattern**: a `case` label that matches an instance of a type and binds the matched value to a variable in one move.
+
+```java
+public class TypePatternBasics {
+    sealed interface Shipment permits Letter, Box, Pallet {}
+    record Letter(double weightGrams) implements Shipment {}
+    record Box(double weightKg, int volumeLiters) implements Shipment {}
+    record Pallet(double weightKg) implements Shipment {}
+
+    static String describe(Shipment s) {
+        return switch (s) {
+            case Letter l -> "Letter: " + l.weightGrams() + "g";
+            case Box b    -> "Box: "    + b.weightKg() + "kg, " + b.volumeLiters() + "L";
+            case Pallet p -> "Pallet: " + p.weightKg() + "kg";
+        };
+    }
+
+    public static void main(String[] args) {
+        System.out.println(describe(new Letter(50)));
+        System.out.println(describe(new Box(2.5, 30)));
+        System.out.println(describe(new Pallet(120)));
+    }
+}
+```
+
+A few details about this form. First, `case Letter l ->` does two jobs: it tests `s instanceof Letter` and, if that's true, binds the value to `l` with the static type `Letter`. The binding is in scope only inside that arm, so each arm has its own local variable. Second, there's no `default` arm and the code still compiles, because `Shipment` is sealed and the three permitted types cover all possibilities. Third, the arrow form (`->`) is the recommended syntax for pattern matching; the older `case Letter l:` colon form exists but has the fall-through trap that arrow form avoids.
+
+Arrow-form pattern cases can mix with arrow-form constant cases when the selector type allows it. Strings and integers are the usual examples:
+
+```java
+public class MixedConstantsAndPatterns {
+    static String label(Object value) {
+        return switch (value) {
+            case Integer i  -> "int " + i;
+            case Long l     -> "long " + l;
+            case String s   -> "string \"" + s + "\"";
+            case null       -> "null";
+            default         -> "other: " + value.getClass().getSimpleName();
+        };
+    }
+
+    public static void main(String[] args) {
+        System.out.println(label(7));
+        System.out.println(label(7L));
+        System.out.println(label("cart"));
+        System.out.println(label(null));
+        System.out.println(label(3.14));
+    }
+}
+```
+
+The pattern matches the runtime type, not the declared type. `label(7)` autoboxes the `int` literal into an `Integer`, which matches `case Integer i`. The `default` arm is there because `Object` is not sealed, so the compiler can't prove all subtypes are covered.
+
+<h1 id="case-null-and-why-you-need-it">case null and Why You Need It</h1>
+
+In the classic `switch`, passing `null` as the selector throws a `NullPointerException` before any case is examined. That made `null` something to handle outside the `switch`, which was easy to overlook. Java 21 standardized `case null` as a legal case label, so `null` can be handled like any other value.
+
+```java
+public class NullInSwitch {
+    static String greet(String name) {
+        return switch (name) {
+            case null      -> "Hello, guest";
+            case "admin"   -> "Hello, admin";
+            default        -> "Hello, " + name;
+        };
+    }
+
+    public static void main(String[] args) {
+        System.out.println(greet(null));
+        System.out.println(greet("admin"));
+        System.out.println(greet("Ashish"));
+    }
+}
+```
+
+Removing the `case null` label and passing `null` causes the switch to throw `NullPointerException`. The old behavior is preserved for backward compatibility, which is why null handling has to be requested explicitly.
+
+`null` can also combine with `default` in a single label, which is useful for treating "no value" the same as "unrecognized value":
+
+```java
+public class NullPlusDefault {
+    static String tier(String customerTier) {
+        return switch (customerTier) {
+            case "gold"           -> "Free express shipping";
+            case "silver"         -> "Free standard shipping";
+            case null, default    -> "Standard rates apply";
+        };
+    }
+
+    public static void main(String[] args) {
+        System.out.println(tier("gold"));
+        System.out.println(tier("silver"));
+        System.out.println(tier("bronze"));
+        System.out.println(tier(null));
+    }
+}
+```
+
+The `case null, default` label fires for `null` and for any value that wasn't matched by an earlier case. This is a small but real readability win compared to a separate `if (x == null)` check above the switch.
+
+There's no runtime price for `case null`. The compiler emits a plain null check before the type-dispatch logic, so adding the label is as cheap as adding any other case.
+
+<h1 id="guards-with-when">Guards With when</h1>
+
+A type pattern matches on type alone. Often a match also requires a condition. That's what a **guard** is. The syntax is `case <pattern> when <booleanExpression> ->`. The arm runs only when the pattern matches and the guard expression is `true`.
+
+Continuing the discount example, treat a "large" percent discount (over 50%) as a special case that requires a manager override:
+
+```java
+public class GuardedDiscount {
+    sealed interface Discount permits PercentOff, FixedOff, Bogo {}
+    record PercentOff(int percent) implements Discount {}
+    record FixedOff(double amount) implements Discount {}
+    record Bogo() implements Discount {}
+
+    static String review(Discount d) {
+        return switch (d) {
+            case PercentOff p when p.percent() > 50  -> "Needs manager approval: " + p.percent() + "% off";
+            case PercentOff p when p.percent() <= 0  -> "Invalid percent: " + p.percent();
+            case PercentOff p                        -> "OK: " + p.percent() + "% off";
+            case FixedOff f when f.amount() > 100.0  -> "Needs manager approval: $" + f.amount() + " off";
+            case FixedOff f                          -> "OK: $" + f.amount() + " off";
+            case Bogo b                              -> "OK: buy-one-get-one";
+        };
+    }
+
+    public static void main(String[] args) {
+        System.out.println(review(new PercentOff(20)));
+        System.out.println(review(new PercentOff(75)));
+        System.out.println(review(new PercentOff(0)));
+        System.out.println(review(new FixedOff(50)));
+        System.out.println(review(new FixedOff(250)));
+        System.out.println(review(new Bogo()));
+    }
+}
+```
+
+A guarded case has the same scope rules as an unguarded one: the pattern variable (`p`, `f`) is in scope inside the guard expression and inside the arm body. This is why `when p.percent() > 50` can refer to `p`.
+
+Ordering matters. The compiler walks cases top-to-bottom and the first one whose pattern matches and whose guard is satisfied wins. Placing `case PercentOff p` before `case PercentOff p when p.percent() > 50` makes the guarded case unreachable, because the unguarded one absorbs every `PercentOff`. The compiler doesn't always catch that (a guard is opaque to the dominance check), so ordering needs care.
+
+A common pattern is "specific to general": guarded cases first, then an unguarded fall-through that handles "any remaining" of that type. The three `PercentOff` cases above follow that shape: the first two narrow on percent, the third handles every other percent.
+
+A guard runs only after the pattern matches, so the guard expression cost is bounded by the type test passing. If the guard does expensive work (a database lookup, a regex match), the cost is paid once per matching value, not once per case in the switch.
+
+<h1 id="record-patterns-and-deconstruction">
+  Record Patterns and Deconstruction
+</h1>
+
+A **record pattern** matches a record and binds its components in one step. Instead of writing `case Discount d` and then calling `d.percent()` inside the arm, write `case Discount(int percent)` and use `percent` directly.
+
+```java
+public class RecordPatternBasics {
+    sealed interface Discount permits PercentOff, FixedOff {}
+    record PercentOff(int percent) implements Discount {}
+    record FixedOff(double amount) implements Discount {}
+
+    static double finalPrice(double price, Discount d) {
+        return switch (d) {
+            case PercentOff(int percent) -> price * (100 - percent) / 100.0;
+            case FixedOff(double amount) -> Math.max(0, price - amount);
+        };
+    }
+
+    public static void main(String[] args) {
+        System.out.println(finalPrice(100.0, new PercentOff(20)));
+        System.out.println(finalPrice(100.0, new FixedOff(15)));
+    }
+}
+```
+
+The shape `PercentOff(int percent)` is a deconstruction pattern. It tests "is this a `PercentOff`?" and, if so, binds the single record component to a local variable called `percent`. The variable name doesn't have to match the record's component name; `PercentOff(int p)` works too. The type does have to be compatible.
+
+Record patterns are especially useful when the record has multiple components, because the deconstruction lines up with the data being read:
+
+```java
+public class MultiComponentRecord {
+    record CartItem(String productName, int quantity, double unitPrice) {}
+
+    static String summarize(CartItem item) {
+        return switch (item) {
+            case CartItem(String name, int qty, double price) when qty == 1 ->
+                "1 x " + name + " ($" + price + ")";
+            case CartItem(String name, int qty, double price) ->
+                qty + " x " + name + " ($" + (qty * price) + ")";
+        };
+    }
+
+    public static void main(String[] args) {
+        System.out.println(summarize(new CartItem("Coffee Mug", 1, 12.50)));
+        System.out.println(summarize(new CartItem("Notebook", 3, 4.99)));
+    }
+}
+```
+
+(Yes, that floating-point output is what `System.out.println` produces for `3 * 4.99`. Use `BigDecimal` for money in real systems.)
+
+<h3 id="nested-record-patterns">Nested Record Patterns</h3>
+
+Nested deconstruction adds further power. Suppose a shopping cart belongs to a customer, and the customer has an address:
+
+```java
+public class NestedDeconstruction {
+    record Address(String city, String country) {}
+    record Customer(String name, Address address) {}
+    record Cart(Customer customer, int itemCount, double total) {}
+
+    static String shippingNote(Cart cart) {
+        return switch (cart) {
+            case Cart(Customer(String name, Address(String city, String country)),
+                      int count, double total) ->
+                "Ship " + count + " items ($" + total + ") to " + name +
+                " in " + city + ", " + country;
+        };
+    }
+
+    public static void main(String[] args) {
+        Cart cart = new Cart(
+                new Customer("Alex", new Address("Bangalore", "India")),
+                3, 79.97);
+        System.out.println(shippingNote(cart));
+    }
+}
+```
+
+The single `case` reaches three levels deep into the structure and binds `name`, `city`, `country`, `count`, and `total` all at once. Without record patterns, the code would bind `cart`, then call `cart.customer()`, then call `customer.address()`, and so on. The nested form reads top-to-bottom like the data, which is easier to follow.
+
+The diagram below shows how the deconstruction lines up with the record structure.
+
+A `case Cart(Customer(String name, Address(String city, String country)), int count, double total)` walks this tree and pulls every leaf into a variable.
+
+A **type pattern** can be used at any nesting level instead of a deconstruction pattern when that level doesn't need to be broken apart. For example, `case Cart(Customer c, int count, double total)` binds `c` as a whole `Customer` without deconstructing it further. Mix and match based on what each arm needs.
+
+The unnamed pattern `_`, introduced in Java 22, ignores record components that aren't needed (`case Cart(Customer(String name, _), _, _) ->` binds only the customer's name).
+
+<h1 id="exhaustiveness-with-sealed-hierarchies">
+  Exhaustiveness With Sealed Hierarchies
+</h1>
+
+A `switch` expression has to produce a value for every input, which means the compiler needs to know that every possible input is covered. For ordinary types like `Object` or `Number`, that's only possible with a `default` arm. For sealed types, the compiler can compute exhaustiveness from the list of permitted subtypes, so `default` becomes optional.
+
+Here's the canonical e-commerce example: an order goes through a sequence of states, each represented by its own record, all implementing a sealed interface.
+
+```java
+public class OrderEventDispatch {
+    sealed interface OrderEvent permits Placed, Shipped, Delivered, Cancelled {}
+
+    record Placed(String orderId, double total) implements OrderEvent {}
+    record Shipped(String orderId, String trackingNumber) implements OrderEvent {}
+    record Delivered(String orderId, String signedBy) implements OrderEvent {}
+    record Cancelled(String orderId, String reason) implements OrderEvent {}
+
+    static String describe(OrderEvent event) {
+        return switch (event) {
+            case Placed(String id, double total) ->
+                "Order " + id + " placed for $" + total;
+            case Shipped(String id, String tracking) ->
+                "Order " + id + " shipped, tracking: " + tracking;
+            case Delivered(String id, String signedBy) ->
+                "Order " + id + " delivered, signed by " + signedBy;
+            case Cancelled(String id, String reason) ->
+                "Order " + id + " cancelled because: " + reason;
+        };
+    }
+
+    public static void main(String[] args) {
+        OrderEvent[] events = {
+            new Placed("A-1001", 49.99),
+            new Shipped("A-1001", "TRK-998877"),
+            new Delivered("A-1001", "Alex"),
+            new Cancelled("A-1002", "out of stock")
+        };
+        for (OrderEvent e : events) {
+            System.out.println(describe(e));
+        }
+    }
+}
+```
+
+There's no `default`, and the code still compiles. The compiler sees that `OrderEvent` is sealed with exactly four permitted subtypes and that every one of them has a case. That's exhaustiveness checking at work.
+
+Now, the payoff. Suppose the business adds a fifth event type for refunded orders. Declare a new record:
+
+```java
+record Refunded(String orderId, double amount) implements OrderEvent {}
+```
+
+…and the moment `Refunded` is added to the `permits` list, every existing `switch` on `OrderEvent` stops compiling until the new case is handled. This is the safety net. In an `if/else instanceof` chain, the missing case would silently fall through to whatever else-branch existed, surfacing only in production. This is analogous to "tagged unions" or "algebraic data types" in languages like Kotlin or Rust.
+
+<h3 id="what-if-the-switch-isnt-exhaustive">
+  What If the Switch Isn't Exhaustive?
+</h3>
+
+If the compiler can't prove exhaustiveness, a `default` is required. Without it, the code doesn't compile. Here's the smallest demonstration:
+
+```java
+public class NonExhaustiveSwitch {
+    static String label(Object value) {
+        return switch (value) {
+            case Integer i -> "int";
+            case String s  -> "string";
+        };
+    }
+}
+```
+
+Compile error (approximate text, exact wording varies by JDK version):
+
+```text
+error: the switch expression does not cover all possible input values
+        return switch (value) {
+               ^
+```
+
+The fix is either a `default` arm or, where applicable, switching the selector type to a sealed type whose subtypes are all matched.
+
+<h3 id="matchexception-at-runtime">MatchException at Runtime</h3>
+
+Even when the compiler accepts a switch as exhaustive, the JVM does a runtime check. If a class hierarchy changes between compile time and runtime (compiled against one version of a sealed interface, then run with a different version that has a new permitted subtype), the JVM throws `MatchException` rather than silently returning `null` or skipping the dispatch. This shouldn't appear in normal use, but it explains why IDEs sometimes mention `MatchException` next to a `switch`.
+
+<h1 id="dominance-rules">Dominance Rules</h1>
+
+When two cases could match the same value, the compiler has to decide whether the second case is reachable. **Dominance** is the rule it uses: a case dominates a later case if every value the later case would match is also matched by the earlier case. The earlier case "swallows" the later one, making it unreachable, and the compiler rejects unreachable cases.
+
+The classic example uses inheritance. `Object` is the supertype of every reference type, including `String`. So `case Object o` matches everything that `case String s` would have matched, plus more.
+
+```java
+public class DominanceError {
+    static String label(Object value) {
+        return switch (value) {
+            case Object o -> "object";
+            case String s -> "string"; // ERROR: dominated by Object
+        };
+    }
+}
+```
+
+Compile error:
+
+```text
+error: this case label is dominated by a preceding case label
+            case String s -> "string";
+                 ^
+```
+
+The fix is to put the more specific case first. Pattern dispatch is "first match wins," so narrow patterns go above broad ones:
+
+```java
+public class DominanceFixed {
+    static String label(Object value) {
+        return switch (value) {
+            case String s -> "string";
+            case Object o -> "object";
+        };
+    }
+
+    public static void main(String[] args) {
+        System.out.println(label("hello"));
+        System.out.println(label(42));
+    }
+}
+```
+
+The rule applies to record patterns too. `case PercentOff p` (type pattern) and `case PercentOff(int percent)` (record pattern) match exactly the same set of values, so whichever appears first dominates the other.
+
+Here's a diagram of the dominance check. Each case's match-set is a region. Dominance means one region contains the other.
+
+The diagram captures the intuition: if the earlier case's match-set is a superset of the later case's match-set, the later case can never fire.
+
+<h3 id="guards-and-dominance">Guards and Dominance</h3>
+
+Guards complicate dominance. The compiler does **not** look inside a guard expression, so a guarded case is considered narrower than its unguarded twin. That means `case PercentOff p` dominates `case PercentOff p when p.percent() > 50`, but `case PercentOff p when p.percent() > 50` does **not** dominate `case PercentOff p` (because the compiler can't prove the guard is always true).
+
+In practice, the rule of thumb is "guarded cases first, then the unguarded fall-through." We saw this in the discount-review example earlier; that ordering exists for a reason.
+
+<h1 id="combining-with-switch-expressions-and-blocks">
+  Combining With switch Expressions and Blocks
+</h1>
+
+So far, every arm in the examples has been a single expression. When an arm needs multiple statements, switch the arrow form to a block and use `yield` to produce the value.
+
+```java
+public class BlockArm {
+    sealed interface OrderEvent permits Placed, Shipped, Cancelled {}
+    record Placed(String orderId, double total) implements OrderEvent {}
+    record Shipped(String orderId, String tracking) implements OrderEvent {}
+    record Cancelled(String orderId, String reason) implements OrderEvent {}
+
+    static String describe(OrderEvent event) {
+        return switch (event) {
+            case Placed(String id, double total) -> {
+                String formatted = String.format("$%.2f", total);
+                String message = "Order " + id + " placed for " + formatted;
+                yield message;
+            }
+            case Shipped(String id, String tracking) ->
+                "Order " + id + " shipped, tracking: " + tracking;
+            case Cancelled(String id, String reason) -> {
+                String upper = reason.toUpperCase();
+                yield "Order " + id + " cancelled: " + upper;
+            }
+        };
+    }
+
+    public static void main(String[] args) {
+        System.out.println(describe(new Placed("A-1001", 49.999)));
+        System.out.println(describe(new Shipped("A-1001", "TRK-998877")));
+        System.out.println(describe(new Cancelled("A-1002", "out of stock")));
+    }
+}
+```
+
+The `Placed` and `Cancelled` arms each open a block with `{ ... }`, do some intermediate work, and emit the final value with `yield`. The `Shipped` arm uses the single-expression form because it has nothing to compute. The two styles mix freely within one `switch`; pick whichever reads better for each arm.
+
+A `switch` used as a statement (not as an expression) doesn't require exhaustiveness and doesn't use `yield`. The form `switch (event) { case Placed p -> handle(p); ... }` works without a `return` or `yield`. Statement switches are useful when each arm has a side effect rather than producing a value. The exhaustiveness rule still applies when pattern cases are used on a sealed selector with strict checks enabled, but for many statement switches a `default` is required.
+
+<h1 id="whats-wrong-with-this-code">What's Wrong With This Code?</h1>
+
+Here's a snippet that looks reasonable at first glance:
+
+```java
+public class BrokenDispatch {
+    sealed interface OrderEvent permits Placed, Shipped, Delivered, Cancelled {}
+    record Placed(String id, double total) implements OrderEvent {}
+    record Shipped(String id, String tracking) implements OrderEvent {}
+    record Delivered(String id, String signedBy) implements OrderEvent {}
+    record Cancelled(String id, String reason) implements OrderEvent {}
+
+    static String describe(OrderEvent event) {
+        return switch (event) {
+            case OrderEvent oe                       -> "any event: " + oe;
+            case Placed(String id, double total)     -> "placed: " + id;
+            case Shipped(String id, String tracking) -> "shipped: " + id;
+            case Delivered(String id, String by)     -> "delivered: " + id;
+            case Cancelled(String id, String reason) -> "cancelled: " + id;
+        };
+    }
+}
+```
+
+This won't compile. The first case, `case OrderEvent oe`, matches every `OrderEvent`, which dominates the four specific record patterns below it. The compiler reports four dominance errors, one per buried case.
+
+**Fix:**
+
+Remove the catch-all, or move it to the end as a fallback. The clean fix is to delete it, since the four specific cases already exhaust the sealed hierarchy:
+
+```java
+public class FixedDispatch {
+    sealed interface OrderEvent permits Placed, Shipped, Delivered, Cancelled {}
+    record Placed(String id, double total) implements OrderEvent {}
+    record Shipped(String id, String tracking) implements OrderEvent {}
+    record Delivered(String id, String signedBy) implements OrderEvent {}
+    record Cancelled(String id, String reason) implements OrderEvent {}
+
+    static String describe(OrderEvent event) {
+        return switch (event) {
+            case Placed(String id, double total)     -> "placed: " + id;
+            case Shipped(String id, String tracking) -> "shipped: " + id;
+            case Delivered(String id, String by)     -> "delivered: " + id;
+            case Cancelled(String id, String reason) -> "cancelled: " + id;
+        };
+    }
+
+    public static void main(String[] args) {
+        System.out.println(describe(new Placed("A-1", 10.0)));
+        System.out.println(describe(new Shipped("A-1", "TRK")));
+    }
+}
+```
+
+Two lessons in one. Catch-all patterns belong at the end of a switch, not the beginning. And when the selector is sealed and every subtype is covered, no catch-all is needed; the compiler reports any missing case.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

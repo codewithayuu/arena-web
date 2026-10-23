@@ -1,0 +1,1023 @@
+---
+title: "Paths & Files"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Paths & Files explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="why-path-replaces-file">Why Path Replaces File</h1>
+
+The legacy `java.io.File` class served as both "a pathname" and "the thing you do file operations on". It tried to be both and was decent at neither. Reading a file with `File` alone is impossible. It has to be combined with `FileReader`, `BufferedReader`, `Scanner`, or one of half a dozen stream classes. Error handling is bolted on with `boolean` return values: `file.delete()` returns `false` if it failed, with no indication of why.
+
+NIO.2 (added in Java 7) split the two concerns. `Path` is purely a value object that names a location in a file system. `Files` is a static class full of methods that take a `Path` and do work, throwing useful exceptions when something goes wrong.
+
+| Concern           | Legacy (`File`)                  | Modern (`Path` + `Files`)             |
+| ----------------- | -------------------------------- | ------------------------------------- |
+| Name a location   | `new File("orders.csv")`         | `Path.of("orders.csv")`               |
+| Read whole file   | Combine with `FileReader`+buffer | `Files.readString(path)` (1 call)     |
+| Delete error      | Returns `false`, no reason       | Throws `IOException` with details     |
+| Symbolic links    | Limited, mostly silent           | First-class with `LinkOption`         |
+| Walk a tree       | Recursive listFiles, manual      | `Files.walk(path)` returns a `Stream` |
+| Atomic moves      | Not supported                    | `StandardCopyOption.ATOMIC_MOVE`      |
+| Watch for changes | Not supported                    | `WatchService`                        |
+
+The legacy `File` still works. It appears in older codebases and in some APIs that haven't migrated. New code should use `Path` and `Files`. To bridge between them, `path.toFile()` and `file.toPath()` convert in either direction.
+
+<h1 id="the-anatomy-of-a-path">The Anatomy of a Path</h1>
+
+A `Path` is more than a string. It models the structure of a pathname: a root, zero or more name elements separated by file-system separators, and a final element which is usually the file name. On Linux and macOS the separator is `/`. On Windows it's `\`. `Path` knows about both and exposes methods to inspect each part by name rather than by string surgery.
+
+The cyan box at the top is the full pathname. The orange box is the root (the bit that anchors the path to a file system). The green box is everything except the file name. The teal boxes are the name elements, indexed from `0`. The red box is the final segment, which is the file name itself.
+
+Here's the same idea in code:
+
+```java
+import java.nio.file.Path;
+
+public class PathAnatomy {
+    public static void main(String[] args) {
+        Path orders = Path.of("/home/shop/orders.csv");
+
+        System.out.println("Path: " + orders);
+        System.out.println("Root: " + orders.getRoot());
+        System.out.println("Parent: " + orders.getParent());
+        System.out.println("FileName: " + orders.getFileName());
+        System.out.println("NameCount: " + orders.getNameCount());
+        System.out.println("Name(0): " + orders.getName(0));
+        System.out.println("Name(1): " + orders.getName(1));
+        System.out.println("Name(2): " + orders.getName(2));
+    }
+}
+```
+
+`getNameCount()` counts the path components, not including the root. `getName(i)` returns the i-th component as another `Path`. `getFileName()` returns the last component, which is `Name(NameCount - 1)`. `getParent()` returns everything up to but not including the last component. `getRoot()` returns the root (`/` on Unix, `C:\` on Windows) for absolute paths and `null` for relative ones.
+
+A relative path behaves the same way but `getRoot()` is `null`:
+
+```java
+import java.nio.file.Path;
+
+public class RelativePath {
+    public static void main(String[] args) {
+        Path uploads = Path.of("uploads/images/cover.jpg");
+        System.out.println("Root: " + uploads.getRoot());
+        System.out.println("Parent: " + uploads.getParent());
+        System.out.println("FileName: " + uploads.getFileName());
+    }
+}
+```
+
+`Path` is immutable. Every method that looks like a mutator (`resolve`, `relativize`, `normalize`) returns a new `Path` and leaves the original alone, the same way `String` works.
+
+<h1 id="creating-a-path">Creating a Path</h1>
+
+There are three ways to build a `Path`, but modern code almost always uses the first one.
+
+```java
+import java.nio.file.FileSystems;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+
+public class CreatePaths {
+    public static void main(String[] args) {
+        // Preferred since Java 11
+        Path a = Path.of("orders.csv");
+        Path b = Path.of("logs", "2024-12-01.log");
+
+        // Older equivalent
+        Path c = Paths.get("orders.csv");
+        Path d = Paths.get("logs", "2024-12-01.log");
+
+        // Underlying mechanism
+        Path e = FileSystems.getDefault().getPath("orders.csv");
+
+        System.out.println(a);
+        System.out.println(b);
+        System.out.println(c);
+        System.out.println(d);
+        System.out.println(e);
+    }
+}
+```
+
+**Output (Linux/macOS):**
+
+```text
+orders.csv
+logs/2024-12-01.log
+orders.csv
+logs/2024-12-01.log
+orders.csv
+```
+
+`Path.of` was added in Java 11 and is the preferred form. It does exactly what `Paths.get` does (`Paths.get` is now a thin wrapper around it), but reads more naturally and matches the pattern used by `List.of`, `Map.of`, and similar factories. `FileSystems.getDefault().getPath(...)` is what both of them call internally. That form is only needed for non-default file systems, like a zip file system, which is covered later in this lesson.
+
+The multi-argument overloads (`Path.of("logs", "2024-12-01.log")`) join the parts with the platform separator. This is safer than string concatenation because no trailing slash needs to be added manually, and the result will be correct on Windows too.
+
+`Path.of(...)` is cheap. It parses the string into name elements but doesn't touch the file system. No I/O happens until the path is passed to a method on `Files`.
+
+<h1 id="combining-and-comparing-paths">Combining and Comparing Paths</h1>
+
+Once a `Path` exists, four methods cover most of the structural work: `resolve`, `relativize`, `normalize`, and `toAbsolutePath`.
+
+**`resolve`** joins one path to another. If the argument is absolute, it replaces the receiver entirely. If it's relative, it gets appended.
+
+```java
+import java.nio.file.Path;
+
+public class ResolveExample {
+    public static void main(String[] args) {
+        Path base = Path.of("/home/shop");
+        Path logsDir = base.resolve("logs");
+        Path logFile = logsDir.resolve("2024-12-01.log");
+
+        System.out.println(logsDir);
+        System.out.println(logFile);
+
+        // Absolute argument replaces the base
+        Path absolute = base.resolve("/etc/config");
+        System.out.println(absolute);
+    }
+}
+```
+
+The third line is a surprise. `resolve` with an absolute argument doesn't append, it returns the argument. To force appending, use `resolve(other.getFileName())` to take only the last component.
+
+**`relativize`** is the inverse: given two paths, compute the relative path from one to the other.
+
+```java
+import java.nio.file.Path;
+
+public class RelativizeExample {
+    public static void main(String[] args) {
+        Path base = Path.of("/home/shop");
+        Path file = Path.of("/home/shop/logs/2024-12-01.log");
+
+        Path relative = base.relativize(file);
+        System.out.println(relative);
+    }
+}
+```
+
+The result is the path used to refer to `file` from `base`. `relativize` works only when both paths are the same kind (both absolute or both relative); mixing them throws `IllegalArgumentException`.
+
+**`normalize`** removes redundant `.` and `..` segments.
+
+```java
+import java.nio.file.Path;
+
+public class NormalizeExample {
+    public static void main(String[] args) {
+        Path messy = Path.of("/home/shop/./uploads/../logs/2024-12-01.log");
+        System.out.println("Before: " + messy);
+        System.out.println("After:  " + messy.normalize());
+    }
+}
+```
+
+`normalize` is a pure string-level operation. It does not consult the file system, so it won't follow symbolic links. For that, use `toRealPath`, covered next.
+
+**`toAbsolutePath`** converts a relative path to an absolute one by anchoring it to the current working directory. It also doesn't touch the file system.
+
+```java
+import java.nio.file.Path;
+
+public class AbsoluteExample {
+    public static void main(String[] args) {
+        Path relative = Path.of("orders.csv");
+        Path absolute = relative.toAbsolutePath();
+        System.out.println("Relative: " + relative);
+        System.out.println("Absolute: " + absolute);
+    }
+}
+```
+
+**Output (when run from `/home/shop`):**
+
+```text
+Relative: orders.csv
+Absolute: /home/shop/orders.csv
+```
+
+**`toRealPath`** is the heavyweight version. It hits the file system: it resolves symbolic links, normalizes the result, and requires the file to actually exist (otherwise it throws `NoSuchFileException`). Use it for the canonical absolute path, for example to compare two paths that might point to the same physical file through different routes.
+
+```java
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public class RealPathExample {
+    public static void main(String[] args) throws IOException {
+        Path tempDir = Files.createTempDirectory("shop");
+        Path orders = tempDir.resolve("orders.csv");
+        Files.writeString(orders, "id,total\n1,29.99\n");
+
+        System.out.println("Path: " + orders);
+        System.out.println("Real: " + orders.toRealPath());
+    }
+}
+```
+
+**Output (paths vary by system):**
+
+```text
+Path: /tmp/shop12345678/orders.csv
+Real: /private/tmp/shop12345678/orders.csv
+```
+
+On macOS, `/tmp` is itself a symlink to `/private/tmp`, so `toRealPath` resolves it. On Linux there might be no change. The key point is that `toRealPath` returns the canonical path the OS would use internally.
+
+Last, equality. `Path.equals` compares paths lexically. Two paths that point to the same file but are written differently are not equal:
+
+```java
+import java.nio.file.Path;
+
+public class PathEquality {
+    public static void main(String[] args) {
+        Path a = Path.of("/home/shop/orders.csv");
+        Path b = Path.of("/home/shop/./orders.csv");
+        Path c = Path.of("/home/shop/orders.csv");
+
+        System.out.println(a.equals(b));  // false, lexical mismatch
+        System.out.println(a.equals(c));  // true, identical strings
+    }
+}
+```
+
+For semantic comparison ("do these point to the same actual file?"), use `Files.isSameFile(a, b)`, which resolves both paths against the file system.
+
+<h1 id="the-files-api-at-a-glance">The Files API at a Glance</h1>
+
+`Files` is a static utility class. Almost every method takes a `Path` (or two) and either returns useful data or performs an operation. The class has dozens of methods, but they group into a small number of categories.
+
+The cyan node is `Files` itself. The five branches are the categories covered here. Methods in the same branch share a vocabulary, so familiarity with one carries over to the rest. The rest of this lesson walks through them in roughly that order.
+
+Two things to know up front. First, most `Files` methods throw `IOException`, which is checked. The options are declaring `throws IOException` on `main` (fine for examples) or wrapping the call in `try`/`catch` (what production code does). Second, methods that return a `Stream` (`Files.lines`, `Files.list`, `Files.walk`, `Files.find`) hold a file handle open and must be closed. Always use them with try-with-resources.
+
+<h1 id="metadata-and-existence-checks">Metadata and Existence Checks</h1>
+
+Before reading or writing, code often asks "does this file exist?" or "is this a directory?". `Files` has predicates for each.
+
+```java
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public class MetadataExample {
+    public static void main(String[] args) throws IOException {
+        Path orders = Files.createTempFile("orders", ".csv");
+        Files.writeString(orders, "id,total\n1,29.99\n2,49.50\n");
+
+        System.out.println("exists:        " + Files.exists(orders));
+        System.out.println("isRegularFile: " + Files.isRegularFile(orders));
+        System.out.println("isDirectory:   " + Files.isDirectory(orders));
+        System.out.println("isReadable:    " + Files.isReadable(orders));
+        System.out.println("isWritable:    " + Files.isWritable(orders));
+        System.out.println("size (bytes):  " + Files.size(orders));
+        System.out.println("modified:      " + Files.getLastModifiedTime(orders));
+
+        Files.deleteIfExists(orders);
+    }
+}
+```
+
+**Output (modification time will vary):**
+
+```text
+exists:        true
+isRegularFile: true
+isDirectory:   false
+isReadable:    true
+isWritable:    true
+size (bytes):  25
+modified:      2025-08-14T13:42:11.482Z
+```
+
+`Files.exists` returns `true` if the file exists, `false` if it doesn't, and also `false` if the JVM can't tell (for example, the path is unreadable due to permissions). There's also `Files.notExists`, which is not the same as `!Files.exists`: it returns `true` only if the file is confirmed to not exist. `false` from both means "unknown".
+
+`Files.isRegularFile` and `Files.isDirectory` answer the direct questions. `Files.size` returns the file size in bytes as a `long`. `Files.getLastModifiedTime` returns a `FileTime`, which has `toInstant()` to get a `java.time.Instant`.
+
+Each of these calls hits the file system. To fetch several properties efficiently, use `Files.readAttributes(path, BasicFileAttributes.class)`, which makes one syscall instead of one per question.
+
+```java
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
+
+public class BulkAttributes {
+    public static void main(String[] args) throws IOException {
+        Path orders = Files.createTempFile("orders", ".csv");
+        Files.writeString(orders, "hello");
+
+        BasicFileAttributes attrs = Files.readAttributes(orders, BasicFileAttributes.class);
+
+        System.out.println("size:     " + attrs.size());
+        System.out.println("created:  " + attrs.creationTime());
+        System.out.println("modified: " + attrs.lastModifiedTime());
+        System.out.println("isFile:   " + attrs.isRegularFile());
+        System.out.println("isDir:    " + attrs.isDirectory());
+
+        Files.deleteIfExists(orders);
+    }
+}
+```
+
+**Output (timestamps vary):**
+
+```text
+size:     5
+created:  2025-08-14T13:45:02.118Z
+modified: 2025-08-14T13:45:02.119Z
+isFile:   true
+isDir:    false
+```
+
+One call, one round trip to the OS, every common attribute returned. For loops that touch thousands of files (a directory walk that filters by size, for example), this is faster than calling each predicate separately.
+
+<h1 id="reading-files">Reading Files</h1>
+
+`Files` has four ways to read a file, and the choice depends on file size and the desired shape of the data.
+
+```java
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.stream.Stream;
+
+public class ReadingFiles {
+    public static void main(String[] args) throws IOException {
+        Path orders = Files.createTempFile("orders", ".csv");
+        Files.writeString(orders, "id,total\n1,29.99\n2,49.50\n3,12.00\n");
+
+        // 1. Whole file as a String (Java 11+)
+        String content = Files.readString(orders);
+        System.out.println("readString:\n" + content);
+
+        // 2. Whole file as a List<String>, line by line
+        List<String> lines = Files.readAllLines(orders);
+        System.out.println("readAllLines: " + lines);
+
+        // 3. Whole file as a byte array
+        byte[] bytes = Files.readAllBytes(orders);
+        System.out.println("readAllBytes: " + bytes.length + " bytes");
+
+        // 4. Lazy line-by-line stream
+        try (Stream<String> stream = Files.lines(orders)) {
+            stream.filter(line -> !line.startsWith("id"))
+                  .forEach(System.out::println);
+        }
+
+        // 5. Buffered reader (most general)
+        try (BufferedReader reader = Files.newBufferedReader(orders)) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                System.out.println("buffered: " + line);
+            }
+        }
+
+        Files.deleteIfExists(orders);
+    }
+}
+```
+
+Five approaches, one file. When to pick each:
+
+| Method                    | Returns          | When to use                                            |
+| ------------------------- | ---------------- | ------------------------------------------------------ |
+| `Files.readString`        | `String`         | Small text file, full content in memory                |
+| `Files.readAllLines`      | `List<String>`   | Small text file, lines as a list                       |
+| `Files.readAllBytes`      | `byte[]`         | Small binary file, or text as raw bytes                |
+| `Files.lines`             | `Stream<String>` | Big text file, process lines lazily, can short-circuit |
+| `Files.newBufferedReader` | `BufferedReader` | Full control, custom parsing, mix of read patterns     |
+
+`Files.readString`, `Files.readAllLines`, and `Files.readAllBytes` load the entire file into memory. For a 10GB log file, that's a 10GB allocation (or an `OutOfMemoryError`). Use `Files.lines` with a stream pipeline for anything that doesn't comfortably fit in heap.
+
+The stream returned by `Files.lines` holds an open file handle. The try-with-resources is not optional. Leaving it out leaks file descriptors, and on a long-running server that eventually fails with "too many open files".
+
+<h1 id="writing-files">Writing Files</h1>
+
+The writing side mirrors the reading side. Four common methods, picked by what is being written and how large it is.
+
+```java
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+
+public class WritingFiles {
+    public static void main(String[] args) throws IOException {
+        Path orders = Files.createTempFile("orders", ".csv");
+
+        // 1. Whole string in one call (Java 11+)
+        Files.writeString(orders, "id,total\n1,29.99\n");
+
+        // 2. Iterable<String>, one per line
+        List<String> moreLines = List.of("2,49.50", "3,12.00");
+        Files.write(orders, moreLines);
+
+        // 3. Raw bytes
+        byte[] footer = "summary,91.49\n".getBytes();
+        Files.write(orders, footer);
+
+        // 4. Buffered writer (most general)
+        try (BufferedWriter writer = Files.newBufferedWriter(orders)) {
+            writer.write("id,total");
+            writer.newLine();
+            writer.write("1,29.99");
+            writer.newLine();
+        }
+
+        System.out.println("Final content:");
+        System.out.println(Files.readString(orders));
+
+        Files.deleteIfExists(orders);
+    }
+}
+```
+
+The last write wins, because each call to `Files.write` without options truncates the file first. That's a critical default to understand. The order in the example is intentional: the first three writes are all overwritten by the buffered writer at the end. To append instead, pass `StandardOpenOption.APPEND`.
+
+| Method                     | Takes              | When to use                                              |
+| -------------------------- | ------------------ | -------------------------------------------------------- |
+| `Files.writeString`        | `String`           | Small text file, one shot                                |
+| `Files.write(p, Iterable)` | `Iterable<String>` | List of lines, one shot, automatic line endings          |
+| `Files.write(p, byte[])`   | `byte[]`           | Binary data or pre-encoded text                          |
+| `Files.newBufferedWriter`  | (returns writer)   | Large output written in many small pieces, custom format |
+
+`Files.write` with a `List<String>` adds a newline after each line (using the platform line separator). `Files.writeString` writes the string verbatim with no added newlines, leaving line endings up to the caller.
+
+```java
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+public class AppendingExample {
+    public static void main(String[] args) throws IOException {
+        Path orders = Files.createTempFile("orders", ".csv");
+
+        Files.writeString(orders, "id,total\n");
+        Files.writeString(orders, "1,29.99\n", StandardOpenOption.APPEND);
+        Files.writeString(orders, "2,49.50\n", StandardOpenOption.APPEND);
+
+        System.out.println(Files.readString(orders));
+
+        Files.deleteIfExists(orders);
+    }
+}
+```
+
+`StandardOpenOption.APPEND` makes each write tack onto the end instead of truncating.
+
+<h1 id="standardopenoption-flags">StandardOpenOption Flags</h1>
+
+`StandardOpenOption` is an `enum` of flags that control how a file is opened. They're varargs on most `Files` methods, so as many as needed can be passed. The common ones:
+
+| Option              | Effect                                                          |
+| ------------------- | --------------------------------------------------------------- |
+| `CREATE`            | Create the file if it doesn't exist                             |
+| `CREATE_NEW`        | Create the file, fail if it already exists                      |
+| `APPEND`            | Open in append mode (writes go to the end)                      |
+| `TRUNCATE_EXISTING` | Truncate the file to zero length on open                        |
+| `READ`              | Open for reading                                                |
+| `WRITE`             | Open for writing                                                |
+| `DELETE_ON_CLOSE`   | Delete the file when the stream is closed (good for temp files) |
+| `SYNC` / `DSYNC`    | Force writes through the OS cache to disk                       |
+
+The defaults for `Files.writeString` and `Files.write(Path, byte[])` are `CREATE`, `TRUNCATE_EXISTING`, and `WRITE`. This is why a second call to `writeString` overwrites the file. For different behavior, pass the options explicitly.
+
+```java
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+public class OpenOptions {
+    public static void main(String[] args) throws IOException {
+        Path orders = Files.createTempFile("orders", ".csv");
+
+        // Default: CREATE + TRUNCATE_EXISTING + WRITE
+        Files.writeString(orders, "First write\n");
+
+        // Append instead of truncating
+        Files.writeString(orders, "Second write\n", StandardOpenOption.APPEND);
+
+        // CREATE_NEW would fail here because the file already exists
+        try {
+            Files.writeString(Path.of(orders.toString()),
+                              "third",
+                              StandardOpenOption.CREATE_NEW);
+        } catch (java.nio.file.FileAlreadyExistsException e) {
+            System.out.println("CREATE_NEW failed: file exists");
+        }
+
+        System.out.println(Files.readString(orders));
+
+        Files.deleteIfExists(orders);
+    }
+}
+```
+
+The difference between `CREATE` and `CREATE_NEW` matters in concurrent code. `CREATE_NEW` is atomic at the OS level: either this caller created the file, or another caller did. There's no race. Use it to guarantee unique creation (lock files, "claim this slot" patterns).
+
+<h1 id="creating-deleting-copying-and-moving">
+  Creating, Deleting, Copying, and Moving
+</h1>
+
+The lifecycle methods come in matched pairs that should feel familiar.
+
+```java
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public class FileLifecycle {
+    public static void main(String[] args) throws IOException {
+        Path workDir = Files.createTempDirectory("shop");
+        System.out.println("Created dir: " + workDir);
+
+        // Create a single file
+        Path orders = workDir.resolve("orders.csv");
+        Files.createFile(orders);
+        Files.writeString(orders, "id,total\n1,29.99\n");
+
+        // Create nested directories in one call
+        Path archiveDir = workDir.resolve("archive/2024/12");
+        Files.createDirectories(archiveDir);
+        System.out.println("Created nested: " + archiveDir);
+
+        // Copy
+        Path backup = workDir.resolve("orders-backup.csv");
+        Files.copy(orders, backup);
+        System.out.println("Copied to: " + backup);
+
+        // Move
+        Path archived = archiveDir.resolve("orders.csv");
+        Files.move(orders, archived);
+        System.out.println("Moved to: " + archived);
+
+        // Delete
+        Files.delete(backup);
+        Files.delete(archived);
+        Files.delete(archiveDir);
+        Files.delete(archiveDir.getParent());
+        Files.delete(archiveDir.getParent().getParent());
+        Files.delete(workDir);
+        System.out.println("Cleaned up.");
+    }
+}
+```
+
+**Output (paths vary):**
+
+```text
+Created dir: /tmp/shop123/
+Created nested: /tmp/shop123/archive/2024/12
+Copied to: /tmp/shop123/orders-backup.csv
+Moved to: /tmp/shop123/archive/2024/12/orders.csv
+Cleaned up.
+```
+
+Three things worth noting.
+
+`createDirectories` creates every missing directory in the path, like `mkdir -p` on Unix. `createDirectory` only creates the leaf and fails if any parent is missing. Prefer `createDirectories` in almost every case.
+
+`copy` and `move` both fail by default if the target exists. To overwrite, pass `StandardCopyOption.REPLACE_EXISTING`. To preserve timestamps and permissions on copy, pass `StandardCopyOption.COPY_ATTRIBUTES`. To require an atomic rename (so observers either see the old file or the new one, never a half-finished state), pass `StandardCopyOption.ATOMIC_MOVE`.
+
+`delete` fails with `NoSuchFileException` if the file is missing. `deleteIfExists` returns `false` instead, which suits cleanup code.
+
+```java
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+
+public class CopyMoveOptions {
+    public static void main(String[] args) throws IOException {
+        Path workDir = Files.createTempDirectory("shop");
+        Path source = workDir.resolve("orders.csv");
+        Files.writeString(source, "id,total\n1,29.99\n");
+
+        Path target = workDir.resolve("orders-backup.csv");
+        Files.writeString(target, "old content\n");
+
+        // Without REPLACE_EXISTING this would throw
+        Files.copy(source, target,
+                   StandardCopyOption.REPLACE_EXISTING,
+                   StandardCopyOption.COPY_ATTRIBUTES);
+
+        System.out.println("Target now: " + Files.readString(target));
+
+        // Atomic move within the same filesystem
+        Path archived = workDir.resolve("archive-orders.csv");
+        Files.move(source, archived, StandardCopyOption.ATOMIC_MOVE);
+        System.out.println("Archived: " + Files.exists(archived));
+        System.out.println("Original: " + Files.exists(source));
+
+        Files.deleteIfExists(target);
+        Files.deleteIfExists(archived);
+        Files.deleteIfExists(workDir);
+    }
+}
+```
+
+The `ATOMIC_MOVE` option matters for production workflows. Writing a file to a temp location and atomically renaming it into place is a standard pattern for safe file updates: other processes never see a partially-written file.
+
+The cyan source on the left feeds three branches: the default behavior (red, throws an exception when the target exists), `REPLACE_EXISTING` (green, overwrites), and `ATOMIC_MOVE` (teal, atomic rename within the same filesystem). The defaults are intentionally conservative because clobbering a file with `copy` is usually a bug; the destructive behavior must be opted into.
+
+`ATOMIC_MOVE` only works when source and target are on the same filesystem. Across filesystems, the OS can't do a single rename and the JVM throws `AtomicMoveNotSupportedException`. Cross-device moves degrade to copy-then-delete, which is not atomic.
+
+<h1 id="walking-directory-trees">Walking Directory Trees</h1>
+
+Three methods walk a directory and produce a `Stream<Path>` you can pipe through `filter`, `map`, and the rest of the stream API. Each one suits a different use case.
+
+The cyan top node is the choice point. The green branch is the simplest case: one directory, one level deep, like `ls` without `-R`. The orange branch is the most common case for recursion: descend the whole tree and process every entry. The teal branch is similar to `walk` but folds the filter into the call. The red branch is the heaviest tool, only needed when something must happen before entering a directory and something else after leaving it (like recursive delete).
+
+Start with `Files.list`, which returns only the immediate children of a directory:
+
+```java
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.stream.Stream;
+
+public class ListExample {
+    public static void main(String[] args) throws IOException {
+        Path uploads = Files.createTempDirectory("uploads");
+        Files.writeString(uploads.resolve("cover.jpg"), "img1");
+        Files.writeString(uploads.resolve("thumb.jpg"), "img2");
+        Files.createDirectory(uploads.resolve("processed"));
+
+        try (Stream<Path> entries = Files.list(uploads)) {
+            entries.forEach(System.out::println);
+        }
+
+        Files.deleteIfExists(uploads.resolve("cover.jpg"));
+        Files.deleteIfExists(uploads.resolve("thumb.jpg"));
+        Files.deleteIfExists(uploads.resolve("processed"));
+        Files.deleteIfExists(uploads);
+    }
+}
+```
+
+**Output (paths vary, order is filesystem-dependent):**
+
+```text
+/tmp/uploads123/cover.jpg
+/tmp/uploads123/thumb.jpg
+/tmp/uploads123/processed
+```
+
+`Files.list` does not recurse. The `processed` directory shows up as a `Path`, but its contents do not. The order of entries is whatever the OS returns; don't rely on it.
+
+`Files.walk` recurses to any depth and returns every file and directory in the tree, starting with the root directory itself:
+
+```java
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.stream.Stream;
+
+public class WalkExample {
+    public static void main(String[] args) throws IOException {
+        Path root = Files.createTempDirectory("uploads");
+        Files.writeString(root.resolve("cover.jpg"), "img");
+        Path processed = Files.createDirectory(root.resolve("processed"));
+        Files.writeString(processed.resolve("cover-thumb.jpg"), "thumb");
+
+        try (Stream<Path> tree = Files.walk(root)) {
+            tree.filter(Files::isRegularFile)
+                .filter(p -> p.toString().endsWith(".jpg"))
+                .forEach(System.out::println);
+        }
+
+        // Cleanup walks again, deepest-first
+        try (Stream<Path> tree = Files.walk(root)) {
+            tree.sorted(java.util.Comparator.reverseOrder())
+                .forEach(p -> {
+                    try { Files.delete(p); }
+                    catch (IOException ignored) {}
+                });
+        }
+    }
+}
+```
+
+**Output (paths vary):**
+
+```text
+/tmp/uploads123/cover.jpg
+/tmp/uploads123/processed/cover-thumb.jpg
+```
+
+`Files.walk(root)` produces a stream where each element is a `Path`. The filtering with `Files::isRegularFile` weeds out directories. The `.endsWith(".jpg")` filter is on the string form of the path; for richer patterns, use `path.getFileName().toString()` or `FileSystems.getDefault().getPathMatcher("glob:**.jpg")`.
+
+The cleanup pattern at the bottom is a useful idiom. `Files.walk` returns entries in pre-order: a directory comes before its children. To delete a tree, the children must be deleted first, so the order is reversed. Sorting by `Comparator.reverseOrder()` on `Path` (which is `Comparable<Path>`) puts deeper paths first.
+
+`Files.find` is `walk` plus a predicate baked into the call. It's slightly more efficient when the filter is known upfront, because the JDK can apply it without building the intermediate stream:
+
+```java
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.stream.Stream;
+
+public class FindExample {
+    public static void main(String[] args) throws IOException {
+        Path root = Files.createTempDirectory("uploads");
+        Files.writeString(root.resolve("cover.jpg"), "img");
+        Files.writeString(root.resolve("readme.txt"), "notes");
+        Path processed = Files.createDirectory(root.resolve("processed"));
+        Files.writeString(processed.resolve("cover-thumb.jpg"), "thumb");
+
+        try (Stream<Path> images = Files.find(
+                root,
+                Integer.MAX_VALUE,
+                (path, attrs) -> attrs.isRegularFile() &&
+                                 path.toString().endsWith(".jpg"))) {
+            images.forEach(System.out::println);
+        }
+
+        try (Stream<Path> all = Files.walk(root)) {
+            all.sorted(java.util.Comparator.reverseOrder())
+               .forEach(p -> {
+                   try { Files.delete(p); }
+                   catch (IOException ignored) {}
+               });
+        }
+    }
+}
+```
+
+**Output (paths vary):**
+
+```text
+/tmp/uploads123/cover.jpg
+/tmp/uploads123/processed/cover-thumb.jpg
+```
+
+The signature is `find(Path start, int maxDepth, BiPredicate<Path, BasicFileAttributes> matcher)`. `maxDepth` controls how far to recurse (use `Integer.MAX_VALUE` for unlimited). The matcher receives both the path and pre-fetched attributes, which saves an extra syscall per entry compared to the equivalent `walk + filter`.
+
+Streams from `Files.list`, `Files.walk`, and `Files.find` hold an open directory handle. Always close them with try-with-resources. They also walk the directory eagerly enough that very large trees (millions of files) build up state; for those, prefer `walkFileTree` with a custom `FileVisitor`.
+
+For full control there's `Files.walkFileTree`, which uses the visitor pattern. It calls four callbacks: before entering a directory, after visiting a file, on failure, and after leaving a directory. The most common pattern is recursive deletion, where the directory must be deleted _after_ its contents are gone:
+
+```java
+import java.io.IOException;
+import java.nio.file.FileVisitResult;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
+
+public class DeleteTreeWithVisitor {
+    public static void main(String[] args) throws IOException {
+        Path root = Files.createTempDirectory("uploads");
+        Files.writeString(root.resolve("cover.jpg"), "img");
+        Path processed = Files.createDirectory(root.resolve("processed"));
+        Files.writeString(processed.resolve("thumb.jpg"), "thumb");
+
+        Files.walkFileTree(root, new SimpleFileVisitor<Path>() {
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs)
+                    throws IOException {
+                System.out.println("Deleting file: " + file);
+                Files.delete(file);
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult postVisitDirectory(Path dir, IOException exc)
+                    throws IOException {
+                System.out.println("Deleting dir:  " + dir);
+                Files.delete(dir);
+                return FileVisitResult.CONTINUE;
+            }
+        });
+    }
+}
+```
+
+**Output (paths vary):**
+
+```text
+Deleting file: /tmp/uploads123/cover.jpg
+Deleting file: /tmp/uploads123/processed/thumb.jpg
+Deleting dir:  /tmp/uploads123/processed
+Deleting dir:  /tmp/uploads123
+```
+
+`SimpleFileVisitor` provides default implementations that just return `CONTINUE`, so only the relevant hooks need to be overridden. The four hooks are `preVisitDirectory`, `visitFile`, `visitFileFailed`, and `postVisitDirectory`. Each one can return `CONTINUE`, `SKIP_SUBTREE` (don't recurse further), `SKIP_SIBLINGS` (skip the rest of the current directory), or `TERMINATE` (stop the walk).
+
+`walkFileTree` is heavier syntactically than `walk`, but it handles error cases visitors can react to (`visitFileFailed`) and provides the pre/post hooks needed for tree-shaped operations.
+
+<h1 id="interop-with-javaio-streams">Interop with java.io Streams</h1>
+
+Some libraries take an `InputStream` or `OutputStream` rather than a `Path`. `Files.newInputStream` and `Files.newOutputStream` bridge the gap:
+
+```java
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+public class StreamInterop {
+    public static void main(String[] args) throws IOException {
+        Path orders = Files.createTempFile("orders", ".csv");
+
+        try (OutputStream out = Files.newOutputStream(orders,
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
+            out.write("id,total\n1,29.99\n".getBytes());
+        }
+
+        try (InputStream in = Files.newInputStream(orders)) {
+            byte[] buffer = new byte[in.available()];
+            int read = in.read(buffer);
+            System.out.println("Read " + read + " bytes:");
+            System.out.println(new String(buffer));
+        }
+
+        Files.deleteIfExists(orders);
+    }
+}
+```
+
+These two methods are the bridge between the modern NIO.2 API and the older `java.io` ecosystem. Use them when a library requires a stream, but prefer `Files.readString` / `Files.writeString` for everyday text work because they're shorter and clearer.
+
+<h1 id="multiple-file-systems-a-peek-at-filesystem">
+  Multiple File Systems: A Peek at FileSystem
+</h1>
+
+Every `Path` belongs to a `FileSystem`. By default that's the default (operating system) filesystem, but Java has a pluggable provider model that lets a JAR file or ZIP file behave as a filesystem. Open it with `FileSystems.newFileSystem(Path, Map)`, get a `FileSystem` back, and ask it for paths that look just like file paths but read entries inside the archive.
+
+```java
+import java.io.IOException;
+import java.nio.file.FileSystem;
+import java.nio.file.FileSystems;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.stream.Stream;
+
+public class ZipFileSystemDemo {
+    public static void main(String[] args) throws IOException {
+        Path zipPath = Files.createTempFile("inventory", ".zip");
+        Files.delete(zipPath);
+
+        Map<String, String> env = new HashMap<>();
+        env.put("create", "true");
+
+        try (FileSystem fs = FileSystems.newFileSystem(zipPath, env)) {
+            Path inside = fs.getPath("inventory.json");
+            Files.writeString(inside, "{\"sku\":\"A1\",\"stock\":42}");
+        }
+
+        try (FileSystem fs = FileSystems.newFileSystem(zipPath, Map.of())) {
+            try (Stream<Path> entries = Files.walk(fs.getPath("/"))) {
+                entries.filter(Files::isRegularFile)
+                       .forEach(p -> {
+                           try {
+                               System.out.println(p + ": " + Files.readString(p));
+                           } catch (IOException e) {
+                               System.out.println("Skipped: " + p);
+                           }
+                       });
+            }
+        }
+
+        Files.deleteIfExists(zipPath);
+    }
+}
+```
+
+The same `Files` calls work against entries inside the zip. That's the power of the abstraction: code that uses `Path` and `Files` is portable between operating systems and between filesystems. Treat zip filesystems as a useful tool rather than a daily driver; they're handy for reading or modifying a small archive without a separate library.
+
+<h1 id="watching-for-changes">Watching for Changes</h1>
+
+`WatchService` asks the OS to notify the application when files in a directory change. It's not push-style: register a directory, then poll the service for events.
+
+```java
+import java.io.IOException;
+import java.nio.file.FileSystems;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardWatchEventKinds;
+import java.nio.file.WatchKey;
+import java.nio.file.WatchService;
+
+public class WatchExample {
+    public static void main(String[] args) throws IOException, InterruptedException {
+        Path incoming = Files.createTempDirectory("incoming");
+
+        WatchService watcher = FileSystems.getDefault().newWatchService();
+        incoming.register(watcher,
+                StandardWatchEventKinds.ENTRY_CREATE,
+                StandardWatchEventKinds.ENTRY_DELETE);
+
+        // Simulate a new order file arriving in another thread
+        new Thread(() -> {
+            try {
+                Thread.sleep(200);
+                Files.writeString(incoming.resolve("order-100.json"),
+                                  "{\"id\":100}");
+            } catch (Exception ignored) {}
+        }).start();
+
+        WatchKey key = watcher.take();
+        key.pollEvents().forEach(event ->
+            System.out.println(event.kind() + ": " + event.context()));
+        key.reset();
+
+        watcher.close();
+        Files.deleteIfExists(incoming.resolve("order-100.json"));
+        Files.deleteIfExists(incoming);
+    }
+}
+```
+
+The flow is: create a `WatchService`, register a directory with the kinds of events of interest (`ENTRY_CREATE`, `ENTRY_MODIFY`, `ENTRY_DELETE`), then call `watcher.take()` (blocks until an event) or `watcher.poll(timeout, unit)` (waits up to a timeout). Each `WatchKey` provides a batch of events; after processing, call `key.reset()` to keep the registration alive.
+
+`WatchService` watches one directory level. It does not recurse. To watch a tree, walk it once, register every directory, and add registrations for new subdirectories as they're created. On some platforms it's also relatively slow to detect changes (Java polls in the background), so don't use it as a hard real-time signal. It works well for "process new files in this drop folder", not for "alert me within a millisecond".
+
+<h1 id="putting-it-together">Putting It Together</h1>
+
+A short program that combines several of the topics covered above: it creates a workspace, drops a few order files in an `incoming` folder, walks them, archives processed ones, and prints a summary.
+
+```java
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.List;
+import java.util.stream.Stream;
+
+public class OrderProcessor {
+    public static void main(String[] args) throws IOException {
+        Path workspace = Files.createTempDirectory("shop");
+        Path incoming = Files.createDirectories(workspace.resolve("incoming"));
+        Path archive = Files.createDirectories(workspace.resolve("archive"));
+
+        // Drop three order files
+        Files.writeString(incoming.resolve("order-100.json"), "{\"id\":100,\"total\":29.99}");
+        Files.writeString(incoming.resolve("order-101.json"), "{\"id\":101,\"total\":12.00}");
+        Files.writeString(incoming.resolve("order-102.json"), "{\"id\":102,\"total\":49.50}");
+
+        // Walk incoming, archive each JSON file
+        List<Path> archived;
+        try (Stream<Path> stream = Files.list(incoming)) {
+            archived = stream.filter(p -> p.toString().endsWith(".json"))
+                             .sorted()
+                             .map(src -> {
+                                 try {
+                                     Path dest = archive.resolve(src.getFileName());
+                                     Files.move(src, dest, StandardCopyOption.ATOMIC_MOVE);
+                                     return dest;
+                                 } catch (IOException e) {
+                                     throw new RuntimeException(e);
+                                 }
+                             })
+                             .toList();
+        }
+
+        System.out.println("Archived " + archived.size() + " orders:");
+        for (Path p : archived) {
+            System.out.println("  " + p.getFileName() + " (" + Files.size(p) + " bytes)");
+        }
+
+        // Cleanup
+        try (Stream<Path> all = Files.walk(workspace)) {
+            all.sorted(java.util.Comparator.reverseOrder())
+               .forEach(p -> {
+                   try { Files.delete(p); }
+                   catch (IOException ignored) {}
+               });
+        }
+    }
+}
+```
+
+**Output (sizes are illustrative):**
+
+```text
+Archived 3 orders:
+  order-100.json (24 bytes)
+  order-101.json (24 bytes)
+  order-102.json (24 bytes)
+```
+
+Nine `Files` methods, one `Stream<Path>`, no `java.io.File` in sight. That's the day-to-day shape of file work in modern Java: assemble paths with `Path.of` and `resolve`, do work with `Files`, close stream-returning calls with try-with-resources, and let exceptions propagate rather than checking booleans.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

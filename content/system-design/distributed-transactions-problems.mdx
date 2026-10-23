@@ -1,0 +1,209 @@
+---
+title: "The Problem with Distributed Transactions"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "The Problem with Distributed Transactions explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+This works because one system owns the whole decision. The database can lock rows, track uncommitted changes, check rules, and recover from its own log.
+
+<h1 id="2-distributed-work-has-no-single-owner">
+  2. Distributed Work Has No Single Owner
+</h1>
+
+Now split the same operation across services.
+
+Each service can make a correct local decision and still leave the full workflow in a bad state.
+
+The order database cannot roll back the inventory database. The inventory service cannot know the payment result unless someone tells it. The payment service may even be an external provider.
+
+Once a service commits a local transaction, undoing it is no longer a database rollback. It becomes a new business action: cancel the order, release the reservation, void the authorization, or issue a refund.
+
+<h1 id="3-why-not-use-one-shared-database">
+  3. Why Not Use One Shared Database?
+</h1>
+
+Putting all data in one database can be the right answer for many systems, especially early in a product's life. A modular monolith with strong local transactions is often simpler and safer than splitting into microservices too early.
+
+But large systems sometimes split ownership for good reasons:
+
+| Reason                      | What It Means                                                                                      |
+| --------------------------- | -------------------------------------------------------------------------------------------------- |
+| **Independent scaling**     | Payment, search, inventory, and orders may have very different traffic patterns                    |
+| **Data ownership**          | Teams need clear control over their schemas, writes, and business rules                            |
+| **Technology fit**          | Some workloads need SQL, others need documents, key-value storage, search, or ledger-style storage |
+| **Fault isolation**         | One overloaded service should not take down every workflow                                         |
+| **Deployment independence** | Teams may need to ship changes without coordinating every database migration                       |
+
+The trade-off is real. When services own their own data, some consistency work moves out of the database and into the application design.
+
+<h1 id="4-failure-scenarios">4. Failure Scenarios</h1>
+
+Distributed failures are often partial. One service may commit, another may time out, and a third may still be working.
+
+<h3 id="partial-commit">Partial Commit</h3>
+
+A four-step order workflow commits two steps before payment fails. The workflow is now stuck halfway through.
+
+The first two services did exactly what they were asked to do. The overall business action is still incomplete.
+
+<h3 id="network-partition">Network Partition</h3>
+
+When the order service and payment service sit in separate data centers, a broken network link can leave each side unsure what the other side is doing.
+
+When services cannot communicate, the caller does not know whether the remote service is down, slow, isolated, or still doing the work.
+
+<h3 id="timeout-uncertainty">Timeout Uncertainty</h3>
+
+A timeout is not an answer. It only means the caller stopped waiting.
+
+Breaking that uncertainty into concrete cases shows why a blind retry can be dangerous:
+
+| What Happened                            | Payment State | Retrying Without Protection |
+| ---------------------------------------- | ------------- | --------------------------- |
+| Request never arrived                    | Not charged   | Safe                        |
+| Request arrived and failed before commit | Not charged   | Usually safe                |
+| Request succeeded but response was lost  | Charged       | May double-charge           |
+
+This is why production payment and ordering systems use idempotency keys, saved request records, unique constraints, and reconciliation jobs. Retrying is necessary. Retrying without protection is dangerous.
+
+<h3 id="service-crash">Service Crash</h3>
+
+Here the payment service crashes after inserting a row but before committing. From the caller's point of view, it just goes silent.
+
+The payment was not committed, but the caller does not automatically know that. A crash after commit but before the response would look almost the same to the caller.
+
+<h1 id="5-consistency-choices">5. Consistency Choices</h1>
+
+Local transactions usually give one application a strong view of one database. Distributed systems force you to choose where strong consistency is worth the cost.
+
+<h3 id="strong-consistency">Strong Consistency</h3>
+
+Strong consistency means reads return the latest committed value, based on the system's rules. In practice, this usually requires coordination before a write is confirmed or before a read is served.
+
+The cost is extra latency and lower availability when the required participants cannot communicate.
+
+<h3 id="eventual-consistency">Eventual Consistency</h3>
+
+Eventual consistency means replicas or services may disagree for a while, but they eventually catch up if updates stop and messages are delivered.
+
+The benefit is lower latency and better availability. The cost is that application code must handle temporary intermediate states.
+
+<h3 id="the-cap-connection">The CAP Connection</h3>
+
+During a network partition, a distributed system cannot always provide both a consistent answer and an available answer.
+
+This is the practical lesson from CAP. Network partitions are not rare surprises. They are part of running distributed systems. Your design must decide what happens when services cannot coordinate.
+
+<h1 id="6-real-consequences">6. Real Consequences</h1>
+
+Inconsistent state does not stay theoretical. It becomes support tickets, accounting gaps, unavailable inventory, and manual cleanup.
+
+<h3 id="double-charge">Double Charge</h3>
+
+Scenario: payment succeeds, but the response is lost.
+
+1. Order Service calls Payment Service.
+2. Payment Service charges the customer.
+3. The response is lost.
+4. Order Service times out and retries.
+5. Payment Service charges the customer again.
+
+<h3 id="unconfirmed-order">Unconfirmed Order</h3>
+
+Scenario: payment succeeds, but order confirmation fails.
+
+1. Payment Service captures $100.
+2. Order Service fails before marking the order `CONFIRMED`.
+3. The order remains `PENDING` or lacks its payment reference.
+4. Support sees a charge with no clear fulfillment state.
+
+<h3 id="orphaned-reservation">Orphaned Reservation</h3>
+
+Scenario: inventory is reserved, but payment fails.
+
+1. Inventory Service reserves 5 items.
+2. Payment Service declines the card.
+3. The workflow crashes before releasing the reservation.
+4. Items appear unavailable until cleanup runs.
+
+<h3 id="conflicting-decisions">Conflicting Decisions</h3>
+
+Scenario: two services make local decisions using stale information.
+
+1. Inventory says the last item is available.
+2. Two order workflows reserve it concurrently.
+3. Both payments succeed.
+4. Only one order can be fulfilled.
+
+<h1 id="7-why-agreement-is-hard">7. Why Agreement Is Hard</h1>
+
+Distributed transaction systems are built from parts that communicate over unreliable networks and fail independently.
+
+<h3 id="no-shared-memory">No Shared Memory</h3>
+
+Services cannot share local variables, process memory, or database locks. They coordinate by sending messages.
+
+Messages can be delayed, lost, duplicated, reordered, or delivered after the caller has already given up.
+
+<h3 id="no-perfect-failure-detector">No Perfect Failure Detector</h3>
+
+If a service does not respond, you cannot tell from the outside what happened. It may have crashed. It may be paused. It may have lost network connectivity. It may have completed the work and lost the response.
+
+Timeouts are useful engineering tools. They are not proof that the work failed.
+
+<h3 id="no-reliable-global-clock">No Reliable Global Clock</h3>
+
+Each machine has its own clock, and clocks drift.
+
+Timestamps are useful for logs, ordering events inside one system, and resolving conflicts. They are not a perfect source of truth for ordering transactions across services.
+
+<h3 id="agreement-needs-durable-state">Agreement Needs Durable State</h3>
+
+If a coordinator asks three participants to commit, every participant must be able to recover its local transaction state after a crash. That means durable logs, transaction IDs, retries, and careful handling of duplicate messages.
+
+This is why distributed transactions are more than "call three services and roll back if something fails." The hard part is recovery after failures at every point in the workflow.
+
+<h1 id="8-what-a-good-solution-must-handle">
+  8. What a Good Solution Must Handle
+</h1>
+
+A practical design must answer these questions:
+
+| Question                           | Why It Matters                                                 |
+| ---------------------------------- | -------------------------------------------------------------- |
+| **Who decides the final outcome?** | Without one decision point, services may disagree forever      |
+| **What is saved safely?**          | Recovery depends on facts that survive crashes                 |
+| **Are retries safe?**              | Duplicate requests are normal in distributed systems           |
+| **What states can users see?**     | Temporary states must still make business sense                |
+| **How are failures repaired?**     | Some work needs compensation, reconciliation, or manual review |
+| **What can become unavailable?**   | Stronger coordination often means more waiting or blocking     |
+
+No pattern gives perfect all-or-nothing behavior, isolation, availability, low latency, and simple operations across every service. Good systems choose the right trade-off for each workflow.
+
+<h1 id="9-approaches">9. Approaches</h1>
+
+Several patterns address distributed transactions, each with different trade-offs.
+
+The table pairs each pattern with where it fits and what it costs:
+
+| Pattern                | Best Fit                                                | Main Trade-off                                                                               |
+| ---------------------- | ------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| **Two-Phase Commit**   | Databases or tightly controlled transactional resources | Strong all-or-nothing commit, but participants can block while holding locks                 |
+| **Three-Phase Commit** | Learning why distributed commit is hard                 | Adds a phase, but relies on network behavior that rarely holds in production                 |
+| **Saga**               | Long-running business workflows across services         | Higher availability, but temporary states and compensation are visible                       |
+| **Outbox**             | Reliable event publishing from a service database       | Makes event publishing reliable, but does not solve the whole business transaction by itself |
+
+<h1 id="summary">Summary</h1>
+
+Distributed transactions are hard because the system loses the thing local transactions depend on: one database with control over all the data. In a distributed workflow, each service commits its own local transaction, so later failures cannot be erased by one database rollback.
+
+Timeouts do not reveal what actually happened. Retries can create duplicates unless operations are idempotent. Temporary states must be valid and observable. Recovery depends on saved state, not error handling alone.
+
+Instead of pretending distributed workflows behave like one database transaction, design clear coordination, compensation, retry, and reconciliation paths. The goal is not to make failures disappear. The goal is to guide the system back to a correct business outcome.
+
+<CommentsSection />
+
+</LessonCard>

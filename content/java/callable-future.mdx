@@ -1,0 +1,624 @@
+---
+title: "Callable & Future"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Callable & Future explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="why-runnable-isnt-enough">Why Runnable Isn't Enough</h1>
+
+A `Runnable` has one method: `void run()`. No return type, no checked exceptions in the signature. That's fine when the task is "log this message" or "increment a counter," but a lot of real work produces a value. Computing a customer's loyalty discount, looking up a vendor's price quote, generating a report, hashing a file. Each of those wants to give the caller an answer.
+
+A result can be shoehorned into a `Runnable` by writing to a shared field, but that gets ugly fast: synchronization is required, there's no built-in signal for when the work is done, and there's nowhere clean to surface an `IOException` that the worker hit halfway through. `Callable<V>` is the cleaner shape.
+
+```java
+import java.util.concurrent.Callable;
+import java.math.BigDecimal;
+
+public class CallableShape {
+    public static void main(String[] args) throws Exception {
+        Callable<BigDecimal> loyaltyDiscount = () -> {
+            BigDecimal lifetimeSpend = new BigDecimal("2400.00");
+            BigDecimal rate = new BigDecimal("0.05");
+            return lifetimeSpend.multiply(rate);
+        };
+
+        BigDecimal discount = loyaltyDiscount.call();
+        System.out.println("Loyalty discount: $" + discount);
+    }
+}
+```
+
+`Callable<V>` is a functional interface with a single method `V call() throws Exception`. Three things stand out compared to `Runnable.run`:
+
+| Aspect               | `Runnable`     | `Callable<V>`                    |
+| -------------------- | -------------- | -------------------------------- |
+| Return type          | `void`         | `V` (any type, including `Void`) |
+| Checked exceptions   | None allowed   | Any `Exception` allowed          |
+| Method name          | `run`          | `call`                           |
+| Functional interface | Yes (Java 1.0) | Yes (Java 1.5)                   |
+
+Calling `loyaltyDiscount.call()` directly on the main thread, like in the example above, is legal but uninteresting. `Callable` exists to be submitted to an `ExecutorService` so it runs on a worker thread, returning a `Future<V>` that can be interrogated later.
+
+<h1 id="submitting-a-callable-to-an-executorservice">
+  Submitting a Callable to an ExecutorService
+</h1>
+
+`ExecutorService.submit(Callable<V>)` returns a `Future<V>`. The submit call doesn't run the task; it queues it. The pool's worker thread picks it up when one is free, runs `call()`, and stores whatever happens (a result or an exception) inside the `Future`. The caller can come back later and read it.
+
+```java
+import java.math.BigDecimal;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+public class SubmitCallable {
+    public static void main(String[] args) throws InterruptedException, ExecutionException {
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+
+        Callable<BigDecimal> loyaltyDiscount = () -> {
+            BigDecimal lifetimeSpend = new BigDecimal("2400.00");
+            BigDecimal rate = new BigDecimal("0.05");
+            Thread.sleep(200); // simulate database lookup
+            return lifetimeSpend.multiply(rate);
+        };
+
+        Future<BigDecimal> handle = pool.submit(loyaltyDiscount);
+        System.out.println("Submitted. Doing other work on main...");
+
+        BigDecimal discount = handle.get();
+        System.out.println("Loyalty discount: $" + discount);
+
+        pool.shutdown();
+    }
+}
+```
+
+The order in the output matters. The main thread prints "Submitted..." right away, because `submit` doesn't block. The pool's worker thread runs the `Callable` in the background. The main thread reaches `handle.get()` and waits there until the worker stores a result. Once the worker finishes, `get()` returns the `BigDecimal` and the main thread keeps going.
+
+The diagram shows the full handoff. The `submit` arrow returns immediately, giving the main thread a `Future` to hold onto. The worker runs the task on its own thread. The `get` call on the main thread blocks until the worker reports back. The `Future` is the meeting point between the two threads, the shared box where the result lands.
+
+A `Runnable` can also be submitted, returning a `Future<?>` (with a result of `null`), or via the `submit(Runnable, V result)` overload that lets the caller choose what `Future.get()` returns when the task finishes. Those overloads exist because `Future` is the unified handle for "something the pool is doing", whether or not the task itself produces a value.
+
+`future.get()` blocks the caller until the result is ready. A main thread sitting on `get()` is doing nothing else while it waits. For independent work, submit all callables first and call `get` on them only after the last submit, or move to `CompletableFuture` chaining.
+
+<h1 id="what-futurev-gives-you">What Future&lt;V&gt; Gives You</h1>
+
+A `Future<V>` has a small surface, five methods in practical use:
+
+| Method                                          | Purpose                                                                      |
+| ----------------------------------------------- | ---------------------------------------------------------------------------- |
+| `V get()`                                       | Block until the task finishes, then return its value.                        |
+| `V get(long timeout, TimeUnit unit)`            | Block for at most `timeout`, then either return or throw `TimeoutException`. |
+| `boolean cancel(boolean mayInterruptIfRunning)` | Attempt to cancel. Returns `true` if cancellation was requested.             |
+| `boolean isCancelled()`                         | Has cancellation been requested and accepted?                                |
+| `boolean isDone()`                              | Has the task finished (normally, with an exception, or by cancellation)?     |
+
+`isDone()` returns `true` for any terminal state. That includes normal completion, exceptional completion, and cancellation. `isDone()` does not reveal which of those three actually happened; that requires calling `get` and observing the result.
+
+```java
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+public class FutureStates {
+    public static void main(String[] args) throws InterruptedException, ExecutionException {
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+
+        Callable<String> task = () -> {
+            Thread.sleep(300);
+            return "vendor-A:$19.99";
+        };
+
+        Future<String> quote = pool.submit(task);
+
+        System.out.println("Just after submit: isDone=" + quote.isDone()
+            + ", isCancelled=" + quote.isCancelled());
+
+        String result = quote.get();
+
+        System.out.println("After get:        isDone=" + quote.isDone()
+            + ", isCancelled=" + quote.isCancelled());
+        System.out.println("Result: " + result);
+
+        pool.shutdown();
+    }
+}
+```
+
+`isDone` flips from `false` to `true` once the worker stores a result. `isCancelled` stays `false` because `cancel` was never called. The `Future` is a small piece of shared state between the calling thread and the worker, and these flags indicate which corner of that state is current.
+
+The three terminal states are normal completion, exceptional completion, and cancellation. `isDone()` returns `true` for all of them. The exact outcome only reveals itself when `get` is called: a normal return, a wrapped exception, or a `CancellationException`.
+
+<h1 id="get-and-how-it-blocks">get() and How It Blocks</h1>
+
+The no-argument `get()` blocks until the task is in a terminal state. If the worker thread is still running, the calling thread parks. If the worker has already finished by the time `get` is called, it returns immediately with the stored value.
+
+```java
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+public class BlockingGet {
+    public static void main(String[] args) throws InterruptedException, ExecutionException {
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+
+        Callable<String> fast = () -> {
+            Thread.sleep(50);
+            return "fast result";
+        };
+        Callable<String> slow = () -> {
+            Thread.sleep(500);
+            return "slow result";
+        };
+
+        long start = System.currentTimeMillis();
+        Future<String> fastHandle = pool.submit(fast);
+        Future<String> slowHandle = pool.submit(slow);
+
+        System.out.println(fastHandle.get() + " at " + (System.currentTimeMillis() - start) + "ms");
+        System.out.println(slowHandle.get() + " at " + (System.currentTimeMillis() - start) + "ms");
+
+        pool.shutdown();
+    }
+}
+```
+
+The exact milliseconds will vary across runs, but the pattern holds. The first `get` returns at around 50ms because the fast task finishes quickly. The second `get` returns at around 500ms because the slow task takes that long. Both calls block the main thread, just for different durations.
+
+The order of the `get` calls matters less than it appears for the total wall-clock time. Both tasks run in parallel on the two-thread pool. Switching the two `get` calls would print the same numbers in a different order; it wouldn't make the program any slower.
+
+`get` throws three notable exceptions:
+
+| Exception               | When                                                                   |
+| ----------------------- | ---------------------------------------------------------------------- |
+| `InterruptedException`  | The thread waiting on `get` was interrupted before the result arrived. |
+| `ExecutionException`    | The task threw an exception. The original is the `cause`.              |
+| `CancellationException` | The task was cancelled before it produced a value.                     |
+
+`InterruptedException` is checked, `ExecutionException` is checked, and `CancellationException` is unchecked. This is why nearly every snippet here declares `throws InterruptedException, ExecutionException` on `main`.
+
+<h1 id="executionexception-how-task-failures-surface">
+  ExecutionException: How Task Failures Surface
+</h1>
+
+When the `Callable.call()` method throws anything, the worker doesn't propagate it directly. It catches the throwable, stores it inside the `Future`, and waits for a `get` call. At that point, `get` throws `ExecutionException` wrapping the original cause.
+
+```java
+import java.math.BigDecimal;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+public class FailingCallable {
+    public static void main(String[] args) throws InterruptedException {
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+
+        Callable<BigDecimal> brokenLookup = () -> {
+            throw new IllegalStateException("vendor API key missing");
+        };
+
+        Future<BigDecimal> handle = pool.submit(brokenLookup);
+
+        try {
+            BigDecimal result = handle.get();
+            System.out.println("Got: " + result);
+        } catch (ExecutionException ex) {
+            System.out.println("Wrapped type: " + ex.getClass().getSimpleName());
+            System.out.println("Cause type:   " + ex.getCause().getClass().getSimpleName());
+            System.out.println("Cause msg:    " + ex.getCause().getMessage());
+        }
+
+        pool.shutdown();
+    }
+}
+```
+
+The original `IllegalStateException` is alive and well, but it arrives at the caller wrapped inside an `ExecutionException`. Unwrap it with `getCause()`. This wrapping is deliberate: a task can be submitted by one thread and `get` can be called by another, possibly much later. The `ExecutionException` makes the boundary between "the task's exception" and "local control flow" explicit. Whatever comes out of the cause originated inside the worker, not inside the code calling `get`.
+
+The same wrapping applies whether the inner exception is checked or unchecked. A `Callable<String>` whose `call()` throws `IOException` produces an `ExecutionException` with an `IOException` cause, even though `IOException` is checked. The wrapping is what allows `get()` to have a single, fixed throws clause regardless of what the callable does.
+
+<h1 id="gettimeout-bounded-waiting">get(timeout): Bounded Waiting</h1>
+
+Blocking forever on a `get()` call is dangerous. The vendor's API might hang, the database might be slow, the worker might be deadlocked. The overload `get(long, TimeUnit)` puts a ceiling on the wait. If the result isn't ready within the timeout, `get` throws `TimeoutException` and the task keeps running unless cancelled separately.
+
+```java
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
+public class BoundedGet {
+    public static void main(String[] args) throws InterruptedException, ExecutionException {
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+
+        Callable<String> slowVendor = () -> {
+            Thread.sleep(800);
+            return "vendor-B:$22.49";
+        };
+
+        Future<String> handle = pool.submit(slowVendor);
+
+        try {
+            String result = handle.get(200, TimeUnit.MILLISECONDS);
+            System.out.println("Got it: " + result);
+        } catch (TimeoutException ex) {
+            System.out.println("Vendor lookup too slow, moving on.");
+            handle.cancel(true);
+        }
+
+        pool.shutdown();
+    }
+}
+```
+
+The task is sleeping for 800ms but the caller is only willing to wait 200ms. The `get` throws `TimeoutException`, the caller catches it and calls `cancel(true)` to release the worker. Without that cancel call, the worker thread would keep running the slow `Thread.sleep` for the rest of its 800ms even though nobody plans to read the result.
+
+A common pattern: race a request against a deadline, and fall back if the deadline trips. The timeout is the deadline; the cancel is the cleanup. Cancel semantics are covered in more detail below.
+
+<h1 id="invokeall-submit-many-wait-for-all">
+  invokeAll: Submit Many, Wait for All
+</h1>
+
+`invokeAll(Collection<Callable<V>>)` submits every callable in the collection, blocks until all of them finish (normally, exceptionally, or by an interrupt), and returns a `List<Future<V>>` in the same order as the input. Each `Future` in the returned list is already in a terminal state, so calling `get` on it doesn't block.
+
+The classic e-commerce shape for this is parallel price quotes from multiple vendors. Finding the cheapest quote requires asking all of them and comparing.
+
+```java
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+public class ParallelQuotes {
+    public static void main(String[] args) throws InterruptedException, ExecutionException {
+        ExecutorService pool = Executors.newFixedThreadPool(3);
+
+        Callable<BigDecimal> vendorA = () -> {
+            Thread.sleep(200);
+            return new BigDecimal("19.99");
+        };
+        Callable<BigDecimal> vendorB = () -> {
+            Thread.sleep(350);
+            return new BigDecimal("22.49");
+        };
+        Callable<BigDecimal> vendorC = () -> {
+            Thread.sleep(150);
+            return new BigDecimal("18.75");
+        };
+
+        List<Callable<BigDecimal>> lookups = List.of(vendorA, vendorB, vendorC);
+        String[] names = {"A", "B", "C"};
+
+        long start = System.currentTimeMillis();
+        List<Future<BigDecimal>> quotes = pool.invokeAll(lookups);
+        long elapsed = System.currentTimeMillis() - start;
+
+        BigDecimal cheapest = null;
+        String cheapestVendor = null;
+
+        for (int i = 0; i < quotes.size(); i++) {
+            BigDecimal price = quotes.get(i).get();
+            System.out.println("Vendor " + names[i] + ": $" + price);
+            if (cheapest == null || price.compareTo(cheapest) < 0) {
+                cheapest = price;
+                cheapestVendor = names[i];
+            }
+        }
+
+        System.out.println("Cheapest: vendor " + cheapestVendor + " at $" + cheapest);
+        System.out.println("Total wait: " + elapsed + "ms");
+
+        pool.shutdown();
+    }
+}
+```
+
+Three vendor calls, three threads, all running in parallel. The total wall-clock time is roughly the slowest of the three (350ms for vendor B), plus a small overhead, not the sum (700ms). `invokeAll` blocks until every quote is in. The returned list is in the same order as the input list, so `quotes.get(0)` is always vendor A regardless of which task finished first.
+
+The three workers start at about the same time and finish in their own order. The pool doesn't return the list to the caller until the last future has completed. The order of completion (C, then A, then B) is independent of the result list's order, which always matches the submission order.
+
+If one of the callables throws, `invokeAll` doesn't fail. It still waits for the others to finish, and the failed task's `Future.get()` is what surfaces the exception. The caller has to walk the list and decide what to do with each result. This is a major contrast with `invokeAny`.
+
+There's also an overload `invokeAll(Collection, long, TimeUnit)` that bounds the total wait. Tasks that haven't finished when the deadline trips are cancelled, and their futures throw `CancellationException` instead of returning a value.
+
+<h1 id="invokeany-first-successful-result-wins">
+  invokeAny: First Successful Result Wins
+</h1>
+
+`invokeAny(Collection<Callable<V>>)` is a different shape. It submits all the callables, waits for any one of them to complete successfully, returns that single value, and cancels the rest. Tasks that fail or are cancelled don't count as "successful," so `invokeAny` keeps waiting until one finishes cleanly or every task has failed.
+
+```java
+import java.math.BigDecimal;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+public class FirstQuote {
+    public static void main(String[] args) throws InterruptedException, ExecutionException {
+        ExecutorService pool = Executors.newFixedThreadPool(3);
+
+        Callable<BigDecimal> vendorA = () -> {
+            Thread.sleep(300);
+            return new BigDecimal("19.99");
+        };
+        Callable<BigDecimal> vendorB = () -> {
+            Thread.sleep(150);
+            return new BigDecimal("22.49");
+        };
+        Callable<BigDecimal> vendorC = () -> {
+            Thread.sleep(450);
+            return new BigDecimal("18.75");
+        };
+
+        long start = System.currentTimeMillis();
+        BigDecimal first = pool.invokeAny(List.of(vendorA, vendorB, vendorC));
+        long elapsed = System.currentTimeMillis() - start;
+
+        System.out.println("First quote back: $" + first);
+        System.out.println("Wait: " + elapsed + "ms");
+
+        pool.shutdown();
+    }
+}
+```
+
+Vendor B finishes first because it's the fastest. `invokeAny` returns that single value and asks the pool to cancel the other two callables. The wait time is roughly the fastest task's duration, not the sum. The caller never sees vendor A's $19.99 or vendor C's $18.75, even though those would have been cheaper, because "first done" is the metric, not "cheapest."
+
+This is a "first successful" semantics, not "first attempted" or "first finished period." If vendor B had failed with an exception, `invokeAny` would have ignored that failure and waited for the next task to finish. If all of them failed, `invokeAny` would throw `ExecutionException` wrapping the last failure.
+
+When does `invokeAny` make sense? When multiple sources can produce the same answer and only one is needed. Some examples: querying replicated read databases for a row, calling a service deployed in three regions to find the closest one, asking three different recommendation engines for "top 10 products." When the goal is "best result," use `invokeAll` and a comparison. When the goal is "any result, as fast as possible," `invokeAny` fits.
+
+| Method              | Returns when                        | Returns what                    | Other tasks                    |
+| ------------------- | ----------------------------------- | ------------------------------- | ------------------------------ |
+| `invokeAll`         | Every task reaches a terminal state | `List<Future<V>>` (input order) | All run to completion          |
+| `invokeAll` (timed) | All done, or deadline hit           | `List<Future<V>>`               | Unfinished tasks are cancelled |
+| `invokeAny`         | One task succeeds, or all fail      | `V` (single value)              | Remaining tasks are cancelled  |
+| `invokeAny` (timed) | One succeeds, or deadline hit       | `V`, or `TimeoutException`      | Remaining tasks are cancelled  |
+
+Both methods block the caller. Neither makes the caller's thread useful while it's waiting. That's a property of the `Future` design.
+
+<h1 id="cancellation-and-cancelboolean">Cancellation and cancel(boolean)</h1>
+
+`Future.cancel(boolean mayInterruptIfRunning)` is the request side of cancellation. It returns `true` if cancellation was requested (which doesn't necessarily mean the task is actually stopped). If the task hasn't started yet, the pool removes it from the queue and it never runs. If the task is running, the pool sets the `Future`'s state to "cancelled" and, only if `mayInterruptIfRunning` is `true`, calls `Thread.interrupt()` on the worker.
+
+The interrupt is a request to the running task, not a kill switch. It only does something if the task actively checks for it (via `Thread.currentThread().isInterrupted()`) or is blocked in a method that throws `InterruptedException` (like `Thread.sleep`, `Object.wait`, or a blocking I/O wait on an interruptible channel). A task that loops on integers without ever checking the interrupt flag will not stop, no matter how many `cancel(true)` calls happen.
+
+```java
+import java.util.concurrent.Callable;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+public class CancelInterruptible {
+    public static void main(String[] args) throws InterruptedException {
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+
+        Callable<String> longLookup = () -> {
+            try {
+                Thread.sleep(2000); // wakes up if interrupted
+                return "vendor-D:$24.99";
+            } catch (InterruptedException ex) {
+                System.out.println("Task: detected interrupt, exiting cleanly");
+                throw ex; // propagate
+            }
+        };
+
+        Future<String> handle = pool.submit(longLookup);
+        Thread.sleep(200); // let it start
+
+        boolean requested = handle.cancel(true);
+        System.out.println("cancel returned: " + requested);
+        System.out.println("isCancelled:     " + handle.isCancelled());
+        System.out.println("isDone:          " + handle.isDone());
+
+        try {
+            handle.get();
+        } catch (CancellationException ex) {
+            System.out.println("get threw CancellationException");
+        } catch (ExecutionException ex) {
+            System.out.println("get threw ExecutionException: " + ex.getCause());
+        }
+
+        pool.shutdown();
+    }
+}
+```
+
+A few things happen at once. `cancel(true)` asks the pool to interrupt the worker. The worker is inside `Thread.sleep(2000)`, which wakes up and throws `InterruptedException`. The callable's `catch` block runs, prints a message, and rethrows. The `Future` records the cancellation. Calling `get` on a cancelled future throws `CancellationException`, not `ExecutionException`, even though the underlying cause was an `InterruptedException`. The pool treats "cancelled" as its own terminal state.
+
+The order of "Task: detected interrupt..." and "cancel returned: true" depends on thread scheduling. Either can come first in a given run: `cancel` only requests, it doesn't wait for the worker to confirm.
+
+Compare that with a callable that ignores interrupts:
+
+```java
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+public class CancelUncooperative {
+    public static void main(String[] args) throws InterruptedException {
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+
+        Callable<Long> stubborn = () -> {
+            long sum = 0;
+            for (long i = 0; i < 10_000_000_000L; i++) {
+                sum += i; // never checks interrupt flag
+            }
+            return sum;
+        };
+
+        Future<Long> handle = pool.submit(stubborn);
+        Thread.sleep(100);
+
+        handle.cancel(true);
+        System.out.println("cancel issued");
+        System.out.println("isCancelled: " + handle.isCancelled());
+
+        Thread.sleep(500);
+        System.out.println("Half a second later, worker is still running.");
+
+        pool.shutdownNow();
+    }
+}
+```
+
+`isCancelled()` returns `true` because the `Future`'s state is "cancelled." The worker thread, on the other hand, never checks `Thread.currentThread().isInterrupted()` and never enters a method that responds to interrupts, so it keeps adding numbers in its tight loop. The cancellation flag and the thread state are two different things. The flag is set; the thread doesn't care.
+
+The fix in a long-running computational task is to check the interrupt flag periodically and bail out cleanly:
+
+```java
+Callable<Long> cooperative = () -> {
+    long sum = 0;
+    for (long i = 0; i < 10_000_000_000L; i++) {
+        if ((i & 0xFFFF) == 0 && Thread.currentThread().isInterrupted()) {
+            throw new InterruptedException("cancelled by caller");
+        }
+        sum += i;
+    }
+    return sum;
+};
+```
+
+The mask `(i & 0xFFFF) == 0` checks the flag every 65,536 iterations, which is frequent enough to respond quickly but rare enough that the check has negligible overhead. The exact frequency depends on the inner loop's cost.
+
+`cancel(false)` is the version that doesn't interrupt. It still cancels the task if the task hasn't started yet (removing it from the queue), but if the task is already running, the cancel call returns `true` and the task is marked cancelled, while the worker keeps running until it finishes on its own. The result it produces is then discarded. `cancel(false)` is useful for short-lived tasks that shouldn't be interrupted mid-run.
+
+`cancel(true)` doesn't kill the thread. The interrupt is a request. A task that doesn't check the flag or doesn't block in an interruptible method will keep running until it finishes naturally. Design long-running tasks to check `Thread.currentThread().isInterrupted()` periodically.
+
+The flowchart traces what happens after a `cancel(true)` call. The two leaf states on the right (worker keeps running, result is discarded) are subtle: the future is "cancelled" from the caller's perspective, but the OS-level thread is still consuming CPU.
+
+<h1 id="futuretask-the-class-underneath">FutureTask: The Class Underneath</h1>
+
+`FutureTask<V>` is the concrete class that implements both `Runnable` and `Future<V>`. When `pool.submit(callable)` runs, the executor wraps the `Callable` in a `FutureTask` (or something very similar) and returns the `Future` side while putting the `Runnable` side into the work queue. The dual-interface trick is what lets one object be both the work to do and the handle to its result.
+
+A `FutureTask` can also be built directly, which is handy for using `Future` behavior outside of an `ExecutorService` (running on a plain `Thread`, scheduling on a custom executor) or for exposing a task that hasn't been started yet.
+
+```java
+import java.math.BigDecimal;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
+
+public class ManualFutureTask {
+    public static void main(String[] args) throws InterruptedException, ExecutionException {
+        Callable<BigDecimal> loyalty = () -> {
+            Thread.sleep(150);
+            BigDecimal spend = new BigDecimal("2400.00");
+            return spend.multiply(new BigDecimal("0.05"));
+        };
+
+        FutureTask<BigDecimal> task = new FutureTask<>(loyalty);
+
+        Thread worker = new Thread(task, "loyalty-worker");
+        worker.start();
+
+        BigDecimal discount = task.get();
+        System.out.println("Loyalty discount: $" + discount);
+        worker.join();
+    }
+}
+```
+
+`new FutureTask<>(callable)` creates a task that's a `Runnable` (passable to `Thread`) and a `Future<BigDecimal>` (callable with `get`). When the worker thread runs `task.run()`, it calls the wrapped `Callable.call()` and stores the result. The main thread's `task.get()` blocks until the worker stores the value, exactly like with an executor-based `Future`.
+
+A `FutureTask` can also be constructed from a `Runnable` plus a value: `new FutureTask<>(runnable, "done")` creates a task whose `get` returns `"done"` when the runnable finishes. That's mostly used internally by the executor framework.
+
+`FutureTask` is the API to use when a task is set up in one place and started later by other code, or when writing a framework that hands out futures without owning the threads. For the regular submit-to-pool pattern, direct use of `FutureTask` is rare; its name typically only appears in stack traces.
+
+<h1 id="putting-quotes-and-loyalty-together">
+  Putting Quotes and Loyalty Together
+</h1>
+
+A small program that ties everything together: a customer is on the checkout page, and the system has to compute their loyalty discount and look up the cheapest vendor price at the same time. Both happen in parallel, both produce `BigDecimal` values, and the final discount applies to the cheapest quote.
+
+```java
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+public class CheckoutScreen {
+    public static void main(String[] args) throws InterruptedException, ExecutionException {
+        ExecutorService pool = Executors.newFixedThreadPool(4);
+
+        Callable<BigDecimal> loyaltyDiscount = () -> {
+            Thread.sleep(180);
+            BigDecimal lifetimeSpend = new BigDecimal("2400.00");
+            return lifetimeSpend.multiply(new BigDecimal("0.05"));
+        };
+
+        Callable<BigDecimal> vendorA = () -> {
+            Thread.sleep(220);
+            return new BigDecimal("19.99");
+        };
+        Callable<BigDecimal> vendorB = () -> {
+            Thread.sleep(150);
+            return new BigDecimal("22.49");
+        };
+        Callable<BigDecimal> vendorC = () -> {
+            Thread.sleep(310);
+            return new BigDecimal("18.75");
+        };
+
+        Future<BigDecimal> loyaltyHandle = pool.submit(loyaltyDiscount);
+
+        List<Future<BigDecimal>> quoteHandles = pool.invokeAll(
+            List.of(vendorA, vendorB, vendorC));
+
+        BigDecimal cheapest = null;
+        for (Future<BigDecimal> q : quoteHandles) {
+            BigDecimal price = q.get();
+            if (cheapest == null || price.compareTo(cheapest) < 0) {
+                cheapest = price;
+            }
+        }
+
+        BigDecimal discount = loyaltyHandle.get();
+        BigDecimal finalPrice = cheapest.subtract(discount.min(cheapest))
+            .setScale(2, RoundingMode.HALF_UP);
+
+        System.out.println("Cheapest quote:  $" + cheapest);
+        System.out.println("Loyalty discount: $" + discount);
+        System.out.println("Final price:     $" + finalPrice);
+
+        pool.shutdown();
+    }
+}
+```
+
+Four callables run in parallel on a four-thread pool. The loyalty discount uses `submit` because it's standalone. The three vendor quotes use `invokeAll` because all of them are needed in submission order. The total wall time is roughly the slowest of the four (vendor C at 310ms), not the sum (860ms). The `min(cheapest)` call caps the discount at the quote so the final price doesn't go negative, a real-world rule.
+
+The structure of the program is the structure of the work: independent tasks fan out, the caller waits for the ones it needs, and the results combine into a single answer. That fan-out-and-combine shape is what makes `Future` useful, and it's also where its limits show. Every `get` is a blocking call. Composing futures (taking one result and feeding it into another future-returning operation) means chained blocks.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

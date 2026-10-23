@@ -1,0 +1,390 @@
+---
+title: "String Templates (Java 21)"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "String Templates (Java 21) explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+String templates were Java's answer to a problem every other modern language solved a decade ago: how do you splice variables into a string without `+` noise, `String.format` mismatches, or unsafe string concatenation that creates a SQL injection vulnerability? The proposed answer was to combine a template (the string with embedded expressions) with a processor (a small class that decides what the template means). This lesson walks through the model, the three built-in processors, and the main feature, custom processors that escape SQL and HTML automatically. We'll also discuss why the feature was pulled and what to use today.
+
+<h1 id="why-string-templates-were-proposed">
+  Why String Templates Were Proposed
+</h1>
+
+Before string templates, Java already had several ways to glue strings and values together. None of them were great.
+
+The first is plain concatenation with `+`. It works, but it gets noisy fast, and every `+` allocates intermediate `String` objects unless the compiler folds them into a single `StringBuilder`. Worse, when building HTML or SQL, you've to remember to escape values yourself, which is easy to forget.
+
+```java
+public class OrderReceiptConcat {
+    public static void main(String[] args) {
+        String customerName = "Priya";
+        int orderId = 4821;
+        double total = 89.97;
+
+        String receipt = "Hi " + customerName + ", your order #" + orderId
+                + " for $" + total + " has been placed.";
+
+        System.out.println(receipt);
+    }
+}
+```
+
+The second is `String.format`. It's better for layouts because the template sits on its own line, but the values are positional. If you reorder the placeholders without reordering the arguments, the compiler won't help you and the issue will surface in production.
+
+```java
+public class OrderReceiptFormat {
+    public static void main(String[] args) {
+        String customerName = "Priya";
+        int orderId = 4821;
+        double total = 89.97;
+
+        String receipt = String.format(
+            "Hi %s, your order #%d for $%.2f has been placed.",
+            customerName, orderId, total
+        );
+
+        System.out.println(receipt);
+    }
+}
+```
+
+The third is `StringBuilder`, which is fine for building strings in a loop but awkward as a way to write a single sentence. The fourth is `MessageFormat`, which is rarely used.
+
+The real pain isn't typing, though. It's safety. Consider this SQL fragment:
+
+```java
+String query = "SELECT * FROM orders WHERE customer = '" + customerName + "'";
+```
+
+If `customerName` is `O'Reilly`, the query breaks. If `customerName` is `'; DROP TABLE orders; --`, it's worse. Every JDBC tutorial tells you to use `PreparedStatement`, but the convenience of plain concatenation tempts engineers into writing the unsafe version. String templates were designed to let you write the convenient form and have the processor handle escaping correctly by default.
+
+The pitch: nicer syntax, safer-by-default interpolation, custom processors for domain-specific languages like SQL, HTML, and JSON.
+
+<h1 id="the-template-processor-model">The Template Processor Model</h1>
+
+The core idea is two pieces working together:
+
+1. A **template** is a string with **embedded expressions** written as `\{expression}`.
+2. A **template processor** is an object that converts the template into a value, usually a `String`, but it can be any type.
+
+Putting them together looks like this:
+
+```text
+PROCESSOR."template with \{expression} parts"
+```
+
+The processor sits on the left of the dot, the template string sits on the right. The result is whatever the processor returns. Most processors return `String`, but a JSON processor could return a `JsonNode`, a SQL processor could return a `PreparedStatement`, and so on.
+
+The diagram shows the whole model. The compiler splits the template into a list of literal text fragments and a list of expression values, then hands both lists to the processor's `process` method. The processor decides what to do with them. That separation makes the design powerful: the same template can produce a plain string, an escaped HTML fragment, or a parameterized SQL query depending on which processor you pick.
+
+All the code below assumes Java 21 or 22 with `--enable-preview` and `--release 21` (or 22) on `javac` and `java`. On Java 23+, this code won't compile.
+
+<h1 id="str-plain-interpolation">STR: Plain Interpolation</h1>
+
+The simplest built-in processor is `STR`. It substitutes each embedded expression with the result of `String.valueOf(expr)` and returns the joined string. You can use it without importing anything, because `STR` is imported automatically into every source file (similar to how `java.lang` is).
+
+```java
+public class CustomerGreeting {
+    public static void main(String[] args) {
+        String customerName = "Priya";
+        int loyaltyPoints = 1240;
+
+        String greeting = STR."Hi \{customerName}, you have \{loyaltyPoints} reward points.";
+
+        System.out.println(greeting);
+    }
+}
+```
+
+The `\{...}` syntax can hold any expression, not just a variable. Method calls, arithmetic, ternary expressions, all of it works:
+
+```java
+public class CartSummary {
+    public static void main(String[] args) {
+        int itemCount = 3;
+        double itemPrice = 29.99;
+
+        String summary = STR."""
+            Cart has \{itemCount} item\{itemCount == 1 ? "" : "s"}.
+            Subtotal: $\{itemCount * itemPrice}
+            Free shipping: \{itemCount * itemPrice >= 50 ? "yes" : "no"}
+            """;
+
+        System.out.println(summary);
+    }
+}
+```
+
+That example also shows templates inside a text block. The `"""..."""` form behaves the same way it does without a processor, the processor gets handed the multi-line template instead of a single line. We covered text blocks in lesson 02; this is the same syntax, with embedded expressions added.
+
+<h1 id="fmt-printf-style-formatting">FMT: printf-Style Formatting</h1>
+
+`STR` works for casual interpolation, but it gives you no control over number formatting. `0.1 + 0.2` would print as `0.30000000000000004`. For currency, percentages, and padding, use `FMT`.
+
+`FMT` is the same idea as `STR`, but each embedded expression can be prefixed with a `printf`-style format specifier. The specifier comes before the `\{...}` and uses the same syntax as `String.format`.
+
+```java
+import java.util.FormatProcessor;
+import static java.util.FormatProcessor.FMT;
+
+public class FormattedReceipt {
+    public static void main(String[] args) {
+        String product = "Wireless Headphones";
+        double price = 89.5;
+        double tax = price * 0.0825;
+        double total = price + tax;
+
+        String receipt = FMT."""
+            %-25s\{product}  %8.2f\{price}
+            %-25s\{"Tax (8.25%)"}  %8.2f\{tax}
+            %-25s\{"Total"}        %8.2f\{total}
+            """;
+
+        System.out.println(receipt);
+    }
+}
+```
+
+The `%-25s` left-pads each label to 25 characters, and `%8.2f` formats each number to 8 characters wide with 2 decimal places. The result is a clean tabular receipt without any manual padding.
+
+`FMT` is the processor for shape-controlled output: currency formatting, alignment, fixed-width tables. For most other cases, `STR` is enough.
+
+Both `STR` and `FMT` build a fresh `String` each time. When producing thousands of log lines per second, this is still cheaper than the equivalent `+` concatenation in most cases, because the compiler can use `StringConcatFactory` internally. It's not free, though. Inside hot loops, prefer a reusable `StringBuilder`.
+
+<h1 id="raw-getting-the-template-object-directly">
+  RAW: Getting the Template Object Directly
+</h1>
+
+`STR` and `FMT` give you back a `String`. Sometimes you want the template itself, not a finished string, so you can do something custom with it. The `RAW` processor returns a `StringTemplate` object that exposes the literal fragments and the expression values as two parallel lists.
+
+```java
+public class RawTemplateInspect {
+    public static void main(String[] args) {
+        String product = "Headphones";
+        int quantity = 2;
+        double price = 89.99;
+
+        StringTemplate tpl = RAW."Order: \{quantity} x \{product} at $\{price}";
+
+        System.out.println("Fragments: " + tpl.fragments());
+        System.out.println("Values:    " + tpl.values());
+    }
+}
+```
+
+The fragments list always has one more element than the values list, because the literal text wraps the expressions. The pattern is `fragment[0] + value[0] + fragment[1] + value[1] + ... + fragment[n]`. That's the contract every custom processor relies on.
+
+`RAW` is rarely useful directly. It exists to give library authors a way to write their own processors without depending on `STR` doing the right thing.
+
+<h1 id="custom-processors">Custom Processors</h1>
+
+This is where the design earns its complexity. A custom processor implements `StringTemplate.Processor<R, E>`, where `R` is the return type and `E` is the exception type. It gets the fragments and values, decides what to do with them, and returns whatever it wants.
+
+The most useful case is escaping. Consider building HTML for a product card that needs to display a product name and description that came from a user. If you splice them in raw, anyone whose product name contains `<script>` can break the page or worse. A custom HTML processor can escape every interpolated value automatically, while leaving the literal HTML in the template alone.
+
+The diagram shows what makes custom processors useful: the literal HTML fragments in the template are left untouched, but every interpolated value gets run through an escape function. The author of the template doesn't have to remember to escape, and the user of the template can't bypass it. This is safe-by-default.
+
+A minimal HTML processor for a product card looks like this:
+
+```java
+public class HtmlProcessorDemo {
+
+    static final StringTemplate.Processor<String, RuntimeException> HTML =
+        StringTemplate.Processor.of(template -> {
+            StringBuilder sb = new StringBuilder();
+            var fragments = template.fragments().iterator();
+            var values = template.values().iterator();
+
+            sb.append(fragments.next());
+            while (values.hasNext()) {
+                sb.append(escape(String.valueOf(values.next())));
+                sb.append(fragments.next());
+            }
+            return sb.toString();
+        });
+
+    static String escape(String input) {
+        return input
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\"", "&quot;")
+            .replace("'", "&#39;");
+    }
+
+    public static void main(String[] args) {
+        String productName = "Wireless <Headphones>";
+        String description = "Cancel \"all\" noise";
+        double price = 89.99;
+
+        String card = HTML."""
+            <div class="product">
+              <h2>\{productName}</h2>
+              <p>\{description}</p>
+              <span class="price">$\{price}</span>
+            </div>
+            """;
+
+        System.out.println(card);
+    }
+}
+```
+
+Look closely at the result. The `<div>`, `<h2>`, and `<p>` tags from the template are untouched, because they're literal fragments. The product name and description, which came from values, were escaped. A product called `<script>alert(1)</script>` would become `&lt;script&gt;alert(1)&lt;/script&gt;`, a harmless string on the page.
+
+The design's strongest claim: a processor can enforce escaping without the template author thinking about it. The same idea applies to SQL, where the processor returns a `PreparedStatement` and binds each value as a parameter rather than splicing it into the SQL text:
+
+```java
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+
+public class SqlProcessorSketch {
+
+    static StringTemplate.Processor<PreparedStatement, SQLException>
+        prepared(Connection conn) {
+        return template -> {
+            String sql = String.join("?", template.fragments());
+            PreparedStatement ps = conn.prepareStatement(sql);
+            int i = 1;
+            for (Object value : template.values()) {
+                ps.setObject(i++, value);
+            }
+            return ps;
+        };
+    }
+
+    // Usage (sketch, not runnable without a real Connection):
+    // var SQL = prepared(connection);
+    // PreparedStatement ps = SQL."""
+    //     SELECT * FROM orders
+    //     WHERE customer_id = \{customerId}
+    //       AND status = \{status}
+    //     """;
+}
+```
+
+Trace what that does. The fragments are joined with `?` placeholders to form the SQL string, and the values are bound through `setObject`. The interpolated values never enter the SQL text, so injection is structurally impossible. That's the kind of API the design aimed for.
+
+<h1 id="templates-inside-text-blocks">Templates Inside Text Blocks</h1>
+
+Any processor works with a text block on the right-hand side. This is how you build a multi-line receipt, an HTML fragment, or a SQL query without escaping newlines yourself.
+
+```java
+public class MultiLineReceipt {
+    public static void main(String[] args) {
+        String customerName = "Priya";
+        int orderId = 4821;
+        String status = "Shipped";
+        double total = 96.88;
+
+        String receipt = STR."""
+            ===== Order Receipt =====
+            Customer: \{customerName}
+            Order ID: #\{orderId}
+            Status:   \{status}
+            Total:    $\{total}
+            =========================
+            """;
+
+        System.out.println(receipt);
+    }
+}
+```
+
+The combination is convenient, especially for HTML, JSON, and SQL where multi-line templates are the norm. The text block handles indentation stripping and the processor handles interpolation, and they compose well.
+
+<h1 id="whats-wrong-with-this-code">What's Wrong With This Code?</h1>
+
+This is the kind of mistake that looks fine in a code review, but the processor is missing.
+
+```java
+String customerName = "Priya";
+String greeting = "Hi \{customerName}, welcome back!";
+System.out.println(greeting);
+```
+
+**What's wrong?**
+
+There's no template processor in front of the string. Without `STR.`, `FMT.`, or some custom processor, the compiler treats `"Hi \{customerName}, welcome back!"` as a plain string literal. The `\{...}` syntax only activates when there's a processor on the left. The output is the literal text:
+
+```text
+Hi \{customerName}, welcome back!
+```
+
+**Fix:**
+
+```java
+String customerName = "Priya";
+String greeting = STR."Hi \{customerName}, welcome back!";
+System.out.println(greeting);
+```
+
+That now prints `Hi Priya, welcome back!`. String templates aren't a language-level feature for interpolation, they're always a method call on a processor. There's no implicit interpolation in Java the way there's in Kotlin (`"$name"`), Python f-strings, or JavaScript template literals.
+
+A second example. Consider this `String.format` SQL builder:
+
+```java
+String customerName = "Bob";
+String sql = String.format(
+    "SELECT * FROM orders WHERE customer_name = '%s'",
+    customerName
+);
+```
+
+For `customerName = "Bob"`, this works. For `customerName = "O'Brien"`, the SQL becomes `SELECT * FROM orders WHERE customer_name = 'O'Brien'`, which is a syntax error. For `customerName = "'; DROP TABLE orders; --"`, the SQL is a disaster. `String.format` doesn't escape, doesn't know it's looking at SQL, and has no way to help you. This is the gap a SQL template processor was designed to close, by returning a `PreparedStatement` that binds values as parameters instead of splicing them into the SQL text.
+
+<h1 id="why-it-was-withdrawn">Why It Was Withdrawn</h1>
+
+JEP 459 (the second preview) was withdrawn before Java 23 shipped, and the feature was pulled from the preview slate. The reasons came from Brian Goetz's mailing-list post and the JEP discussion. Three problems stood out.
+
+The first was the `\{...}` syntax itself. Backslash inside a string already means "this is an escape sequence". Adding `\{...}` as a new escape created friction with strings that contain regex (`\d`, `\w`), JSON (lots of `\"` and `\\`), and other escape-heavy formats. People found themselves writing `\\{` to keep a literal `\{` in the output, the kind of confusion the feature was supposed to remove.
+
+The second was implicit processor selection. The fact that `STR` is imported automatically meant that beginners could write `STR."hello"` without knowing what `STR` is or how processors work. That was a feature, but it also meant the syntax looked like language-level interpolation when it was actually a method dispatch on an object that was never explicitly declared. IDE support struggled, because the editor needed to know which processor was in play to type-check the expressions inside the template. It's hard to navigate to the definition of a "syntax".
+
+The third was the model itself. The two-step (template, then processor) was elegant but unfamiliar. Engineers reading code couldn't always predict what `SQL."SELECT * FROM ..."` would do without finding the `SQL` processor's definition. For a feature meant to make code clearer, that's a steep ask.
+
+Brian Goetz's summary was, roughly, that the feature missed the bar on two of its own goals: be safer than concatenation by default, and feel natural in the IDE. Rather than ship a feature that would be stuck in the language forever, the architects pulled it for redesign.
+
+A new design is being worked on. The shape is likely to be similar (template plus processor produces value), but the syntax and the API may change. Keep an eye on the JEP index.
+
+<h1 id="what-to-use-today">What to Use Today</h1>
+
+Since the preview syntax doesn't work on Java 23+, here's what to use in current code.
+
+| Use case                    | What to use                                            |
+| --------------------------- | ------------------------------------------------------ |
+| Casual concatenation        | `+` or `String.formatted(...)`                         |
+| Formatted output (currency) | `String.format(...)` or `"%s".formatted(...)`          |
+| Localized messages          | `java.text.MessageFormat`                              |
+| Building SQL                | `PreparedStatement` with `?` placeholders              |
+| Building HTML               | A real templating engine (Thymeleaf, Pebble, JStachio) |
+| Multi-line strings          | Text blocks (`"""..."""`) with `String.formatted(...)` |
+
+The `String.formatted` method, added in Java 15, is the closest modern shorthand for `String.format`. It's an instance method on the template string, which reads more naturally than wrapping the call:
+
+```java
+public class FormattedShorthand {
+    public static void main(String[] args) {
+        String customerName = "Priya";
+        double total = 89.97;
+
+        String receipt = "Hi %s, your total is $%.2f.".formatted(customerName, total);
+
+        System.out.println(receipt);
+    }
+}
+```
+
+That's not as compact as `STR."Hi \{customerName}, your total is $\{total}"`, but it's what's available today.
+
+For HTML and SQL, the answer hasn't changed in years: don't build them by concatenation. Use a templating engine or `PreparedStatement`. String templates would have made one-off cases more convenient, but they don't replace the dedicated tools you should already be using for production code.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

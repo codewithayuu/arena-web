@@ -1,0 +1,1666 @@
+---
+title: "Load Balancing Algorithms"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Load Balancing Algorithms explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+This matters because algorithm names can be misleading.
+
+"Least connections" is useful only if connection count tells you something useful about load. "Least response time" helps only if recent latency is a good hint about what will happen next. "Round robin" is fine only when requests and backends are similar.
+
+No algorithm can make up for missing health checks, bad timeouts, retry storms, or not enough capacity.
+
+<h1 id="2-round-robin">2. Round Robin</h1>
+
+Round robin sends requests to backends in order, then loops back to the beginning.
+
+<h3 id="when-it-works">When It Works</h3>
+
+Round robin is a good default when:
+
+- Backends have similar capacity.
+- Requests have similar cost.
+- Connections are short-lived.
+- There is no strong need for sticky routing.
+- Health checks remove failed backends.
+
+<h3 id="where-it-fails">Where It Fails</h3>
+
+Round robin ignores current load. If one backend gets slow because of garbage collection, a noisy neighbor, repeated cache misses, or a long-running request, round robin keeps sending it traffic.
+
+It also performs poorly when requests have very different costs. Ten small requests and ten "generate a large report" requests are not the same amount of work.
+
+<h3 id="simple-implementation">Simple Implementation</h3>
+
+A round robin picker is just a counter and a remainder operation. The code below shows the same idea across six languages.
+
+```java
+import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+
+class RoundRobin {
+    private final List<String> backends;
+    private final AtomicInteger index = new AtomicInteger(0);
+
+    RoundRobin(List<String> backends) {
+        if (backends.isEmpty()) throw new IllegalArgumentException("backends cannot be empty");
+        this.backends = backends;
+    }
+
+    String pick() {
+        int i = Math.floorMod(index.getAndIncrement(), backends.size());
+        return backends.get(i);
+    }
+}
+```
+
+```python
+class RoundRobin:
+    def __init__(self, backends):
+        if not backends:
+            raise ValueError("backends cannot be empty")
+        self.backends = backends
+        self.index = 0
+
+    def pick(self):
+        i = self.index % len(self.backends)
+        self.index += 1
+        return self.backends[i]
+```
+
+```cpp
+#include <vector>
+#include <string>
+#include <stdexcept>
+
+class RoundRobin {
+private:
+    std::vector<std::string> backends;
+    int index = 0;
+
+public:
+    RoundRobin(const std::vector<std::string>& backends) : backends(backends) {
+        if (backends.empty()) throw std::invalid_argument("backends cannot be empty");
+    }
+
+    std::string pick() {
+        int i = index % static_cast<int>(backends.size());
+        index += 1;
+        return backends[i];
+    }
+};
+```
+
+```go
+type RoundRobin struct {
+	backends []string
+	index    int
+}
+
+func NewRoundRobin(backends []string) *RoundRobin {
+	if len(backends) == 0 {
+		panic("backends cannot be empty")
+	}
+	return &RoundRobin{backends: backends}
+}
+
+func (r *RoundRobin) Pick() string {
+	i := r.index % len(r.backends)
+	r.index += 1
+	return r.backends[i]
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+
+class RoundRobin
+{
+    private readonly List<string> backends;
+    private int index = 0;
+
+    public RoundRobin(List<string> backends)
+    {
+        if (backends.Count == 0) throw new ArgumentException("backends cannot be empty");
+        this.backends = backends;
+    }
+
+    public string Pick()
+    {
+        int i = index % backends.Count;
+        index += 1;
+        return backends[i];
+    }
+}
+```
+
+```typescript
+class RoundRobin {
+  private backends: string[];
+  private index = 0;
+
+  constructor(backends: string[]) {
+    if (backends.length === 0) throw new Error("backends cannot be empty");
+    this.backends = backends;
+  }
+
+  pick(): string {
+    const i = this.index % this.backends.length;
+    this.index += 1;
+    return this.backends[i];
+  }
+}
+```
+
+In production, the list should contain only healthy backends that are ready for traffic.
+
+<h1 id="3-weighted-round-robin">3. Weighted Round Robin</h1>
+
+Weighted round robin gives some backends more turns than others.
+
+If backends have weights `[5, 1, 1]`, the first backend should receive roughly five times as many picks as either of the others.
+
+<h3 id="when-it-works">When It Works</h3>
+
+Use weighted round robin when:
+
+- Backends have known capacity differences.
+- You want to send a small percentage of traffic to a canary.
+- A new region should receive limited traffic during ramp-up.
+- You need a simple active-active split.
+
+<h3 id="where-it-fails">Where It Fails</h3>
+
+Weights are fixed unless you update them. They may not match what is happening right now.
+
+A backend with weight `5` may still be overloaded if it receives expensive requests. A backend with weight `1` may be underused if its requests are cheap.
+
+Weighted round robin knows only the capacity you configured ahead of time. It does not automatically understand live load.
+
+<h3 id="smooth-weighted-round-robin">Smooth Weighted Round Robin</h3>
+
+A simple weighted round robin implementation can create bursts. A smoother version spreads picks across the cycle.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+class SmoothWeightedRoundRobin {
+    private static class Backend {
+        String name;
+        int weight;
+        int current;
+
+        Backend(String name, int weight) {
+            this.name = name;
+            this.weight = weight;
+        }
+    }
+
+    private final List<Backend> backends = new ArrayList<>();
+    private final int totalWeight;
+
+    SmoothWeightedRoundRobin(List<String> names, List<Integer> weights) {
+        if (names.size() != weights.size() || names.isEmpty()) {
+            throw new IllegalArgumentException("names and weights must be non-empty and equal length");
+        }
+        int total = 0;
+        for (int i = 0; i < names.size(); i++) {
+            backends.add(new Backend(names.get(i), weights.get(i)));
+            total += weights.get(i);
+        }
+        totalWeight = total;
+    }
+
+    String pick() {
+        Backend best = null;
+        for (Backend backend : backends) {
+            backend.current += backend.weight;
+            if (best == null || backend.current > best.current) {
+                best = backend;
+            }
+        }
+        best.current -= totalWeight;
+        return best.name;
+    }
+}
+```
+
+```python
+class SmoothWeightedRoundRobin:
+    class Backend:
+        def __init__(self, name, weight):
+            self.name = name
+            self.weight = weight
+            self.current = 0
+
+    def __init__(self, names, weights):
+        if len(names) != len(weights) or not names:
+            raise ValueError("names and weights must be non-empty and equal length")
+        self.backends = []
+        total = 0
+        for i in range(len(names)):
+            self.backends.append(self.Backend(names[i], weights[i]))
+            total += weights[i]
+        self.total_weight = total
+
+    def pick(self):
+        best = None
+        for backend in self.backends:
+            backend.current += backend.weight
+            if best is None or backend.current > best.current:
+                best = backend
+        best.current -= self.total_weight
+        return best.name
+```
+
+```cpp
+#include <vector>
+#include <string>
+#include <stdexcept>
+
+class SmoothWeightedRoundRobin {
+private:
+    struct Backend {
+        std::string name;
+        int weight;
+        int current;
+
+        Backend(const std::string& name, int weight) : name(name), weight(weight), current(0) {}
+    };
+
+    std::vector<Backend> backends;
+    int totalWeight;
+
+public:
+    SmoothWeightedRoundRobin(const std::vector<std::string>& names, const std::vector<int>& weights) {
+        if (names.size() != weights.size() || names.empty()) {
+            throw std::invalid_argument("names and weights must be non-empty and equal length");
+        }
+        int total = 0;
+        for (size_t i = 0; i < names.size(); i++) {
+            backends.emplace_back(names[i], weights[i]);
+            total += weights[i];
+        }
+        totalWeight = total;
+    }
+
+    std::string pick() {
+        Backend* best = nullptr;
+        for (auto& backend : backends) {
+            backend.current += backend.weight;
+            if (best == nullptr || backend.current > best->current) {
+                best = &backend;
+            }
+        }
+        best->current -= totalWeight;
+        return best->name;
+    }
+};
+```
+
+```go
+type SmoothWeightedRoundRobin struct {
+	backends    []backend
+	totalWeight int
+}
+
+type backend struct {
+	name    string
+	weight  int
+	current int
+}
+
+func NewSmoothWeightedRoundRobin(names []string, weights []int) *SmoothWeightedRoundRobin {
+	if len(names) != len(weights) || len(names) == 0 {
+		panic("names and weights must be non-empty and equal length")
+	}
+	backends := make([]backend, 0, len(names))
+	total := 0
+	for i := 0; i < len(names); i++ {
+		backends = append(backends, backend{name: names[i], weight: weights[i]})
+		total += weights[i]
+	}
+	return &SmoothWeightedRoundRobin{backends: backends, totalWeight: total}
+}
+
+func (s *SmoothWeightedRoundRobin) Pick() string {
+	var best *backend
+	for i := range s.backends {
+		s.backends[i].current += s.backends[i].weight
+		if best == nil || s.backends[i].current > best.current {
+			best = &s.backends[i]
+		}
+	}
+	best.current -= s.totalWeight
+	return best.name
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+
+class SmoothWeightedRoundRobin
+{
+    private class Backend
+    {
+        public string Name;
+        public int Weight;
+        public int Current;
+
+        public Backend(string name, int weight)
+        {
+            Name = name;
+            Weight = weight;
+            Current = 0;
+        }
+    }
+
+    private readonly List<Backend> backends = new List<Backend>();
+    private readonly int totalWeight;
+
+    public SmoothWeightedRoundRobin(List<string> names, List<int> weights)
+    {
+        if (names.Count != weights.Count || names.Count == 0)
+        {
+            throw new ArgumentException("names and weights must be non-empty and equal length");
+        }
+        int total = 0;
+        for (int i = 0; i < names.Count; i++)
+        {
+            backends.Add(new Backend(names[i], weights[i]));
+            total += weights[i];
+        }
+        totalWeight = total;
+    }
+
+    public string Pick()
+    {
+        Backend best = null;
+        foreach (var backend in backends)
+        {
+            backend.Current += backend.Weight;
+            if (best == null || backend.Current > best.Current)
+            {
+                best = backend;
+            }
+        }
+        best.Current -= totalWeight;
+        return best.Name;
+    }
+}
+```
+
+```typescript
+class SmoothWeightedRoundRobin {
+  private static Backend = class {
+    name: string;
+    weight: number;
+    current: number;
+
+    constructor(name: string, weight: number) {
+      this.name = name;
+      this.weight = weight;
+      this.current = 0;
+    }
+  };
+
+  private backends: InstanceType<typeof SmoothWeightedRoundRobin.Backend>[] =
+    [];
+  private totalWeight: number;
+
+  constructor(names: string[], weights: number[]) {
+    if (names.length !== weights.length || names.length === 0) {
+      throw new Error("names and weights must be non-empty and equal length");
+    }
+    let total = 0;
+    for (let i = 0; i < names.length; i++) {
+      this.backends.push(
+        new SmoothWeightedRoundRobin.Backend(names[i], weights[i]),
+      );
+      total += weights[i];
+    }
+    this.totalWeight = total;
+  }
+
+  pick(): string {
+    let best: InstanceType<typeof SmoothWeightedRoundRobin.Backend> | null =
+      null;
+    for (const backend of this.backends) {
+      backend.current += backend.weight;
+      if (best === null || backend.current > best.current) {
+        best = backend;
+      }
+    }
+    best!.current -= this.totalWeight;
+    return best!.name;
+  }
+}
+```
+
+This is still not a replacement for live load feedback.
+
+<h1 id="4-least-connections-and-least-requests">
+  4. Least Connections and Least Requests
+</h1>
+
+Least connections sends new work to the backend with the fewest open connections.
+
+In HTTP and gRPC systems, **least requests** is often more useful. It tracks active in-flight requests or streams instead of just open connections.
+
+<h3 id="when-it-works">When It Works</h3>
+
+Use least connections or least requests when:
+
+- Requests have uneven duration.
+- Connections stay open long enough to matter.
+- Backends have similar capacity.
+- The load balancer can accurately track active work.
+
+This is a better fit than round robin for WebSockets, long polling, gRPC streams, and APIs where some requests take much longer than others.
+
+<h3 id="where-it-fails">Where It Fails</h3>
+
+Connection count is not always the same as load.
+
+One idle WebSocket is not the same as one busy gRPC stream. One image request is not the same as one expensive search query.
+
+If a backend is slow, it may build up more active requests, and least requests will naturally send less traffic to it. That is useful. But if the measurements jump around too much, traffic can swing back and forth between backends.
+
+<h3 id="basic-implementation">Basic Implementation</h3>
+
+To pick the least-loaded backend, keep a count of active requests per backend and choose the lowest count. The code below shows that bookkeeping, including the increment and release steps.
+
+```java
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+
+class LeastRequests {
+    private final Map<String, Integer> active = new HashMap<>();
+    private final Random random = new Random();
+
+    LeastRequests(List<String> backends) {
+        for (String backend : backends) active.put(backend, 0);
+    }
+
+    synchronized String pick() {
+        int min = active.values().stream().min(Integer::compareTo).orElseThrow();
+        List<String> candidates = active.entrySet().stream()
+            .filter(entry -> entry.getValue() == min)
+            .map(Map.Entry::getKey)
+            .toList();
+        String chosen = candidates.get(random.nextInt(candidates.size()));
+        active.put(chosen, active.get(chosen) + 1);
+        return chosen;
+    }
+
+    synchronized void release(String backend) {
+        active.computeIfPresent(backend, (key, count) -> Math.max(0, count - 1));
+    }
+}
+```
+
+```python
+import random
+
+class LeastRequests:
+    def __init__(self, backends):
+        self.active = {backend: 0 for backend in backends}
+        self.random = random.Random()
+
+    def pick(self):
+        min_active = min(self.active.values())
+        candidates = [backend for backend, count in self.active.items() if count == min_active]
+        chosen = candidates[self.random.randrange(len(candidates))]
+        self.active[chosen] += 1
+        return chosen
+
+    def release(self, backend):
+        if backend in self.active:
+            self.active[backend] = max(0, self.active[backend] - 1)
+```
+
+```cpp
+#include <unordered_map>
+#include <vector>
+#include <string>
+#include <random>
+#include <algorithm>
+
+class LeastRequests {
+    std::unordered_map<std::string, int> active;
+    std::mt19937 random;
+
+public:
+    LeastRequests(const std::vector<std::string>& backends) : random(std::random_device{}()) {
+        for (const auto& backend : backends) active[backend] = 0;
+    }
+
+    std::string pick() {
+        int min_active = std::min_element(
+            active.begin(), active.end(),
+            [](const auto& a, const auto& b) { return a.second < b.second; }
+        )->second;
+
+        std::vector<std::string> candidates;
+        for (const auto& [backend, count] : active) {
+            if (count == min_active) candidates.push_back(backend);
+        }
+
+        std::uniform_int_distribution<int> dist(0, static_cast<int>(candidates.size()) - 1);
+        std::string chosen = candidates[dist(random)];
+        active[chosen] += 1;
+        return chosen;
+    }
+
+    void release(const std::string& backend) {
+        auto it = active.find(backend);
+        if (it != active.end()) it->second = std::max(0, it->second - 1);
+    }
+};
+```
+
+```go
+type LeastRequests struct {
+	active map[string]int
+	random *rand.Rand
+}
+
+func NewLeastRequests(backends []string) *LeastRequests {
+	active := make(map[string]int, len(backends))
+	for _, backend := range backends {
+		active[backend] = 0
+	}
+	return &LeastRequests{
+		active: active,
+		random: rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
+}
+
+func (lr *LeastRequests) Pick() string {
+	min := -1
+	for _, count := range lr.active {
+		if min == -1 || count < min {
+			min = count
+		}
+	}
+	candidates := make([]string, 0)
+	for backend, count := range lr.active {
+		if count == min {
+			candidates = append(candidates, backend)
+		}
+	}
+	chosen := candidates[lr.random.Intn(len(candidates))]
+	lr.active[chosen]++
+	return chosen
+}
+
+func (lr *LeastRequests) Release(backend string) {
+	if count, ok := lr.active[backend]; ok {
+		if count > 0 {
+			lr.active[backend] = count - 1
+		} else {
+			lr.active[backend] = 0
+		}
+	}
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+class LeastRequests
+{
+    private readonly Dictionary<string, int> active = new Dictionary<string, int>();
+    private readonly Random random = new Random();
+
+    public LeastRequests(List<string> backends)
+    {
+        foreach (var backend in backends) active[backend] = 0;
+    }
+
+    public string pick()
+    {
+        int min = active.Values.Min();
+        List<string> candidates = active.Where(entry => entry.Value == min)
+            .Select(entry => entry.Key)
+            .ToList();
+        string chosen = candidates[random.Next(candidates.Count)];
+        active[chosen]++;
+        return chosen;
+    }
+
+    public void release(string backend)
+    {
+        if (active.ContainsKey(backend)) active[backend] = Math.Max(0, active[backend] - 1);
+    }
+}
+```
+
+```typescript
+class LeastRequests {
+  private active: Map<string, number> = new Map();
+  private random: () => number = Math.random;
+
+  constructor(backends: string[]) {
+    for (const backend of backends) this.active.set(backend, 0);
+  }
+
+  pick(): string {
+    let min = Infinity;
+    for (const count of this.active.values()) min = Math.min(min, count);
+    const candidates: string[] = [];
+    for (const [backend, count] of this.active.entries()) {
+      if (count === min) candidates.push(backend);
+    }
+    const chosen = candidates[Math.floor(this.random() * candidates.length)];
+    this.active.set(chosen, (this.active.get(chosen) ?? 0) + 1);
+    return chosen;
+  }
+
+  release(backend: string): void {
+    if (this.active.has(backend))
+      this.active.set(
+        backend,
+        Math.max(0, (this.active.get(backend) ?? 0) - 1),
+      );
+  }
+}
+```
+
+Production implementations must safely handle backend removal, failed requests, timeouts, and concurrent updates.
+
+<h1 id="5-power-of-two-choices">5. Power of Two Choices</h1>
+
+The **power of two choices**, often called P2C, picks two random healthy backends and sends the request to the less loaded one.
+
+It works surprisingly well for such a simple idea. It avoids scanning every backend, but still avoids the worst random choices.
+
+<h3 id="where-the-differences-show-up">Where the Differences Show Up</h3>
+
+For large backend pools, scanning every backend for every request can be expensive or hard to keep in sync. P2C gives most of the benefit while checking only two backends.
+
+Many modern proxies use variants of this idea for least-request balancing.
+
+<h3 id="simple-implementation">Simple Implementation</h3>
+
+P2C is simple in code: sample two backends at random, then return whichever has fewer active requests.
+
+```java
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+
+class PowerOfTwoChoices {
+    private final Map<String, Integer> active = new HashMap<>();
+    private final Random random = new Random();
+
+    PowerOfTwoChoices(List<String> backends) {
+        if (backends.size() < 2) throw new IllegalArgumentException("need at least two backends");
+        for (String backend : backends) active.put(backend, 0);
+    }
+
+    synchronized String pick() {
+        var names = active.keySet().stream().toList();
+        String a = names.get(random.nextInt(names.size()));
+        String b;
+        do {
+            b = names.get(random.nextInt(names.size()));
+        } while (a.equals(b));
+
+        String chosen = active.get(a) <= active.get(b) ? a : b;
+        active.put(chosen, active.get(chosen) + 1);
+        return chosen;
+    }
+}
+```
+
+```python
+from random import Random
+
+class PowerOfTwoChoices:
+    def __init__(self, backends):
+        if len(backends) < 2:
+            raise ValueError("need at least two backends")
+        self.active = {backend: 0 for backend in backends}
+        self.random = Random()
+
+    def pick(self):
+        names = list(self.active.keys())
+        a = names[self.random.randrange(len(names))]
+        b = a
+        while a == b:
+            b = names[self.random.randrange(len(names))]
+
+        chosen = a if self.active[a] <= self.active[b] else b
+        self.active[chosen] += 1
+        return chosen
+```
+
+```cpp
+#include <unordered_map>
+#include <vector>
+#include <string>
+#include <random>
+#include <stdexcept>
+
+class PowerOfTwoChoices {
+private:
+    std::unordered_map<std::string, int> active;
+    std::mt19937 random;
+
+public:
+    PowerOfTwoChoices(const std::vector<std::string>& backends) : random(std::random_device{}()) {
+        if (backends.size() < 2) throw std::invalid_argument("need at least two backends");
+        for (const auto& backend : backends) active[backend] = 0;
+    }
+
+    std::string pick() {
+        std::vector<std::string> names;
+        names.reserve(active.size());
+        for (const auto& kv : active) names.push_back(kv.first);
+
+        std::uniform_int_distribution<std::size_t> dist(0, names.size() - 1);
+        std::string a = names[dist(random)];
+        std::string b;
+        do {
+            b = names[dist(random)];
+        } while (a == b);
+
+        std::string chosen = active[a] <= active[b] ? a : b;
+        active[chosen] += 1;
+        return chosen;
+    }
+}
+```
+
+```go
+type PowerOfTwoChoices struct {
+	active map[string]int
+	random *rand.Rand
+}
+
+func NewPowerOfTwoChoices(backends []string) *PowerOfTwoChoices {
+	if len(backends) < 2 {
+		panic("need at least two backends")
+	}
+	active := make(map[string]int)
+	for _, backend := range backends {
+		active[backend] = 0
+	}
+	return &PowerOfTwoChoices{
+		active: active,
+		random: rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
+}
+
+func (p *PowerOfTwoChoices) Pick() string {
+	names := make([]string, 0, len(p.active))
+	for name := range p.active {
+		names = append(names, name)
+	}
+	a := names[p.random.Intn(len(names))]
+	b := a
+	for a == b {
+		b = names[p.random.Intn(len(names))]
+	}
+
+	chosen := a
+	if p.active[a] > p.active[b] {
+		chosen = b
+	}
+	p.active[chosen]++
+	return chosen
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+class PowerOfTwoChoices {
+    private readonly Dictionary<string, int> active = new Dictionary<string, int>();
+    private readonly Random random = new Random();
+
+    public PowerOfTwoChoices(List<string> backends) {
+        if (backends.Count < 2) throw new ArgumentException("need at least two backends");
+        foreach (string backend in backends) active[backend] = 0;
+    }
+
+    public string pick() {
+        var names = active.Keys.ToList();
+        string a = names[random.Next(names.Count)];
+        string b;
+        do {
+            b = names[random.Next(names.Count)];
+        } while (a.Equals(b));
+
+        string chosen = active[a] <= active[b] ? a : b;
+        active[chosen] += 1;
+        return chosen;
+    }
+}
+```
+
+```typescript
+class PowerOfTwoChoices {
+  private active: Map<string, number> = new Map();
+  private random: { nextInt(max: number): number } = {
+    nextInt: (max: number) => Math.floor(Math.random() * max),
+  };
+
+  constructor(backends: string[]) {
+    if (backends.length < 2) throw new Error("need at least two backends");
+    for (const backend of backends) this.active.set(backend, 0);
+  }
+
+  pick(): string {
+    const names = Array.from(this.active.keys());
+    const a = names[this.random.nextInt(names.length)];
+    let b = a;
+    while (a === b) {
+      b = names[this.random.nextInt(names.length)];
+    }
+
+    const chosen = this.active.get(a)! <= this.active.get(b)! ? a : b;
+    this.active.set(chosen, this.active.get(chosen)! + 1);
+    return chosen;
+  }
+}
+```
+
+If backend weights differ, compare an adjusted score instead of raw active counts.
+
+<h1 id="6-random">6. Random</h1>
+
+Random selection chooses a healthy backend at random.
+
+That may sound too simple, but it can be useful in distributed systems. It needs very little coordination and avoids every load balancer making the exact same choice at the exact same time.
+
+<h3 id="when-it-works">When It Works</h3>
+
+Use random selection when:
+
+- Backends are similar.
+- The pool is large.
+- Requests are short-lived.
+- You want a simple fallback rule.
+- You combine it with health checks and retries.
+
+<h3 id="simple-implementation">Simple Implementation</h3>
+
+There is not much to random selection in code: choose an index in the backend list with a random number.
+
+```java
+import java.util.List;
+import java.util.Random;
+
+class RandomPicker {
+    private final List<String> backends;
+    private final Random random = new Random();
+
+    RandomPicker(List<String> backends) {
+        if (backends.isEmpty()) throw new IllegalArgumentException("backends cannot be empty");
+        this.backends = backends;
+    }
+
+    String pick() {
+        return backends.get(random.nextInt(backends.size()));
+    }
+}
+```
+
+```python
+import random
+
+class RandomPicker:
+    def __init__(self, backends):
+        if not backends:
+            raise ValueError("backends cannot be empty")
+        self.backends = backends
+        self.random = random.Random()
+
+    def pick(self):
+        return self.backends[self.random.randrange(len(self.backends))]
+```
+
+```cpp
+#include <vector>
+#include <string>
+#include <random>
+#include <stdexcept>
+
+class RandomPicker {
+private:
+    const std::vector<std::string>& backends;
+    std::mt19937 random;
+
+public:
+    RandomPicker(const std::vector<std::string>& backends) : backends(backends), random(std::random_device{}()) {
+        if (backends.empty()) throw std::invalid_argument("backends cannot be empty");
+    }
+
+    std::string pick() {
+        std::uniform_int_distribution<std::size_t> dist(0, backends.size() - 1);
+        return backends[dist(random)];
+    }
+};
+```
+
+```go
+type RandomPicker struct {
+	backends []string
+	random   *rand.Rand
+}
+
+func NewRandomPicker(backends []string) *RandomPicker {
+	if len(backends) == 0 {
+		panic("backends cannot be empty")
+	}
+	return &RandomPicker{
+		backends: backends,
+		random:   rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
+}
+
+func (p *RandomPicker) Pick() string {
+	return p.backends[p.random.Intn(len(p.backends))]
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+
+class RandomPicker
+{
+    private readonly List<string> backends;
+    private readonly Random random = new Random();
+
+    RandomPicker(List<string> backends)
+    {
+        if (backends.Count == 0) throw new ArgumentException("backends cannot be empty");
+        this.backends = backends;
+    }
+
+    public string Pick()
+    {
+        return backends[random.Next(backends.Count)];
+    }
+}
+```
+
+```typescript
+class RandomPicker {
+  private backends: string[];
+  private random: number = Math.random();
+
+  constructor(backends: string[]) {
+    if (backends.length === 0) throw new Error("backends cannot be empty");
+    this.backends = backends;
+  }
+
+  pick(): string {
+    return this.backends[Math.floor(Math.random() * this.backends.length)];
+  }
+}
+```
+
+<h3 id="where-it-fails">Where It Fails</h3>
+
+Pure random can create unlucky streaks. It also ignores capacity and active load. P2C is often a better default when you can track a simple load signal.
+
+<h1 id="7-least-response-time">7. Least Response Time</h1>
+
+Least response time routes traffic to the backend with the best observed latency.
+
+<h3 id="when-it-works">When It Works</h3>
+
+Use it when latency varies by backend and recent latency is a useful hint about future latency.
+
+Examples:
+
+- Backends in different zones
+- Heterogeneous instances
+- Services with variable dependency latency
+- Read-heavy services where response time correlates with load
+
+<h3 id="where-it-fails">Where It Fails</h3>
+
+Least response time can be unstable.
+
+If one backend receives fewer requests, its latency data may be old. If one backend gets a run of cheap requests, it may look faster than it really is. If every load balancer chases the fastest backend at the same time, they can all pile onto it and make it slow.
+
+Use smoothing, minimum sample counts, outlier detection, and circuit breakers. Do not route all traffic based on one recent response.
+
+<h3 id="smoothed-latency">Smoothed Latency</h3>
+
+The implementation below uses a moving average for each backend's latency. That way, one unusually slow or fast response does not swing routing decisions by itself.
+
+```java
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+class SmoothedLatency {
+    private final Map<String, Double> latencyMs = new HashMap<>();
+    private final double alpha;
+
+    SmoothedLatency(List<String> backends, double alpha) {
+        for (String backend : backends) latencyMs.put(backend, null);
+        this.alpha = alpha;
+    }
+
+    void record(String backend, double observedMs) {
+        Double current = latencyMs.get(backend);
+        latencyMs.put(
+            backend,
+            current == null ? observedMs : (1 - alpha) * current + alpha * observedMs
+        );
+    }
+
+    String pick() {
+        return latencyMs.entrySet().stream()
+            .filter(entry -> entry.getValue() != null)
+            .min(Map.Entry.comparingByValue())
+            .map(Map.Entry::getKey)
+            .orElseGet(() -> latencyMs.keySet().iterator().next());
+    }
+}
+```
+
+```python
+class SmoothedLatency:
+    def __init__(self, backends, alpha):
+        self.latency_ms = {backend: None for backend in backends}
+        self.alpha = alpha
+
+    def record(self, backend, observed_ms):
+        current = self.latency_ms.get(backend)
+        self.latency_ms[backend] = observed_ms if current is None else (1 - self.alpha) * current + self.alpha * observed_ms
+
+    def pick(self):
+        candidates = [(latency, backend) for backend, latency in self.latency_ms.items() if latency is not None]
+        if candidates:
+            return min(candidates)[1]
+        return next(iter(self.latency_ms))
+```
+
+```cpp
+#include <unordered_map>
+#include <vector>
+#include <string>
+#include <optional>
+
+class SmoothedLatency {
+private:
+    std::unordered_map<std::string, std::optional<double>> latencyMs;
+    double alpha;
+
+public:
+    SmoothedLatency(const std::vector<std::string>& backends, double alpha) : alpha(alpha) {
+        for (const auto& backend : backends) latencyMs[backend] = std::nullopt;
+    }
+
+    void record(const std::string& backend, double observedMs) {
+        auto current = latencyMs[backend];
+        latencyMs[backend] = current.has_value() ? (1 - alpha) * *current + alpha * observedMs : observedMs;
+    }
+
+    std::string pick() {
+        auto best = latencyMs.end();
+        for (auto it = latencyMs.begin(); it != latencyMs.end(); ++it) {
+            if (it->second.has_value() && (best == latencyMs.end() || it->second.value() < best->second.value())) {
+                best = it;
+            }
+        }
+        if (best != latencyMs.end()) return best->first;
+        return latencyMs.begin()->first;
+    }
+};
+```
+
+```go
+type SmoothedLatency struct {
+	latencyMs map[string]*float64
+	alpha     float64
+}
+
+func NewSmoothedLatency(backends []string, alpha float64) *SmoothedLatency {
+	latencyMs := make(map[string]*float64, len(backends))
+	for _, backend := range backends {
+		latencyMs[backend] = nil
+	}
+	return &SmoothedLatency{latencyMs: latencyMs, alpha: alpha}
+}
+
+func (s *SmoothedLatency) Record(backend string, observedMs float64) {
+	current := s.latencyMs[backend]
+	if current == nil {
+		s.latencyMs[backend] = &observedMs
+	} else {
+		v := (1-s.alpha)*(*current) + s.alpha*observedMs
+		s.latencyMs[backend] = &v
+	}
+}
+
+func (s *SmoothedLatency) Pick() string {
+	var bestKey string
+	var bestVal float64
+	found := false
+	for backend, latency := range s.latencyMs {
+		if latency != nil && (!found || *latency < bestVal) {
+			bestKey = backend
+			bestVal = *latency
+			found = true
+		}
+	}
+	if found {
+		return bestKey
+	}
+	for backend := range s.latencyMs {
+		return backend
+	}
+	return ""
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+class SmoothedLatency
+{
+    private readonly Dictionary<string, double?> latencyMs = new Dictionary<string, double?>();
+    private readonly double alpha;
+
+    SmoothedLatency(List<string> backends, double alpha)
+    {
+        foreach (string backend in backends) latencyMs[backend] = null;
+        this.alpha = alpha;
+    }
+
+    void record(string backend, double observedMs)
+    {
+        double? current = latencyMs[backend];
+        latencyMs[backend] = current == null ? observedMs : (1 - alpha) * current.Value + alpha * observedMs;
+    }
+
+    string pick()
+    {
+        return latencyMs
+            .Where(entry => entry.Value != null)
+            .OrderBy(entry => entry.Value)
+            .Select(entry => entry.Key)
+            .FirstOrDefault() ?? latencyMs.Keys.First();
+    }
+}
+```
+
+```typescript
+class SmoothedLatency {
+  private latencyMs: Map<string, number | null> = new Map();
+  private readonly alpha: number;
+
+  constructor(backends: string[], alpha: number) {
+    for (const backend of backends) this.latencyMs.set(backend, null);
+    this.alpha = alpha;
+  }
+
+  record(backend: string, observedMs: number): void {
+    const current = this.latencyMs.get(backend);
+    this.latencyMs.set(
+      backend,
+      current === null || current === undefined
+        ? observedMs
+        : (1 - this.alpha) * current + this.alpha * observedMs,
+    );
+  }
+
+  pick(): string {
+    let bestKey: string | undefined;
+    let bestVal = Infinity;
+    for (const [backend, latency] of this.latencyMs.entries()) {
+      if (latency !== null && latency < bestVal) {
+        bestVal = latency;
+        bestKey = backend;
+      }
+    }
+    if (bestKey !== undefined) return bestKey;
+    return this.latencyMs.keys().next().value;
+  }
+}
+```
+
+This example is intentionally incomplete. A production version needs exploration, which means it should occasionally try new or quiet backends so their latency data does not go stale.
+
+<h1 id="8-hash-based-routing">8. Hash-Based Routing</h1>
+
+Hash-based routing sends the same key to the same backend while the backend set is stable.
+
+The key might be:
+
+- Source IP
+- Session ID
+- User ID
+- Tenant ID
+- Cache key
+- Request path
+- Model name
+
+<h3 id="source-ip-hash">Source IP Hash</h3>
+
+Source IP hash is simple: hash the client IP and map it to a backend.
+
+It can help with sticky sessions, but it has problems:
+
+- Many clients may share one NAT IP.
+- Mobile clients change IPs.
+- IPv6 privacy addresses can change.
+- Large enterprise customers can create hot spots.
+- Adding or removing a backend remaps many clients if simple modulo hashing is used.
+
+Source IP hash is a blunt tool. Cookie-based, header-based, or application-key hashing is often better.
+
+<h3 id="consistent-hashing">Consistent Hashing</h3>
+
+Consistent hashing reduces how many keys move when backends are added or removed.
+
+Instead of computing `hash(key) % number_of_backends`, the load balancer maps backends and keys onto a hash ring. When one backend changes, only part of the key space moves.
+
+Rendezvous hashing is a simpler alternative with the same basic goal: keep key-to-backend mapping stable. It scores every backend for a key and picks the highest score. When a backend is added or removed, only the keys that prefer that backend move.
+
+```java
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+
+class RendezvousHash {
+    private final List<String> backends;
+
+    RendezvousHash(List<String> backends) {
+        if (backends.isEmpty()) throw new IllegalArgumentException("backends cannot be empty");
+        this.backends = backends;
+    }
+
+    String pick(String key) {
+        String best = null;
+        long bestScore = -1;
+        for (String backend : backends) {
+            long score = fnv1a32(key + "|" + backend);
+            if (best == null || Long.compareUnsigned(score, bestScore) > 0) {
+                best = backend;
+                bestScore = score;
+            }
+        }
+        return best;
+    }
+
+    private static long fnv1a32(String value) {
+        long hash = 0x811c9dc5L;
+        for (byte b : value.getBytes(StandardCharsets.UTF_8)) {
+            hash ^= Byte.toUnsignedInt(b);
+            hash = (hash * 0x01000193L) & 0xffffffffL;
+        }
+        return hash;
+    }
+}
+```
+
+```python
+class RendezvousHash:
+    def __init__(self, backends):
+        if not backends:
+            raise ValueError("backends cannot be empty")
+        self.backends = backends
+
+    def pick(self, key):
+        best = None
+        best_score = -1
+        for backend in self.backends:
+            score = self.fnv1a32(key + "|" + backend)
+            if best is None or score > best_score:
+                best = backend
+                best_score = score
+        return best
+
+    @staticmethod
+    def fnv1a32(value):
+        hash = 0x811C9DC5
+        for b in value.encode("utf-8"):
+            hash ^= b
+            hash = (hash * 0x01000193) & 0xFFFFFFFF
+        return hash
+```
+
+```cpp
+#include <vector>
+#include <string>
+#include <stdexcept>
+#include <cstdint>
+
+class RendezvousHash {
+private:
+    std::vector<std::string> backends;
+
+public:
+    RendezvousHash(const std::vector<std::string>& backends) : backends(backends) {
+        if (backends.empty()) throw std::invalid_argument("backends cannot be empty");
+    }
+
+    std::string pick(const std::string& key) {
+        std::string best;
+        uint32_t bestScore = 0;
+        bool hasBest = false;
+        for (const std::string& backend : backends) {
+            uint32_t score = fnv1a32(key + "|" + backend);
+            if (!hasBest || score > bestScore) {
+                best = backend;
+                bestScore = score;
+                hasBest = true;
+            }
+        }
+        return best;
+    }
+
+private:
+    static uint32_t fnv1a32(const std::string& value) {
+        uint32_t hash = 0x811c9dc5u;
+        for (unsigned char b : value) {
+            hash ^= b;
+            hash *= 0x01000193u;
+        }
+        return hash;
+    }
+};
+```
+
+```go
+type RendezvousHash struct {
+	backends []string
+}
+
+func NewRendezvousHash(backends []string) *RendezvousHash {
+	if len(backends) == 0 {
+		panic("backends cannot be empty")
+	}
+	return &RendezvousHash{backends: backends}
+}
+
+func (r *RendezvousHash) pick(key string) string {
+	var best string
+	var bestScore uint32
+	hasBest := false
+	for _, backend := range r.backends {
+		score := fnv1a32(key + "|" + backend)
+		if !hasBest || score > bestScore {
+			best = backend
+			bestScore = score
+			hasBest = true
+		}
+	}
+	return best
+}
+
+func fnv1a32(value string) uint32 {
+	var hash uint32 = 0x811c9dc5
+	for i := 0; i < len(value); i++ {
+		hash ^= uint32(value[i])
+		hash *= 0x01000193
+	}
+	return hash
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+class RendezvousHash
+{
+    private readonly List<string> backends;
+
+    public RendezvousHash(List<string> backends)
+    {
+        if (backends.Count == 0) throw new ArgumentException("backends cannot be empty");
+        this.backends = backends;
+    }
+
+    public string pick(string key)
+    {
+        string best = null;
+        uint bestScore = 0;
+        bool hasBest = false;
+        foreach (string backend in backends)
+        {
+            uint score = fnv1a32(key + "|" + backend);
+            if (!hasBest || score > bestScore)
+            {
+                best = backend;
+                bestScore = score;
+                hasBest = true;
+            }
+        }
+        return best;
+    }
+
+    private static uint fnv1a32(string value)
+    {
+        uint hash = 0x811c9dc5u;
+        foreach (byte b in Encoding.UTF8.GetBytes(value))
+        {
+            hash ^= b;
+            hash *= 0x01000193u;
+        }
+        return hash;
+    }
+}
+```
+
+```typescript
+class RendezvousHash {
+  private readonly backends: string[];
+
+  constructor(backends: string[]) {
+    if (backends.length === 0) throw new Error("backends cannot be empty");
+    this.backends = backends;
+  }
+
+  pick(key: string): string {
+    let best: string | null = null;
+    let bestScore = -1;
+    for (const backend of this.backends) {
+      const score = fnv1a32(key + "|" + backend);
+      if (best === null || score > bestScore) {
+        best = backend;
+        bestScore = score;
+      }
+    }
+    return best!;
+  }
+
+  private static fnv1a32(value: string): number {
+    let hash = 0x811c9dc5;
+    for (const b of new TextEncoder().encode(value)) {
+      hash ^= b;
+      hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash;
+  }
+}
+```
+
+Consistent hashing is useful for:
+
+- Distributed caches
+- Stateful shards
+- Session affinity
+- Tenant-local routing
+- Reducing cache churn during scaling
+
+<h3 id="maglev-and-rendezvous-hashing">Maglev and Rendezvous Hashing</h3>
+
+Modern proxies may use variants such as Maglev hashing or rendezvous hashing. They serve the same broad goal: keep key-to-backend mapping stable while limiting how much traffic moves when the backend set changes.
+
+Use these when key stability matters. Be careful when the workload has hot keys. One popular key can overload one backend unless you have a plan to split or shed that traffic.
+
+<h1 id="9-locality-aware-routing">9. Locality-Aware Routing</h1>
+
+Locality-aware routing prefers nearby backends: same zone, same region, same rack, or same cluster.
+
+This reduces latency and cross-zone cost. It can also keep failures smaller when a dependency has regional problems.
+
+<h3 id="where-it-fails">Where It Fails</h3>
+
+Locality can overload local capacity. If one zone has 40% of clients but only 25% of backend capacity, strict local routing will overload that zone while remote capacity sits idle.
+
+Good locality rules need spillover:
+
+1. Prefer local healthy backends.
+2. Spill to nearby zones when local load crosses a threshold.
+3. Avoid sending traffic to a region that violates legal or data residency rules.
+4. Rebalance slowly after recovery.
+
+<h1 id="10-adaptive-and-load-aware-routing">
+  10. Adaptive and Load-Aware Routing
+</h1>
+
+Adaptive routing uses live signals such as queue depth, CPU, error rate, observed latency, or load reports from the application.
+
+This is common in advanced service meshes, RPC frameworks, and inference gateways.
+
+<h3 id="when-it-helps">When It Helps</h3>
+
+Adaptive routing is useful when simple signals are not enough:
+
+- Expensive API requests
+- Search and ranking systems
+- ML inference
+- Multi-tenant services
+- Backends with different hardware
+- Services with queues
+
+<h3 id="where-it-fails">Where It Fails</h3>
+
+Adaptive systems can create feedback loops. If every client routes away from a slightly slow backend at the same time, load shifts suddenly and creates a new slow backend.
+
+Use smoothing, caps, outlier detection, slow start, and circuit breakers. Make the algorithm stable before making it clever.
+
+<h1 id="11-algorithm-choice-by-workload">11. Algorithm Choice by Workload</h1>
+
+The right algorithm depends less on abstract theory than on the shape of the traffic it serves. This table maps common workloads to a sensible starting point.
+
+| Workload                                | Good Starting Point                             | Why                                      |
+| --------------------------------------- | ----------------------------------------------- | ---------------------------------------- |
+| **Static web/API with equal instances** | Round robin or P2C                              | Simple and effective                     |
+| **Uneven request duration**             | Least requests or P2C                           | Avoids piling onto busy backends         |
+| **Long-lived connections**              | Least connections                               | Connection count matters more            |
+| **Heterogeneous instances**             | Weighted round robin or weighted least requests | Capacity differs                         |
+| **Cache cluster**                       | Consistent hash / Maglev / rendezvous           | Keeps the same keys near the same caches |
+| **Canary release**                      | Weighted routing                                | Controls exposure                        |
+| **Multi-zone service**                  | Locality-aware with spillover                   | Keeps traffic close but avoids overload  |
+| **AI inference gateway**                | Queue/load-aware routing behind L7 LB           | Model, GPU, and queue signals matter     |
+
+In practice, several layers may each apply their own algorithm:
+
+- DNS chooses a region.
+- A regional load balancer chooses a gateway.
+- The gateway chooses a service pool.
+- The service router chooses a model worker, shard, or replica.
+
+Each layer should use the signals it can actually see.
+
+<h1 id="12-common-mistakes">12. Common Mistakes</h1>
+
+A good algorithm still fails when the surrounding setup works against it.
+
+<h3 id="confusing-requests-with-work">Confusing Requests with Work</h3>
+
+Equal request count does not mean equal load. Measure CPU, memory, queue time, latency, active requests, and error rates.
+
+<h3 id="ignoring-slow-start">Ignoring Slow Start</h3>
+
+A newly added backend often has cold caches, empty connection pools, and warmup work such as JIT compilation or model loading. Sending it a full traffic share immediately can hurt it.
+
+Slow start gradually increases traffic to new or recovered backends.
+
+<h3 id="retrying-without-budgets">Retrying Without Budgets</h3>
+
+Retries can turn a partial outage into a full outage. A load balancer should not blindly retry every failed request.
+
+Retry only when:
+
+- The method is safe or the request is safe to repeat.
+- The retry has a deadline.
+- There is a retry budget.
+- The next backend is likely to do better.
+
+<h3 id="keeping-dead-backends-in-the-pool">
+  Keeping Dead Backends in the Pool
+</h3>
+
+Algorithms assume the backend pool contains only instances that should receive traffic. Health checks and endpoint discovery must remove dead, draining, or overloaded instances.
+
+<h3 id="using-sticky-routing-to-hide-bad-state-management">
+  Using Sticky Routing to Hide Bad State Management
+</h3>
+
+Sticky routing can be valid, but it should not be the only thing keeping the application correct. Backends fail. Deployments happen. Clients move.
+
+If moving a user to another backend breaks the session, write that down as a real reliability risk.
+
+<h1 id="13-quick-comparison">13. Quick Comparison</h1>
+
+This table gathers every algorithm covered in the chapter into one view. Use it when you need to compare options quickly.
+
+| Algorithm                    | Load Awareness       | Affinity            | Cost   | Best Use                                       |
+| ---------------------------- | -------------------- | ------------------- | ------ | ---------------------------------------------- |
+| **Round robin**              | None                 | No                  | Low    | Similar short requests                         |
+| **Weighted round robin**     | Static capacity only | No                  | Low    | Known capacity differences, canaries           |
+| **Least connections**        | Active connections   | No                  | Medium | Long-lived connections                         |
+| **Least requests**           | In-flight requests   | No                  | Medium | Uneven request duration                        |
+| **Power of two choices**     | Rough active load    | No                  | Low    | Large pools                                    |
+| **Random**                   | None                 | No                  | Low    | Simple fallback, large similar pools           |
+| **Least response time**      | Observed latency     | No                  | Medium | Latency-sensitive services with stable samples |
+| **Source IP hash**           | None                 | Weak                | Low    | Simple affinity                                |
+| **Consistent hash / Maglev** | None by default      | Strong key affinity | Medium | Caches, shards, session locality               |
+| **Locality-aware**           | Location and health  | Sometimes           | Medium | Multi-zone and multi-region services           |
+| **Adaptive routing**         | Custom live signals  | Depends             | High   | Expensive, mixed-capacity, or queued workloads |
+
+<h1 id="summary">Summary</h1>
+
+Load-balancing algorithms are rules for choosing a backend. The best rule depends on what the load balancer can see and what the workload needs.
+
+Round robin is simple, not smart. It works best when requests and backends are similar.
+
+Weights express expected capacity, not live load. They help with canaries and mixed-capacity backend pools, but they can drift away from reality.
+
+Least connections and least requests handle uneven request duration better when active-work tracking is accurate. Power of two choices is a strong default for large pools because it balances well without scanning every backend.
+
+Hash-based routing with consistent hashing, Maglev, or rendezvous hashing keeps related traffic near the same backend and moves fewer keys when backends change.
+
+Latency-aware routing needs smoothing so recent measurements do not cause noisy traffic swings. Locality-aware routing needs spillover so nearby capacity is preferred but not overloaded.
+
+AI inference needs application-aware routing. GPU type, model availability, queue depth, tenant quota, and data rules matter more than generic request counts.
+
+In every case, the algorithm is only part of reliability. Health checks, timeouts, draining, slow start, retries, and observability decide how the system behaves under stress.
+
+Choose the simplest algorithm that matches the workload, then prove it with production metrics.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,272 @@
+---
+title: "GC Algorithms"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "GC Algorithms explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+This chapter covers the role of each `-XX:+Use...GC` flag, the behavior of each collector, and how to make a defensible production choice.
+
+<h1 id="a-quick-lay-of-the-land">A Quick Lay of the Land</h1>
+
+HotSpot has shipped many collectors over the years. The ones that still matter in modern Java (17, 21, 25) are these:
+
+- **Serial GC**: a single-threaded collector for small heaps and small machines.
+- **Parallel GC**: a multi-threaded throughput collector, also called the throughput collector.
+- **G1 GC**: a region-based, pause-time-targeting collector. Default since Java 9.
+- **ZGC**: a low-latency concurrent collector aimed at very short pauses on large heaps.
+- **Shenandoah**: another low-latency concurrent collector, developed by Red Hat.
+- **Epsilon**: a no-op collector that allocates but never reclaims, used for testing and ultra-short-lived processes.
+
+CMS (Concurrent Mark Sweep) was an earlier low-latency collector. It was deprecated in Java 9 and removed in Java 14, so on a supported Java version it's unavailable. CMS still shows up in older blog posts and Stack Overflow answers; treat those as historical. G1 replaced it as the default low-pause collector, and ZGC and Shenandoah replaced it for workloads that really need short pauses.
+
+The flag pattern is the same for all of them: pass `-XX:+UseXxxGC` on the `java` command line. For example:
+
+```text
+java -XX:+UseG1GC -Xmx4g -jar checkout-service.jar
+java -XX:+UseZGC -Xmx32g -jar analytics-service.jar
+java -XX:+UseSerialGC -Xmx256m -jar small-cli-tool.jar
+```
+
+Only one collector runs at a time, and the choice is fixed for the life of the JVM process. The collector cannot be switched after startup.
+
+Picking the wrong collector for a workload can cost 20-50% of throughput, or add hundreds of milliseconds of pause time to user-facing requests. The default (G1 on modern Java) is a reasonable starting point, not a final answer.
+
+<h1 id="serial-gc">Serial GC</h1>
+
+Serial GC is the simplest collector HotSpot ships. It uses a single thread for everything: a single thread marks live objects, a single thread copies survivors out of the young generation, and a single thread sweeps and compacts the old generation. The whole world stops during every collection, no work is done concurrently with your application, and once the collection finishes the application threads resume.
+
+That sounds primitive, and it is. The reason it's still in the JVM is that for very small heaps and small machines, the simplicity wins. There's no coordination overhead between GC threads, no concurrent bookkeeping cost during normal allocation, and the GC code path is tiny so it stays in CPU cache. On a heap of a few hundred megabytes running on a single core, Serial often outperforms more sophisticated collectors that were designed for multi-gigabyte heaps on many-core machines.
+
+Enable it with:
+
+```text
+java -XX:+UseSerialGC -Xmx512m -jar small-service.jar
+```
+
+When the JVM picks defaults, it considers Serial GC for environments where it makes sense. On containers with less than about 2 CPUs available and less than roughly 2 GB of heap, the JVM may pick Serial by default. The exact thresholds change between Java versions, so don't rely on the heuristic; request Serial explicitly when it's the intended choice.
+
+Pause behavior: short pauses on small heaps (tens to low hundreds of milliseconds), proportionally longer pauses as the heap grows. Past about a gigabyte, the pauses get noticeable; past a few gigabytes, they get unacceptable for anything user-facing.
+
+When Serial GC fits:
+
+- A short-lived CLI tool that exits in a few seconds.
+- A small background utility on a memory-constrained host.
+- A container with a single CPU and a few hundred megabytes of heap.
+- A unit test that needs deterministic, lock-free GC behavior.
+
+When Serial GC does not fit:
+
+- Any user-facing service on a multi-core machine. The single-threaded collector leaves other cores idle.
+- Any heap larger than about 1 GB if pause time matters.
+- Any workload where allocation rate is high enough that the application spends meaningful time waiting for the collector.
+
+<h1 id="parallel-gc">Parallel GC</h1>
+
+Parallel GC is essentially Serial GC scaled across CPU cores. Instead of one thread doing all the work, a configurable pool of threads splits the work and runs it in parallel. The world still stops during every collection (it's still a stop-the-world collector), but the collection finishes faster because multiple threads are working at once. The young generation uses a parallel copying collector; the old generation uses a parallel mark-sweep-compact. It was the default collector from Java 7 through Java 8.
+
+The design goal is **throughput**: maximize the percentage of CPU time spent running the application versus running the collector. Parallel GC doesn't try to keep pause times short. It tries to keep the total fraction of time spent collecting as low as possible. On a CPU-bound batch job that runs for an hour, fewer, slightly longer pauses (say, three 800ms pauses) often beat many short ones (say, sixty 50ms pauses), because the longer pauses parallelize more efficiently and avoid per-collection overhead.
+
+Enable it with:
+
+```text
+java -XX:+UseParallelGC -Xmx8g -jar nightly-revenue-report.jar
+```
+
+The number of GC threads can be tuned with `-XX:ParallelGCThreads=N`. By default, it's roughly the number of CPU cores, capped at a sensible maximum.
+
+Pause behavior: hundreds of milliseconds is normal on multi-gigabyte heaps. On very large heaps (tens of gigabytes), full collections can hit multiple seconds. That's the trade-off you accept in exchange for higher throughput.
+
+A concrete e-commerce example: a nightly job that aggregates the day's orders into per-region revenue reports. The job runs at 2 AM, no user is watching, and the only thing the operations team cares about is that the job finishes before the morning standup. A two-second GC pause in the middle of the job doesn't matter. What matters is that the job finishes at 3:15 instead of 3:45. Parallel GC is built for exactly this shape of workload.
+
+When Parallel GC fits:
+
+- Batch jobs and offline processing where throughput dominates.
+- Background analytics, ETL pipelines, scheduled reports.
+- Workloads that can absorb half-second to multi-second pauses without anyone noticing.
+
+When Parallel GC does not fit:
+
+- User-facing services where a stop-the-world pause is a visible latency spike.
+- Any workload with strict tail-latency requirements (p99, p99.9).
+
+<h1 id="cms-historical-context">CMS (Historical Context)</h1>
+
+CMS, the Concurrent Mark Sweep collector, was HotSpot's first attempt at a low-pause collector. It did most of its marking work concurrently with the application, so it could keep individual GC pauses shorter than Parallel GC. It had two big drawbacks: it didn't compact the old generation (so heap fragmentation could trigger expensive full GCs over time), and its code base was complex enough that maintaining it slowed down the rest of the JVM. CMS was deprecated in Java 9 and removed in Java 14. On Java 17 or later, CMS is no longer available. G1, ZGC, and Shenandoah cover what CMS was originally built for, with better behavior and active maintenance.
+
+<h1 id="g1-gc-garbage-first">G1 GC (Garbage-First)</h1>
+
+G1 has been the default collector since Java 9, and for most workloads it's the right default. The design idea is different from Parallel and CMS. Instead of dividing the heap into a young generation (Eden + survivors) and an old generation as two big contiguous regions, G1 divides the heap into a large number of equal-sized regions, typically 1 MB to 32 MB depending on heap size. Any region can act as young or old at any time. The collector tracks how much garbage is in each region and how much it would cost to collect that region, and on each cycle it picks the regions with the best garbage-to-cost ratio (hence "garbage-first").
+
+This region-based design gives G1 something the older collectors don't have: a soft target for pause time. Tell G1 "try to keep pauses under 200 milliseconds", and it adjusts the size of each collection (how many regions it picks) to fit in that budget. It's not a hard guarantee, especially for full collections triggered by allocation pressure, but for normal mixed collections it usually meets the target.
+
+The flag for the pause target:
+
+```text
+java -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -Xmx8g -jar checkout-service.jar
+```
+
+The default `MaxGCPauseMillis` is 200ms, which is also the typical production pause profile: most pauses land in the 100-200 millisecond range on heaps from a few gigabytes to a few tens of gigabytes. Some go shorter, occasional full collections go longer. Treat the 100-200ms figure as a typical range, not a guarantee.
+
+A simplified picture of the G1 heap layout:
+
+The diagram is a snapshot at one moment. Every region has a role at this instant: Eden for fresh allocations, Survivor for objects that survived one young collection, Old for tenured objects, Humongous for objects too large to fit in a single region, and Free for unused regions waiting to be assigned. After the next collection, a region that was Eden may become Free, a Free region may be promoted to Survivor, and so on. Roles are not pinned to physical regions, which is what gives G1 its flexibility.
+
+Three aspects of G1 are worth covering in practice.
+
+**Mixed collections.** A young collection scoops up only young regions. A mixed collection picks up some old regions too, the ones with the most garbage. G1 spreads old-generation cleanup across many mixed collections instead of doing one big full collection, which is how it keeps individual pauses short.
+
+**Humongous objects.** Any allocation larger than half a region is treated specially. G1 allocates it directly in old-generation regions and treats it as a single object spanning one or more regions. Lots of humongous allocations (think large `byte[]` buffers or huge images) can fragment the heap and trigger full collections.
+
+**Full GC.** G1 can still fall back to a single-threaded full GC if it can't keep up with allocation, but modern JVMs (Java 10+) parallelize the full GC too. A full GC is a sign that G1 is overloaded, not that it's working normally; when they show up in logs, the fix is usually more heap, less garbage, or a different collector.
+
+Enable G1 explicitly:
+
+```text
+java -XX:+UseG1GC -XX:MaxGCPauseMillis=150 -Xmx16g -jar checkout-service.jar
+```
+
+When G1 fits:
+
+- The default starting point for almost any server-side Java workload.
+- Heaps from about 4 GB to about 32 GB.
+- Latency-sensitive services with a soft pause budget around 100-200ms.
+
+When G1 may not fit:
+
+- Heaps below about 4 GB with strict latency requirements (Serial or Parallel may be simpler and faster).
+- Heaps above 32 GB or workloads with very strict latency budgets, where ZGC or Shenandoah usually wins.
+- Workloads with lots of humongous allocations.
+
+<h1 id="zgc">ZGC</h1>
+
+ZGC is HotSpot's low-latency collector, available in production since Java 15 and made generational in Java 21. Its design goal is pause times of a few milliseconds or less, even on very large heaps (multi-terabyte heaps are explicitly a supported scenario).
+
+ZGC works through **colored pointers** combined with **load barriers**. A small number of bits in every object reference encode information about the reference's state (for example, whether the object it points to has been relocated). Whenever the application reads a reference, the JVM inserts a tiny barrier that checks those bits and, if needed, fixes the reference up to point at the new location. That lets ZGC move objects in memory while the application is running, without stopping every thread to find and rewrite their references. The stop-the-world phases shrink to almost nothing because the bulk of the work happens concurrently.
+
+The heap is divided into regions, similar to G1, but ZGC's regions are larger (typically 2 MB, 32 MB, or 4 MB, depending on object size) and the collector can relocate objects across regions concurrently. Generational ZGC (Java 21+) adds the usual young/old split, which improves throughput because most objects die young and the collector can focus on the young generation more often.
+
+Enable ZGC:
+
+```text
+java -XX:+UseZGC -Xmx64g -jar analytics-service.jar
+```
+
+Pause behavior: typically sub-millisecond to single-digit-millisecond pauses, even on heaps of tens or hundreds of gigabytes. Treat that as a typical range, not a hard guarantee; pathological workloads or under-sized heaps can still produce longer pauses.
+
+When ZGC fits:
+
+- Large heaps (tens of gigabytes and up) where G1 pauses grow uncomfortably long.
+- Latency-sensitive services with strict tail-latency budgets (p99 < 10ms).
+- Real-time-ish workloads where any pause longer than a frame budget is unacceptable.
+- Applications using off-heap memory heavily, where the on-heap collector should be invisible.
+
+When ZGC may not fit:
+
+- Small heaps (a few gigabytes), where G1 is simpler and the latency savings don't matter.
+- Tight CPU budgets, since the load barriers and concurrent work take a few percent of CPU.
+- Older JDK versions; pre-21 ZGC is non-generational and gives up some throughput.
+
+ZGC's load barriers add a small per-read cost (typically a few percent of CPU). On a CPU-bound workload, total throughput may drop slightly compared to Parallel or G1. The trade is fewer and shorter pauses for slightly less raw throughput.
+
+<h1 id="shenandoah">Shenandoah</h1>
+
+Shenandoah is a low-latency concurrent collector developed by Red Hat and shipped with OpenJDK builds (it's not in Oracle's commercial JDK). The goals are similar to ZGC: keep pauses very short regardless of heap size. The implementation strategy is different. Shenandoah uses **Brooks pointers**, which are forwarding pointers stored just before each object's header. When the collector moves an object, the old location's Brooks pointer is updated to point at the new location, and every access to the object goes through the pointer to find the current copy. That lets Shenandoah relocate objects concurrently with the application.
+
+Enable Shenandoah (only on OpenJDK builds that include it):
+
+```text
+java -XX:+UseShenandoahGC -Xmx16g -jar checkout-service.jar
+```
+
+Pause behavior: like ZGC, sub-millisecond to low-single-digit-millisecond pauses are typical, even on multi-gigabyte heaps. Whether Shenandoah or ZGC performs better on a given workload depends on allocation patterns, heap size, and hardware; both are reasonable choices for low-latency workloads.
+
+When Shenandoah fits:
+
+- Same latency-sensitive workloads as ZGC.
+- Environments standardized on OpenJDK (especially Red Hat OpenJDK builds).
+- Workloads where benchmarks show Shenandoah measurably beats ZGC for the given allocation shape.
+
+When Shenandoah may not fit:
+
+- JDK distributions that don't ship Shenandoah (Oracle's commercial JDK in particular).
+- Workloads where ZGC's measured behavior is already meeting the latency targets; there's no reason to switch.
+
+For most teams, ZGC vs Shenandoah is a wash, and the choice comes down to which one the JDK distribution supports and which one has been benchmarked against the actual workload.
+
+<h1 id="epsilon">Epsilon</h1>
+
+Epsilon is a collector that doesn't collect. It allocates memory, hands it to the application, and when the heap runs out, the JVM exits with an `OutOfMemoryError`. There is no marking, no sweeping, no compaction, no concurrent work. It's intentionally a no-op.
+
+Why ship that as a collector? Two reasons:
+
+1. **Benchmarking.** When measuring pure application throughput without any GC noise, Epsilon provides a clean baseline. Any pause in the timing comes from application code, not the JVM.
+2. **Short-lived, throwaway processes.** A small AWS Lambda function or a CLI tool that runs for a few seconds and exits may never need to reclaim memory. If the heap can be sized to fit the entire run, Epsilon avoids the cost of GC entirely.
+
+Enable Epsilon:
+
+```text
+java -XX:+UnlockExperimentalVMOptions -XX:+UseEpsilonGC -Xmx512m -jar tiny-tool.jar
+```
+
+The `-XX:+UnlockExperimentalVMOptions` flag is required because Epsilon is officially marked experimental.
+
+When Epsilon fits:
+
+- A benchmark where you want to measure code, not the GC.
+- A throwaway process whose entire lifetime fits in the allocated heap.
+- An integration test where you want a known, simple memory model.
+
+When Epsilon does not fit:
+
+- Anything long-running. It will hit OOM eventually.
+- Anything where peak heap size is uncertain. Epsilon will not save it.
+
+Epsilon is a precision tool. Use it for what it's for, and not for anything else.
+
+<h1 id="comparison-at-a-glance">Comparison at a Glance</h1>
+
+| Collector  | Default?                   | Since                               | Typical pause                                    | Throughput            | Heap sweet spot       | When to choose                                                      |
+| ---------- | -------------------------- | ----------------------------------- | ------------------------------------------------ | --------------------- | --------------------- | ------------------------------------------------------------------- |
+| Serial     | Default on tiny containers | All versions                        | Short on small heaps, grows linearly             | High on a single core | Up to ~1 GB           | Small CLI tools, memory-constrained single-core environments        |
+| Parallel   | Default Java 7-8           | All versions                        | Hundreds of ms to several seconds on large heaps | Highest               | 2 GB to 32 GB         | Batch jobs, ETL, offline analytics                                  |
+| G1         | Default since Java 9       | Java 7, default 9                   | ~100-200ms typical                               | High                  | 4 GB to 32 GB         | Default for server-side services; balance of latency and throughput |
+| ZGC        | No                         | Production Java 15, generational 21 | Sub-ms to single-digit ms typical                | Slight cost vs G1     | 8 GB to multi-TB      | Latency-critical services, very large heaps                         |
+| Shenandoah | No                         | Java 12 (OpenJDK)                   | Sub-ms to single-digit ms typical                | Slight cost vs G1     | Similar to ZGC        | Same as ZGC, on OpenJDK builds that ship it                         |
+| Epsilon    | No                         | Java 11                             | None (no collection)                             | Highest possible      | Whatever fits in heap | Benchmarks, short-lived processes                                   |
+
+Defaults change between Java versions, so "G1 is the default" isn't a permanent fact. It's the default in Java 9 through current versions, and the next major shift is likely when ZGC becomes safe enough to default on for general workloads. Always check the documentation for your specific JDK.
+
+<h1 id="pause-profile-visualization">Pause Profile Visualization</h1>
+
+To make the difference concrete, here's a stylized timeline of three collectors handling the same allocation load. Each bar represents a stop-the-world pause; the height roughly indicates duration.
+
+The numbers are illustrative, not measured, but the shape is what matters. Parallel GC concentrates its work in a few long pauses; total collector time may be lower than the others, but each pause is painful for any request that lands on it. G1 spreads its work across many medium pauses. ZGC has many pauses too, but each one is short enough that most requests won't register them. The y-axis story is the most important: a 200ms pause is a visible latency spike in a user-facing service, while a 2ms pause is below most monitoring thresholds.
+
+For a checkout API, the G1 profile is acceptable and the Parallel profile is not. The customer who happens to click "Place Order" during one of those 1200ms pauses sees a noticeable hesitation. The customer whose request lands during a G1 pause sees a small p99 bump, which is annoying but usually within budget. The customer whose request lands during a ZGC pause sees nothing at all.
+
+<h1 id="how-to-pick-a-collector">How to Pick a Collector</h1>
+
+The choice usually comes down to three questions. What is the heap size? What is the latency budget? What is the workload doing?
+
+A simple decision tree for typical situations:
+
+Three concrete e-commerce examples make the trade-offs feel real.
+
+**Example 1: the checkout API.** A user clicks "Place Order" and waits for the response. The team's SLO is p99 under 300ms for the checkout endpoint. The service has an 8 GB heap and runs on a 4-core box. The natural choice is G1 with the default 200ms pause target. Pauses land somewhere in the 100-200ms range, well within the latency budget. The team checks GC logs once a week and otherwise leaves the collector alone. If the p99 starts climbing because the catalog grew, they can either bump the heap, tighten the pause target, or experiment with ZGC. Parallel would be a poor starting point; even a single 800ms pause would breach the SLO.
+
+**Example 2: the nightly revenue report.** Every night at 2 AM, a job pulls the day's orders, joins them against the customer table, and writes a per-region report. The job runs for about an hour on a 16 GB heap and nobody is watching it. The right collector is Parallel GC, because the only thing that matters is total time. A few seconds of pause time over the course of an hour is invisible, and Parallel will finish the job faster than G1 would. Picking ZGC here would actually slow the job down because of the load barrier cost.
+
+**Example 3: the CLI tool that generates a coupon code.** An ops engineer runs `coupon-gen --campaign BLACK_FRIDAY` and gets a code back in about two seconds. The process exits, takes its heap with it, and is never seen again. Serial GC is fine, and Epsilon with a sized heap of, say, 64 MB is even better, because the process never lives long enough to need a real collector. G1 here is pure overhead.
+
+Three workloads, three different collectors, all defensible. The general pattern: when the latency budget and heap size are known, the collector choice is usually obvious. Otherwise, start with G1 and measure.
+
+Picking the collector is the first big decision; everything else is dialing in flags within that choice.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

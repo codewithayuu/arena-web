@@ -1,0 +1,307 @@
+---
+title: "Publish-Subscribe (Pub/Sub)"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Pub/Sub explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+The order service has become tightly coupled to services that have nothing to do with placing an order.
+
+What we want is a way for the order service to announce that an order was placed, without caring who is listening. That is the idea behind **publish-subscribe**.
+
+<h1 id="1-what-is-pubsub">1. What Is Pub/Sub?</h1>
+
+Publish-subscribe, or pub/sub, is a messaging pattern with three main parts:
+
+- **Publishers** are services that produce messages.
+- **Subscribers** are services that want to receive those messages.
+- A **message broker** sits in between and organizes messages into topics.
+
+A **topic** is a named channel for a particular kind of event, such as `OrderPlaced` or `PaymentCompleted`.
+
+A publisher sends a message to a topic. It does not know which services will receive it, or how many there are. Subscribers register their interest in a topic, and the broker delivers a copy of every message on that topic to each subscriber.
+
+So in our example, the order service publishes a single `OrderPlaced` event. The inventory, email, analytics, and fraud services each subscribe to that topic, and each one receives its own copy.
+
+If a new recommendation service wants to react to orders next month, it simply subscribes to the topic. The order service does not change at all.
+
+This one-to-many delivery is called **fan-out**, and it is the core feature of pub/sub.
+
+<h1 id="2-pubsub-vs-message-queues">2. Pub/Sub vs Message Queues</h1>
+
+Pub/sub is often confused with message queues, so it's worth understanding the difference.
+
+In a traditional **message queue**, each message is delivered to one consumer. If five workers are reading from the same queue, only one of them receives a given message. The others don't see it. Message queues are mainly designed to spread work across multiple workers.
+
+In **pub/sub**, each published message is delivered to every subscriber. The goal is to broadcast events to multiple consumers.
+
+| Question                | Message Queue                 | Pub/Sub                               |
+| ----------------------- | ----------------------------- | ------------------------------------- |
+| Who receives a message? | One worker from a pool        | Every subscriber                      |
+| Main purpose            | Spread work across workers    | Broadcast one event to many listeners |
+| Producer intent         | "Someone should do this task" | "This thing happened"                 |
+| Example                 | Transcode this video          | Order placed                          |
+
+A simple rule of thumb: use a **queue** when one worker should do a task, and use **pub/sub** when something happened and several services may care.
+
+<h3 id="combining-both">Combining Both</h3>
+
+In practice, most production systems combine both approaches. A common setup is to publish an event to a topic and give each subscriber its own queue, such as Amazon SNS feeding into SQS queues. The topic handles the fan-out, and each queue buffers work for one service.
+
+<h1 id="3-the-life-of-a-message">3. The Life of a Message</h1>
+
+Let's walk through what happens to a single message.
+
+<h3 id="step-1-publish-and-store">Step 1: Publish and Store</h3>
+
+First, the publisher sends the message to a topic on the broker. The broker stores it. In a durable system, it writes the message to disk and often replicates it to other broker nodes.
+
+Only then does the broker acknowledge the publish. This acknowledgment tells the publisher that the message is safe and it can move on.
+
+<h3 id="step-2-deliver-to-every-subscription">
+  Step 2: Deliver to Every Subscription
+</h3>
+
+Next, the broker makes the message available to every subscription on that topic. A **subscription** is the link between one subscriber and the topic, and it keeps track of that subscriber's progress.
+
+<h3 id="step-3-process-and-acknowledge">Step 3: Process and Acknowledge</h3>
+
+Each subscriber receives the message, processes it, and then acknowledges it. This second acknowledgment is important. It tells the broker that this subscriber is done with the message.
+
+If a subscriber crashes before acknowledging, the broker assumes the message was not processed and delivers it again later.
+
+This means a subscriber can see the same message more than once, so subscribers should be **idempotent**. The Delivery Semantics chapter covers how.
+
+<h3 id="subscriptions-are-independent">Subscriptions Are Independent</h3>
+
+Each subscription tracks its own progress independently. So if the analytics service falls behind, the email service keeps receiving messages at full speed. A slow subscriber builds up its own backlog without slowing down anyone else.
+
+That independence is a big part of the value of pub/sub.
+
+<h1 id="4-push-vs-pull-delivery">4. Push vs Pull Delivery</h1>
+
+There are two ways a broker can get messages to subscribers.
+
+<h3 id="push">Push</h3>
+
+In **push** delivery, the broker sends each message to the subscriber, usually by calling an HTTP endpoint the subscriber exposes.
+
+This is simple to set up, and the subscriber does not need to run a polling loop. The downside is that the broker controls the pace. If messages arrive faster than the subscriber can handle them, the broker has to detect that and slow down.
+
+<h3 id="pull">Pull</h3>
+
+In **pull** delivery, the subscriber asks the broker for the next batch of messages whenever it is ready.
+
+The subscriber controls its own pace, which makes it easier to handle bursts and to process messages in batches.
+
+<h3 id="which-one-to-use">Which One to Use</h3>
+
+| Delivery Mode | Strength                              | Trade-off                                                     | Examples                                |
+| ------------- | ------------------------------------- | ------------------------------------------------------------- | --------------------------------------- |
+| **Push**      | Simple setup, no polling loop         | Broker sets the pace; subscriber endpoint must stay reachable | Amazon SNS, Google Cloud Pub/Sub (push) |
+| **Pull**      | Subscriber controls rate and batching | Subscriber must run polling workers                           | Kafka, Google Cloud Pub/Sub (pull)      |
+
+Pull is usually the better fit for high-throughput backend processing, while push works well for serverless functions and simpler integrations.
+
+<h1 id="5-ephemeral-vs-durable-pubsub">5. Ephemeral vs Durable Pub/Sub</h1>
+
+Not every pub/sub system stores messages.
+
+<h3 id="ephemeral-redis-pubsub">Ephemeral: Redis Pub/Sub</h3>
+
+Redis Pub/Sub is a good example of the **ephemeral** model. When a publisher sends a message, Redis forwards it to whoever is subscribed at that moment, and then the message is gone.
+
+If a subscriber is disconnected for a few seconds, it misses everything published during that time. There is no backlog and no replay.
+
+This is fine for short-lived data where only the latest state matters, such as live cursor positions or typing indicators. But for events like `OrderPlaced` or `PaymentCompleted`, losing a message is not acceptable.
+
+<h3 id="durable-kafka-google-cloud-pubsub-sns-with-sqs">
+  Durable: Kafka, Google Cloud Pub/Sub, SNS with SQS
+</h3>
+
+**Durable** systems such as Kafka, Google Cloud Pub/Sub, and Amazon SNS with SQS keep messages until subscribers process them, or for a configured retention period.
+
+| Model                                         | Behavior                                                                   | Good For                                           |
+| --------------------------------------------- | -------------------------------------------------------------------------- | -------------------------------------------------- |
+| **Ephemeral** (Redis Pub/Sub)                 | Only subscribers connected right now receive the message                   | Cursor positions, typing indicators, live presence |
+| **Durable** (Google Cloud Pub/Sub, SNS + SQS) | Messages wait until each subscriber acknowledges them or retention expires | Business events, background processing             |
+| **Replayable log** (Kafka)                    | Messages stay for a set time whether or not anyone has read them           | Reprocessing, data pipelines, rebuilding state     |
+
+<h3 id="replay-with-kafka">Replay with Kafka</h3>
+
+Kafka goes a step further. It stores messages in an append-only log and keeps them for a configured time, whether or not anyone has read them.
+
+Each consumer group tracks its position in the log, called an **offset**. Because the messages are still there, a consumer can rewind its offset and replay old events.
+
+Replay is useful when you deploy a bug fix and need to reprocess the last day of data, or when a new service needs to build its state from historical events.
+
+Replay also means the same events get processed again, which is one more reason subscribers need to be idempotent.
+
+<h1 id="6-message-ordering">6. Message Ordering</h1>
+
+In general, pub/sub systems don't guarantee that subscribers receive messages in the order they were published, at least not across an entire topic.
+
+There are two common reasons:
+
+- Messages are often spread across multiple partitions or servers to improve scalability.
+- Retries can cause older messages to arrive after newer ones.
+
+For example, a subscriber might receive an `OrderCancelled` event before the matching `OrderCreated` event.
+
+<h3 id="ordering-by-key">Ordering by Key</h3>
+
+Most systems handle this by preserving order for messages with the same **key**, rather than across the entire topic.
+
+In Kafka, each topic is divided into **partitions**, and messages within a partition are stored in order. When a publisher includes a key, such as an order ID, all messages with that key are assigned to the same partition.
+
+This means events for order 123 can be processed in order, while events for different orders are processed in parallel.
+
+<h3 id="the-cost-of-ordering">The Cost of Ordering</h3>
+
+Maintaining order comes with a trade-off: **reduced parallelism**. Messages for the same key must be processed one after another.
+
+If one key gets far more traffic than the others, it can become a bottleneck that adding more consumers won't fix, because all of that key's messages still go to one partition and one consumer. That's why it's important to choose an ordering key based on what your application actually needs.
+
+<h3 id="handling-out-of-order-events">Handling Out-of-Order Events</h3>
+
+When messages can still arrive out of order, subscribers can use **version numbers** to spot and ignore events older than the latest version they've already processed. For example, if a subscriber has already applied version 5 of an order, it can safely drop a late version 4.
+
+<h1 id="7-scaling-subscribers">7. Scaling Subscribers</h1>
+
+Now let's look at throughput. Suppose our `OrderPlaced` topic receives 50,000 events per second, and a single analytics consumer can no longer keep up.
+
+To handle the load, we can add more consumers to the **analytics consumer group**. A consumer group is a set of workers that share one subscription's work. Every group still gets every event, but inside a group, each event is handled by only one worker.
+
+Kafka calls this a consumer group. Other systems may call it a shared subscription or competing consumers, but the idea is the same.
+
+<h3 id="partitions-set-the-limit">Partitions Set the Limit</h3>
+
+In Kafka, partitions are distributed among the consumers in a group, and each partition is assigned to only one consumer in that group at a time.
+
+For example, if a topic has 12 partitions, up to 12 consumers can process messages in parallel. A thirteenth consumer would sit idle.
+
+This means the number of partitions sets the maximum parallelism within a consumer group, so it's important to plan for future growth when choosing the partition count.
+
+<h3 id="watch-consumer-lag">Watch Consumer Lag</h3>
+
+Another important metric to monitor is **consumer lag**, which measures how far a consumer is behind the latest messages in a partition.
+
+If lag keeps increasing, consumers aren't processing messages fast enough. This is often an early sign that you need to add more consumers, optimize processing, or fix a slow downstream dependency.
+
+<h1 id="8-publishing-reliably-the-outbox-pattern">
+  8. Publishing Reliably: The Outbox Pattern
+</h1>
+
+There's also an important failure case on the publisher side.
+
+Let's return to our order service. It saves an order to the database and then publishes an `OrderPlaced` event. But what happens if the service crashes after saving the order, before publishing the event? The order exists in the database, but other services never find out about it.
+
+Reversing the steps doesn't solve the problem either. If the service publishes the event first and the database write fails, subscribers may process an event for an order that doesn't exist.
+
+This is called the **dual-write problem**. It happens because we need to update two separate systems, but there's no single transaction that covers both.
+
+<h3 id="the-transactional-outbox">The Transactional Outbox</h3>
+
+A common solution is the **transactional outbox pattern**. Instead of publishing the event directly, the order service saves both the order and the event in its own database, in the same transaction. The event goes into a separate **outbox** table.
+
+Either both rows are saved or neither is. A background process then reads new entries from the outbox table and publishes them to the message broker. If that process crashes, it can resume and publish any remaining events.
+
+This approach can occasionally publish the same event more than once, for example if the relay crashes after publishing but before marking the row as sent. That's why subscribers still need to be idempotent.
+
+Tools like **Debezium** can also implement this pattern by reading changes directly from the database's transaction log instead of repeatedly polling the outbox table.
+
+<h1 id="9-designing-events">9. Designing Events</h1>
+
+Finally, it's important to think about how you design your events.
+
+<h3 id="describe-what-happened">Describe What Happened</h3>
+
+A well-designed event describes something that has already happened, such as `OrderPlaced`, rather than giving an instruction like `SendEmail`. The publisher simply announces what happened, and each subscriber decides how to respond.
+
+Good event:
+
+```json
+{
+  "eventId": "evt_8f3a2c",
+  "eventType": "OrderPlaced",
+  "timestamp": "2026-05-24T10:30:00Z",
+  "schemaVersion": 2,
+  "payload": {
+    "orderId": "order_123",
+    "customerId": "cust_789",
+    "total": 59.99
+  }
+}
+```
+
+Less useful event:
+
+```json
+{
+  "instruction": "SendEmailAndUpdateAnalyticsAndReserveStock"
+}
+```
+
+The first event lets subscribers decide what to do. The second forces the publisher to know too much about other services.
+
+Most events include a few common fields:
+
+- An **event ID**, for deduplication.
+- An **event type**.
+- A **timestamp**.
+- A **schema version**.
+- The actual **payload**.
+
+<h3 id="evolving-schemas-safely">Evolving Schemas Safely</h3>
+
+You also need to think about how event schemas change over time. Multiple services may depend on the same topic, so a breaking change to an event format can affect consumers you might not even know about.
+
+A safer approach is to add new optional fields and avoid renaming or removing existing ones.
+
+Many teams also use a **schema registry** with formats like Avro or Protocol Buffers. The registry checks each new schema version for compatibility and catches breaking changes before they are deployed.
+
+<h3 id="topics-and-filtering">Topics and Filtering</h3>
+
+Keep topic names predictable and organized by domain, such as `orders.events`, `payments.events`, and `users.events`. Creating a new topic for every small variation quickly becomes hard to manage.
+
+Not every subscriber cares about every event on a topic. A refund service might only want `OrderCancelled` events. Many brokers support **filtering** on message attributes, so a subscription receives only the messages that match. Filtering at the broker saves work compared with having every consumer parse each message just to decide whether to ignore it.
+
+<h1 id="10-when-to-use-pubsub">10. When to Use Pub/Sub</h1>
+
+Pub/sub is a good fit when a single event needs to reach multiple independent services. Common examples include:
+
+- Order and payment events
+- User activity tracking
+- Notifications
+- Cache invalidation across servers
+- Real-time applications where WebSocket servers need to exchange messages
+
+It's also useful when you want services to operate and evolve independently, or when you need to handle traffic spikes without overwhelming downstream systems.
+
+<h3 id="trade-offs">Trade-offs</h3>
+
+Pub/sub comes with some trade-offs:
+
+- **Eventual consistency:** Because subscribers process events asynchronously, different parts of the system may not be updated at the same time.
+- **Harder debugging:** A single user action might trigger a chain of events across multiple services. Distributed tracing becomes important for understanding what happened.
+- **No immediate response:** If a checkout page needs to know whether a payment was approved before moving on, a direct request is usually simpler and more appropriate.
+
+<h1 id="summary">Summary</h1>
+
+Pub/sub lets a publisher send an event once, while any number of subscribers receive and process it independently.
+
+To make it reliable, you need:
+
+- **Durable storage**, so events survive crashes and disconnected subscribers.
+- **At-least-once delivery with idempotent subscribers**, so retries and replays are safe.
+- **The right ordering keys**, so related events stay in order without giving up all parallelism.
+- **Dead-letter handling**, so one bad event doesn't block a subscription forever.
+- **A safe way to publish events alongside database writes**, such as the transactional outbox pattern.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

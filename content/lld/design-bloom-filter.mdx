@@ -1,0 +1,830 @@
+---
+title: "Design Bloom Filter"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Design Bloom Filter explained with clear examples, visuals, and practice questions in Mindflare's Low Level Design course."
+---
+
+<LessonCard>
+
+Here is an example of how a discussion between the candidate and the interviewer might unfold:
+
+> **Candidate:** "What type of elements will the Bloom filter store? Are we working with strings, integers, or arbitrary objects?"
+>
+> **Interviewer:** "Let's keep it simple and work with strings. That covers most practical use cases like URLs, usernames, and email addresses."
+>
+> **Candidate:** "What operations should the Bloom Filter support? Just `add` and `mightContain`, or do we also need to support deletion?"
+>
+> **Interviewer:** "Just `add` and `mightContain`. Deletion is not required in a standard Bloom Filter."
+>
+> **Candidate:** "What false positive rate is acceptable? Should the caller be able to configure this?"
+>
+> **Interviewer:** "Yes, the caller should be able to specify a desired false positive rate. A reasonable default would be 1%."
+>
+> **Candidate:** "Should the filter be thread-safe? Could multiple threads add elements or check membership concurrently?"
+>
+> **Interviewer:** "Yes, assume it will be used in a multi-threaded environment, like multiple request handlers checking a URL blacklist."
+>
+> **Candidate:** "Should we allow the caller to choose which hash function algorithm to use?"
+>
+> **Interviewer:** "That would be nice. Different use cases might benefit from different hash function characteristics."
+
+Based on the discussion, here’s a summary of the functional requirements:
+
+Now that we understand what we're building, let's identify the building blocks of our system.
+
+<h1 id="2-identifying-core-entities">2. Identifying Core Entities</h1>
+
+Unlike systems that model real-world concepts like users or bookings, a Bloom filter is a data structure design problem. The core challenge is about choosing the right internal components and computing optimal parameters to achieve the desired probabilistic guarantees.
+
+<h3 id="21-the-need-for-space-efficient-membership-testing">
+  2.1 The Need for Space-Efficient Membership Testing
+</h3>
+
+The simplest way to test set membership is a HashSet. It gives O(1) lookup and zero false positives. So why not just use one?
+
+Because a HashSet stores every element. If you're tracking 10 million URLs for a safe browsing check, that's hundreds of megabytes of memory.
+
+A Bloom filter can answer the same question, "Is this URL in the blacklist?", using a fraction of the space. The trade-off is that it might occasionally say "yes" when the answer is actually "no" (a false positive), but it will never say "no" when the answer is "yes" (no false negatives).
+
+<h3 id="22-how-bit-arrays-enable-membership-testing">
+  2.2 How Bit Arrays Enable Membership Testing
+</h3>
+
+The foundation of a Bloom filter is a **bit array**: a fixed-size array where each position is either 0 or 1.
+
+To add an element, we hash it to produce k different positions in the array and set those bits to 1. To check membership, we hash the element the same way and check if all k positions are 1. If any position is 0, the element was definitely never added. If all are 1, the element is probably in the set, but those bits might have been set by other elements.
+
+<h3 id="23-why-multiple-hash-functions-reduce-false-positives">
+  2.3 Why Multiple Hash Functions Reduce False Positives
+</h3>
+
+With a single hash function, many different elements map to the same position. The collision rate is high, and false positives are frequent. By using k independent hash functions, each element maps to k different positions. For a false positive to occur, ALL k positions must have been set by other elements. The probability of this happening drops exponentially with k.
+
+<h3 id="24-entity-overview">2.4 Entity Overview</h3>
+
+Here's how these entities relate to each other:
+
+| Entity                | Type           | Responsibility                                                                |
+| --------------------- | -------------- | ----------------------------------------------------------------------------- |
+| `HashStrategy`        | Interface      | Defines the contract for hashing an element to a bit position                 |
+| `MurmurHashStrategy`  | Implementation | Murmur3-inspired hashing with good distribution                               |
+| `FNVHashStrategy`     | Implementation | FNV-1a hashing, simple and fast                                               |
+| `DJB2HashStrategy`    | Implementation | DJB2 hashing, lightweight alternative                                         |
+| `BitArray`            | Data Class     | Wraps a fixed-size boolean array with set/get/clear operations                |
+| `BloomFilterConfig`   | Data Class     | Immutable configuration holding computed optimal parameters                   |
+| `BloomFilter`         | Core Class     | Coordinates hash functions and bit array for probabilistic membership testing |
+| `BloomFilter.Builder` | Builder        | Constructs a BloomFilter with configurable parameters and sensible defaults   |
+
+These entities form the core abstractions of our Bloom filter. They separate concerns cleanly: hashing is pluggable, configuration is computed once and immutable, and the main class coordinates everything.
+
+> In an actual interview, you are not expected to know or implement specific hash algorithms like MurmurHash, FNV, or DJB2. These are included here for completeness.
+>
+> In an interview, a simpler approach works just as well: use a basic polynomial hash function with different seeds (e.g., `hash = hash * seed + char` for each character).
+>
+> What matters is demonstrating that you understand the Strategy pattern, the role of seeds in producing independent hash functions, and how the hash output maps to a bit position. The specific algorithm is not what the interviewer is evaluating.
+
+With our entities identified, let's define their attributes, behaviors, and relationships.
+
+<h1 id="3-designing-classes-and-relationships">
+  3. Designing Classes and Relationships
+</h1>
+
+Now that we know what entities we need, let's flesh out their details. For each class, we'll define what data it holds (attributes) and what it can do (methods). Then we'll look at how these classes connect to each other.
+
+> While listing class methods, we will skip trivial **getters and setters** to keep the walkthrough focused on core behaviors
+
+<h2 id="31-class-definitions">3.1 Class Definitions</h2>
+
+We'll work bottom-up: simple types first, then interfaces, then implementations, then the main class.
+
+<h3 id="interfaces">Interfaces</h3>
+
+<h4 id="hashstrategy">HashStrategy</h4>
+
+We need a way to hash elements to bit positions. We could hardcode a single hash algorithm, but different scenarios benefit from different algorithms. A URL blacklist might prioritize speed, while a spell checker might prioritize distribution quality. An interface lets us swap algorithms without changing the BloomFilter class.
+
+`HashStrategy` defines the contract for hashing an element to a position in the bit array.
+
+| Method                              | Description                                                                                                      |
+| ----------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `hash(element, seed, bitArraySize)` | Computes a hash for the given element using the provided seed, and returns a position within `[0, bitArraySize)` |
+
+The `seed` parameter is what gives us k independent hash values from a single algorithm. Instead of implementing k different hash functions, we call the same function k times with different seeds (0, 1, 2, ..., k-1). Each seed produces a different bit position for the same element.
+
+<h3 id="core-class">Core Class</h3>
+
+<h4 id="bitarray">BitArray</h4>
+
+The bit array is the storage backbone of the Bloom filter. We could use a raw boolean array directly in BloomFilter, but wrapping it in a dedicated class gives us a clean API for set/get/clear operations and keeps the BloomFilter class focused on coordination rather than low-level bit manipulation.
+
+`BitArray` wraps a fixed-size array of bits with set, get, and clear operations.
+
+| Attribute | Type   | Description                     | Mutable?                      |
+| --------- | ------ | ------------------------------- | ----------------------------- |
+| `bits`    | bool[] | The underlying bit storage      | Yes (individual bits are set) |
+| `size`    | int    | The number of bits in the array | No                            |
+
+| Method           | Description                                                          |
+| ---------------- | -------------------------------------------------------------------- |
+| `BitArray(size)` | Creates a bit array of the given size, all bits initialized to false |
+| `set(position)`  | Sets the bit at the given position to true                           |
+| `get(position)`  | Returns whether the bit at the given position is true                |
+| `clear()`        | Resets all bits to false                                             |
+
+<h3 id="bloomfilterconfig">BloomFilterConfig</h3>
+
+Construction of a Bloom filter requires several related parameters, and some of them (bit array size, number of hash functions) are derived from others (expected elements, false positive rate). We need an object to hold these computed values so the BloomFilter can reference them without recomputing.
+
+`BloomFilterConfig` is an immutable configuration object that holds both the caller's inputs and the computed optimal parameters.
+
+| Attribute           | Type   | Description                                                    | Mutable? |
+| ------------------- | ------ | -------------------------------------------------------------- | -------- |
+| `expectedElements`  | int    | The number of elements the filter is designed for              | No       |
+| `falsePositiveRate` | double | The desired probability of false positives (e.g., 0.01 for 1%) | No       |
+| `bitArraySize`      | int    | Computed optimal bit array size (m)                            | No       |
+| `numHashFunctions`  | int    | Computed optimal number of hash functions (k)                  | No       |
+
+| Method                                                   | Description                                                   |
+| -------------------------------------------------------- | ------------------------------------------------------------- |
+| `BloomFilterConfig(expectedElements, falsePositiveRate)` | Computes and stores optimal m and k from the given parameters |
+
+All fields are read-only. Once the config is created, it never changes. This makes it safe to share across threads without synchronization.
+
+<h3 id="bloomfilter">BloomFilter</h3>
+
+This is the main class that ties everything together. It coordinates the hash strategy and bit array to provide the probabilistic membership testing API.
+
+`BloomFilter` accepts string inputs, uses a configurable hash strategy to compute k bit positions, and manages the bit array.
+
+| Attribute      | Type              | Description                                     | Mutable?                  |
+| -------------- | ----------------- | ----------------------------------------------- | ------------------------- |
+| `config`       | BloomFilterConfig | Immutable configuration with optimal parameters | No                        |
+| `bitArray`     | BitArray          | The bit storage for membership tracking         | Yes (bits are set on add) |
+| `hashStrategy` | HashStrategy      | The pluggable hash function algorithm           | No                        |
+
+| Method                  | Description                                                          |
+| ----------------------- | -------------------------------------------------------------------- |
+| `add(element)`          | Hashes the element k times and sets the corresponding bits           |
+| `mightContain(element)` | Hashes the element k times and returns true only if all bits are set |
+| `clear()`               | Resets the bit array to all zeros                                    |
+
+<h4 id="key-design-principles">Key Design Principles:</h4>
+
+1. **Single Responsibility:** BloomFilter coordinates operations but delegates hashing to HashStrategy and bit storage to BitArray.
+2. **Encapsulation:** The internal bit array and hash computations are hidden. Callers only see `add`, `mightContain`, and `clear`.
+3. **Thread Safety:** Both `add` and `mightContain` should be synchronized to prevent race conditions when multiple threads share a filter.
+
+<h3 id="bloomfilterbuilder">BloomFilter.Builder</h3>
+
+The BloomFilter has several construction parameters: expected elements (required), false positive rate (has a sensible default of 0.01), and hash strategy (has a sensible default of Murmur hashing). Rather than a constructor with many parameters, a Builder lets the caller specify only what they care about and rely on defaults for the rest. It also computes the derived values (bit array size, number of hash functions) automatically.
+
+| Method                      | Description                                                                    |
+| --------------------------- | ------------------------------------------------------------------------------ |
+| `Builder(expectedElements)` | Creates a builder with the required expected elements count                    |
+| `falsePositiveRate(rate)`   | Sets the desired false positive rate (default: 0.01)                           |
+| `hashStrategy(strategy)`    | Sets the hash function algorithm (default: MurmurHashStrategy)                 |
+| `build()`                   | Validates parameters, computes optimal m and k, and constructs the BloomFilter |
+
+<h2 id="32-key-design-patterns">3.2 Key Design Patterns</h2>
+
+This problem is data-structure-heavy: the core challenge is algorithmic, choosing the right structure and computing optimal parameters, not behavioral. Two patterns earn their place.
+
+<h3 id="hash-strategy">(Hash Strategy)</h3>
+
+**The Problem:** Hash algorithms trade off speed, distribution quality, and collision resistance. A URL blacklist checking millions of URLs per second might prioritize speed, while a spell checker might prioritize distribution quality.
+
+**The Solution:** The Strategy pattern puts a family of hash algorithms behind a common interface. The BloomFilter delegates hashing to whatever strategy it is given, so new algorithms are added as new classes instead of by editing the BloomFilter class, following the Open/Closed Principle.
+
+<h3 id="bloomfilterbuilder">(BloomFilter.Builder)</h3>
+
+**The Problem:** A BloomFilter takes a required expected element count plus an optional false positive rate and hash strategy, and it must derive the bit array size and hash function count from them. A single constructor carrying all of this is hard to read.
+
+**The Solution:** The Builder separates construction. The caller sets only the parameters they care about, and the builder validates inputs, applies defaults, and computes the derived values. `new BloomFilter.Builder(1000000).falsePositiveRate(0.001).build()` reads clearly.
+
+<h2 id="33-full-class-diagram">3.3 Full Class Diagram</h2>
+
+<h1 id="try-it-yourself-exercise">Try It Yourself (Exercise)</h1>
+
+Before reading the full implementation, try building this yourself. Below are template stubs for the classes from the design. The enums, data classes, and the demo are already written for you. The job is to fill in the core logic where the `TODO` comments appear.
+
+**Your task:** Implement every `TODO` using the design from the previous sections. When you are done, run the demo. A correct implementation produces the expected output shown below.
+
+<h1 id="4-code-implementation">4. Code Implementation</h1>
+
+Now let's translate our design into working code. We'll build bottom-up: foundational types first, then interfaces, then implementations, then the main class. This order matters because each layer depends on the ones below it.
+
+<h1 id="5-run-and-test">5. Run and Test</h1>
+
+<h1 id="6-concurrency-and-thread-safety">6. Concurrency and Thread Safety</h1>
+
+Bloom filters are commonly shared across threads. Think of a web server where multiple request-handling threads check a URL blacklist, or a database where multiple query threads check a Bloom filter before performing expensive disk lookups. These are real scenarios where concurrent access is expected.
+
+<h3 id="concern-1-concurrent-add-and-mightcontain">
+  Concern 1: Concurrent add() and mightContain()
+</h3>
+
+In a web server checking a URL blacklist, one thread might be adding newly discovered malicious URLs while another thread is checking whether an incoming request's URL is in the blacklist.
+
+<h4 id="setup">Setup</h4>
+
+Thread A adds "malicious.com" (which hashes to positions 3, 7, and 11). Thread B simultaneously checks "malicious.com".
+
+<h4 id="without-synchronization">Without synchronization:</h4>
+
+1. Thread A: Calls `add("malicious.com")`, sets bit at position 3
+2. Thread B: Calls `mightContain("malicious.com")`, checks position 3 - true
+3. Thread B: Checks position 7 - false (Thread A hasn't set it yet)
+4. Thread B: Returns `false`
+5. Thread A: Sets bit at position 7
+6. Thread A: Sets bit at position 11
+
+<h4 id="result">Result</h4>
+
+Thread B gets a false negative. "malicious.com" was being added to the filter, but the check returned false because only some of the k bits were set at the time of the check. In a safe browsing scenario, this means a known malicious URL slips through.
+
+<h4 id="with-synchronization">With synchronization:</h4>
+
+Thread A acquires the lock, sets all three bits atomically, and releases the lock. Thread B then acquires the lock, checks all three bits (all true), and returns true. No false negatives from partial writes.
+
+```java
+// Both methods are synchronized on the same BloomFilter instance
+public synchronized void add(String element) {
+    for (int i = 0; i < config.getNumHashFunctions(); i++) {
+        int position = hashStrategy.hash(element, i, config.getBitArraySize());
+        bitArray.set(position);
+    }
+}
+
+public synchronized boolean mightContain(String element) {
+    for (int i = 0; i < config.getNumHashFunctions(); i++) {
+        int position = hashStrategy.hash(element, i, config.getBitArraySize());
+        if (!bitArray.get(position)) {
+            return false;
+        }
+    }
+    return true;
+}
+```
+
+```python
+# Both methods acquire the same lock on the BloomFilter instance
+def add(self, element: str) -> None:
+    with self._lock:
+        for i in range(self._config.num_hash_functions):
+            position = self._hash_strategy.hash(element, i, self._config.bit_array_size)
+            self._bit_array.set(position)
+
+def might_contain(self, element: str) -> bool:
+    with self._lock:
+        for i in range(self._config.num_hash_functions):
+            position = self._hash_strategy.hash(element, i, self._config.bit_array_size)
+            if not self._bit_array.get(position):
+                return False
+        return True
+```
+
+```cpp
+// Both methods lock the same mutex on the BloomFilter instance
+void add(const string& element) {
+    lock_guard<mutex> lock(mtx);
+    for (int i = 0; i < config.getNumHashFunctions(); i++) {
+        int position = hashStrategy->hash(element, i, config.getBitArraySize());
+        bitArray.set(position);
+    }
+}
+
+bool mightContain(const string& element) {
+    lock_guard<mutex> lock(mtx);
+    for (int i = 0; i < config.getNumHashFunctions(); i++) {
+        int position = hashStrategy->hash(element, i, config.getBitArraySize());
+        if (!bitArray.get(position)) {
+            return false;
+        }
+    }
+    return true;
+}
+```
+
+```csharp
+// Both methods use lock(_lock) on the same BloomFilter instance
+public void Add(string element)
+{
+    lock (_lock)
+    {
+        for (var i = 0; i < _config.NumHashFunctions; i++)
+        {
+            var position = _hashStrategy.Hash(element, i, _config.BitArraySize);
+            _bitArray.Set(position);
+        }
+    }
+}
+
+public bool MightContain(string element)
+{
+    lock (_lock)
+    {
+        for (var i = 0; i < _config.NumHashFunctions; i++)
+        {
+            var position = _hashStrategy.Hash(element, i, _config.BitArraySize);
+            if (!_bitArray.Get(position))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+```
+
+```go
+// Add acquires a write lock, ensuring all k bits are set atomically
+func (bf *BloomFilter) Add(element string) {
+	bf.mu.Lock()
+	defer bf.mu.Unlock()
+
+	for i := 0; i < bf.config.NumHashFunctions(); i++ {
+		position := bf.hashStrategy.Hash(element, i, bf.config.BitArraySize())
+		bf.bitArray.Set(position)
+	}
+}
+
+// MightContain acquires a read lock, ensuring consistent reads across all k positions
+func (bf *BloomFilter) MightContain(element string) bool {
+	bf.mu.RLock()
+	defer bf.mu.RUnlock()
+
+	for i := 0; i < bf.config.NumHashFunctions(); i++ {
+		position := bf.hashStrategy.Hash(element, i, bf.config.BitArraySize())
+		if !bf.bitArray.Get(position) {
+			return false
+		}
+	}
+	return true
+}
+```
+
+```typescript
+// Our implementation is synchronous, so this concern doesn't apply.
+// All k bits are set in a single, uninterrupted loop iteration.
+add(element: string): void {
+  for (let i = 0; i < this.config.numHashFunctions; i++) {
+    const position = this.hashStrategy.hash(element, i, this.config.bitArraySize);
+    this.bitArray.set(position);
+  }
+}
+
+mightContain(element: string): boolean {
+  for (let i = 0; i < this.config.numHashFunctions; i++) {
+    const position = this.hashStrategy.hash(element, i, this.config.bitArraySize);
+    if (!this.bitArray.get(position)) {
+      return false;
+    }
+  }
+  return true;
+}
+```
+
+<h1 id="7-extensions">7. Extensions</h1>
+
+The design holds up well as new requirements arrive, because each concern lives in its own class. The hash logic sits behind `HashStrategy`, the storage sits behind `BitArray`, and the derived parameters sit in `BloomFilterConfig`. Every extension below adds new classes or fields without rewriting the existing `add` and `mightContain` logic.
+
+<h2 id="71-counting-bloom-filter-for-deletion">
+  7.1 Counting Bloom Filter for Deletion
+</h2>
+
+**Scenario:** "We need to remove elements, not just add them."
+
+A standard Bloom filter cannot support deletion. Clearing a bit during a remove would also clear it for every other element that hashed to the same position, which introduces false negatives. A Counting Bloom Filter replaces each single bit with a small counter. Adding an element increments the k counters, removing it decrements them, and a position is considered set whenever its counter is above zero. This keeps the same hashing flow used in `BloomFilter` and only swaps `BitArray` for a counter array.
+
+```java
+class CountingBloomFilter {
+    private final BloomFilterConfig config;
+    private final int[] counters;
+    private final HashStrategy hashStrategy;
+
+    public CountingBloomFilter(BloomFilterConfig config, HashStrategy hashStrategy) {
+        this.config = config;
+        this.counters = new int[config.getBitArraySize()];
+        this.hashStrategy = hashStrategy;
+    }
+
+    public synchronized void add(String element) {
+        for (int i = 0; i < config.getNumHashFunctions(); i++) {
+            int pos = hashStrategy.hash(element, i, config.getBitArraySize());
+            counters[pos]++;
+        }
+    }
+
+    public synchronized void remove(String element) {
+        for (int i = 0; i < config.getNumHashFunctions(); i++) {
+            int pos = hashStrategy.hash(element, i, config.getBitArraySize());
+            if (counters[pos] > 0) counters[pos]--;
+        }
+    }
+
+    public synchronized boolean mightContain(String element) {
+        for (int i = 0; i < config.getNumHashFunctions(); i++) {
+            int pos = hashStrategy.hash(element, i, config.getBitArraySize());
+            if (counters[pos] == 0) return false;
+        }
+        return true;
+    }
+}
+```
+
+```python
+class CountingBloomFilter:
+    def __init__(self, config, hash_strategy):
+        self.config = config
+        self.counters = [0] * config.bit_array_size
+        self.hash_strategy = hash_strategy
+
+    def add(self, element):
+        for i in range(self.config.num_hash_functions):
+            pos = self.hash_strategy.hash(element, i, self.config.bit_array_size)
+            self.counters[pos] += 1
+
+    def remove(self, element):
+        for i in range(self.config.num_hash_functions):
+            pos = self.hash_strategy.hash(element, i, self.config.bit_array_size)
+            if self.counters[pos] > 0:
+                self.counters[pos] -= 1
+
+    def might_contain(self, element):
+        for i in range(self.config.num_hash_functions):
+            pos = self.hash_strategy.hash(element, i, self.config.bit_array_size)
+            if self.counters[pos] == 0:
+                return False
+        return True
+```
+
+```cpp
+class CountingBloomFilter {
+    BloomFilterConfig config;
+    vector<int> counters;
+    HashStrategy* hashStrategy;
+public:
+    CountingBloomFilter(BloomFilterConfig config, HashStrategy* hashStrategy)
+        : config(config), counters(config.getBitArraySize(), 0), hashStrategy(hashStrategy) {}
+
+    void add(const string& element) {
+        for (int i = 0; i < config.getNumHashFunctions(); i++)
+            counters[hashStrategy->hash(element, i, config.getBitArraySize())]++;
+    }
+
+    void remove(const string& element) {
+        for (int i = 0; i < config.getNumHashFunctions(); i++) {
+            int pos = hashStrategy->hash(element, i, config.getBitArraySize());
+            if (counters[pos] > 0) counters[pos]--;
+        }
+    }
+
+    bool mightContain(const string& element) {
+        for (int i = 0; i < config.getNumHashFunctions(); i++)
+            if (counters[hashStrategy->hash(element, i, config.getBitArraySize())] == 0)
+                return false;
+        return true;
+    }
+};
+```
+
+```go
+type CountingBloomFilter struct {
+	config       BloomFilterConfig
+	counters     []int
+	hashStrategy HashStrategy
+}
+
+func (c *CountingBloomFilter) Add(element string) {
+	for i := 0; i < c.config.NumHashFunctions; i++ {
+		pos := c.hashStrategy.Hash(element, i, c.config.BitArraySize)
+		c.counters[pos]++
+	}
+}
+
+func (c *CountingBloomFilter) Remove(element string) {
+	for i := 0; i < c.config.NumHashFunctions; i++ {
+		pos := c.hashStrategy.Hash(element, i, c.config.BitArraySize)
+		if c.counters[pos] > 0 {
+			c.counters[pos]--
+		}
+	}
+}
+
+func (c *CountingBloomFilter) MightContain(element string) bool {
+	for i := 0; i < c.config.NumHashFunctions; i++ {
+		pos := c.hashStrategy.Hash(element, i, c.config.BitArraySize)
+		if c.counters[pos] == 0 {
+			return false
+		}
+	}
+	return true
+}
+```
+
+```csharp
+public class CountingBloomFilter {
+    private readonly BloomFilterConfig config;
+    private readonly int[] counters;
+    private readonly IHashStrategy hashStrategy;
+
+    public CountingBloomFilter(BloomFilterConfig config, IHashStrategy hashStrategy) {
+        this.config = config;
+        this.counters = new int[config.BitArraySize];
+        this.hashStrategy = hashStrategy;
+    }
+
+    public void Add(string element) {
+        for (int i = 0; i < config.NumHashFunctions; i++)
+            counters[hashStrategy.Hash(element, i, config.BitArraySize)]++;
+    }
+
+    public void Remove(string element) {
+        for (int i = 0; i < config.NumHashFunctions; i++) {
+            int pos = hashStrategy.Hash(element, i, config.BitArraySize);
+            if (counters[pos] > 0) counters[pos]--;
+        }
+    }
+
+    public bool MightContain(string element) {
+        for (int i = 0; i < config.NumHashFunctions; i++)
+            if (counters[hashStrategy.Hash(element, i, config.BitArraySize)] == 0)
+                return false;
+        return true;
+    }
+}
+```
+
+```typescript
+class CountingBloomFilter {
+  private counters: number[];
+
+  constructor(
+    private config: BloomFilterConfig,
+    private hashStrategy: HashStrategy,
+  ) {
+    this.counters = new Array(config.bitArraySize).fill(0);
+  }
+
+  add(element: string): void {
+    for (let i = 0; i < this.config.numHashFunctions; i++) {
+      this.counters[
+        this.hashStrategy.hash(element, i, this.config.bitArraySize)
+      ]++;
+    }
+  }
+
+  remove(element: string): void {
+    for (let i = 0; i < this.config.numHashFunctions; i++) {
+      const pos = this.hashStrategy.hash(element, i, this.config.bitArraySize);
+      if (this.counters[pos] > 0) this.counters[pos]--;
+    }
+  }
+
+  mightContain(element: string): boolean {
+    for (let i = 0; i < this.config.numHashFunctions; i++) {
+      if (
+        this.counters[
+          this.hashStrategy.hash(element, i, this.config.bitArraySize)
+        ] === 0
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+}
+```
+
+The cost is memory. Each position now needs several bits instead of one, so a typical 4-bit counter makes the structure four times larger than a plain `BitArray`. Counters can also overflow if the same position is incremented many times, so production implementations cap each counter at its maximum value and stop decrementing it once it saturates.
+
+<h2 id="72-scalable-bloom-filter-that-grows">
+  7.2 Scalable Bloom Filter That Grows
+</h2>
+
+**Scenario:** "We do not know the element count in advance, and the false positive rate climbs once we exceed the planned capacity."
+
+A fixed `BloomFilterConfig` is sized for a chosen number of elements. Once you add far more than that, the bit array fills up and the false positive rate rises past the target. A Scalable Bloom Filter handles this by keeping a list of `BloomFilter` instances. When the newest filter reaches its capacity, it adds a larger filter with a tighter false positive rate so the combined rate stays bounded. A membership check returns true if any filter reports a possible match.
+
+```java
+class ScalableBloomFilter {
+    private final List<BloomFilter> filters = new ArrayList<>();
+    private int capacityPerFilter;
+    private int countInCurrent;
+    private double currentFpRate;
+
+    public ScalableBloomFilter(int initialCapacity, double initialFpRate) {
+        this.capacityPerFilter = initialCapacity;
+        this.currentFpRate = initialFpRate;
+        addFilter();
+    }
+
+    private void addFilter() {
+        filters.add(new BloomFilter.Builder(capacityPerFilter)
+                .falsePositiveRate(currentFpRate)
+                .build());
+        countInCurrent = 0;
+    }
+
+    public synchronized void add(String element) {
+        if (countInCurrent >= capacityPerFilter) {
+            capacityPerFilter *= 2;       // grow capacity
+            currentFpRate *= 0.5;         // tighten rate so total stays bounded
+            addFilter();
+        }
+        filters.get(filters.size() - 1).add(element);
+        countInCurrent++;
+    }
+
+    public synchronized boolean mightContain(String element) {
+        for (BloomFilter f : filters) {
+            if (f.mightContain(element)) return true;
+        }
+        return false;
+    }
+}
+```
+
+```python
+class ScalableBloomFilter:
+    def __init__(self, initial_capacity, initial_fp_rate):
+        self.filters = []
+        self.capacity_per_filter = initial_capacity
+        self.current_fp_rate = initial_fp_rate
+        self.count_in_current = 0
+        self._add_filter()
+
+    def _add_filter(self):
+        self.filters.append(
+            BloomFilter.builder(self.capacity_per_filter)
+            .false_positive_rate(self.current_fp_rate)
+            .build()
+        )
+        self.count_in_current = 0
+
+    def add(self, element):
+        if self.count_in_current >= self.capacity_per_filter:
+            self.capacity_per_filter *= 2
+            self.current_fp_rate *= 0.5
+            self._add_filter()
+        self.filters[-1].add(element)
+        self.count_in_current += 1
+
+    def might_contain(self, element):
+        return any(f.might_contain(element) for f in self.filters)
+```
+
+```cpp
+class ScalableBloomFilter {
+    vector<BloomFilter> filters;
+    int capacityPerFilter;
+    int countInCurrent = 0;
+    double currentFpRate;
+
+    void addFilter() {
+        filters.push_back(BloomFilter::Builder(capacityPerFilter)
+                              .falsePositiveRate(currentFpRate)
+                              .build());
+        countInCurrent = 0;
+    }
+public:
+    ScalableBloomFilter(int initialCapacity, double initialFpRate)
+        : capacityPerFilter(initialCapacity), currentFpRate(initialFpRate) {
+        addFilter();
+    }
+
+    void add(const string& element) {
+        if (countInCurrent >= capacityPerFilter) {
+            capacityPerFilter *= 2;
+            currentFpRate *= 0.5;
+            addFilter();
+        }
+        filters.back().add(element);
+        countInCurrent++;
+    }
+
+    bool mightContain(const string& element) {
+        for (auto& f : filters)
+            if (f.mightContain(element)) return true;
+        return false;
+    }
+};
+```
+
+```go
+type ScalableBloomFilter struct {
+	filters           []*BloomFilter
+	capacityPerFilter int
+	countInCurrent    int
+	currentFpRate     float64
+}
+
+func (s *ScalableBloomFilter) addFilter() {
+	f := NewBuilder(s.capacityPerFilter).FalsePositiveRate(s.currentFpRate).Build()
+	s.filters = append(s.filters, f)
+	s.countInCurrent = 0
+}
+
+func (s *ScalableBloomFilter) Add(element string) {
+	if s.countInCurrent >= s.capacityPerFilter {
+		s.capacityPerFilter *= 2
+		s.currentFpRate *= 0.5
+		s.addFilter()
+	}
+	s.filters[len(s.filters)-1].Add(element)
+	s.countInCurrent++
+}
+
+func (s *ScalableBloomFilter) MightContain(element string) bool {
+	for _, f := range s.filters {
+		if f.MightContain(element) {
+			return true
+		}
+	}
+	return false
+}
+```
+
+```csharp
+public class ScalableBloomFilter {
+    private readonly List<BloomFilter> filters = new();
+    private int capacityPerFilter;
+    private int countInCurrent;
+    private double currentFpRate;
+
+    public ScalableBloomFilter(int initialCapacity, double initialFpRate) {
+        capacityPerFilter = initialCapacity;
+        currentFpRate = initialFpRate;
+        AddFilter();
+    }
+
+    private void AddFilter() {
+        filters.Add(new BloomFilter.Builder(capacityPerFilter)
+            .FalsePositiveRate(currentFpRate)
+            .Build());
+        countInCurrent = 0;
+    }
+
+    public void Add(string element) {
+        if (countInCurrent >= capacityPerFilter) {
+            capacityPerFilter *= 2;
+            currentFpRate *= 0.5;
+            AddFilter();
+        }
+        filters[^1].Add(element);
+        countInCurrent++;
+    }
+
+    public bool MightContain(string element) {
+        foreach (var f in filters)
+            if (f.MightContain(element)) return true;
+        return false;
+    }
+}
+```
+
+```typescript
+class ScalableBloomFilter {
+  private filters: BloomFilter[] = [];
+  private countInCurrent = 0;
+
+  constructor(
+    private capacityPerFilter: number,
+    private currentFpRate: number,
+  ) {
+    this.addFilter();
+  }
+
+  private addFilter(): void {
+    this.filters.push(
+      new BloomFilter.Builder(this.capacityPerFilter)
+        .falsePositiveRate(this.currentFpRate)
+        .build(),
+    );
+    this.countInCurrent = 0;
+  }
+
+  add(element: string): void {
+    if (this.countInCurrent >= this.capacityPerFilter) {
+      this.capacityPerFilter *= 2;
+      this.currentFpRate *= 0.5;
+      this.addFilter();
+    }
+    this.filters[this.filters.length - 1].add(element);
+    this.countInCurrent++;
+  }
+
+  mightContain(element: string): boolean {
+    return this.filters.some((f) => f.mightContain(element));
+  }
+}
+```
+
+The trade-off is lookup cost. A membership check now scans every filter in the list, so a query touches more bits as the structure grows. Halving the false positive rate at each step keeps the total bounded, because the sum of a shrinking geometric series converges.
+
+<h1 id="8-quiz">8. Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

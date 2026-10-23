@@ -1,0 +1,178 @@
+---
+title: "Name Mangling"
+readTime: "10 min read"
+lastUpdated: "June 6, 2026"
+description: "Name Mangling explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="the-rewrite-rule">The Rewrite Rule</h1>
+
+Python applies name mangling to any identifier inside a class body that starts with **two leading underscores and ends with at most one trailing underscore**. The compiler replaces the identifier with an underscore, the class name, and the original identifier:
+
+The instance dictionary doesn't contain `__balance`. It contains `_Customer__balance`. Inside the class body, both `self.__balance = balance` in `__init__` and `return self.__balance` in `show` were rewritten to use the mangled name. The class's methods read naturally; the storage key is something else.
+
+The rewrite happens at compile time, once per class. It doesn't fire on every method call; the compiler has already done the substitution by the time the class object exists. From then on, the name `__balance` only resolves correctly inside code that was compiled as part of the `Customer` class body, because that's where the substitution happened.
+
+The diagram traces the lifecycle of a double-underscore attribute. The source code uses the short name, the compiler rewrites it during class body compilation, the rewrite produces a longer name that includes the class, and the attribute lives on the instance under that longer name. There's no runtime check that says "is this attribute private"; the rewrite happens once and the longer name is a different string from then on.
+
+Some details about the rule that matter in practice:
+
+- The class name used for mangling is the **class where the source code appears**, not the runtime type of the instance. The subclass section explains why this matters.
+- Only names with **at most one trailing underscore** are mangled. `__x` and `__x_` get mangled; `__x__` doesn't.
+- The mangling is a textual transformation on identifiers. It doesn't apply to string keys or dynamic attribute access. `getattr(obj, "__balance")` will not find the mangled storage.
+
+<h1 id="why-mangling-exists-subclass-collisions">
+  Why Mangling Exists: Subclass Collisions
+</h1>
+
+The reason Python has name mangling at all isn't to provide privacy. It's to prevent a specific class of bug: a base class and a subclass independently picking the same internal attribute name and overwriting each other without any warning.
+
+Consider two classes written by different authors. The base class is part of a library; the subclass is in application code. Both happen to use `self.__id` for their own internal bookkeeping:
+
+Both classes write `self.__id`, but each one is rewritten using the name of the class where the source code lives. `Product.__init__` is in the `Product` class body, so its `self.__id` becomes `self._Product__id`. `SubscriptionProduct.__init__` is in the `SubscriptionProduct` class body, so its `self.__id` becomes `self._SubscriptionProduct__id`. The instance ends up with two separate attributes, one for each layer of the hierarchy.
+
+When `Product.show_product_id` does `return self.__id`, the lookup is for `_Product__id`, because that line of code was compiled as part of `Product`. It finds `"prod-Pro Tier"` and returns it. When `SubscriptionProduct.show_sub_id` does `return self.__id`, the lookup is for `_SubscriptionProduct__id`, because that line was compiled as part of `SubscriptionProduct`. It finds `"sub-monthly"`.
+
+The diagram shows the storage layout. A `SubscriptionProduct` instance carries both `_Product__id` and `_SubscriptionProduct__id` as separate attributes. Each method only sees the one that matches the class where it was defined. Without name mangling, the second `__init__` would overwrite the first, and `show_product_id` would return `"sub-monthly"`, which is the wrong value for the base class's purposes.
+
+This is the case that name mangling was designed for: a base class that wants to keep its internal state safe from subclass accidents. The author of `Product` doesn't have to know what attribute names `SubscriptionProduct` (or any other subclass) might use, and the author of `SubscriptionProduct` doesn't have to read the base class's source to avoid collisions. The mangling rule handles it automatically as long as both sides use the double-underscore convention.
+
+The mangling isn't asking "is this attribute private?" It's asking "which class authored this reference?" The answer determines which mangled name the code looks for, and that's what keeps the two classes' attributes from colliding.
+
+<h1 id="the-mangling-is-based-on-the-source-class-not-the-runtime-type">
+  The Mangling Is Based on the Source Class, Not the Runtime Type
+</h1>
+
+One detail is easy to get wrong: name mangling uses the **class where the source code physically appears**, not the runtime type of `self`. This is a compile-time rule, and it follows the source, not the object.
+
+`Sub` doesn't define `__data` of its own and doesn't override `reveal`. When `s.reveal()` runs, Python finds `reveal` on `Base` (because of the normal MRO walk) and executes its body. The line `return self.__data` was compiled as part of `Base`, so the mangled name embedded in the bytecode is `_Base__data`. Even though `s` is a `Sub` instance, the lookup is still for `_Base__data`, which `Base.__init__` set, so it succeeds.
+
+Now consider what happens if `Sub` writes its own `self.__data`:
+
+`Sub.__init__` writes `_Sub__data`. `Base.reveal` still looks up `_Base__data` because that's the mangled name embedded in its bytecode. The two attributes coexist on the same instance, and `reveal` returns the base's value, not the subclass's. This is what makes mangling useful as collision protection: a subclass can use any double-underscore name without disturbing the base class's storage.
+
+This is also why double-underscore names don't behave like overrides in the usual sense. Overriding a method (or a single-underscore attribute) means the subclass's version takes precedence at lookup time. Overriding a double-underscore attribute doesn't override anything; it creates a separate, parallel attribute. That difference is the point. A regular override fits when both classes refer to the same conceptual field. A double-underscore mangled name fits when both classes happen to use the same identifier for unrelated internal state.
+
+<h1 id="mangling-is-not-privacy">Mangling Is Not Privacy</h1>
+
+One limitation deserves emphasis: name mangling does not hide anything. The attribute is still on the instance, still readable, still writable. The mangled name is a different identifier, and any caller willing to type it can reach the value.
+
+The attribute is reachable. The mangled name is derived from a documented rule, and any caller who knows the rule can read or write the value. Python's design treats this as a feature, not a hole. Mangling was never meant to lock the attribute up; it exists to keep accidents from happening when two classes use the same `__name` for unrelated purposes. Locking would have required a different language design.
+
+The mangling can also be bypassed using `getattr` or `setattr` with the mangled name as a string:
+
+`getattr` and `setattr` take a string and don't apply any name mangling. They look up the name as passed in. The mangled name works through them too. There's nothing the class can do to prevent this; Python's attribute model is open by default.
+
+Normal attribute access has no overhead (mangling happens once at compile time). Writing `instance._ClassName__attr` to reach into a class's mangled state opts out of the safety the mangling offered, and the next release of that class can rename the attribute without warning. The mangled name isn't a stable API.
+
+For actual access control (preventing reads or writes, not discouraging them), Python doesn't ship a built-in tool. The closest options are `__slots__` (to forbid arbitrary new attributes), `@property` with no setter (to make a read-only attribute), or descriptors with custom `__set__` logic that raises on writes. All of those guard against specific kinds of misuse, but none of them prevent a determined caller from reaching into the instance dictionary.
+
+<h1 id="dunders-are-exempt">Dunders Are Exempt</h1>
+
+A name with two leading underscores **and** two trailing underscores is a "dunder" (double underscore on both sides). Dunders are not mangled. They're reserved by Python for the language's own protocols.
+
+`__init__` and `__str__` are stored under their written names, not under `_Product__init__` and `_Product__str__`. The trailing pair of underscores exempts them from the mangling rule.
+
+The reason for the exemption is that dunders are how Python's protocols hook into classes. The interpreter calls `cls.__init__` on instantiation, `obj.__str__` when `str(obj)` runs, `obj.__len__` when `len(obj)` runs, and so on. If those names were mangled, the interpreter would have to know each subclass's name to find them, which would break the protocol mechanism. The language carves out dunders and leaves them alone.
+
+Don't invent your own dunder names. The double-underscore-on-both-sides naming pattern is reserved for the language. New protocols (like the buffer protocol or the iterator protocol) might add dunders in the future, and a method named `__myhelper__` could collide with a name the standard library starts using. For a "private internal" name, use a single underscore for "internal" or a double leading underscore (with at most one trailing underscore) for mangled.
+
+The diagram lays out the four cases the mangling rule recognizes. Bare names are stored under their written form. Single-underscore names are also stored under their written form (the underscore is a convention, not a rewrite). Double-underscore names are rewritten to include the class. Dunders are stored under their written form because the trailing pair of underscores opts them out of the rewrite.
+
+<h1 id="when-to-use-mangling-and-when-not-to">
+  When to Use Mangling, and When Not To
+</h1>
+
+The practical question: when should a double-underscore name appear in your own code?
+
+The answer: rarely. Most Python code does fine with the single-underscore convention. Mangling adds a small barrier against accidental access from outside the class, but it also makes the attribute harder to inspect during debugging (because `vars(instance)` shows the mangled name, not the one written in source) and harder to refer to in test fixtures that might need to reach into the internal state for setup.
+
+The case where mangling pays off is **base classes that are designed to be subclassed and have internal attributes that subclasses must not overwrite**. A framework class that expects user code to inherit from it, with internal bookkeeping that the user shouldn't touch (and shouldn't be able to break by accident through picking the same attribute name), is the use case for double underscores. The mangling rewrites the attribute with the class name, so the subclass's same-spelled attribute lives elsewhere on the instance and the two never collide.
+
+Outside base classes meant for inheritance, mangling usually isn't needed. Use the single underscore. The decision laid out in a table:
+
+Two rows are worth highlighting. The third row is the use case where mangling fits: when collision risk is real, mangling is the answer. The last row is the trap: double underscores sometimes get reached for to obtain true privacy, but Python doesn't give privacy, just an awkwardly-named accessor.
+
+Python codebases tend to use double underscores sparingly. The Python standard library uses them in a few base classes (parts of `collections`, `unittest`, some abstract base classes), but for ordinary application code, the single-underscore convention does almost all the work. When in doubt, single underscore is the safer default.
+
+<h1 id="inspecting-whats-really-stored">Inspecting What's Really Stored</h1>
+
+The fastest way to understand what mangling did to a class is to look at the instance directly. `vars(instance)` returns the instance's `__dict__`, which is the literal storage that backs attribute lookups.
+
+Four attributes, three different storage rules. `order_id` and `_customer` are stored under their written names. `__total` and `__status_` are both mangled because both have two leading underscores and at most one trailing underscore. Defining `__status__` instead (two trailing underscores) would make it a dunder and exempt from mangling.
+
+`dir(instance)` shows more, including the class's methods and the dunders inherited from `object`:
+
+Filtering for the `_ClassName__` prefix isolates the mangled storage. This is a useful trick when debugging to see which attributes the class created through mangling versus which it created as plain underscore-prefixed names.
+
+To confirm the mangling rule in the REPL:
+
+`__bar` and `__baz_` are both mangled because each has at most one trailing underscore. `__qux__` has two trailing underscores, which puts it in dunder territory, so it's stored under its original name. This is the kind of quick check worth running once when learning the rule, because the trailing-underscore distinction is the easiest part to overlook.
+
+<h1 id="quiz">Quiz</h1>
+
+<h1 id="quiz-questions">Quiz Questions</h1>
+
+**Question 1: Inside a class body, which source identifier is mangled by Python's compiler?**
+
+- [x] \_\_balance
+- [ ] **balance**
+- [ ] \_balance
+- [ ] balance\_\_
+
+**Question 2: Which statement best describes why Python has name mangling?**
+
+- [ ] It makes attributes private and blocks outside access.
+- [x] It reduces accidental collisions in subclasses.
+- [ ] It speeds up instance lookup with cached names.
+- [ ] It makes overriding methods follow the MRO.
+
+**Question 3: A method defined in Base contains self.\_\_data and is called on an instance of Sub. Which attribute name does that method look up?**
+
+- [x] \_Base\_\_data, because the source is in Base.
+- [ ] \_Sub\_\_data, because self is a Sub instance.
+- [ ] \_\_data, because inheritance cancels mangling.
+- [ ] \_Base\_\_data only after normal MRO lookup fails.
+
+**Question 4: An instance created by class Vault stores an attribute assigned as self.\_\_code inside Vault. Which expression uses the actual storage key?**
+
+- [ ] getattr(vault, "\_\_code", None)
+- [x] getattr(vault, "\_Vault\_\_code")
+- [ ] vault.**dict**.get("\_\_code")
+- [ ] hasattr(vault, "\_\_code") == True
+
+**Question 5: Which double-leading-underscore identifier is not mangled when used in a class body?**
+
+- [ ] \_\_token
+- [ ] \__token_
+- [x] **init**
+- [ ] \_\_\_token
+
+**Question 6: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 7: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 8: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+<QuizCard />
+
+<CommentsSection />
+
+</LessonCard>

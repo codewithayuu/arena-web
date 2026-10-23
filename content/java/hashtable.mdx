@@ -1,0 +1,369 @@
+---
+title: "Hashtable"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Hashtable explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="what-hashtable-is-and-where-it-came-from">
+  What Hashtable Is and Where It Came From
+</h1>
+
+`Hashtable` predates the Collections Framework. The same thing happened with `Vector`. Both classes were retrofitted later to implement the modern interfaces (`Hashtable` now implements `Map`), but their original design choices came from a time when the Java team assumed a shared object should be thread-safe by default.
+
+The class lives in `java.util` and stores key-value pairs using a hash table internally, like `HashMap`. The shape of the API is almost identical:
+
+```java
+import java.util.Hashtable;
+
+public class HashtableBasics {
+    public static void main(String[] args) {
+        Hashtable<String, Integer> stock = new Hashtable<>();
+
+        stock.put("notebook", 12);
+        stock.put("pen", 40);
+        stock.put("eraser", 25);
+
+        System.out.println("Pens in stock: " + stock.get("pen"));
+        System.out.println("Total products: " + stock.size());
+        System.out.println("Has notebook? " + stock.containsKey("notebook"));
+    }
+}
+```
+
+Swapping `Hashtable` for `HashMap` in that program produces the same output. The shape of the API is the same. What's different is what happens underneath each `put` and `get` call, and what restrictions the class places on the keys and values passed in.
+
+The defaults:
+
+| Property          | Hashtable                                    | HashMap     |
+| ----------------- | -------------------------------------------- | ----------- |
+| Initial capacity  | 11                                           | 16          |
+| Load factor       | 0.75                                         | 0.75        |
+| Null keys         | Not allowed                                  | One allowed |
+| Null values       | Not allowed                                  | Allowed     |
+| Synchronization   | Every method                                 | None        |
+| Introduced in     | Java 1.0                                     | Java 1.2    |
+| Iterator behavior | Fail-fast (modern), originally `Enumeration` | Fail-fast   |
+
+The initial capacity of 11 is a holdover from the original design, which preferred prime numbers for the internal array size to spread hash codes evenly. `HashMap` later switched to powers of two because it allows faster modulo-by-mask arithmetic. The 0.75 load factor matches because both classes resize when 75% of the buckets are occupied.
+
+<h1 id="no-null-keys-no-null-values">No Null Keys, No Null Values</h1>
+
+`Hashtable` rejects `null` as either a key or a value. This is the first behavior difference that tends to surface when porting code from `HashMap` to `Hashtable` or the other way around.
+
+```java
+import java.util.Hashtable;
+
+public class NullsRejected {
+    public static void main(String[] args) {
+        Hashtable<String, Integer> stock = new Hashtable<>();
+
+        try {
+            stock.put("pen", null);
+        } catch (NullPointerException e) {
+            System.out.println("Null value rejected: " + e.getMessage());
+        }
+
+        try {
+            stock.put(null, 5);
+        } catch (NullPointerException e) {
+            System.out.println("Null key rejected: " + e.getMessage());
+        }
+    }
+}
+```
+
+Both `put` calls throw `NullPointerException` immediately. The original `Hashtable` design chose this behavior so that `get(key)` returning `null` could only mean one thing: the key isn't in the map. With `HashMap`, a `null` return from `get` is ambiguous, since it might mean the key is missing or it might mean the value stored is `null`. Telling them apart requires `containsKey`.
+
+The trade-off was clear when `Hashtable` was the only map available. Today, the `null` restriction is more of an irritant than a feature, because most code that runs on a `HashMap` will break the moment a `Hashtable` is dropped in and fed a `null` value.
+
+<h1 id="how-the-synchronization-works">How the Synchronization Works</h1>
+
+Every public method on `Hashtable` is declared `synchronized`. That keyword on a non-static method means the method acquires the lock on the `Hashtable` instance before its body runs, and releases it when the body returns. While one thread holds the lock, no other thread can enter any synchronized method on the same instance.
+
+A simplified `put` inside `Hashtable`:
+
+```java
+public synchronized V put(K key, V value) {
+    // body runs only when this thread owns the lock
+    // ...
+}
+```
+
+Every method follows the same pattern: `get`, `put`, `remove`, `size`, `containsKey`, `isEmpty`, and so on. They all acquire the same lock on the same `Hashtable` instance.
+
+This guarantees single-thread atomicity for individual operations. If thread A is inside `put`, thread B calling `get` on the same `Hashtable` waits until A is done. The internal hash array can't be observed in a half-modified state.
+
+A timeline shows the serialization:
+
+The diagram shows two threads competing for the lock. Thread A wins the race, runs its `put`, and releases the lock. Thread B, which arrived at almost the same time, waits the whole duration of A's `put` before it can start its `get`. Even though `get` doesn't modify anything, it still has to wait, because the lock guards every method without distinguishing reads from writes.
+
+A small program uses `Hashtable` from two threads and works correctly only because of that lock:
+
+```java
+import java.util.Hashtable;
+
+public class TwoThreadHashtable {
+    public static void main(String[] args) throws InterruptedException {
+        Hashtable<String, Integer> stock = new Hashtable<>();
+        stock.put("notebook", 100);
+
+        Thread reader = new Thread(() -> {
+            for (int i = 0; i < 5; i++) {
+                System.out.println("Reader sees: " + stock.get("notebook"));
+            }
+        });
+
+        Thread writer = new Thread(() -> {
+            for (int i = 0; i < 5; i++) {
+                stock.put("notebook", 100 - i);
+            }
+        });
+
+        reader.start();
+        writer.start();
+        reader.join();
+        writer.join();
+
+        System.out.println("Final stock: " + stock.get("notebook"));
+    }
+}
+```
+
+The exact intermediate values depend on thread scheduling, so the reader's lines might be different from run to run. None of the reads ever sees a corrupted state, and the final value reflects the last successful `put`. With `HashMap` instead, repeated runs under contention could occasionally land in an infinite loop inside `HashMap.get`, due to a known race condition that existed up through Java 7. `Hashtable` doesn't have that problem, because the lock prevents two threads from being inside `put` at the same time.
+
+<h1 id="where-the-synchronization-falls-short">
+  Where the Synchronization Falls Short
+</h1>
+
+Per-method synchronization is fine in theory and weak in practice for two separate reasons. The first is performance under contention. The second is that it doesn't make compound operations safe.
+
+The performance issue is the obvious one. Every read, including ones that don't change anything, takes the lock. With ten threads all calling `get` on a `Hashtable`, nine of them are blocked while the tenth runs. The hash table itself can support concurrent reads, but the lock forces them into a queue. As thread count goes up, throughput on `Hashtable` flattens and then drops, because most threads are sitting in the wait queue rather than doing work.
+
+The compound-operation issue is more subtle. Consider an inventory module that wants to decrement stock for a product, but only if the product is in the table:
+
+```java
+import java.util.Hashtable;
+
+public class CompoundBug {
+    private static final Hashtable<String, Integer> stock = new Hashtable<>();
+
+    public static void main(String[] args) {
+        stock.put("notebook", 10);
+
+        // Two threads run this method concurrently
+        decrementIfPresent("notebook");
+        decrementIfPresent("notebook");
+
+        System.out.println("Final stock: " + stock.get("notebook"));
+    }
+
+    static void decrementIfPresent(String key) {
+        if (stock.containsKey(key)) {       // (1) lock acquired and released
+            Integer current = stock.get(key); // (2) lock acquired and released
+            stock.put(key, current - 1);     // (3) lock acquired and released
+        }
+    }
+}
+```
+
+**Output (typical):**
+
+```text
+Final stock: 9
+```
+
+That looks fine. The problem only shows up when both threads run truly in parallel. The bug is that the lock is released between steps (1), (2), and (3). Two threads can both pass the `containsKey` check, both read `10`, and both write `9`. One decrement is lost. The final stock is `9` instead of `8`.
+
+The lock makes each individual call atomic. It does nothing for a sequence of calls. Wrapping the whole sequence in a `synchronized` block on the same lock is required:
+
+```java
+synchronized (stock) {
+    if (stock.containsKey(key)) {
+        Integer current = stock.get(key);
+        stock.put(key, current - 1);
+    }
+}
+```
+
+That works because `Hashtable.put`, `Hashtable.get`, and `Hashtable.containsKey` all lock on the `Hashtable` instance itself, so an external `synchronized (stock)` block uses the same lock. But now the code is as locked as before, and the per-method synchronization is doing nothing extra. The cost is paid but no benefit beyond manual locking is gained.
+
+Every `Hashtable` operation acquires and releases the instance lock. Under heavy multi-threaded read load, throughput is bounded by lock contention rather than by the hash table's actual capacity. For new code that needs concurrent access, `ConcurrentHashMap` allows multiple readers and many writers to run in parallel.
+
+<h1 id="modern-replacements">Modern Replacements</h1>
+
+Since Java 1.2, `Hashtable` has had two replacements that cover different needs. Neither is the same thing as `Hashtable`, but together they cover what `Hashtable` was trying to do.
+
+<h3 id="collectionssynchronizedmap">Collections.synchronizedMap</h3>
+
+`Collections.synchronizedMap` wraps any `Map` (typically a `HashMap`) in a synchronized adapter. The adapter holds a single lock and acquires it inside every method, just like `Hashtable`. The big difference is that any underlying map (`HashMap`, `LinkedHashMap`, `TreeMap`) can be wrapped, and the wrapper adapts it for thread safety.
+
+```java
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+
+public class SyncMapDemo {
+    public static void main(String[] args) {
+        Map<String, Integer> stock = Collections.synchronizedMap(new HashMap<>());
+
+        stock.put("notebook", 12);
+        stock.put("pen", null);            // null values allowed
+        stock.put(null, 5);                // null key allowed
+
+        System.out.println("Notebook stock: " + stock.get("notebook"));
+        System.out.println("Pen stock: " + stock.get("pen"));
+        System.out.println("Null-key value: " + stock.get(null));
+    }
+}
+```
+
+The underlying `HashMap` accepts one `null` key and any number of `null` values, and the synchronized wrapper passes those through. This is closer to "modern semantics with `Hashtable`-style synchronization."
+
+The compound-operation problem is the same. `synchronizedMap` locks each method, not each sequence. Multi-step logic still has to be wrapped in an external `synchronized` block, using the wrapper itself as the lock object. Iteration is a particular issue: hold the lock manually while iterating, or risk `ConcurrentModificationException` if another thread modifies the map mid-iteration.
+
+```java
+Map<String, Integer> stock = Collections.synchronizedMap(new HashMap<>());
+// ... populate ...
+
+synchronized (stock) {
+    for (Map.Entry<String, Integer> entry : stock.entrySet()) {
+        System.out.println(entry.getKey() + " -> " + entry.getValue());
+    }
+}
+```
+
+<h3 id="concurrenthashmap">ConcurrentHashMap</h3>
+
+`ConcurrentHashMap` arrived in Java 5 and is the modern answer for concurrent maps. It uses fine-grained locking and lock-free reads, so multiple threads can read and write in parallel without serializing on a single lock. For new code that needs a thread-safe map, `ConcurrentHashMap` is the first choice.
+
+| Use case                                                              | Pick                                   |
+| --------------------------------------------------------------------- | -------------------------------------- |
+| Single-threaded code                                                  | `HashMap`                              |
+| Legacy code that already uses `Hashtable`                             | Leave it, unless you measure a problem |
+| New thread-safe map, simple needs                                     | `ConcurrentHashMap`                    |
+| Wrap an existing non-thread-safe map for occasional concurrent access | `Collections.synchronizedMap`          |
+| Heavy read concurrency                                                | `ConcurrentHashMap`                    |
+
+<h1 id="when-youll-still-see-hashtable">When You'll Still See Hashtable</h1>
+
+`Hashtable` is effectively obsolete for new code, but it hasn't gone anywhere. It still appears in three places:
+
+The first is legacy application code, especially codebases that started in the late 1990s. An older inventory module written in Java 1.2 will use `Hashtable` for any shared map, because that was the default choice at the time. Replacing it is usually safe but requires testing, since the `null` rules are different from `HashMap`.
+
+The second is legacy APIs. A few classes in the JDK and in older libraries return or accept `Hashtable` instances directly. The most visible example is `java.util.Properties`, which extends `Hashtable<Object, Object>`. Loading a `.properties` file uses a `Hashtable` underneath. The `System.getProperties()` method also returns a `Properties` instance.
+
+```java
+import java.util.Properties;
+
+public class PropertiesDemo {
+    public static void main(String[] args) {
+        Properties config = new Properties();
+        config.setProperty("store.name", "BookCorner");
+        config.setProperty("store.currency", "USD");
+
+        System.out.println("Class: " + config.getClass().getSuperclass().getSimpleName());
+        System.out.println("Store: " + config.getProperty("store.name"));
+    }
+}
+```
+
+The output confirms that `Properties` is built on `Hashtable`. The underlying `Hashtable` API on a `Properties` instance shouldn't be used directly, but the inheritance is there.
+
+The third is JNDI (`javax.naming.InitialContext`) and a few enterprise APIs that take a `Hashtable<String, String>` for environment configuration. The signature is fixed by the API, so even modern code has to pass a `Hashtable` when calling those entry points.
+
+For everything else, `Hashtable` is a teaching artifact. Know what it is, know why it's deprecated by convention (it's not deprecated by annotation), and know which replacement to use.
+
+<h1 id="a-side-by-side-comparison">A Side-by-Side Comparison</h1>
+
+A small program that runs the same sequence on a `Hashtable` and a `HashMap` shows the behavior differences:
+
+```java
+import java.util.HashMap;
+import java.util.Hashtable;
+import java.util.Map;
+
+public class HashtableVsHashMap {
+    public static void main(String[] args) {
+        Map<String, Integer> hashtable = new Hashtable<>();
+        Map<String, Integer> hashmap = new HashMap<>();
+
+        // Same put on both
+        hashtable.put("pen", 40);
+        hashmap.put("pen", 40);
+
+        // HashMap accepts a null value; Hashtable does not
+        try {
+            hashtable.put("eraser", null);
+        } catch (NullPointerException e) {
+            System.out.println("Hashtable rejected null value");
+        }
+        hashmap.put("eraser", null);
+        System.out.println("HashMap accepted null value: " + hashmap.containsKey("eraser"));
+
+        // HashMap accepts a null key; Hashtable does not
+        try {
+            hashtable.put(null, 1);
+        } catch (NullPointerException e) {
+            System.out.println("Hashtable rejected null key");
+        }
+        hashmap.put(null, 1);
+        System.out.println("HashMap accepted null key: " + hashmap.containsKey(null));
+    }
+}
+```
+
+The same `put` call behaves differently depending on which map is on the left. The exceptions from `Hashtable` are the most common reason a port between `HashMap` and `Hashtable` fails in tests but passes a casual read.
+
+A second program shows the synchronization difference. Two threads bump a shared counter using both maps, with no external locking:
+
+```java
+import java.util.HashMap;
+import java.util.Hashtable;
+import java.util.Map;
+
+public class ContentionDemo {
+    public static void main(String[] args) throws InterruptedException {
+        runOn("Hashtable", new Hashtable<>());
+        runOn("HashMap", new HashMap<>());
+    }
+
+    static void runOn(String label, Map<String, Integer> map) throws InterruptedException {
+        map.put("hits", 0);
+
+        Runnable bump = () -> {
+            for (int i = 0; i < 1000; i++) {
+                map.put("hits", map.get("hits") + 1);
+            }
+        };
+
+        Thread t1 = new Thread(bump);
+        Thread t2 = new Thread(bump);
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+
+        System.out.println(label + " final hits: " + map.get("hits"));
+    }
+}
+```
+
+**Output (typical):**
+
+```text
+Hashtable final hits: 1247
+HashMap final hits: 1183
+```
+
+Both numbers are below `2000`, which would be the result if every increment had completed without interference. The lost-update problem is the same on both, because the `get`-then-`put` pair isn't atomic on either one. `Hashtable` protects each individual call, but not the pair. `HashMap` doesn't even protect the individual call, so the actual numbers vary more from run to run, and on rare occasions a `HashMap` race in older JVMs could leave the map in a state that crashes a subsequent `get`. Modern `HashMap` won't infinite-loop the way Java 7's version could, but the count is still wrong.
+
+`Hashtable`'s lock helps with a narrow set of failures (no corrupted internal state during a single call) but does nothing for compound operations. For concurrent work, `ConcurrentHashMap` is the appropriate tool, and it also exposes atomic helpers like `compute`, `merge`, and `putIfAbsent` that fix the lost-update problem cleanly.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

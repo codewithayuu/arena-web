@@ -1,0 +1,457 @@
+---
+title: "Security Best Practices"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "Security Best Practices explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="sql-injection-use-parameterized-queries">
+  SQL Injection: Use Parameterized Queries
+</h1>
+
+SQL injection happens when user input is concatenated directly into a SQL string. The classic example:
+
+```python
+# Anti-pattern: vulnerable to SQL injection
+import sqlite3
+
+conn = sqlite3.connect("shop.db")
+cursor = conn.cursor()
+
+email = input("Enter customer email: ")
+query = f"SELECT * FROM customers WHERE email = '{email}'"
+cursor.execute(query)
+```
+
+If the user enters `priya@example.com`, this works. If they enter `' OR '1'='1`, the query becomes `SELECT * FROM customers WHERE email = '' OR '1'='1'`, which returns every customer. Worse inputs (`'; DROP TABLE customers; --`) destroy data.
+
+**Fix:** never build SQL by concatenation. Pass the values as parameters, and let the database driver escape them.
+
+```python
+import sqlite3
+
+conn = sqlite3.connect("shop.db")
+cursor = conn.cursor()
+
+email = input("Enter customer email: ")
+cursor.execute("SELECT * FROM customers WHERE email = ?", (email,))
+results = cursor.fetchall()
+```
+
+The `?` placeholder (or `%s` in psycopg2, `:name` in some drivers) tells the driver "the next argument is a value, not SQL." The driver handles quoting, escaping, and type conversion. The placeholder syntax varies by driver:
+
+| Library                 | Placeholder | Example                                |
+| ----------------------- | ----------- | -------------------------------------- |
+| `sqlite3`               | `?`         | `cursor.execute("... = ?", (value,))`  |
+| `psycopg2` (PostgreSQL) | `%s`        | `cursor.execute("... = %s", (value,))` |
+| `mysql-connector`       | `%s`        | `cursor.execute("... = %s", (value,))` |
+| `pyodbc`                | `?`         | `cursor.execute("... = ?", value)`     |
+
+Higher-level libraries (SQLAlchemy, Django ORM, Tortoise ORM) make this even safer because they build queries from objects, so injection is structurally impossible for normal use. The rare cases where you do need raw SQL inside an ORM still use parameterized queries, never f-strings.
+
+This is a common Python security bug. The fix is mechanical: anywhere SQL meets user input, it goes through a placeholder.
+
+The decision in the middle is the whole game. Concatenation produces SQL injection. Parameterization keeps the input as data, never as code.
+
+<h1 id="command-injection-avoid-shelltrue">
+  Command Injection: Avoid shell=True
+</h1>
+
+When a Python program runs a shell command, the same risk applies one layer up. If user input ends up inside a shell string, an attacker can inject extra commands.
+
+```python
+# Anti-pattern: shell injection
+import subprocess
+
+filename = input("File to back up: ")
+subprocess.run(f"tar -czf backup.tar.gz {filename}", shell=True)
+```
+
+If the user enters `data.txt`, this works. If they enter `data.txt; rm -rf /`, the shell runs both commands. The shell parses the string before executing it, so any shell metacharacter (`;`, `&&`, `|`, `>`, backticks) gives the attacker an entry point.
+
+**Fix 1:** pass arguments as a list and skip the shell entirely. `subprocess.run` accepts a list of arguments where each item is one argv entry, no shell parsing.
+
+```python
+import subprocess
+
+filename = input("File to back up: ")
+subprocess.run(["tar", "-czf", "backup.tar.gz", filename], check=True)
+```
+
+The list form sends the arguments directly to `execve`. The filename is one argv element. Even if the user enters `; rm -rf /`, it becomes a single (very weird) filename, not two commands.
+
+**Fix 2:** if you absolutely must use a shell (because you need pipes, redirects, or shell features), quote the user input with `shlex.quote`.
+
+```python
+import shlex
+import subprocess
+
+filename = input("File to back up: ")
+safe = shlex.quote(filename)
+subprocess.run(f"tar -czf backup.tar.gz {safe} | gzip", shell=True)
+```
+
+`shlex.quote` wraps the value in single quotes and escapes any single quotes inside it, so the shell sees one literal argument. This is acceptable but easy to get wrong; prefer the list form whenever possible.
+
+The rule of thumb: `subprocess.run([...])` without `shell=True` is the default. Use `shell=True` only when you need shell features, and even then, never let raw user input touch the command string.
+
+`shell=True` also makes commands slower (spinning up a shell), less portable (Windows shell differs from POSIX), and harder to debug (you get the shell's error messages, not the command's). The list form is faster, safer, and clearer.
+
+<h1 id="path-traversal-validate-paths">Path Traversal: Validate Paths</h1>
+
+When a program opens a file whose name comes from user input, an attacker can use `..` to escape the intended directory.
+
+```python
+# Anti-pattern: path traversal
+from pathlib import Path
+
+UPLOADS = Path("/var/uploads")
+
+filename = input("Filename: ")
+path = UPLOADS / filename
+data = path.read_bytes()
+```
+
+If the user enters `report.pdf`, this reads `/var/uploads/report.pdf`. If they enter `../../etc/passwd`, it reads `/etc/passwd`. The `/` operator doesn't reject `..` parts, and `Path` won't either; the code has to validate.
+
+**Fix:** resolve the candidate path, then check that it's still inside the intended directory.
+
+```python
+from pathlib import Path
+
+UPLOADS = Path("/var/uploads").resolve()
+
+def safe_read(filename: str) -> bytes:
+    candidate = (UPLOADS / filename).resolve()
+    if not candidate.is_relative_to(UPLOADS):
+        raise ValueError(f"Path escape attempt: {filename}")
+    return candidate.read_bytes()
+```
+
+`resolve()` collapses `..` components and symlinks into an absolute path. `is_relative_to` (added in Python 3.9) checks whether the resolved path is still under `UPLOADS`. If not, the input was trying to escape.
+
+For older Python versions (or extra defense in depth), compare path strings directly:
+
+```python
+candidate = (UPLOADS / filename).resolve()
+if not str(candidate).startswith(str(UPLOADS) + "/"):
+    raise ValueError("Path escape attempt")
+```
+
+Don't forget the trailing slash, or `/var/uploads-public` would match `/var/uploads`.
+
+A common related mistake is allowing absolute paths from input. If the user enters `/etc/passwd`, then `UPLOADS / "/etc/passwd"` resolves to `/etc/passwd` because `/` joined with an absolute path discards the left side. Validate that the input doesn't start with `/`, or use `os.path.basename` to keep only the filename.
+
+<h1 id="pickle-and-untrusted-data">Pickle and Untrusted Data</h1>
+
+`pickle.loads` reconstructs Python objects from a byte stream. The format is powerful enough to execute arbitrary code during deserialization, by design. That makes pickle the wrong choice for any data that came from outside your program.
+
+```python
+# Anti-pattern: pickle on untrusted input
+import pickle
+
+data = request.body              # bytes from an HTTP request
+obj = pickle.loads(data)         # attacker controls obj
+```
+
+A malicious payload can contain a `__reduce__` directive that runs `os.system("rm -rf /")` (or anything else) when `pickle.loads` is called. There's no sandbox. The Python docs say it directly: "Never unpickle data received from an untrusted or unauthenticated source."
+
+**Fix:** for any data that came from a network, a user, or a file the user can edit, use a format that doesn't execute code:
+
+| Need                            | Use this                                                      |
+| ------------------------------- | ------------------------------------------------------------- |
+| Human-readable, structured data | `json`                                                        |
+| Compact binary                  | `msgpack`, `protobuf`, `flatbuffers`                          |
+| Python literals only            | `ast.literal_eval` for input strings                          |
+| Schema validation               | `pydantic`, `attrs`, `dataclasses` with explicit construction |
+
+```python
+import json
+
+data = request.body
+obj = json.loads(data)         # safe; can't execute code
+```
+
+Pickle is fine for trusted, internal use: caching computed results to disk in a directory only your program writes to, sending objects between processes you control via `multiprocessing`. Anywhere the bytes could have come from someone else, switch to JSON or a schema-validated format.
+
+The same warning applies to `yaml.load` (use `yaml.safe_load` instead), `marshal`, `shelve`, and any other "load a Python object from bytes" function.
+
+<h1 id="eval-and-exec-on-user-input">eval and exec on User Input</h1>
+
+From a security angle, `eval` on user input is remote code execution. Any input is a vector.
+
+```python
+# Anti-pattern: gives the attacker arbitrary code execution
+user_filter = input("Filter expression: ")
+result = eval(user_filter)
+```
+
+A user typing `__import__('os').system('cat /etc/shadow')` runs that. There is no safe way to sanitize the input; expression grammars are too rich to filter reliably.
+
+**Fix:** the same options as the pickle case. If you need a number, parse a number. If you need a list, parse JSON. If you need a limited expression language (a search query, a math formula), build a real parser with a whitelist, or use a library like `simpleeval` that limits what's allowed.
+
+```python
+import ast
+
+raw = input("Cart sizes: ")
+sizes = ast.literal_eval(raw)
+if not isinstance(sizes, list) or not all(isinstance(s, int) for s in sizes):
+    raise ValueError("Expected a list of integers")
+```
+
+`ast.literal_eval` only accepts literals. Any function call, attribute access, or name lookup raises `ValueError`. That's enough for most "let the user type a small data structure" use cases.
+
+<h1 id="random-for-tokens-use-secrets-instead">
+  random for Tokens: Use secrets Instead
+</h1>
+
+The `random` module is a pseudo-random number generator (Mersenne Twister by default) designed for simulations, games, and statistical sampling. It is **not** cryptographically secure. Given a few outputs, the internal state can be recovered, so tokens generated with `random` are predictable.
+
+```python
+# Anti-pattern: predictable tokens
+import random
+import string
+
+def make_password_reset_token():
+    return "".join(random.choices(string.ascii_letters + string.digits, k=32))
+```
+
+An attacker who sees a few previous tokens can compute the next one. For a password reset link, that means hijacking accounts.
+
+**Fix:** use the `secrets` module (Python 3.6+). It draws from the operating system's cryptographic random source and is designed for tokens, passwords, and keys.
+
+```python
+import secrets
+
+def make_password_reset_token() -> str:
+    return secrets.token_urlsafe(32)   # 32 random bytes, URL-safe base64
+
+def make_api_key() -> str:
+    return secrets.token_hex(32)       # 64-character hex string
+```
+
+The `secrets` module also has `secrets.compare_digest(a, b)` for comparing tokens without leaking length information through timing. If you compare tokens with `==`, the comparison short-circuits on the first mismatched byte, which an attacker can measure to recover the token byte by byte.
+
+```python
+# Anti-pattern: timing attack on token comparison
+if user_token == expected_token: ...
+
+# Fix
+import secrets
+if secrets.compare_digest(user_token, expected_token): ...
+```
+
+The rule is binary: any random value that an attacker shouldn't be able to guess (tokens, session IDs, password reset links, API keys, encryption nonces, salts) comes from `secrets`. Everything else (dice, shuffled playlists, simulation seeds) can use `random`.
+
+<h1 id="secrets-in-code">Secrets in Code</h1>
+
+A significant share of "security incidents" trace back to a single line: an API key, database password, or signing secret committed to a git repository.
+
+```python
+# Anti-pattern: secret in source code
+STRIPE_API_KEY = "sk_live_4eC39HqLyjWDarjtT1zdp7dc"
+DATABASE_URL = "postgres://admin:hunter2@db.example.com/orders"
+```
+
+Once committed, the secret is in the repository's history forever, even if a later commit removes it. Anyone with read access (CI logs, forks, leaked backups, public repositories) has it.
+
+**Fix:** read secrets from environment variables, a secrets manager, or a config file outside source control.
+
+```python
+import os
+
+STRIPE_API_KEY = os.environ["STRIPE_API_KEY"]
+DATABASE_URL = os.environ["DATABASE_URL"]
+```
+
+`os.environ["X"]` raises `KeyError` if the variable is missing, which is the desired behavior; the program fails fast instead of running with empty credentials. For optional values, `os.environ.get("X", default)` is the pattern.
+
+For local development, a `.env` file plus `python-dotenv` is the common shape:
+
+```python
+from dotenv import load_dotenv
+import os
+
+load_dotenv()  # reads .env file in the project root
+STRIPE_API_KEY = os.environ["STRIPE_API_KEY"]
+```
+
+The `.env` file goes in `.gitignore` and never gets committed. A `.env.example` with the variable names (but no values) tells future developers what to set.
+
+For production, real secret managers (AWS Secrets Manager, GCP Secret Manager, HashiCorp Vault, Doppler) replace the `.env` file. The Python code stays the same: read from an environment variable, the secret manager injects the value.
+
+Two tools that catch this anti-pattern:
+
+- **`detect-secrets`** scans for accidental secrets in code; add it to a pre-commit hook.
+- **GitHub secret scanning** notifies you when a recognized secret is pushed, and can auto-revoke certain providers' keys.
+
+If a secret does end up in git, rotate it immediately. Removing the commit doesn't help; assume it's compromised, generate a new one, and revoke the old one through the provider's console.
+
+<h1 id="dependency-vulnerabilities">Dependency Vulnerabilities</h1>
+
+Most Python projects depend on dozens of third-party packages, and a vulnerability in any of them is a vulnerability in your project. The 2017 Equifax breach happened because of an unpatched dependency. The fixes are well-understood, but they require running scanners regularly.
+
+```text
+# Find known vulnerabilities in installed packages
+pip install pip-audit
+pip-audit
+
+# Alternative: safety
+pip install safety
+safety check
+```
+
+`pip-audit` is the PyPA's official tool; `safety` is the older third-party option. Both check the installed packages (or a `requirements.txt`) against the Python Packaging Advisory Database. A report looks like this:
+
+```text
+Found 1 known vulnerability in 1 package
+Name      Version  ID                  Fix Versions
+requests  2.19.0   GHSA-xxxx-xxxx-xxxx  2.20.0,2.20.1
+```
+
+The fix is to upgrade the package. In a CI pipeline, the scan runs on every commit and fails the build when vulnerabilities are found.
+
+For long-term dependency hygiene:
+
+1. **Pin versions in production.** Use `pip-tools` to generate a fully resolved `requirements.txt` with exact versions. The same versions get installed everywhere; issues surface in development, not production.
+2. **Use a dependency dashboard.** GitHub's Dependabot, Renovate, or Snyk open pull requests when dependencies have updates, so you upgrade on a schedule instead of in a panic.
+3. **Watch out for typosquatting.** Packages with names like `python-requests` (instead of `requests`) or `urlib3` (instead of `urllib3`) appear on PyPI from time to time and steal credentials. Copy package names from the official documentation, not from search results.
+4. **Audit what you're installing.** A package with three downloads a week and no recent commits is a higher risk than one with a million downloads and an active team. `pypi-stats` and the package's PyPI page tell you both.
+
+<h1 id="https-and-tls">HTTPS and TLS</h1>
+
+Network calls in production should always go over HTTPS. The `requests`, `httpx`, and `urllib3` libraries all do this correctly by default, and they verify TLS certificates by default. The mistake to avoid is disabling those checks.
+
+```python
+# Anti-pattern: ignores certificate errors
+import requests
+response = requests.get("https://api.example.com/orders", verify=False)
+```
+
+`verify=False` accepts any certificate, including ones signed by an attacker. A network adversary can intercept the connection, present their own cert, and read or modify the response. The library prints a warning, which is easy to dismiss.
+
+**Fix:** keep `verify=True` (the default). If the server uses a self-signed or internal CA, point `verify` at the CA bundle:
+
+```python
+response = requests.get(
+    "https://internal.example.com/orders",
+    verify="/etc/ssl/certs/internal-ca.pem",
+)
+```
+
+For client certificates (mutual TLS), pass the cert pair:
+
+```python
+response = requests.get(
+    "https://api.example.com/orders",
+    cert=("/etc/ssl/certs/client.pem", "/etc/ssl/private/client.key"),
+)
+```
+
+The same rule applies one layer down: when writing a server, configure TLS through a reverse proxy (nginx, Caddy) or a managed load balancer (AWS ALB, GCP Load Balancer). Terminating TLS in pure Python is possible (`ssl.SSLContext`) but easy to misconfigure; dedicated tools handle the cipher list, the key rotation, and the OCSP stapling.
+
+<h1 id="static-analysis-bandit-and-semgrep">
+  Static Analysis: Bandit and Semgrep
+</h1>
+
+Some security bugs can be found by reading the code. Tools that do this automatically catch a lot of low-hanging fruit before the code ships.
+
+**Bandit** scans Python code for known security anti-patterns: `eval`, `exec`, weak crypto, hardcoded passwords, `subprocess` with `shell=True`, unsafe deserialization, and dozens more. It runs in seconds.
+
+```text
+pip install bandit
+bandit -r src/
+```
+
+A typical report points at the file, line, severity, and rule:
+
+```text
+Issue: [B602:subprocess_popen_with_shell_equals_true] subprocess call with shell=True
+Severity: High   Confidence: High
+File: src/backup.py:14
+13     filename = request.args["file"]
+14     subprocess.run(f"tar -czf backup.tar.gz {filename}", shell=True)
+```
+
+**Semgrep** is a more general pattern-matching tool with a large library of Python security rules. It catches a broader set of bugs (SQL injection patterns, missing CSRF tokens, XSS in templates) and is easy to extend with custom rules.
+
+```text
+pip install semgrep
+semgrep --config p/python --config p/security-audit src/
+```
+
+Both tools fit into a pre-commit hook and a CI pipeline. They produce false positives, so the workflow is "scan, triage, fix the real ones, suppress the noise with explicit comments." For the ones you intentionally accept, add a `# nosec` or `# nosemgrep` comment with a reason.
+
+<h1 id="owasp-top-10-mapping">OWASP Top 10 Mapping</h1>
+
+The OWASP Top 10 is the industry's shorthand for the most common web application security risks. The 2021 list maps cleanly to the Python anti-patterns above.
+
+| OWASP category                            | Python manifestations                                                             | Fix                                                                                                |
+| ----------------------------------------- | --------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| A01: Broken Access Control                | Missing auth checks, path traversal, IDOR (insecure direct object reference)      | Validate authorization on every request; validate paths; never trust client-supplied IDs           |
+| A02: Cryptographic Failures               | `random` for tokens, weak hashes (MD5, SHA-1), hardcoded keys                     | Use `secrets`, use `hashlib.sha256` or `bcrypt`/`argon2` for passwords, load keys from environment |
+| A03: Injection                            | SQL injection, command injection, NoSQL injection, LDAP injection                 | Parameterized queries, list-form subprocess, escape user input at the boundary                     |
+| A04: Insecure Design                      | Missing rate limits, no audit logging, trust boundaries unclear                   | Threat model the design; assume input is hostile; log security-relevant events                     |
+| A05: Security Misconfiguration            | `DEBUG=True` in prod, default credentials, overly permissive CORS, `verify=False` | Strict prod config; remove defaults; least-privilege CORS; verify TLS                              |
+| A06: Vulnerable Components                | Outdated packages, dependency typosquatting                                       | `pip-audit`, Dependabot, pin versions, audit unknown packages                                      |
+| A07: Auth and Session Failures            | Predictable session tokens, plaintext password storage, weak password policies    | `secrets.token_urlsafe`, `bcrypt`/`argon2`, strong password requirements                           |
+| A08: Software and Data Integrity Failures | `pickle.loads` on untrusted data, missing package signatures, CI poisoning        | JSON / msgpack instead of pickle, sign artifacts, lock CI to specific commit SHAs                  |
+| A09: Logging and Monitoring Failures      | No logs for auth attempts, no alerts on suspicious activity                       | Structured logging, log auth events, alert on patterns (e.g., failed logins)                       |
+| A10: SSRF                                 | A server that fetches a URL the user supplied, with no validation                 | Allowlist hostnames, block private IP ranges, use a proxy that enforces both                       |
+
+Most of these are not framework-specific. Django, Flask, FastAPI, and pure-`stdlib` programs all hit the same set of risks. The frameworks each have docs sections on hardening (Django's `manage.py check --deploy`, FastAPI's `OAuth2PasswordBearer`); reading them is part of shipping the framework.
+
+Three OWASP items shown in code:
+
+```python
+# A02: Use bcrypt or argon2 for password storage, not raw hashes.
+import bcrypt
+
+def hash_password(plaintext: str) -> bytes:
+    return bcrypt.hashpw(plaintext.encode(), bcrypt.gensalt())
+
+def verify_password(plaintext: str, stored: bytes) -> bool:
+    return bcrypt.checkpw(plaintext.encode(), stored)
+```
+
+```python
+# A05: Disable DEBUG and any verbose error pages before deploying.
+import os
+DEBUG = os.environ.get("ENV") == "development"
+```
+
+```python
+# A10: Validate user-supplied URLs before fetching them server-side.
+from urllib.parse import urlparse
+
+ALLOWED_HOSTS = {"images.example.com", "cdn.example.com"}
+
+def fetch_image(url: str) -> bytes:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Bad scheme")
+    if parsed.hostname not in ALLOWED_HOSTS:
+        raise ValueError("Disallowed host")
+    response = requests.get(url, timeout=5)
+    return response.content
+```
+
+The pattern across all three is the same: validate at the boundary, use the standard library or a vetted package for the cryptographic part, fail closed when the input doesn't fit the rules.
+
+Adding security checks slows individual requests by a few microseconds to a few milliseconds. The cost of the missing check is an incident response, not a slow endpoint. Security work pays off in disasters that didn't happen.
+
+<h1 id="a-security-workflow">A Security Workflow</h1>
+
+Security isn't a one-time pass over the code; it's a workflow that runs continuously.
+
+The loop in the diagram is the practical version of "security-as-process." Static analysis catches the easier issues, dependency audits catch the high-impact transitive bugs, code review catches design-level issues, tests confirm specific behaviors, and monitoring catches the things that slipped through. When an incident happens, rotate and patch, then feed the lesson back into the linter rules and the code review checklist.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

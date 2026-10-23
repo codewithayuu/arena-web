@@ -1,0 +1,774 @@
+---
+title: "Executor Framework"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Executor Framework explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+The running example uses `Runnable` tasks so the API stays in focus.
+
+<h1 id="why-use-an-executor-not-raw-threads">
+  Why Use an Executor, Not Raw Threads
+</h1>
+
+A program that calls `new Thread(task).start()` for every job is doing too much work and getting too little control. It creates a thread per task (expensive), it has no way to limit how many threads run at once (dangerous), it has no way to wait for a batch of work to finish (awkward), and it has no clean way to shut down. The framework replaces all of that with two ideas: submit a task, and let something else decide how to run it.
+
+```java
+public class RawThreadsHurt {
+    public static void main(String[] args) {
+        for (int orderId = 1; orderId <= 3; orderId++) {
+            final int id = orderId;
+            new Thread(() -> System.out.println("Confirming order " + id + " on " + Thread.currentThread().getName())).start();
+        }
+    }
+}
+```
+
+Three orders, three brand-new threads. None of them gets reused. There's no central place to ask "are all orders done yet?" The order of the output is also non-deterministic, so on another run the lines could come out in a different order or the thread names could shift. Contrast that with the executor version:
+
+```java
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+public class ExecutorReplaces {
+    public static void main(String[] args) throws InterruptedException {
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+
+        for (int orderId = 1; orderId <= 3; orderId++) {
+            final int id = orderId;
+            pool.submit(() -> System.out.println("Confirming order " + id + " on " + Thread.currentThread().getName()));
+        }
+
+        pool.shutdown();
+        pool.awaitTermination(5, TimeUnit.SECONDS);
+    }
+}
+```
+
+Same three orders, only two threads. The first two tasks each grab a worker. The third task waits for one of the workers to come free, then runs on it. The structural point for now: a pool plus a submit-and-shutdown protocol is the basic shape of every executor program.
+
+The diagram shows the model. Application code drops tasks into a queue. A small fixed set of workers picks them off and runs them. The threads are never wired up, named, or joined manually. The framework owns that wiring; the application owns the tasks and the lifecycle.
+
+<h1 id="the-executor-interface">The Executor Interface</h1>
+
+`java.util.concurrent.Executor` is the lowest layer of the API. It has exactly one method:
+
+```text
+void execute(Runnable command)
+```
+
+That's the whole contract. Hand it a `Runnable`, and the executor runs the runnable at some point, on some thread, in some manner of its choosing. The interface doesn't promise the task runs immediately, doesn't promise it runs on a different thread, doesn't promise concurrency at all. A legal `Executor` is one that runs every task on the calling thread:
+
+```java
+import java.util.concurrent.Executor;
+
+public class SameThreadExecutor {
+    public static void main(String[] args) {
+        Executor inline = command -> command.run();
+
+        inline.execute(() -> System.out.println("Order confirmed on " + Thread.currentThread().getName()));
+        System.out.println("After execute on " + Thread.currentThread().getName());
+    }
+}
+```
+
+The lambda assigned to `inline` satisfies the `Executor` interface (one abstract method, takes a `Runnable`). Its implementation calls `command.run()` synchronously on the caller's thread. The runnable prints first, and only then does control return to `main` to print the second line. That's a legitimate executor, though not a useful one for real work.
+
+In practice, the bare `Executor` interface is rarely used directly. The pool implementations all expose `ExecutorService`, which extends `Executor` with the methods used in real code. The reason `Executor` exists as a separate interface is that some libraries accept the small contract on purpose, so they can be handed either a pool, an inline runner, or something exotic without depending on the wider API.
+
+<h1 id="executorservice-the-practical-api">
+  ExecutorService: The Practical API
+</h1>
+
+`ExecutorService` extends `Executor` with lifecycle management, task submission methods that return a `Future`, and bulk-submission helpers. The methods fall into three groups:
+
+| Group        | Methods                                             | Purpose                                                |
+| ------------ | --------------------------------------------------- | ------------------------------------------------------ |
+| Submit       | `submit(Runnable)`, `submit(Callable<T>)`           | Hand off a task, get a `Future` to track it            |
+| Bulk submit  | `invokeAll(tasks)`, `invokeAny(tasks)`              | Submit a collection, wait for all (or one) to finish   |
+| Lifecycle    | `shutdown()`, `shutdownNow()`, `awaitTermination()` | Stop accepting tasks, stop running tasks, wait for end |
+| State checks | `isShutdown()`, `isTerminated()`                    | Ask the service where it is in its lifecycle           |
+
+The submit and bulk-submit methods return `Future` objects. For this lesson the `Runnable` overload of `submit` is used, which returns a `Future<?>` whose only useful operation is "wait until the task finishes" or "check if it threw an exception." The lifecycle methods are the load-bearing pieces of the rest of this chapter.
+
+```java
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+public class FirstSubmissions {
+    public static void main(String[] args) throws InterruptedException {
+        ExecutorService pool = Executors.newFixedThreadPool(3);
+
+        pool.submit(() -> sendConfirmationEmail(1001));
+        pool.submit(() -> sendConfirmationEmail(1002));
+        pool.submit(() -> sendConfirmationEmail(1003));
+        pool.submit(() -> sendConfirmationEmail(1004));
+
+        pool.shutdown();
+        pool.awaitTermination(5, TimeUnit.SECONDS);
+
+        System.out.println("All confirmations sent.");
+    }
+
+    static void sendConfirmationEmail(int orderId) {
+        System.out.println("Sending email for order " + orderId + " on " + Thread.currentThread().getName());
+        try {
+            Thread.sleep(200);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+}
+```
+
+Four orders, three workers. The first three each pick up an order and start the (simulated) email send. When `pool-1-thread-1` finishes its 200 ms sleep, it picks up the fourth order. The exact thread names won't always match the example, because the scheduler decides which worker grabs the queued task, but the pattern is stable: workers churn through the queue until it's empty.
+
+`submit` always returns a `Future`, even for `Runnable` tasks where the value is always `null`. Allocating that future has a small cost compared to bare `execute`. When completion, exceptions, or cancellation don't matter, `execute` is slightly cheaper. In real code, the safety of being able to inspect failures usually wins.
+
+The `submit` versus `execute` choice is worth pausing on. With `execute`, if the runnable throws an exception, it's reported to the pool's `UncaughtExceptionHandler` (or printed to stderr by default), and the rest of the program never sees it. With `submit`, the exception is captured in the `Future`, and calling `future.get()` rethrows it as the cause of an `ExecutionException`. For order processing, that visibility matters: knowing which order failed is more useful than knowing that something failed somewhere.
+
+<h1 id="the-executors-factory-class">The Executors Factory Class</h1>
+
+Constructing a pool with `new ThreadPoolExecutor(...)` directly is rare. The `Executors` class has static factory methods that build the common pool shapes. The ones to know:
+
+| Factory method                                 | What you get                                                           |
+| ---------------------------------------------- | ---------------------------------------------------------------------- |
+| `newFixedThreadPool(n)`                        | A pool with exactly `n` threads, an unbounded queue                    |
+| `newCachedThreadPool()`                        | Threads created on demand, idle threads die after 60 seconds, no queue |
+| `newSingleThreadExecutor()`                    | One worker thread, an unbounded queue (tasks run in submission order)  |
+| `newScheduledThreadPool(n)`                    | A pool that supports delayed and periodic tasks                        |
+| `newVirtualThreadPerTaskExecutor()` (Java 21+) | A new virtual thread for every task                                    |
+
+For most order-processing work, `newFixedThreadPool` is a sensible starting point.
+
+```java
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+public class FactoryShapes {
+    public static void main(String[] args) throws InterruptedException {
+        ExecutorService fixed = Executors.newFixedThreadPool(2);
+        ExecutorService single = Executors.newSingleThreadExecutor();
+
+        fixed.submit(() -> System.out.println("[fixed] order 1 on " + Thread.currentThread().getName()));
+        fixed.submit(() -> System.out.println("[fixed] order 2 on " + Thread.currentThread().getName()));
+        fixed.submit(() -> System.out.println("[fixed] order 3 on " + Thread.currentThread().getName()));
+
+        single.submit(() -> System.out.println("[single] email 1 on " + Thread.currentThread().getName()));
+        single.submit(() -> System.out.println("[single] email 2 on " + Thread.currentThread().getName()));
+
+        fixed.shutdown();
+        single.shutdown();
+        fixed.awaitTermination(5, TimeUnit.SECONDS);
+        single.awaitTermination(5, TimeUnit.SECONDS);
+    }
+}
+```
+
+The fixed pool spreads three tasks across two workers. The single-thread executor runs both of its tasks on the same worker (`pool-2-thread-1`) in submission order, because that's its whole job: serial execution with a queue in front. A single-thread executor fits a sequence of tasks that must not overlap, like writing audit lines to a single log file.
+
+Both `newFixedThreadPool` and `newSingleThreadExecutor` use an unbounded queue. If tasks arrive faster than the pool can drain them, the queue grows without limit and the JVM eventually runs out of heap. In production, prefer a bounded queue (via the `ThreadPoolExecutor` constructor) so the pool refuses excess work explicitly rather than buffering it forever.
+
+The cached pool is a different beast. It creates threads on demand and lets them die after 60 seconds of idle time. It works well for short, bursty, mostly-IO tasks. It works poorly for steady high-throughput workloads, because there's no upper bound on the number of threads it can spawn. A misconfigured cached pool can turn one second of traffic into a thousand live threads. For order processing under load, the fixed pool's predictable thread count is almost always the better default.
+
+<h1 id="submitting-order-confirmation-tasks">
+  Submitting Order-Confirmation Tasks
+</h1>
+
+A more realistic shape. An online store places an order and needs three things to happen: an email to the customer, an SMS to the customer's phone, and an entry written to an audit log. Each is independent. Each takes a moment because it's a network call. A pool with three workers can do all three in parallel, then the main thread can move on.
+
+```java
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+public class OrderConfirmationPipeline {
+
+    public static void main(String[] args) throws InterruptedException {
+        ExecutorService pool = Executors.newFixedThreadPool(3);
+
+        long start = System.currentTimeMillis();
+
+        for (int orderId = 5001; orderId <= 5003; orderId++) {
+            int id = orderId;
+            pool.submit(() -> sendEmail(id));
+            pool.submit(() -> sendSms(id));
+            pool.submit(() -> writeAudit(id));
+        }
+
+        pool.shutdown();
+        pool.awaitTermination(10, TimeUnit.SECONDS);
+
+        long elapsed = System.currentTimeMillis() - start;
+        System.out.println("All 9 confirmation tasks finished in " + elapsed + " ms.");
+    }
+
+    static void sendEmail(int orderId) {
+        sleep(150);
+        System.out.println("Email sent for order " + orderId);
+    }
+
+    static void sendSms(int orderId) {
+        sleep(120);
+        System.out.println("SMS sent for order " + orderId);
+    }
+
+    static void writeAudit(int orderId) {
+        sleep(80);
+        System.out.println("Audit logged for order " + orderId);
+    }
+
+    static void sleep(int ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+}
+```
+
+Nine tasks, three workers, and the whole batch finishes in about half a second. The exact order varies between runs because the scheduler decides which task starts on which worker. What is stable is that each order's audit log appears before its SMS, which appears before its email, because the audit job sleeps the least and finishes first when all three run together. If the calls were sequential on a single thread, the same nine tasks would take about nine times 117 ms (the average), which is over a second. Spreading them across three workers cuts the wall-clock time to one-third.
+
+Each placed order fans out to three tasks. They sit briefly in the executor's queue, then three workers pick them up and run them in parallel. The customer-facing thread (the one that called `placeOrder`) doesn't wait for the tasks; it returns immediately and lets the workers finish on their own time. The shutdown step at the end of `main` is what guarantees the program waits for the workers before exiting.
+
+<h1 id="invokeall-and-invokeany">invokeAll and invokeAny</h1>
+
+When a batch of tasks should be submitted as a unit, the bulk-submit methods are cleaner than a loop of `submit` calls. They take a `Collection<Callable<T>>` and block until the batch reaches the requested state.
+
+`invokeAll` submits every task and blocks until they all finish (or are cancelled). It returns a `List<Future<T>>` in the same order as the input collection, so each task's result can be read out by index.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+
+public class InvokeAllDemo {
+
+    public static void main(String[] args) throws InterruptedException, ExecutionException {
+        ExecutorService pool = Executors.newFixedThreadPool(3);
+
+        List<Callable<String>> tasks = new ArrayList<>();
+        tasks.add(() -> confirm(5001));
+        tasks.add(() -> confirm(5002));
+        tasks.add(() -> confirm(5003));
+
+        List<Future<String>> results = pool.invokeAll(tasks);
+
+        for (Future<String> f : results) {
+            System.out.println(f.get());
+        }
+
+        pool.shutdown();
+        pool.awaitTermination(5, TimeUnit.SECONDS);
+    }
+
+    static String confirm(int orderId) throws InterruptedException {
+        Thread.sleep(100);
+        return "Order " + orderId + " confirmed";
+    }
+}
+```
+
+`invokeAll` doesn't return until all three tasks have either finished or been cancelled. After it returns, every future in the list is done, so calling `get` on them in a loop never blocks for long. The output preserves input order even though the tasks themselves ran in parallel.
+
+`invokeAny` is the inverse. It submits every task and returns the result of the first one that finishes successfully, cancelling the rest. It fits when several ways exist to answer the same question and only one answer is needed. A common shape is querying two regional pricing services and accepting whichever responds first.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+public class InvokeAnyDemo {
+
+    public static void main(String[] args) throws InterruptedException, ExecutionException {
+        ExecutorService pool = Executors.newFixedThreadPool(3);
+
+        List<Callable<String>> regionalPriceLookups = new ArrayList<>();
+        regionalPriceLookups.add(() -> lookupPrice("us-east", 200));
+        regionalPriceLookups.add(() -> lookupPrice("us-west", 80));
+        regionalPriceLookups.add(() -> lookupPrice("eu-central", 150));
+
+        String firstAnswer = pool.invokeAny(regionalPriceLookups);
+        System.out.println("Got: " + firstAnswer);
+
+        pool.shutdown();
+        pool.awaitTermination(5, TimeUnit.SECONDS);
+    }
+
+    static String lookupPrice(String region, int latencyMs) throws InterruptedException {
+        Thread.sleep(latencyMs);
+        return region + " says $49.99";
+    }
+}
+```
+
+`us-west` sleeps for 80 ms, the others for 150 and 200. `invokeAny` returns the moment `us-west` finishes, and the other two tasks are cancelled. If the fastest task throws an exception, `invokeAny` retries with the next finisher; only if every task fails does it throw `ExecutionException`. The rest of the chapter won't lean heavily on these methods, but the takeaway is clear: instead of a loop of submits and a loop of `future.get()` calls, `invokeAll` does both in one line, and `invokeAny` handles the "race for first answer" pattern.
+
+<h1 id="the-lifecycle-of-an-executorservice">
+  The Lifecycle of an ExecutorService
+</h1>
+
+An `ExecutorService` has a finite, one-way lifecycle. Once it leaves a state, it never comes back. Five states matter:
+
+1. **RUNNING.** Accepts new tasks. Runs them. This is the state right after the pool is created.
+2. **SHUTDOWN.** No new tasks accepted (submits throw `RejectedExecutionException`). Already-queued tasks still run to completion.
+3. **STOP.** No new tasks accepted. Running tasks are sent an interrupt. The queue is drained but not executed.
+4. **TIDYING.** All tasks have finished. The pool is doing final bookkeeping (a hook called `terminated()`).
+5. **TERMINATED.** Fully shut down. `isTerminated()` returns true.
+
+The pool moves through these states by calling `shutdown()` (RUNNING to SHUTDOWN), `shutdownNow()` (RUNNING or SHUTDOWN to STOP), and then waiting for it to reach TERMINATED with `awaitTermination()`.
+
+The diagram shows the entire lifecycle. The two human-driven transitions are `shutdown()` and `shutdownNow()`. The two automatic transitions are "queue drained" and "tasks done." `awaitTermination` waits for the pool to reach the green TERMINATED node. The rest of this section walks through each transition with code.
+
+<h3 id="shutdown-polite-refusal-of-new-work">
+  shutdown(): Polite Refusal of New Work
+</h3>
+
+`shutdown()` is the gentle one. It moves the pool from RUNNING to SHUTDOWN. After the call:
+
+- The pool stops accepting new tasks. `submit` and `execute` throw `RejectedExecutionException`.
+- Tasks already in the queue still run. They get their turn.
+- Tasks already running keep running. They aren't interrupted.
+
+`shutdown()` returns immediately. It doesn't wait for anything. To wait, call `awaitTermination` next.
+
+```java
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+
+public class PoliteShutdown {
+    public static void main(String[] args) throws InterruptedException {
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+
+        for (int i = 1; i <= 4; i++) {
+            int id = i;
+            pool.submit(() -> {
+                try {
+                    Thread.sleep(200);
+                    System.out.println("Order " + id + " confirmed");
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+        }
+
+        pool.shutdown();
+        System.out.println("shutdown() called. isShutdown=" + pool.isShutdown()
+            + ", isTerminated=" + pool.isTerminated());
+
+        try {
+            pool.submit(() -> System.out.println("Late task"));
+        } catch (RejectedExecutionException e) {
+            System.out.println("New submit rejected after shutdown().");
+        }
+
+        pool.awaitTermination(5, TimeUnit.SECONDS);
+        System.out.println("After awaitTermination. isTerminated=" + pool.isTerminated());
+    }
+}
+```
+
+`shutdown()` flips `isShutdown` to true right away, but the pool isn't terminated yet because four tasks are still queued or running. The late `submit` is rejected with an exception, exactly as advertised. Meanwhile, the four queued tasks keep running and printing. After `awaitTermination` returns, every task is done and `isTerminated` is now true.
+
+The distinction between `isShutdown` and `isTerminated` is a frequent source of confusion. `isShutdown` is true as soon as `shutdown()` or `shutdownNow()` is called, even if work is still in progress. `isTerminated` is true only once the pool has actually finished everything and reached the TERMINATED state. Check `isShutdown` to ask "can submission still happen?" and `isTerminated` to ask "is the pool fully done?"
+
+<h3 id="awaittermination-wait-with-a-timeout">
+  awaitTermination: Wait With a Timeout
+</h3>
+
+`awaitTermination(timeout, unit)` blocks the calling thread until one of three things happens:
+
+1. The pool reaches TERMINATED. Returns `true`.
+2. The timeout elapses. Returns `false`. The pool is still running.
+3. The calling thread is interrupted. Throws `InterruptedException`.
+
+The timeout is mandatory. There's no "wait forever" version, and that's deliberate. A wait-forever call is a deadlock waiting to happen. A reasonable shutdown loop uses a short, sane timeout and escalates if the pool doesn't terminate.
+
+```java
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+public class AwaitTerminationDemo {
+    public static void main(String[] args) throws InterruptedException {
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+
+        pool.submit(() -> {
+            try {
+                Thread.sleep(800);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+
+        pool.shutdown();
+
+        boolean done = pool.awaitTermination(300, TimeUnit.MILLISECONDS);
+        System.out.println("After 300 ms: terminated? " + done);
+
+        done = pool.awaitTermination(2, TimeUnit.SECONDS);
+        System.out.println("After waiting more: terminated? " + done);
+    }
+}
+```
+
+The first `awaitTermination` returns `false` because the task is still sleeping at 300 ms. The second call returns `true` once the task wakes up and the pool drains. In a real shutdown loop, the `false` return is your cue to escalate.
+
+<h3 id="shutdownnow-the-forceful-stop">shutdownNow(): The Forceful Stop</h3>
+
+`shutdownNow()` is the hammer. It moves the pool to STOP. After the call:
+
+- Every queued task is removed from the queue without running. The list of skipped tasks is returned to the caller.
+- Every running task is sent an interrupt via `Thread.interrupt()`. Whether the task actually stops depends on whether the task code respects interrupts.
+
+The interrupt rule is more consequential than it appears. An interrupt is a request, not a kill. If task code is `while (true) { doStuff(); }` and never checks `Thread.currentThread().isInterrupted()` and never calls a blocking method like `Thread.sleep` that throws `InterruptedException`, then `shutdownNow()` will set the interrupt flag and the task will keep running forever. The framework can't kill a thread that refuses to listen.
+
+```java
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+public class ShutdownNowDemo {
+    public static void main(String[] args) throws InterruptedException {
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+
+        pool.submit(() -> {
+            for (int i = 0; i < 5; i++) {
+                if (Thread.currentThread().isInterrupted()) {
+                    System.out.println("Running task noticed interrupt and stopped.");
+                    return;
+                }
+                try {
+                    Thread.sleep(200);
+                    System.out.println("Step " + i);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    System.out.println("Sleep interrupted. Exiting.");
+                    return;
+                }
+            }
+        });
+
+        Runnable queued1 = () -> System.out.println("Queued task 1 ran");
+        Runnable queued2 = () -> System.out.println("Queued task 2 ran");
+        pool.submit(queued1);
+        pool.submit(queued2);
+
+        Thread.sleep(300);
+
+        List<Runnable> notExecuted = pool.shutdownNow();
+        System.out.println("shutdownNow() returned " + notExecuted.size() + " never-run tasks.");
+
+        boolean done = pool.awaitTermination(2, TimeUnit.SECONDS);
+        System.out.println("Terminated? " + done);
+    }
+}
+```
+
+The first task gets through one iteration, prints `Step 0`, and then the interrupt arrives while it's sleeping. `Thread.sleep` throws `InterruptedException`, the catch block runs, and the task exits cleanly. The two queued tasks never run; `shutdownNow` returns them in a list so the caller can decide what to do (retry them on a different pool, log them, drop them). The pool then transitions to TERMINATED.
+
+The "return the not-run tasks" detail is useful in deployments. During a graceful restart, calling `shutdownNow()` near a deadline and re-queuing the returned tasks onto a different pool keeps work from being lost.
+
+<h1 id="graceful-shutdown-the-standard-pattern">
+  Graceful Shutdown: The Standard Pattern
+</h1>
+
+A reliable shutdown pattern uses both `shutdown` and `shutdownNow`. The shape is:
+
+1. Call `shutdown()` so no new tasks can be submitted.
+2. Call `awaitTermination(grace, unit)` with a reasonable grace period. If the pool finishes in time, the work is done.
+3. If the grace period elapses, call `shutdownNow()` to interrupt anything still running.
+4. Call `awaitTermination` again with a short hard-stop timeout, mostly to confirm the interrupted tasks actually stopped.
+5. If the pool still isn't terminated, some tasks ignored the interrupt; log loudly and proceed.
+
+```java
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+public class GracefulShutdown {
+
+    public static void main(String[] args) {
+        ExecutorService pool = Executors.newFixedThreadPool(3);
+
+        for (int i = 1; i <= 6; i++) {
+            int id = i;
+            pool.submit(() -> sendConfirmation(id));
+        }
+
+        shutdownAndAwait(pool, 5, 2, TimeUnit.SECONDS);
+        System.out.println("Service has finished cleanly.");
+    }
+
+    static void shutdownAndAwait(ExecutorService pool, long graceSeconds, long hardSeconds, TimeUnit unit) {
+        pool.shutdown();
+        try {
+            if (!pool.awaitTermination(graceSeconds, unit)) {
+                System.out.println("Grace period elapsed. Forcing shutdownNow().");
+                pool.shutdownNow();
+                if (!pool.awaitTermination(hardSeconds, unit)) {
+                    System.out.println("Pool did not terminate even after shutdownNow().");
+                }
+            }
+        } catch (InterruptedException e) {
+            System.out.println("Caller interrupted. Forcing shutdownNow().");
+            pool.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    static void sendConfirmation(int orderId) {
+        try {
+            Thread.sleep(300);
+            System.out.println("Order " + orderId + " confirmation sent on " + Thread.currentThread().getName());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            System.out.println("Order " + orderId + " confirmation interrupted.");
+        }
+    }
+}
+```
+
+All six confirmations finish well inside the 5-second grace window, so `awaitTermination` returns `true` and `shutdownNow` is never called. That's the happy path. To see the unhappy path, drop the grace from `5` to `1`. The first batch of three finishes (the tasks each sleep 300 ms), but the second batch doesn't have time, so `shutdownNow` kicks in and interrupts the running tasks. The interrupt message shows up in the output, the pool reaches TERMINATED, and the program exits.
+
+The `shutdownAndAwait` helper is useful to copy into a util class. Every long-lived service that uses pools needs this dance somewhere. Writing the helper once saves debugging time later when something stops draining cleanly during a deploy.
+
+<h1 id="try-with-resources-for-executorservice-java-19">
+  Try-With-Resources for ExecutorService (Java 19+)
+</h1>
+
+Since Java 19, `ExecutorService` extends `AutoCloseable`. The default `close()` method does exactly the "graceful then forceful" dance: it calls `shutdown()`, waits a while, calls `shutdownNow()` if the wait expires, and propagates interrupts. That makes try-with-resources viable for executors in the same way it has always been for streams.
+
+```java
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+public class TryWithResourcesPool {
+
+    public static void main(String[] args) {
+        try (ExecutorService pool = Executors.newFixedThreadPool(3)) {
+            for (int orderId = 7001; orderId <= 7004; orderId++) {
+                int id = orderId;
+                pool.submit(() -> {
+                    try {
+                        Thread.sleep(150);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    System.out.println("Confirmation sent for order " + id);
+                });
+            }
+            // Falling off the try block triggers pool.close()
+        }
+
+        System.out.println("Pool closed, main exiting.");
+    }
+}
+```
+
+There's no explicit `shutdown` in this program. The closing brace of the `try` triggers `close()`, which runs the graceful shutdown internally and waits for all submitted tasks to finish. The "Pool closed" line is guaranteed to print after every task has run.
+
+Caveats on the try-with-resources style:
+
+- The wait inside `close()` is effectively unbounded (it loops on `awaitTermination` until the pool terminates), so a misbehaving task that never finishes will block the program forever at the closing brace. The explicit `shutdownAndAwait` helper allows escalation; `close()` doesn't.
+- The pool is local to the try block. When the pool must outlive the method (because some long-lived component holds onto it), try-with-resources is the wrong fit.
+- This shape is Java 19+ only. Older JDKs don't have `AutoCloseable` on `ExecutorService`.
+
+For one-off scripts and short-lived programs, try-with-resources is the cleanest version of the pattern. For long-running services, the explicit `shutdownAndAwait` helper still wins.
+
+<h1 id="whats-wrong-forgetting-to-shut-down">
+  What's Wrong: Forgetting to Shut Down
+</h1>
+
+A common bug in the executor API. A pool is built, tasks are submitted, the tasks finish, and the JVM never exits. The program hangs.
+
+**What's wrong with this code?**
+
+```java
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+public class HangingMain {
+    public static void main(String[] args) {
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+
+        pool.submit(() -> System.out.println("Order 1 confirmed"));
+        pool.submit(() -> System.out.println("Order 2 confirmed"));
+
+        System.out.println("All tasks submitted, main returning.");
+        // No shutdown. JVM never exits.
+    }
+}
+```
+
+**Output (then the program hangs):**
+
+```text
+All tasks submitted, main returning.
+Order 1 confirmed
+Order 2 confirmed
+```
+
+The two confirmations print, the "All tasks submitted" message prints, and then the program sits there. Running it in a terminal requires Ctrl+C to kill it. The reason is that the pool's worker threads are non-daemon by default, and the JVM doesn't exit until every non-daemon thread has exited. The workers are idle, waiting for more tasks from the queue, but they're alive. As far as the JVM is concerned, "non-daemon thread still running" means "program still running."
+
+**Fix:**
+
+```java
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+public class CleanMain {
+    public static void main(String[] args) throws InterruptedException {
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+
+        pool.submit(() -> System.out.println("Order 1 confirmed"));
+        pool.submit(() -> System.out.println("Order 2 confirmed"));
+
+        pool.shutdown();
+        pool.awaitTermination(5, TimeUnit.SECONDS);
+
+        System.out.println("All tasks submitted, main returning.");
+    }
+}
+```
+
+The `shutdown()` call signals the workers to exit once the queue drains. `awaitTermination` blocks the main thread until the workers have actually gone away. After that the JVM exits naturally because there are no non-daemon threads left.
+
+A pool with no shutdown is the executor equivalent of a leaked file handle. In a short program it hangs on exit. In a long-running service, repeatedly creating pools without shutting them down leaks threads, and threads have real memory and OS costs. A leaked pool of size 32 means 32 OS threads held forever for nothing.
+
+The mistake is easy to make because the pool runs the tasks just fine without `shutdown()`. The tasks finish, the program looks like it worked, and only the exit hang reveals the bug. Make a habit of writing the shutdown right when the pool is created. On Java 19+, try-with-resources handles it automatically. On an older JDK, the `shutdownAndAwait` helper is the standard pattern.
+
+<h1 id="when-the-pool-says-no-rejectedexecutionhandler">
+  When the Pool Says No: RejectedExecutionHandler
+</h1>
+
+A pool can reject a submission for two reasons: the pool has already been shut down, or the pool has a bounded queue and the queue is full. Bounded queues come from `new ThreadPoolExecutor(...)` rather than the `Executors` factory methods we've used so far, but rejection still applies to the factory-built pools because of the shutdown case.
+
+`RejectedExecutionHandler` is the interface that decides what happens when a submission is rejected. It has one method, `rejectedExecution(Runnable r, ThreadPoolExecutor executor)`, called by the pool when it can't accept the task. The JDK ships four built-in policies as nested classes of `ThreadPoolExecutor`:
+
+| Policy                | Behavior on rejection                                                           |
+| --------------------- | ------------------------------------------------------------------------------- |
+| `AbortPolicy`         | Throws `RejectedExecutionException`. This is the default for the factory pools. |
+| `CallerRunsPolicy`    | Runs the task on the caller's thread. Slows the caller as natural backpressure. |
+| `DiscardPolicy`       | Silently drops the task. No exception.                                          |
+| `DiscardOldestPolicy` | Drops the oldest task in the queue and tries to accept the new one.             |
+
+Custom policies are also possible. The signature provides both the task and the executor, so a custom policy can log, increment a metric, write the task to a dead-letter file, or do something else.
+
+```java
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+
+public class RejectionDemo {
+
+    public static void main(String[] args) throws InterruptedException {
+        ExecutorService pool = Executors.newFixedThreadPool(1);
+
+        pool.submit(() -> sleep(200));
+        pool.shutdown();
+
+        try {
+            pool.submit(() -> System.out.println("Should not run"));
+        } catch (RejectedExecutionException e) {
+            System.out.println("Submission after shutdown was rejected.");
+        }
+
+        pool.awaitTermination(2, TimeUnit.SECONDS);
+    }
+
+    static void sleep(int ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+}
+```
+
+The default `AbortPolicy` threw `RejectedExecutionException` from the post-shutdown `submit`. In real code, that exception is usually a signal that the calling code is doing something wrong (submitting work after the pool has been retired), so the abort behavior is a reasonable default. Pools with bounded queues, where rejection can happen as a steady-state backpressure mechanism, often configure `CallerRunsPolicy` instead so the caller naturally slows down when the workers can't keep up.
+
+The takeaway is that the framework has a defined rejection model, and `RejectedExecutionException` should be known so it can be handled where it might appear.
+
+<h1 id="a-realistic-deployment-story">A Realistic Deployment Story</h1>
+
+To pull the lifecycle pieces together, the kind of code that runs in an order-processing service during a rolling deployment. The service has been told to drain (stop accepting new work), and it's working its way through whatever's still in flight before exiting.
+
+```java
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class DeploymentDrain {
+
+    public static void main(String[] args) throws InterruptedException {
+        ExecutorService confirmationPool = Executors.newFixedThreadPool(4);
+
+        // Simulate accepting traffic for a moment.
+        AtomicInteger orderCounter = new AtomicInteger();
+        for (int i = 0; i < 8; i++) {
+            int orderId = 8000 + orderCounter.incrementAndGet();
+            confirmationPool.submit(() -> processOrder(orderId));
+        }
+
+        Thread.sleep(50);
+        System.out.println(">>> Deployment signal received: draining the pool. <<<");
+
+        boolean drainedCleanly = shutdownAndAwait(confirmationPool, 3, 1, TimeUnit.SECONDS);
+        System.out.println("Pool drained cleanly? " + drainedCleanly);
+    }
+
+    static boolean shutdownAndAwait(ExecutorService pool, long grace, long hardStop, TimeUnit unit) throws InterruptedException {
+        pool.shutdown();
+        if (pool.awaitTermination(grace, unit)) {
+            return true;
+        }
+        System.out.println("Grace expired. Forcing shutdownNow().");
+        pool.shutdownNow();
+        return pool.awaitTermination(hardStop, unit);
+    }
+
+    static void processOrder(int orderId) {
+        try {
+            Thread.sleep(200);
+            System.out.println("Order " + orderId + " confirmed by " + Thread.currentThread().getName());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            System.out.println("Order " + orderId + " confirmation aborted.");
+        }
+    }
+}
+```
+
+Eight orders, four workers, two rounds of 200 ms each. The drain signal arrives after the first 50 ms (the four workers are still in their first sleep), and `shutdown` followed by `awaitTermination(3 seconds)` is plenty of time to finish the second batch. The pool returns `true` from `awaitTermination`, the helper returns `true`, and the service prints "drained cleanly" before exiting.
+
+Running the same program with the work-time bumped up (say `Thread.sleep(1000)` per order) and the grace tightened to one second shows the helper fall through to `shutdownNow`, interrupt the running tasks, and report a clean termination via the hard-stop wait. That's the contract: the pool always terminates, eventually, but whether it does so gracefully or forcefully depends on the timeouts chosen.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

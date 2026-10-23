@@ -1,0 +1,301 @@
+---
+title: "Three Pillars of Observability"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Three Pillars of Observability explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+<h1 id="1-monitoring-vs-observability">1. Monitoring vs Observability</h1>
+
+You may have heard the term monitoring, so it helps to separate the two ideas.
+
+**Monitoring** means watching a set of known signals. You decide in advance what to track, such as CPU usage, error rate, or response time. Then you set alerts when those values cross a threshold.
+
+Monitoring works well for problems you already expect. But in distributed systems, many failures are new. Maybe checkout is slow only for users paying with one specific card type, in one region, after a recent deployment. Nobody wrote an alert for that.
+
+**Observability** is the ability to understand the internal state of a system by looking at the data it produces. A well-instrumented system lets you ask new questions during an incident, without shipping new code first.
+
+| Monitoring                      | Observability                                                  |
+| ------------------------------- | -------------------------------------------------------------- |
+| Watches known signals           | Lets you ask new questions                                     |
+| Decided in advance              | Explored during an incident                                    |
+| "Is the error rate above 1%?"   | "Why is checkout slow only for this card type in this region?" |
+| Dashboards and threshold alerts | Queries across metrics, logs, and traces                       |
+| Catches problems you expect     | Helps debug problems you did not expect                        |
+
+In practice, you need both. Monitoring catches the issues you can predict. Observability helps you debug the ones you cannot.
+
+To make that possible, systems typically produce three kinds of telemetry data: **metrics**, **logs**, and **traces**. These are often called the **three pillars of observability**.
+
+<h1 id="2-one-question-per-pillar">2. One Question per Pillar</h1>
+
+Each pillar is good at answering a different kind of question.
+
+**Metrics tell you whether something is wrong.** For example, the error rate for checkout jumped from 0.5% to 8%.
+
+**Logs tell you what exactly happened.** For example, a specific payment request failed with a connection timeout.
+
+**Traces tell you where the time went.** For example, a checkout request spent most of its time waiting on the fraud check service.
+
+None of them gives the full picture alone. So let's look at each one, starting with metrics.
+
+<h1 id="3-metrics">3. Metrics</h1>
+
+A metric is a **numeric measurement recorded over time**.
+
+Most metric systems support a few basic types:
+
+- A **counter** only goes up. Total requests served is a counter.
+- A **gauge** can go up and down. The number of active database connections is a gauge.
+- A **histogram** groups measurements into buckets. Request latency is usually recorded as a histogram, so you can later calculate values such as the median or the 99th percentile.
+
+Here is what these look like in a Prometheus-style format:
+
+```text
+# Counter: total requests served, only goes up
+http_requests_total{service="checkout", endpoint="/checkout", status="500"} 1523
+
+# Gauge: current value, can go up or down
+db_active_connections{service="payment"} 47
+
+# Histogram: request latency grouped into buckets
+http_request_duration_seconds_bucket{endpoint="/checkout", le="0.1"} 14523
+http_request_duration_seconds_bucket{endpoint="/checkout", le="0.5"} 18456
+http_request_duration_seconds_bucket{endpoint="/checkout", le="1.0"} 19234
+```
+
+Metrics also carry **labels**. A request counter might have labels for the service name, the endpoint, and the status code. That lets you ask questions such as: _how many requests to the checkout endpoint returned a 500 error in the last 10 minutes?_
+
+| Type          | Behavior                   | Example                                       | Common queries                          |
+| ------------- | -------------------------- | --------------------------------------------- | --------------------------------------- |
+| **Counter**   | Only goes up               | Total requests, errors, bytes sent            | Rate per second, increase over a window |
+| **Gauge**     | Goes up and down           | Active connections, queue depth, memory usage | Current value, min, max                 |
+| **Histogram** | Groups values into buckets | Request latency, response size                | Median, p95, p99                        |
+
+<h3 id="why-metrics-are-cheap">Why Metrics Are Cheap</h3>
+
+The main strength of metrics is that they are **compact**. A metric does not store every request. It stores a number that summarizes many requests.
+
+Whether your service handles 100 requests per second or 100,000, the request counter is still a single number updated over time. That makes metrics cheap to store and fast to query. It is why metrics power most dashboards and alerts.
+
+One important detail is how you summarize latency. Suppose 99 requests take 50 ms and one request takes 5 seconds. The average is about 100 ms, which looks healthy. But 1% of your users are waiting 5 seconds.
+
+That is why teams usually track **percentiles** such as **p95** and **p99** instead of relying on averages.
+
+A common starting point is the **four golden signals**: latency, traffic, errors, and saturation. Together they show how long requests take, how much demand the service is under, how often requests fail, and how close resources are to their limits.
+
+<h3 id="the-limits-of-metrics">The Limits of Metrics</h3>
+
+Metrics also have a clear limitation. Because they aggregate data, they **lose individual details**. A metric can tell you that the checkout error rate is 8%. It cannot tell you which orders failed or why.
+
+You might think the fix is to add more labels, such as a user ID or an order ID. But every unique combination of label values creates a **separate time series**.
+
+```text
+# Bounded labels: a handful of series
+http_requests_total{service="checkout", region="us-east", status="500"}
+
+# Unbounded label: one series per user
+http_requests_total{service="checkout", user_id="u_10293847"}
+http_requests_total{service="checkout", user_id="u_10293848"}
+... 10 million more
+```
+
+With 10 million users, adding user ID as a label can turn one metric into 10 million time series. This is called the **high cardinality** problem, and it can overload a metrics system quickly.
+
+So labels should have a **small, bounded set of values**, such as service name, region, or status code.
+
+When you need details about individual requests, you need a different kind of data. This is where logs come in.
+
+<h1 id="4-logs">4. Logs</h1>
+
+A log is a **timestamped record of something that happened** in the system.
+
+A service might write a log when it receives a request, when a payment fails, when a retry happens, or when a background job finishes.
+
+```text
+2026-01-15T10:23:45.123Z INFO  [order-service]   Checkout received: order_id=123 user_id=789
+2026-01-15T10:23:45.456Z WARN  [payment-service] Retrying charge: order_id=123 attempt=2
+2026-01-15T10:23:48.789Z ERROR [payment-service] Payment failed: order_id=123 error="connection timeout"
+2026-01-15T10:24:00.012Z INFO  [email-worker]    Job finished: job=send_receipts processed=412
+```
+
+Logs are the **most detailed** of the three pillars. That level of detail is what you need once you know something is wrong and want to understand the exact cause.
+
+<h3 id="structured-logging">Structured Logging</h3>
+
+How you write logs matters a lot. Many applications write plain text lines, such as:
+
+```text
+Payment failed for order 123 after 3 retries
+```
+
+That is easy for a person to read, but it is hard to search across millions of entries. The log system has to guess where each value is.
+
+**Structured logging** solves this by writing each log as a set of key-value fields, usually in JSON. Instead of one sentence, the log has separate fields for the timestamp, the level, the service, the order ID, the error type, and the retry count.
+
+```json
+{
+  "timestamp": "2026-01-15T10:23:48.789Z",
+  "level": "ERROR",
+  "service": "payment-service",
+  "message": "Payment failed",
+  "order_id": "123",
+  "error_type": "timeout",
+  "retry_count": 3
+}
+```
+
+Now you can run precise queries: _show me every error from the payment service in the last hour where the error type was timeout._
+
+This makes logs far easier to search, filter, and aggregate during an incident.
+
+<h3 id="the-limits-of-logs">The Limits of Logs</h3>
+
+Logs have their own trade-offs.
+
+The biggest one is **volume**. A busy system can produce terabytes of logs per day, and storing and indexing all of it gets expensive. So teams use **log levels** such as debug, info, warning, and error, and often turn off debug logs in production.
+
+The second problem is that logs are **spread across many machines**. Containers come and go, and a log file on a container that no longer exists is gone. That is why production systems ship logs to a **central system** where you can search them all in one place.
+
+But even with centralized logs, one question remains hard. If a request touched six services, how do you connect the log lines those six services wrote about that one request?
+
+That brings us to the third pillar.
+
+<h1 id="5-traces">5. Traces</h1>
+
+A trace **follows a single request** as it moves through the system.
+
+Suppose a user clicks the checkout button. The request enters the API gateway, which calls the order service. The order service calls the inventory service and the payment service. The payment service calls a fraud check service before charging the card.
+
+A trace records this entire journey.
+
+Each unit of work inside the trace is called a **span**. The API gateway handling the request is one span. The order service processing it is another span. Each span records when it started, how long it took, whether it succeeded, and which span called it.
+
+Put together, the spans form a **tree** that shows how the request moved through the system.
+
+A span usually stores a trace ID, its own span ID, its parent span ID, an operation name, start and end times, a status, and key-value attributes that describe the work.
+
+<h3 id="how-trace-context-is-propagated">How Trace Context Is Propagated</h3>
+
+For this to work, every service needs to know which trace a request belongs to.
+
+When the request enters the system, the first service generates a unique **trace ID**. When it calls another service, it passes that trace ID along, usually in an HTTP header.
+
+A common standard for this is the **W3C Trace Context** specification, which defines a header called `traceparent`:
+
+```text
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+             │  │                                │                └ flags (01 = sampled)
+             │  │                                └ parent span ID
+             │  └ trace ID (shared by every span in the request)
+             └ version
+```
+
+The next service reads the header, creates its own span under the same trace ID, and passes the context along to any service it calls.
+
+If even one service in the chain fails to pass the context along, the trace **breaks into disconnected pieces**. That is one reason most teams rely on tracing libraries instead of writing it themselves.
+
+<h3 id="what-traces-reveal">What Traces Reveal</h3>
+
+Tracing tools usually display a trace as a **waterfall**. Each span is a horizontal bar, and its length shows how long it took.
+
+Suppose the checkout request took 4 seconds in total. In the waterfall, you might see that the order service took only 50 ms of its own time, the inventory call took 100 ms, and the fraud check took 3.5 seconds.
+
+```text
+Trace ID: abc-123                                     total 4.0 s
+├── API Gateway            ████████████████████████████  4.0 s
+│   └── Order Service       ███████████████████████████  3.95 s (50 ms own time)
+│       ├── Inventory       █                             100 ms
+│       └── Payment Service  ██████████████████████████   3.8 s
+│           └── Fraud Check  ████████████████████████     3.5 s  ← SLOW
+```
+
+Now you know exactly where to look.
+
+Traces can reveal other problems too. You might notice that three service calls run **one after another** when they could run in parallel. These patterns are very hard to spot from metrics or logs alone.
+
+<h3 id="the-limits-of-traces">The Limits of Traces</h3>
+
+Like logs, traces can produce a large amount of data. Recording every span for every request in a high-traffic system is often too expensive. So most systems use **sampling**.
+
+With **head-based sampling**, the decision is made when the request starts. For example, the system might keep 1% of all traces. This is simple and cheap, but it may throw away the rare slow or failed request you actually care about.
+
+With **tail-based sampling**, the system waits until the request finishes and then decides whether to keep it. That way, it can keep every trace with an error or high latency, and only a small sample of normal ones.
+
+The cost is that the tracing infrastructure has to **hold spans in memory** until each trace is complete.
+
+|                               | Head-based sampling                      | Tail-based sampling                                      |
+| ----------------------------- | ---------------------------------------- | -------------------------------------------------------- |
+| **When the decision is made** | When the request starts                  | After the request finishes                               |
+| **What it keeps**             | A fixed percentage, chosen blindly       | Every error and slow trace, plus a sample of normal ones |
+| **Cost**                      | Simple and cheap                         | Spans must be buffered until each trace completes        |
+| **Risk**                      | Can drop the rare failure you care about | More infrastructure to run and scale                     |
+
+<h1 id="6-how-the-pillars-work-together">6. How the Pillars Work Together</h1>
+
+Let's go back to the slow checkout problem and see how the three pillars fit together.
+
+1. **Metrics.** An alert fires because the p99 latency of the checkout endpoint has gone above 2 seconds. A latency breakdown by service shows that the payment service started slowing down 20 minutes ago.
+2. **Traces.** You open a few slow traces for checkout requests. Each one shows the same pattern: the call from the payment service to the fraud check service is taking over 3 seconds.
+3. **Logs.** You take the trace ID from one of those traces and search the logs for it. The fraud check service logs show that its connection pool to the database is exhausted, and requests are waiting for a free connection.
+
+Metrics told you **something was wrong**. Traces told you **where**. And logs told you **why**.
+
+<h1 id="7-correlation-between-pillars">7. Correlation Between Pillars</h1>
+
+That investigation only worked because the three pillars were **connected**.
+
+The most important link is the **trace ID**. If every log line includes the trace ID of the request that produced it, you can jump from a trace directly to the relevant logs.
+
+```json
+{
+  "timestamp": "2026-01-15T10:23:48.789Z",
+  "level": "ERROR",
+  "service": "fraud-check-service",
+  "message": "Timed out waiting for a database connection",
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "span_id": "00f067aa0ba902b7",
+  "pool_size": 20,
+  "pool_waiting": 143
+}
+```
+
+Many systems also attach example trace IDs to metrics. These are called **exemplars**. So when you see a latency spike on a chart, you can click through to a trace of a request that was part of that spike.
+
+Without these links, you end up with three separate tools and a lot of manual guesswork during an incident, matching timestamps by hand across thousands of concurrent requests.
+
+<h1 id="8-instrumentation-and-opentelemetry">
+  8. Instrumentation and OpenTelemetry
+</h1>
+
+All this data has to come from somewhere. The process of adding code that produces metrics, logs, and traces is called **instrumentation**.
+
+Libraries for HTTP servers, database clients, and message queues can create many spans and metrics **automatically**, while business metrics such as orders placed per minute are added **by hand**.
+
+For a long time, each monitoring vendor had its own libraries and data formats, which made switching tools painful.
+
+**OpenTelemetry** is an open-source project that addresses this. It provides a vendor-neutral set of APIs, SDKs, and a data format for generating and exporting metrics, logs, and traces.
+
+Applications send telemetry to an **OpenTelemetry Collector**, which forwards it to backends such as Prometheus for metrics, Loki or Elasticsearch for logs, and Jaeger for traces.
+
+This way, the instrumentation in your code does not have to change when your backend does.
+
+A good rule of thumb when instrumenting a service: _if this breaks during an incident, what will I need to know to fix it?_ Then make sure the system captures that information by default.
+
+<h1 id="summary">Summary</h1>
+
+Observability is the ability to understand what is happening inside a system from the data it produces.
+
+- **Metrics** give you cheap, aggregated numbers that tell you when something is wrong. Track percentiles, not averages, and keep label values bounded.
+- **Logs** give you detailed records of individual events that explain what happened. Write them as structured fields and ship them to a central system.
+- **Traces** follow requests across services and show where the time and errors come from. Propagate trace context everywhere and sample carefully.
+
+Each one has its own costs and limits. Collecting all three does not make a system observable on its own. The value comes from **connecting them**, through trace IDs in logs and exemplars on metrics, so you can move from an alert to a trace to the exact log line that explains the problem.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

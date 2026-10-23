@@ -1,0 +1,933 @@
+---
+title: "Mocking with unittest.mock"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "Mocking explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="why-mocking-matters">Why Mocking Matters</h1>
+
+Consider this function that processes an order. It calls a payment gateway (the external service that processes a credit card charge), sends a confirmation email, and updates an inventory API.
+
+```python
+import requests
+
+def place_order(customer_id, items, total):
+    response = requests.post(
+        "https://payments.example.com/charge",
+        json={"customer_id": customer_id, "amount": total},
+        timeout=10,
+    )
+    if response.status_code != 200:
+        return {"status": "failed", "reason": "payment_declined"}
+
+    requests.post(
+        "https://email.example.com/send",
+        json={"to": customer_id, "subject": "Order confirmed"},
+        timeout=10,
+    )
+
+    requests.post(
+        "https://inventory.example.com/reserve",
+        json={"items": items},
+        timeout=10,
+    )
+
+    return {"status": "ok"}
+```
+
+Testing this for real means hitting three live services every time. The tests would be slow (network round trips), flaky (any service hiccup fails the test), expensive (real charges and emails), and impossible to run offline. You also can't easily test the "payment declined" branch because you'd need a credit card that's set up to fail.
+
+Mocking replaces those network calls with stand-in objects. The test runs in microseconds, never hits the network, and you can dictate exactly what each fake response should look like, including failures.
+
+```python
+from unittest.mock import patch, MagicMock
+
+def test_successful_order():
+    with patch("requests.post") as mock_post:
+        mock_post.return_value = MagicMock(status_code=200)
+
+        result = place_order(customer_id=42, items=["Wireless Mouse"], total=29.99)
+
+        assert result == {"status": "ok"}
+        assert mock_post.call_count == 3
+```
+
+No real HTTP calls. The test ran offline. We pinned down exactly which response the fake should return. That's the whole point of mocking.
+
+<h1 id="mock-vs-magicmock">Mock vs MagicMock</h1>
+
+`unittest.mock` ships two main mock classes: `Mock` and `MagicMock`. They're almost the same, with one important difference.
+
+```python
+from unittest.mock import Mock, MagicMock
+
+m = Mock()
+m.some_method()
+print(m.some_method.call_count)
+```
+
+A `Mock` records every call made on it and lets you query that later. It also auto-creates attributes on access, so `m.anything.you.want()` works without complaint. What `Mock` does _not_ do is implement Python's dunder methods. If your code under test uses `len(obj)`, `obj[0]`, `obj + 1`, or `with obj:`, a plain `Mock` will blow up.
+
+```python
+from unittest.mock import Mock
+
+m = Mock()
+try:
+    len(m)
+except TypeError as e:
+    print(f"failed: {e}")
+```
+
+`MagicMock` fixes that by pre-configuring all the dunder methods (`__len__`, `__getitem__`, `__iter__`, `__enter__`, `__exit__`, and so on) to return sensible defaults.
+
+```python
+from unittest.mock import MagicMock
+
+m = MagicMock()
+print(len(m))
+print(m[0])
+
+with m as ctx:
+    print(f"ctx is the mock too: {ctx is m.__enter__.return_value}")
+```
+
+Use `MagicMock` by default. It costs the same and avoids surprises when the code under test uses dunder methods. Reach for plain `Mock` only when you specifically want `len()` or `with` to raise (to verify your code doesn't use them), which is rare.
+
+| Feature                                  | `Mock` | `MagicMock`      |
+| ---------------------------------------- | ------ | ---------------- |
+| Records calls                            | Yes    | Yes              |
+| Auto-creates attributes                  | Yes    | Yes              |
+| Supports `len()`, `iter()`, `with`, `[]` | No     | Yes              |
+| Default to use                           | Rare   | Most of the time |
+
+> **Cost:** `MagicMock` carries a tiny amount of overhead for setting up dunder methods. It's irrelevant for tests, which run a few thousand times at most. Use `MagicMock` unless you have a specific reason not to.
+
+<h1 id="configuring-return-values">Configuring Return Values</h1>
+
+A bare mock returns a child mock from every call. That's almost never what you want for tests. You usually want the mock to return a specific value when called.
+
+```python
+from unittest.mock import MagicMock
+
+payment_gateway = MagicMock()
+payment_gateway.charge.return_value = {"status": "ok", "transaction_id": "txn_001"}
+
+result = payment_gateway.charge(customer_id=42, amount=29.99)
+print(result)
+```
+
+The `return_value` attribute pins down what the mock returns when called. Every call from now on returns the same value, no matter what arguments you pass.
+
+```python
+from unittest.mock import MagicMock
+
+inventory = MagicMock()
+inventory.stock_count.return_value = 42
+
+print(inventory.stock_count("Wireless Mouse"))
+print(inventory.stock_count("USB Cable"))
+print(inventory.stock_count("Headphones"))
+```
+
+Every call returns `42` because `return_value` is a single fixed value. If you want different return values for different calls, you need `side_effect`.
+
+<h1 id="side-effects-exceptions-sequences-and-functions">
+  Side Effects: Exceptions, Sequences, and Functions
+</h1>
+
+`side_effect` is the more powerful sibling of `return_value`. It can do three different things depending on what you assign to it.
+
+<h3 id="raising-an-exception">Raising an Exception</h3>
+
+Assign an exception (or exception class) to `side_effect` and the mock raises it when called.
+
+```python
+from unittest.mock import MagicMock
+
+payment_gateway = MagicMock()
+payment_gateway.charge.side_effect = ConnectionError("network down")
+
+try:
+    payment_gateway.charge(customer_id=42, amount=29.99)
+except ConnectionError as e:
+    print(f"got: {e}")
+```
+
+This is how you test the failure branches of your code. Want to verify that your retry logic kicks in when the payment gateway times out? Make the mock raise `TimeoutError` and watch what your function does.
+
+<h3 id="returning-a-sequence">Returning a Sequence</h3>
+
+Assign a list (or any iterable) to `side_effect` and the mock returns each item in turn. The first call gets the first item, the second call gets the second, and so on. When the iterable runs out, the next call raises `StopIteration`.
+
+```python
+from unittest.mock import MagicMock
+
+inventory = MagicMock()
+inventory.stock_count.side_effect = [10, 5, 0]
+
+print(inventory.stock_count("Wireless Mouse"))
+print(inventory.stock_count("Wireless Mouse"))
+print(inventory.stock_count("Wireless Mouse"))
+```
+
+This is useful for testing retry loops: make the first two calls fail and the third succeed.
+
+```python
+from unittest.mock import MagicMock
+
+payment_gateway = MagicMock()
+payment_gateway.charge.side_effect = [
+    ConnectionError("first failure"),
+    ConnectionError("second failure"),
+    {"status": "ok", "transaction_id": "txn_001"},
+]
+
+for attempt in range(3):
+    try:
+        result = payment_gateway.charge(amount=29.99)
+        print(f"attempt {attempt}: succeeded with {result}")
+        break
+    except ConnectionError as e:
+        print(f"attempt {attempt}: failed with {e}")
+```
+
+Items in the list that are exception instances get raised; everything else gets returned. You can mix both freely.
+
+<h3 id="calling-a-function">Calling a Function</h3>
+
+Assign a function to `side_effect` and the mock calls that function with the same arguments and returns whatever the function returns. This is the right tool when the return value depends on the input arguments.
+
+```python
+from unittest.mock import MagicMock
+
+def fake_stock_count(product_name):
+    stock = {"Wireless Mouse": 10, "USB Cable": 50, "Headphones": 0}
+    return stock.get(product_name, 0)
+
+inventory = MagicMock()
+inventory.stock_count.side_effect = fake_stock_count
+
+print(inventory.stock_count("Wireless Mouse"))
+print(inventory.stock_count("Headphones"))
+print(inventory.stock_count("Unknown Product"))
+```
+
+The mock still records every call (you can assert on `call_args_list`), but the return value comes from the function. Use this when "fixed value" or "fixed sequence" isn't expressive enough.
+
+| Assigned to `side_effect`   | Behavior                                                               |
+| --------------------------- | ---------------------------------------------------------------------- |
+| Exception instance or class | Mock raises it on every call                                           |
+| List or iterable            | Mock returns items one by one, raises `StopIteration` when exhausted   |
+| Function                    | Mock calls the function with the same arguments and returns its result |
+| `None` (default)            | No side effect; the mock returns `return_value`                        |
+
+> **Cost:** `side_effect` takes precedence over `return_value`. If both are set, the side effect wins. The one exception is `DEFAULT` (a sentinel from `unittest.mock`): if `side_effect` returns `DEFAULT`, the mock falls back to `return_value`. Most of the time you'll only set one.
+
+<h1 id="assertion-api">Assertion API</h1>
+
+Recording calls is only useful if you can assert on what happened. `Mock` and `MagicMock` ship a family of assertion methods plus some inspection attributes.
+
+```python
+from unittest.mock import MagicMock
+
+email_service = MagicMock()
+email_service.send(to="alice@example.com", subject="Order confirmed")
+email_service.send(to="bob@example.com", subject="Order shipped")
+
+email_service.send.assert_called()
+print("assert_called passed")
+
+email_service.send.assert_called_with(to="bob@example.com", subject="Order shipped")
+print("assert_called_with passed (last call)")
+
+email_service.send.assert_any_call(to="alice@example.com", subject="Order confirmed")
+print("assert_any_call passed (any call)")
+
+print(f"call_count: {email_service.send.call_count}")
+print(f"last call_args: {email_service.send.call_args}")
+print(f"all call_args_list: {email_service.send.call_args_list}")
+```
+
+Here's the full set worth knowing, in roughly the order you'll reach for them:
+
+| Method or attribute                        | What it checks                                            |
+| ------------------------------------------ | --------------------------------------------------------- |
+| `assert_called()`                          | The mock was called at least once                         |
+| `assert_called_once()`                     | The mock was called exactly once                          |
+| `assert_called_with(*args, **kwargs)`      | The **last** call matched these arguments                 |
+| `assert_called_once_with(*args, **kwargs)` | Called exactly once with these arguments                  |
+| `assert_any_call(*args, **kwargs)`         | At least one of the calls used these arguments            |
+| `assert_not_called()`                      | The mock was never called                                 |
+| `call_count`                               | Number of times the mock was called (integer)             |
+| `call_args`                                | The arguments of the **last** call (a `call(...)` object) |
+| `call_args_list`                           | All calls in order, as a list of `call(...)` objects      |
+| `called`                                   | Boolean: was it called at least once                      |
+
+The naming trips up a lot of people. `assert_called_with` checks the _last_ call, not whether the mock was _ever_ called with those arguments. For "ever called with X", use `assert_any_call`.
+
+```python
+from unittest.mock import MagicMock
+
+email_service = MagicMock()
+email_service.send(to="alice@example.com")
+email_service.send(to="bob@example.com")
+
+try:
+    email_service.send.assert_called_with(to="alice@example.com")
+except AssertionError as e:
+    print(f"failed: {e}")
+```
+
+The last call was to Bob, so `assert_called_with(to="alice@example.com")` fails even though Alice was called earlier. Use `assert_any_call` for that.
+
+```python
+from unittest.mock import MagicMock
+
+email_service = MagicMock()
+email_service.send(to="alice@example.com")
+email_service.send(to="bob@example.com")
+
+email_service.send.assert_any_call(to="alice@example.com")
+print("assert_any_call passed")
+```
+
+> **Cost:** A common trap: `assert_called_once` and `assert_called_once_with` were added in Python 3.6. They also won't fire if you typo them (`assert_called_once` vs `assert_calledonce`) because every attribute access on a mock auto-creates a child mock. Use `autospec=True` or run with a recent Python version that has runtime checks for the common misspellings.
+
+<h1 id="patch-decorator-context-manager-and-manual">
+  patch: Decorator, Context Manager, and Manual
+</h1>
+
+`MagicMock` is useful on its own, but most real tests need to replace a name in some other module with a mock. That's what `patch` does. It temporarily swaps an attribute for a mock and puts the original back when you're done. There are three ways to use it.
+
+<h3 id="as-a-decorator">As a Decorator</h3>
+
+```python
+from unittest.mock import patch, MagicMock
+
+def get_stock_count(product_name):
+    import requests
+    response = requests.get(f"https://inventory.example.com/stock/{product_name}")
+    return response.json()["count"]
+
+@patch("requests.get")
+def test_get_stock_count(mock_get):
+    mock_get.return_value = MagicMock(json=lambda: {"count": 42})
+
+    count = get_stock_count("Wireless Mouse")
+
+    assert count == 42
+    mock_get.assert_called_once_with("https://inventory.example.com/stock/Wireless Mouse")
+    print("test passed")
+
+test_get_stock_count()
+```
+
+`@patch("requests.get")` replaces `requests.get` with a `MagicMock` for the duration of the test, then puts the real `requests.get` back. The mock gets injected as the first parameter to the test function.
+
+If you stack multiple `@patch` decorators, the arguments come in **bottom-up** order. The decorator closest to the function gets the first parameter.
+
+```python
+from unittest.mock import patch
+
+@patch("requests.post")
+@patch("requests.get")
+def test_two_patches(mock_get, mock_post):
+    print(f"mock_get: {mock_get}")
+    print(f"mock_post: {mock_post}")
+
+test_two_patches()
+```
+
+The closer the decorator is to the function, the earlier its mock appears in the argument list. This is the most common source of "wait, why does this mock have the wrong methods" confusion.
+
+<h3 id="as-a-context-manager">As a Context Manager</h3>
+
+When you only need to patch something for part of a test, or when you're not writing a function (such as in an interactive script), use `patch` as a context manager.
+
+```python
+from unittest.mock import patch, MagicMock
+
+def get_stock_count(product_name):
+    import requests
+    response = requests.get(f"https://inventory.example.com/stock/{product_name}")
+    return response.json()["count"]
+
+def test_get_stock_count():
+    with patch("requests.get") as mock_get:
+        mock_get.return_value = MagicMock(json=lambda: {"count": 42})
+        count = get_stock_count("Wireless Mouse")
+        assert count == 42
+    print("test passed, patch reverted")
+
+test_get_stock_count()
+```
+
+The `with` block scopes the patch tightly. Once you exit, `requests.get` is the real one again. Use this when you want fine-grained control over which lines see the mock.
+
+<h3 id="manual-start-and-stop">Manual Start and Stop</h3>
+
+For setup/teardown patterns (like `setUp`/`tearDown` in `unittest`, or pytest fixtures that aren't using `monkeypatch`), call `start()` and `stop()` directly.
+
+```python
+from unittest.mock import patch, MagicMock
+
+patcher = patch("requests.get")
+mock_get = patcher.start()
+mock_get.return_value = MagicMock(json=lambda: {"count": 42})
+
+import requests
+print(requests.get("anything").json())
+
+patcher.stop()
+
+print(type(requests.get))
+```
+
+The manual form is the most verbose and the easiest to forget to clean up. Always pair `start()` with `stop()`, and prefer the decorator or context manager forms unless you specifically need the start/stop split.
+
+<h1 id="patchobject-patching-a-specific-attribute">
+  patch.object: Patching a Specific Attribute
+</h1>
+
+`patch("some.module.name")` patches by string lookup. Sometimes you already have the object in hand and want to patch one of its attributes. That's what `patch.object` is for.
+
+```python
+from unittest.mock import patch
+import requests
+
+def test_with_patch_object():
+    with patch.object(requests, "get") as mock_get:
+        mock_get.return_value.status_code = 200
+        response = requests.get("https://example.com")
+        print(f"status_code: {response.status_code}")
+
+test_with_patch_object()
+```
+
+The first argument is the object, the second is the attribute name as a string. This is handy when you've already imported the module and don't want to spell out the full dotted path.
+
+`patch.object` shines for patching instance attributes too:
+
+```python
+from unittest.mock import patch
+
+class PaymentGateway:
+    def charge(self, amount):
+        return {"status": "ok", "amount": amount}
+
+gateway = PaymentGateway()
+
+with patch.object(gateway, "charge", return_value={"status": "declined"}) as mock_charge:
+    print(gateway.charge(29.99))
+
+print(gateway.charge(29.99))
+```
+
+Inside the `with`, `gateway.charge` is the mock and returns the declined response. Outside, the real method is back. Notice you can pass `return_value=` directly to `patch.object` as a keyword argument to skip the separate assignment.
+
+<h1 id="the-where-to-patch-gotcha">The "Where to Patch" Gotcha</h1>
+
+This is the single most common mistake people make with `patch`. The rule sounds simple but it's easy to get wrong.
+
+**Patch where the name is looked up, not where it's defined.**
+
+To see why, imagine an `orders.py` module that uses `requests` to charge a customer:
+
+```python
+# orders.py
+import requests
+
+def place_order(customer_id, amount):
+    response = requests.post(
+        "https://payments.example.com/charge",
+        json={"customer_id": customer_id, "amount": amount},
+    )
+    return response.json()
+```
+
+When `orders.py` runs `import requests`, Python binds the name `requests` inside the `orders` module's namespace. The line `requests.post(...)` looks up `requests` in `orders.__dict__`, not in some global place. So if you patch `requests.post`, you've only changed the `requests` module's `post` attribute, but `orders.requests` still has the original reference if `orders.py` did `from requests import post` instead of `import requests`.
+
+The diagram below shows the two namespaces involved:
+
+The diagram has two paths: the source module (`requests`) where the function lives, and the importer module (`orders`) where the function is _used_. `patch` has to target the namespace that the code under test actually looks up.
+
+A concrete example. Two ways to import:
+
+```python
+# orders_a.py
+import requests
+
+def place_order(amount):
+    return requests.post("https://payments.example.com/charge", json={"amount": amount})
+```
+
+```python
+# orders_b.py
+from requests import post
+
+def place_order(amount):
+    return post("https://payments.example.com/charge", json={"amount": amount})
+```
+
+For `orders_a.py`, both of these work:
+
+```python
+# Patch the source: orders_a.requests.post still points at the patched function
+patch("requests.post")
+
+# Patch the importer: orders_a.requests.post is also fine
+patch("orders_a.requests.post")
+```
+
+For `orders_b.py`, you **must** patch `orders_b.post`, not `requests.post`:
+
+```python
+# WRONG: this patches requests.post, but orders_b already has its own
+# reference to the original post function from the import time
+patch("requests.post")
+
+# RIGHT: patch the local name in orders_b
+patch("orders_b.post")
+```
+
+Here's a working demonstration. We'll define two small modules inline and patch each one correctly.
+
+```python
+import sys
+import types
+from unittest.mock import patch
+
+# Build a fake "requests" module on the fly
+fake_requests = types.ModuleType("requests")
+fake_requests.post = lambda url, **kwargs: {"status": "real_post_called"}
+sys.modules["requests"] = fake_requests
+
+# orders_a uses "import requests" then "requests.post(...)"
+orders_a = types.ModuleType("orders_a")
+exec(
+    "import requests\n"
+    "def place_order(amount):\n"
+    "    return requests.post('https://payments.example.com', json={'amount': amount})\n",
+    orders_a.__dict__,
+)
+sys.modules["orders_a"] = orders_a
+
+# orders_b uses "from requests import post" then "post(...)"
+orders_b = types.ModuleType("orders_b")
+exec(
+    "from requests import post\n"
+    "def place_order(amount):\n"
+    "    return post('https://payments.example.com', json={'amount': amount})\n",
+    orders_b.__dict__,
+)
+sys.modules["orders_b"] = orders_b
+
+# Patching requests.post works for orders_a (it looks up requests.post fresh)
+with patch("requests.post", return_value={"status": "mocked"}):
+    print(f"orders_a (patch requests.post): {orders_a.place_order(29.99)}")
+
+# Patching requests.post does NOT work for orders_b (it has its own reference)
+with patch("requests.post", return_value={"status": "mocked"}):
+    print(f"orders_b (patch requests.post): {orders_b.place_order(29.99)}")
+
+# Patching orders_b.post works correctly
+with patch("orders_b.post", return_value={"status": "mocked"}):
+    print(f"orders_b (patch orders_b.post): {orders_b.place_order(29.99)}")
+```
+
+`orders_a` works because `requests.post` is looked up every time `place_order` runs (it does `requests.post(...)`). `orders_b` already captured a reference to `post` at import time, so patching `requests.post` later has no effect on the name `orders_b.post`. To fix it, patch `orders_b.post` directly.
+
+The rule again: patch the name where the code under test looks it up. If you ever get a confusing test result where the mock didn't seem to apply, this is almost certainly the cause.
+
+<h1 id="autospec-and-create_autospec">autospec and create_autospec</h1>
+
+A mock will happily accept any attribute access and any call signature. That's flexible, but it means typos in your test code go unnoticed.
+
+```python
+from unittest.mock import MagicMock
+
+payment_gateway = MagicMock()
+payment_gateway.chrage(amount=29.99)  # typo: chrage instead of charge
+print("typo went unnoticed")
+```
+
+The mock doesn't know that `chrage` isn't a real method, so it cheerfully creates a child mock and lets the test pass. The same problem happens with argument signatures: you can pass any keyword to a mocked method, even if the real method doesn't accept it.
+
+`autospec=True` (an option for `patch`) and `create_autospec` (a standalone function) build mocks that mirror the **signature** of the real thing. Attribute access for missing names raises `AttributeError`, and calls with the wrong signature raise `TypeError`.
+
+```python
+from unittest.mock import patch, create_autospec
+
+class PaymentGateway:
+    def charge(self, customer_id, amount):
+        return {"status": "ok"}
+
+gateway = PaymentGateway()
+mock_gateway = create_autospec(gateway)
+
+# Real method, right signature: works
+mock_gateway.charge(customer_id=42, amount=29.99)
+print("right signature ok")
+
+# Real method, wrong signature: TypeError
+try:
+    mock_gateway.charge(customer_id=42)
+except TypeError as e:
+    print(f"wrong signature: {e}")
+
+# Made-up method: AttributeError
+try:
+    mock_gateway.chrage(amount=29.99)
+except AttributeError as e:
+    print(f"missing method: {e}")
+```
+
+Now the typo and the wrong signature both fail loudly. That's exactly what you want from tests.
+
+The `patch` decorator also accepts `autospec=True`, which is the easiest way to get a strict mock for the duration of a test.
+
+```python
+from unittest.mock import patch
+
+class PaymentGateway:
+    def charge(self, customer_id, amount):
+        return {"status": "ok"}
+
+# Make PaymentGateway a module-level name we can patch
+import sys, types
+mod = types.ModuleType("payments_mod")
+mod.PaymentGateway = PaymentGateway
+sys.modules["payments_mod"] = mod
+
+with patch("payments_mod.PaymentGateway", autospec=True) as mock_class:
+    instance = mock_class.return_value
+    try:
+        instance.chrage(amount=29.99)
+    except AttributeError as e:
+        print(f"caught: {e}")
+```
+
+Use `autospec=True` whenever the thing you're patching has a stable interface. The extra strictness catches refactoring bugs: if you rename `charge` to `process_payment` but forget to update the test, autospec fails loudly instead of silently passing.
+
+| Option                      | Catches typos in attribute names | Catches wrong call signatures | Setup cost        |
+| --------------------------- | -------------------------------- | ----------------------------- | ----------------- |
+| `MagicMock()`               | No                               | No                            | None              |
+| `MagicMock(spec=Klass)`     | Yes                              | No                            | Pass the class    |
+| `create_autospec(Klass)`    | Yes                              | Yes                           | One function call |
+| `patch(..., autospec=True)` | Yes                              | Yes                           | One keyword arg   |
+
+> **Cost:** `autospec` introspects the target at patch time, which adds a small amount of overhead. For tests it's negligible. The benefit (catching refactoring bugs) far outweighs the cost.
+
+<h1 id="spec-vs-autospec">spec vs autospec</h1>
+
+`spec` and `autospec` solve overlapping problems, and the difference is worth knowing.
+
+`MagicMock(spec=Klass)` limits the mock to the attribute _names_ of the class. It doesn't check call signatures.
+
+```python
+from unittest.mock import MagicMock
+
+class PaymentGateway:
+    def charge(self, customer_id, amount):
+        return {"status": "ok"}
+
+m = MagicMock(spec=PaymentGateway)
+
+# Right name, wrong signature: still passes (spec doesn't check signatures)
+m.charge(wrong_kwarg=42)
+print("spec didn't catch wrong signature")
+
+# Wrong name: AttributeError
+try:
+    m.chrage()
+except AttributeError as e:
+    print(f"spec caught typo: {e}")
+```
+
+`create_autospec(Klass)` (or `patch(..., autospec=True)`) is stricter: it checks both attribute names _and_ call signatures.
+
+```python
+from unittest.mock import create_autospec
+
+class PaymentGateway:
+    def charge(self, customer_id, amount):
+        return {"status": "ok"}
+
+m = create_autospec(PaymentGateway)
+
+try:
+    m.charge(wrong_kwarg=42)
+except TypeError as e:
+    print(f"autospec caught wrong signature: {e}")
+```
+
+Prefer `autospec` when the target has a stable signature you want to enforce. Fall back to `spec` when you need the attribute-name check but want the signature flexibility (rare in practice).
+
+<h1 id="mocking-properties-attributes-context-managers-and-async">
+  Mocking Properties, Attributes, Context Managers, and Async
+</h1>
+
+The patterns above cover regular method calls. A few special cases need slightly different recipes.
+
+<h3 id="properties">Properties</h3>
+
+Setting `mock.some_property = value` works for plain attributes, but Python properties on a class have to be patched with `PropertyMock`.
+
+```python
+from unittest.mock import MagicMock, PropertyMock
+
+class Order:
+    @property
+    def status(self):
+        return "pending"
+
+mock_order = MagicMock(spec=Order)
+type(mock_order).status = PropertyMock(return_value="delivered")
+
+print(mock_order.status)
+print(mock_order.status)
+print(type(mock_order).status.call_count)
+```
+
+`PropertyMock` has to be attached to the **type** of the mock (`type(mock_order)`), not the instance, because that's how Python looks up descriptors. `PropertyMock` also tracks how many times the property was accessed, which is sometimes useful.
+
+<h3 id="plain-attributes">Plain Attributes</h3>
+
+For non-property attributes, just assign them directly:
+
+```python
+from unittest.mock import MagicMock
+
+order = MagicMock()
+order.order_id = 1001
+order.total = 29.99
+order.status = "shipped"
+
+print(order.order_id, order.total, order.status)
+```
+
+<h3 id="context-managers">Context Managers</h3>
+
+`MagicMock` already supports `with`, so mocking a context manager is straightforward. The trick is that the value bound to `as` comes from `__enter__.return_value`.
+
+```python
+from unittest.mock import MagicMock
+
+mock_file = MagicMock()
+mock_file.__enter__.return_value.read.return_value = "order_id,total\n1001,29.99"
+
+with mock_file as f:
+    print(f.read())
+```
+
+<h3 id="async-functions">Async Functions</h3>
+
+Python 3.8 added `AsyncMock` for mocking `async def` functions and coroutines. It's like `MagicMock` but the call returns an awaitable.
+
+```python
+import asyncio
+from unittest.mock import AsyncMock
+
+email_service = AsyncMock()
+email_service.send.return_value = {"status": "sent"}
+
+async def main():
+    result = await email_service.send(to="alice@example.com")
+    print(result)
+
+asyncio.run(main())
+print(f"send was called: {email_service.send.await_count} times")
+```
+
+`AsyncMock` also has `await_count`, `await_args`, `await_args_list`, and `assert_awaited*` family of assertions that mirror the sync ones. Use `AsyncMock` (not `MagicMock`) whenever the thing under test calls `await mock(...)`.
+
+<h1 id="pytests-monkeypatch-a-lighter-alternative">
+  pytest's monkeypatch: A Lighter Alternative
+</h1>
+
+`pytest` ships a built-in fixture called `monkeypatch` that does the same kind of "swap something out, put it back when the test ends" job as `unittest.mock.patch`. It's lighter weight, doesn't require importing `unittest.mock`, and is the idiomatic choice in pytest tests for simple swaps. `monkeypatch` doesn't build a `Mock`. It just sets an attribute and remembers to restore it.
+
+```python
+# In a real pytest test file
+
+def get_api_key():
+    import os
+    return os.environ["API_KEY"]
+
+def test_get_api_key(monkeypatch):
+    monkeypatch.setenv("API_KEY", "test_key_123")
+    assert get_api_key() == "test_key_123"
+```
+
+The `monkeypatch` fixture exposes these helpers (the most common ones):
+
+| Helper                                     | What it does                                  |
+| ------------------------------------------ | --------------------------------------------- |
+| `monkeypatch.setattr(target, name, value)` | Set an attribute, restore on teardown         |
+| `monkeypatch.delattr(target, name)`        | Delete an attribute, restore on teardown      |
+| `monkeypatch.setenv(name, value)`          | Set an environment variable                   |
+| `monkeypatch.delenv(name)`                 | Delete an environment variable                |
+| `monkeypatch.setitem(d, key, value)`       | Set a dict item, restore on teardown          |
+| `monkeypatch.delitem(d, key)`              | Delete a dict item, restore on teardown       |
+| `monkeypatch.chdir(path)`                  | Change working directory, restore on teardown |
+| `monkeypatch.syspath_prepend(path)`        | Prepend to `sys.path`, restore on teardown    |
+
+`monkeypatch.setattr` accepts the same "dotted string" form as `patch`:
+
+```python
+# Two equivalent forms
+monkeypatch.setattr("requests.get", fake_get)
+monkeypatch.setattr(requests, "get", fake_get)
+```
+
+The choice between `monkeypatch` and `patch` is mostly about scale of needs.
+
+**Reach for `monkeypatch` when:**
+
+- You just need to swap in a function or a value
+- You need to set environment variables or dict entries
+- You're already writing pytest tests (the fixture is right there)
+
+**Reach for `patch` (with `MagicMock`) when:**
+
+- You need a mock that records calls (`call_args_list`, `assert_called_with`)
+- You want `autospec` to enforce signatures
+- You're not using pytest (so the `monkeypatch` fixture isn't available)
+- You need `side_effect` for sequences, exceptions, or functions
+
+Here's the same kind of test written both ways for comparison:
+
+```python
+# With monkeypatch (pytest)
+def test_with_monkeypatch(monkeypatch):
+    def fake_get(url):
+        class Resp:
+            def json(self):
+                return {"count": 42}
+        return Resp()
+
+    monkeypatch.setattr("requests.get", fake_get)
+
+    import requests
+    assert requests.get("anything").json() == {"count": 42}
+```
+
+```python
+# With patch + MagicMock
+from unittest.mock import patch, MagicMock
+
+def test_with_patch():
+    with patch("requests.get") as mock_get:
+        mock_get.return_value.json.return_value = {"count": 42}
+
+        import requests
+        assert requests.get("anything").json() == {"count": 42}
+        mock_get.assert_called_once_with("anything")
+```
+
+The `monkeypatch` version is shorter and reads like "set this, the test will handle the rest". The `patch` version gives you the `mock_get` handle so you can assert on the calls. Pick whichever you need; mixing both in the same project is fine and common.
+
+<h1 id="over-mocking-the-brittleness-trap">
+  Over-Mocking: The Brittleness Trap
+</h1>
+
+Mocks are powerful, and that's the problem. If you mock too much, your tests start to look like they pass while the underlying code is broken. A test that mocks every collaborator only proves that the code calls those collaborators in the order you expected, not that the system actually works.
+
+Two rules of thumb keep over-mocking in check:
+
+**Don't mock what you don't own.** Wrap third-party libraries (HTTP clients, database drivers, payment SDKs) in your own thin adapter layer, and mock the adapter, not the library. The library's interface might change between versions; your adapter is yours to keep stable.
+
+```python
+# A thin adapter around requests
+class PaymentClient:
+    def charge(self, customer_id, amount):
+        import requests
+        response = requests.post(
+            "https://payments.example.com/charge",
+            json={"customer_id": customer_id, "amount": amount},
+        )
+        return response.json()
+```
+
+In tests, mock `PaymentClient.charge`, not `requests.post`. If `requests` ever changes its API, only the adapter needs updating; the tests stay valid.
+
+**Don't mock value objects or pure functions.** Things like dataclasses, `datetime` arithmetic, or pure utility functions don't need mocking. They're fast, deterministic, and don't reach outside the process. Mocking them adds noise and decouples your test from real behavior.
+
+```python
+# Don't mock this
+from dataclasses import dataclass
+
+@dataclass
+class Order:
+    order_id: int
+    total: float
+
+# It's already fast and deterministic. Just construct one in the test.
+order = Order(order_id=1001, total=29.99)
+```
+
+The watchword is "mock at the boundaries": where your code talks to something slow, expensive, non-deterministic, or outside your control. Everything inside that boundary stays real.
+
+> **Cost:** Over-mocked tests are brittle. They break every time you refactor the implementation, even when the behavior is unchanged. Worse, they can keep passing even after the real system breaks, because the mocks still produce the expected interactions. If a test's assertions are mostly `assert_called_with(...)`, that's a smell. The test is checking the conversation, not the outcome.
+
+<h1 id="a-realistic-test-order-placement-with-mocks">
+  A Realistic Test: Order Placement with Mocks
+</h1>
+
+To pull everything together, here's a test for the `place_order` function from earlier. It exercises `return_value`, `side_effect`, multiple patches, and the call assertions.
+
+```python
+from unittest.mock import patch, MagicMock
+
+def place_order(customer_id, items, total):
+    import requests
+    response = requests.post(
+        "https://payments.example.com/charge",
+        json={"customer_id": customer_id, "amount": total},
+        timeout=10,
+    )
+    if response.status_code != 200:
+        return {"status": "failed", "reason": "payment_declined"}
+
+    requests.post(
+        "https://email.example.com/send",
+        json={"to": customer_id, "subject": "Order confirmed"},
+        timeout=10,
+    )
+    return {"status": "ok"}
+
+# Test 1: happy path
+with patch("requests.post") as mock_post:
+    mock_post.return_value = MagicMock(status_code=200)
+    result = place_order(customer_id=42, items=["Wireless Mouse"], total=29.99)
+    print(f"happy path: {result}")
+    print(f"call_count: {mock_post.call_count}")
+
+# Test 2: payment declined
+with patch("requests.post") as mock_post:
+    mock_post.return_value = MagicMock(status_code=402)
+    result = place_order(customer_id=42, items=["Wireless Mouse"], total=29.99)
+    print(f"declined: {result}")
+    print(f"call_count: {mock_post.call_count}")
+
+# Test 3: payment service raises
+with patch("requests.post") as mock_post:
+    mock_post.side_effect = ConnectionError("payment service down")
+    try:
+        place_order(customer_id=42, items=["Wireless Mouse"], total=29.99)
+    except ConnectionError as e:
+        print(f"raised: {e}")
+```
+
+Three branches, three tests, no real network calls. The "declined" case shows that the email isn't sent when the charge fails (`call_count` is `1`, not `2`). The "raised" case shows the connection error propagates correctly. This is what you get from mocking at the right boundary.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

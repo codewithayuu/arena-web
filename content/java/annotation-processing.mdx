@@ -1,0 +1,168 @@
+---
+title: "Annotation Processing"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Annotation Processing explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+This chapter covers both flows. The compile-time path uses the `javax.annotation.processing` API to plug into `javac`, inspect annotated code, and either emit compiler errors or generate brand new source files. The runtime path uses reflection on annotations whose retention is `RUNTIME` to inspect classes, methods, and fields while the application runs. By the end you'll have built one working processor that rejects bad code at compile time and one runtime validator that walks an object's fields and reports violations.
+
+<h1 id="the-two-flows-at-a-glance">The Two Flows at a Glance</h1>
+
+When you put `@Override` on a method, the Java compiler reads it and checks that the method really does override something. When Spring sees `@Autowired` on a field, it reads the annotation at runtime and injects a bean. Same syntax, two completely different mechanisms.
+
+The first flow runs inside `javac`. The compiler discovers user-written **annotation processors**, hands them the set of annotated elements it found in your source, and lets each processor decide what to do: emit a diagnostic, generate a new `.java` file, or just observe and stay silent. Processors run before bytecode is written. They can't change existing source, but they can refuse to let the compilation succeed.
+
+The second flow runs in the JVM. As long as an annotation is declared with `@Retention(RetentionPolicy.RUNTIME)`, it's preserved in the class file and the running JVM can read it back through the reflection API. Libraries like Hibernate Validator, Jackson, and JUnit work this way: they call `Class.getAnnotation(...)` or similar methods at runtime and adjust behavior based on what they find.
+
+The diagram shows where each flow lives. The compile-time path is everything left of the `.class` files. The runtime path is everything right of them. An annotation can participate in only one of the two, both, or neither, depending on its retention policy.
+
+The two flows have very different strengths. A compile-time check catches the problem before the code can even run, which means broken code never reaches a test environment or production. A runtime check has access to actual values (the field's contents, not just its type), so it can validate things the compiler can't see. Most production frameworks use a mix: configuration-style annotations (`@Entity`, `@Table`) are read at runtime when the framework boots, but lint-style annotations (`@Override`, `@SuppressWarnings`) are checked at compile time.
+
+<h1 id="the-compile-time-flow-javaxannotationprocessing">
+  The Compile-Time Flow: javax.annotation.processing
+</h1>
+
+Annotation processors are user code that the compiler runs as a plugin. You write a class, register it on the classpath, and `javac` invokes it during compilation. The processor doesn't see the raw source text. It sees a structured model of the code: classes, methods, fields, and parameters, all represented as `Element` objects.
+
+The starting point is `javax.annotation.processing.AbstractProcessor`. You subclass it, override `process(...)`, and the compiler calls your `process` method one or more times during compilation. Two annotations on your processor class tell the compiler what to give you: `@SupportedAnnotationTypes` lists the fully qualified annotation names you care about, and `@SupportedSourceVersion` tells the compiler which Java version your processor understands.
+
+Inside `process`, you get a `Set<? extends TypeElement>` (the annotation types found in this round) and a `RoundEnvironment`. The round environment is how you ask "which elements in this round are annotated with X?" via `getElementsAnnotatedWith(annotationClass)`. From there you walk the elements, check whatever invariants you care about, and either report problems through the messager or generate new source files through the filer.
+
+The diagram captures the lifecycle. `javac` discovers processors before compiling. It groups the work into **rounds**: the first round looks at the original source, and if any processor generates new source, the compiler does another round on the generated code. Rounds continue until no processor produces new source, after which `process` is called one final time with `processingOver()` returning `true`.
+
+A processor can do three things and only three things. It can read elements (their names, modifiers, types, annotations). It can generate new source files via the filer. And it can emit diagnostics (notes, warnings, errors) via the messager. What it cannot do is modify existing source code. There's no API to rename a method, inject a field into an existing class, or rewrite a method body. The closest you get is generating a brand-new class that the application uses alongside the original.
+
+That constraint shapes how processors are designed. Libraries like Lombok appear to rewrite existing classes (adding getters and setters) but they actually rely on internal compiler APIs that are not part of the supported `javax.annotation.processing` contract. With the supported API, the pattern is always: scan annotated elements, generate companion classes, and the application code refers to those companions explicitly.
+
+<h1 id="building-a-compile-time-processor-requireszeroargconstructor">
+  Building a Compile-Time Processor: @RequiresZeroArgConstructor
+</h1>
+
+Here's the use case. Many frameworks (JPA, Jackson, JAXB) require entity classes to have a no-argument constructor so they can be instantiated reflectively. Getting this wrong produces a confusing runtime exception, often deep in the framework's internals, far from the class that's missing the constructor. A compile-time check catches the problem at the only stage where the fix is obvious: the moment you save the file.
+
+The plan is to define a `@RequiresZeroArgConstructor` annotation and write a processor that, for every class marked with it, verifies the class declares a public no-argument constructor. If it doesn't, the processor emits a compile error pointing at the class.
+
+Start with the annotation itself. It only needs to be visible at compile time, so `SOURCE` retention is sufficient (the processor reads it before the class file is written).
+
+Now the processor. The class extends `AbstractProcessor`, declares which annotations it supports, and implements `process`. Inside `process`, it asks the round environment for everything annotated with `@RequiresZeroArgConstructor`, walks each one, and checks that the class has a constructor with zero parameters.
+
+The structure mirrors the API. `getElementsAnnotatedWith` returns every `Element` carrying the annotation in this round. For each one, the processor checks the element kind (defending against a user putting the annotation on something that isn't a class), then walks the class's enclosed elements to look for a public no-arg constructor. The messager's `printMessage` with `Diagnostic.Kind.ERROR` is what makes the build fail; passing the element as the last argument anchors the error to the offending source location, so the IDE highlights the right class.
+
+Returning `true` from `process` claims the annotation: it tells the compiler "I handled this annotation, no other processor needs to look at it." Returning `false` would let other processors also see the annotation. For a checker-style processor like this, claiming the annotation is fine.
+
+Now `javac` has to find the processor. There are two ways to wire it in. The first uses a service descriptor in `META-INF/services`. Create this file at exactly this path inside the processor's JAR (or the processor's `resources` directory in a Maven/Gradle build):
+
+**File:** `META-INF/services/javax.annotation.processing.Processor`
+
+The file is plain text. One fully qualified processor class name per line. The Java `ServiceLoader` mechanism reads this file when `javac` boots, discovers the processor, and instantiates it. This is how most processors in the wild register themselves; it's the same `ServiceLoader` pattern that JDBC drivers use.
+
+The second option is the `-processor` flag, which tells `javac` exactly which processor to run, bypassing service discovery:
+
+The `-processorpath` tells `javac` where to find the processor classes. It's separate from the regular classpath because processors run in a different layer of the compiler. In practice, build tools like Maven and Gradle handle this with `annotationProcessorPath`, so you rarely invoke `javac` directly.
+
+With the wiring in place, here's a class that should fail the check.
+
+The `Order` class declares only a two-argument constructor. The processor sees the annotation, scans for a no-arg constructor, finds none, and emits an error.
+
+**Compiler output:**
+
+The fix is to add the constructor.
+
+Now the compile succeeds. The class is safe for any framework that instantiates entities reflectively.
+
+Each annotation processor runs every time `javac` compiles the project, including incremental compiles in your IDE. Keep `process` cheap and avoid I/O. A processor that does a lot of work slows every keystroke compile in IntelliJ or Eclipse.
+
+The processor we wrote is a **checker**: it reads code and emits diagnostics. The other common shape is a **generator**, which creates new source. Generators use `processingEnv.getFiler().createSourceFile(...)` to write a new `.java` file, often a companion class to the annotated one. Dagger's dependency injection graph, MapStruct's bean mappers, and AutoValue's value classes are all generated this way at compile time. The principles are identical to what we did here; the only addition is calling the filer and writing valid Java to its output writer.
+
+<h1 id="the-runtime-flow-reading-annotations-via-reflection">
+  The Runtime Flow: Reading Annotations via Reflection
+</h1>
+
+The compile-time flow runs once, before the program executes. The runtime flow runs whenever the program asks. As long as an annotation is declared `@Retention(RetentionPolicy.RUNTIME)`, the JVM keeps it in the class file, loads it when the class is loaded, and lets you read it through the reflection API.
+
+The entry point on a class is the `java.lang.Class` object. Every class in a running JVM has one, accessible via `SomeClass.class` or `someObject.getClass()`. On that `Class` object, four methods cover annotation inspection.
+
+The same four methods exist on `Method`, `Field`, `Constructor`, and `Parameter`, so once you can navigate to those elements (via `getDeclaredMethods()`, `getDeclaredFields()`, and so on), the rest of the API is the same. Here we focus on the annotation-reading half.
+
+The diagram traces the lookup. Start with an object (or its class), navigate down to the field (or method, constructor, parameter), check whether the annotation is present, and if so, fetch it and read its values. Each step is a method call. There's no magic and no framework needed; the JDK ships with the entire API.
+
+The annotation instance returned by `getAnnotation` is a real Java object that implements the annotation type. Its methods correspond to the annotation's elements. If your annotation declares `int min() default 0`, then `myAnnotation.min()` returns the configured value (or `0` if the user didn't specify one). This is how runtime libraries read configuration: they don't parse strings, they call element methods on annotation instances.
+
+Repeatable annotations (introduced in Java 8) need a special call. `getAnnotation` returns only one instance, so for repeatable annotations you call `getAnnotationsByType` instead, which returns an array of all the applied instances.
+
+<h1 id="building-a-runtime-validator-customer-field-constraints">
+  Building a Runtime Validator: Customer Field Constraints
+</h1>
+
+Validation is the classic runtime-annotation use case. Hibernate Validator (the reference implementation of Jakarta Bean Validation) works exactly this way: you decorate fields with `@NotNull`, `@Size`, `@Min`, and so on, hand the object to a validator, and the validator walks the fields via reflection and reports violations.
+
+We'll build a tiny version. Three annotations: `@NotNull`, `@Min`, and `@MaxLength`. One validator class that takes any object, walks its fields, and prints every violation it finds. The example domain is a `Customer` class with a name, email, age, and loyalty points.
+
+First, the annotations. All three need runtime retention so the validator can read them.
+
+Each annotation has a `message` element with a default. `@Min` and `@MaxLength` also take a numeric `value`. The `value` element gets special syntactic treatment: you can write `@Min(18)` instead of `@Min(value = 18)`. Multiple elements (`@Min(value = 18, message = "...")`) require named syntax.
+
+Now the `Customer` class, decorated with the three annotations.
+
+And the validator. It walks every declared field of an arbitrary object, checks for each supported annotation, and reports any failure.
+
+A few details. `getDeclaredFields()` returns every field declared on the class, including private ones, but it does not include inherited fields; for a class hierarchy you'd walk superclasses too. `setAccessible(true)` opens up private field access; without it, `field.get(target)` would throw `IllegalAccessException` on a private field. `field.isAnnotationPresent(...)` is the fast check; `field.getAnnotation(...)` is the call that returns the actual instance, on which you read element values like `annotation.message()` and `annotation.value()`.
+
+Now exercise it.
+
+The validator never knew anything about `Customer` at compile time. It just walks fields, asks each one "are you annotated with `@NotNull`?", and acts on the answer. Add a new constraint annotation, register one more `if` branch in `validate`, and any class can be checked.
+
+Reflection-based reads are slower than direct field access by roughly 5-10x in microbenchmarks. For a one-time validation per request, the cost is negligible compared to I/O. For a hot loop that runs millions of times per second, frameworks usually cache the result of the reflective walk (the list of annotated fields per class) rather than redoing it on every call.
+
+<h1 id="reading-annotations-through-the-reflection-apis">
+  Reading Annotations Through the Reflection APIs
+</h1>
+
+The validator focused on fields, but the same pattern works for any annotatable element. Each reflection type has the same four annotation-reading methods.
+
+The output is short because the `Customer` class has annotations only on its fields, not on the class or methods. Switch a target to `ElementType.METHOD` and add the annotation to a method, and `getAnnotations()` on that method would return it. The shape of the API never changes.
+
+For repeatable annotations, the call is slightly different. If you declared an annotation as repeatable and applied it twice to the same element, `getAnnotation` returns only one of them (or the container annotation, depending on how the repeatable was set up), so use `getAnnotationsByType` instead.
+
+`getAnnotationsByType` handles the container annotation transparently. You don't have to know whether `DiscountRule` was declared with a container or how the compiler packed multiple instances into the class file; you just ask for the array and iterate.
+
+<h1 id="compile-time-vs-runtime-choosing-between-them">
+  Compile-Time vs Runtime: Choosing Between Them
+</h1>
+
+The two flows are not interchangeable. Each has things the other can't do, and the choice depends on what you're trying to enforce.
+
+Compile-time wins when you can decide the answer purely from the shape of the code. "Does this class have a no-arg constructor?" is structural. The compiler already has the answer in front of it; a processor just inspects what's there. "Does this method name match the regex `^get[A-Z]`?" is structural too. Anything that depends only on declarations, signatures, and annotation values is a candidate for compile-time enforcement, with the bonus that the build fails immediately when something goes wrong.
+
+Runtime wins when the answer depends on values that don't exist at compile time. "Is this field's value null at validation time?" is a runtime question; the compiler doesn't know what value `customer.name` will hold. "Which @Service-annotated class implements interface X so I can autowire it?" depends on the classpath at boot time. Dependency injection containers, ORMs, web framework routers, and validators all answer questions that require live objects.
+
+A third pattern combines both. The classic example is Jakarta Bean Validation: the constraints (`@NotNull`, `@Size`) are read at runtime by Hibernate Validator, but there's an optional annotation processor (Hibernate Validator Annotation Processor) that runs at compile time to check that, for example, `@Size` is only applied to types that support a length check. The processor catches the misconfiguration before the application starts; the runtime layer does the actual data validation. Two flows working together cover what either one alone would miss.
+
+<h1 id="real-world-frameworks-where-each-flow-shows-up">
+  Real-World Frameworks: Where Each Flow Shows Up
+</h1>
+
+Both flows are everywhere in the Java ecosystem. A few examples make the boundaries concrete.
+
+**Lombok** uses compile-time annotation processing (and some unsupported internal APIs) to generate boilerplate. When you annotate a class with `@Getter`, `@Setter`, or `@Data`, Lombok runs during compilation and synthesizes the accessor methods so they appear in the class file even though they aren't in your source. The application code calls `customer.getName()` and the compiler sees a real method. Without the processor, the same call would be a compile error.
+
+**MapStruct** is another compile-time generator. You declare a mapper interface with `@Mapper`, and MapStruct generates an implementation class that does the field-by-field copying. The generated class is plain Java code (you can read it in `build/generated/sources/`), which is one of compile-time generation's advantages: there's no runtime reflection, no surprise behavior, just generated source you can step through in a debugger.
+
+**Hibernate Validator** (Jakarta Bean Validation) is the standard runtime example. The constraint annotations on entity fields (`@NotNull`, `@Email`, `@Size`, `@Min`, `@Max`) are runtime-retained, and the validator reads them via reflection when `Validator.validate(customer)` runs. The validator's first pass over a class is reflective (slow), but it caches the result, so subsequent validations of the same class are fast.
+
+**Jackson** uses runtime reflection for serialization. `@JsonProperty("customer_id")` on a field tells Jackson to use `customer_id` as the JSON name when serializing. Jackson reads the annotation when it first encounters the class, caches a serializer for that class, and reuses the cached serializer for every subsequent object of the same type.
+
+**Spring Framework** mixes both. Configuration annotations like `@Component`, `@Autowired`, `@Service`, and `@Repository` are runtime-retained and read by the Spring context at startup. Spring Boot also generates compile-time metadata for its actuator and configuration properties, so some of the same annotations participate in both flows. Spring's choice is deliberate: dependency injection has to be runtime because the classpath is the source of truth, but configuration metadata that the IDE wants to autocomplete is better generated at compile time.
+
+**JUnit 5** reads `@Test`, `@BeforeEach`, `@AfterEach`, and similar annotations at runtime via reflection. The test engine scans the test class, finds annotated methods, and invokes them in the correct order. There's no compile-time processor for the core annotations; the engine assumes any class on the test classpath might contain tests and looks them up dynamically.
+
+Knowing which flow a library uses helps when you debug it. A Hibernate Validator misconfiguration shows up at runtime (often the first time the offending entity is validated). A Lombok misconfiguration shows up at compile time (the generated method is missing or the annotation reports an error). The diagnosis tool differs accordingly.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

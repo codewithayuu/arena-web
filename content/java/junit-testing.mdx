@@ -1,0 +1,884 @@
+---
+title: "JUnit Testing"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "JUnit Testing explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="why-junit-5">Why JUnit 5</h1>
+
+JUnit 4 ran the Java world for over a decade. It worked, but it was a single jar with no internal seams, designed before Java had lambdas, and its parameterized test API was famously awkward. JUnit 5 is a rewrite that fixes all three problems at once. The artifact is now split into three pieces:
+
+| Module         | What it does                                                                                                                   |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| JUnit Platform | The runtime that IDEs, build tools, and CI servers talk to. It launches tests but doesn't define them.                         |
+| JUnit Jupiter  | The actual programming model: `@Test`, assertions, lifecycle hooks, parameterized tests. This is what you write tests against. |
+| JUnit Vintage  | A compatibility engine that lets old JUnit 3 and 4 tests run on the new platform during a migration.                           |
+
+That split matters because it lets the API evolve without breaking the runners. A new annotation in Jupiter doesn't force every IDE to update. New engines can plug into the same platform; Kotlin's `kotlin-test` and Spock both ride on it.
+
+The user-facing wins are simpler. Assertions take a `Supplier<String>` for failure messages, so the message string is only built when an assertion actually fails. Tests can be nested with `@Nested` to group related cases by behavior. Parameterized tests are first-class with a clean `@ParameterizedTest` plus source annotations. Display names can be sentences. The whole library targets Java 8 and up, so lambdas and method references are first-class throughout.
+
+The build tool talks to the Platform. The Platform finds engines (Jupiter, Vintage, or others) and asks each one to discover and run its tests. Application code rarely touches the Platform directly; Jupiter tests do the work and the build tool handles the rest.
+
+<h1 id="adding-junit-5-to-a-project">Adding JUnit 5 to a Project</h1>
+
+A new test depends on the `junit-jupiter` aggregator artifact, which pulls in the API you write against, the engine that runs the tests, and the assertion classes.
+
+**Maven** (`pom.xml`):
+
+```text
+<dependencies>
+    <dependency>
+        <groupId>org.junit.jupiter</groupId>
+        <artifactId>junit-jupiter</artifactId>
+        <version>5.10.2</version>
+        <scope>test</scope>
+    </dependency>
+</dependencies>
+
+<build>
+    <plugins>
+        <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <version>3.2.5</version>
+        </plugin>
+    </plugins>
+</build>
+```
+
+The `test` scope means the jars are on the test classpath but not the main one, which keeps test code from leaking into production builds. Surefire is the Maven plugin that runs unit tests, and it speaks the JUnit Platform protocol natively from version 3.0 onward.
+
+**Gradle** (`build.gradle`):
+
+```text
+dependencies {
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+}
+
+test {
+    useJUnitPlatform()
+}
+```
+
+The `useJUnitPlatform()` line is easy to miss on a first setup. Without it, Gradle defaults to the JUnit 4 runner and quietly skips every Jupiter test.
+
+The standard source layout puts production code in `src/main/java` and tests in `src/test/java`. Both Maven and Gradle pick this up by convention. A test class that lives at `src/test/java/com/shop/cart/CartTest.java` belongs to the `com.shop.cart` package, the same as the class it tests. That matters because it lets the test see package-private members without making them public.
+
+The two trees mirror each other one for one. A new class on the left wants a new test class on the right, in the same package, named after the class with a `Test` suffix.
+
+<h1 id="your-first-test">Your First Test</h1>
+
+A small e-commerce class and the test that exercises it. The class lives at `src/main/java/com/shop/cart/Cart.java`.
+
+```java
+package com.shop.cart;
+
+import java.util.ArrayList;
+import java.util.List;
+
+public class Cart {
+    private final List<String> items = new ArrayList<>();
+
+    public void addItem(String productName) {
+        if (productName == null || productName.isBlank()) {
+            throw new IllegalArgumentException("product name must not be blank");
+        }
+        items.add(productName);
+    }
+
+    public int size() {
+        return items.size();
+    }
+
+    public List<String> items() {
+        return List.copyOf(items);
+    }
+}
+```
+
+The test class lives at `src/test/java/com/shop/cart/CartTest.java`.
+
+```java
+package com.shop.cart;
+
+import org.junit.jupiter.api.Test;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+class CartTest {
+
+    @Test
+    void newCartHasZeroItems() {
+        Cart cart = new Cart();
+        assertEquals(0, cart.size());
+    }
+
+    @Test
+    void addingOneItemMakesSizeOne() {
+        Cart cart = new Cart();
+        cart.addItem("Wireless Mouse");
+        assertEquals(1, cart.size());
+    }
+}
+```
+
+A few details. The test class and the test methods are both package-private (no `public` keyword). Jupiter discovers them by reflection and doesn't require public visibility, which keeps the test file uncluttered. The `@Test` annotation marks a method as a test case. The `assertEquals` import is a static import, which is the idiomatic style: it allows `assertEquals(0, cart.size())` instead of `Assertions.assertEquals(0, cart.size())`.
+
+Running `mvn test` (or `gradle test`) compiles the test sources, launches the JUnit Platform, and runs every `@Test` method it can find. The console output looks something like this.
+
+Two passes. Each test method runs in isolation: Jupiter creates a fresh `CartTest` instance for each method by default, so the cart in `newCartHasZeroItems` is a different object from the cart in `addingOneItemMakesSizeOne`. The lifecycle section below covers this in more detail.
+
+<h1 id="the-assertions-api">The Assertions API</h1>
+
+Jupiter's `Assertions` class is the home of every standard assertion. Each method either passes silently or throws an `AssertionFailedError` with a message that includes the expected and actual values. The full set is in `org.junit.jupiter.api.Assertions`; the ones below cover the majority of cases.
+
+```java
+package com.shop.cart;
+
+import org.junit.jupiter.api.Test;
+
+import java.util.List;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class AssertionsTest {
+
+    @Test
+    void valueEquality() {
+        int cartSize = 3;
+        assertEquals(3, cartSize);
+        assertNotEquals(0, cartSize);
+    }
+
+    @Test
+    void booleanChecks() {
+        Cart cart = new Cart();
+        cart.addItem("Wireless Mouse");
+        assertTrue(cart.size() > 0);
+        assertFalse(cart.items().isEmpty());
+    }
+
+    @Test
+    void nullChecks() {
+        String couponCode = null;
+        String customerName = "Alice";
+        assertNull(couponCode);
+        assertNotNull(customerName);
+    }
+
+    @Test
+    void arraysAndIterables() {
+        int[] expectedQuantities = {2, 3, 1};
+        int[] actualQuantities = {2, 3, 1};
+        assertArrayEquals(expectedQuantities, actualQuantities);
+
+        List<String> expectedItems = List.of("Wireless Mouse", "USB Cable");
+        List<String> actualItems = List.of("Wireless Mouse", "USB Cable");
+        assertIterableEquals(expectedItems, actualItems);
+    }
+}
+```
+
+`assertEquals` is the main building block. The first argument is the expected value, the second is the actual one. Get the order wrong and the failure message reads backwards, which is confusing at 2 AM but doesn't change whether the test passes. `assertArrayEquals` compares arrays element by element; using `assertEquals` on two arrays compares references and almost always fails. `assertIterableEquals` walks both iterables in order, comparing element by element.
+
+The third argument on most assertions is an optional failure message. Jupiter accepts both a `String` and a `Supplier<String>`. The supplier form is preferred when the message is expensive to build, because the lambda only runs on failure.
+
+```java
+@Test
+void messagesWithSuppliers() {
+    Cart cart = new Cart();
+    cart.addItem("Wireless Mouse");
+
+    assertEquals(1, cart.size(),
+        () -> "expected one item but cart was: " + cart.items());
+}
+```
+
+If the assertion passes, the lambda never runs and the `cart.items()` call is skipped. Passing a plain `String` builds the message on every invocation, pass or fail. For one-off checks it doesn't matter; in a parameterized test that runs a thousand times, the `Supplier` form is preferable.
+
+<h3 id="grouped-assertions-with-assertall">
+  Grouped Assertions with assertAll
+</h3>
+
+A test often has multiple expectations against the same object. Writing them one after another stops the test at the first failure, so a broken object that violates three invariants produces three separate test runs to find them all. `assertAll` solves this by running each assertion and reporting every failure together.
+
+```java
+@Test
+void cartShape() {
+    Cart cart = new Cart();
+    cart.addItem("Wireless Mouse");
+    cart.addItem("USB Cable");
+
+    assertAll("cart contents",
+        () -> assertEquals(2, cart.size()),
+        () -> assertTrue(cart.items().contains("Wireless Mouse")),
+        () -> assertTrue(cart.items().contains("USB Cable"))
+    );
+}
+```
+
+If two of those three checks fail, the failure message lists both. Without `assertAll`, only the first failure surfaces; fixing it, rerunning, and then learning about the second turns one investigation into several. Use `assertAll` whenever a single object's state needs to satisfy several conditions.
+
+Every lambda inside `assertAll` is wrapped in a `try`/`catch`, so the assertion machinery is slightly heavier per check than a flat sequence. Negligible in normal tests, but avoid `assertAll` to wrap thousands of assertions in a loop.
+
+<h3 id="testing-for-exceptions">Testing for Exceptions</h3>
+
+Two patterns come up often. The first is "this call should throw exception X with a particular message." The second is "this call should not throw."
+
+```java
+@Test
+void blankProductNameThrows() {
+    Cart cart = new Cart();
+    IllegalArgumentException thrown = assertThrows(
+        IllegalArgumentException.class,
+        () -> cart.addItem("")
+    );
+    assertEquals("product name must not be blank", thrown.getMessage());
+}
+
+@Test
+void validProductNameDoesNotThrow() {
+    Cart cart = new Cart();
+    assertDoesNotThrow(() -> cart.addItem("Wireless Mouse"));
+}
+```
+
+`assertThrows` takes the expected exception class and a lambda. It passes if the lambda throws that exception (or a subclass) and fails if the lambda completes normally or throws a different type. The returned exception is the actual thrown object, available for further assertions about its message, cause, or fields. `assertDoesNotThrow` is the inverse, and is mostly useful when the call has side effects that should keep running after the check.
+
+<h3 id="time-bound-assertions">Time-Bound Assertions</h3>
+
+`assertTimeout` runs a lambda and fails if it takes longer than the given duration. There are two flavors with a real difference in behavior.
+
+```java
+import java.time.Duration;
+
+@Test
+void priceLookupIsFast() {
+    Cart cart = new Cart();
+    cart.addItem("Wireless Mouse");
+
+    assertTimeout(Duration.ofMillis(50), () -> {
+        cart.items();
+    });
+}
+
+@Test
+void priceLookupIsFastEvenWhenAborted() {
+    assertTimeoutPreemptively(Duration.ofMillis(50), () -> {
+        Thread.sleep(10);
+    });
+}
+```
+
+`assertTimeout` runs the lambda to completion on the same thread, then checks whether it took too long. A hung lambda will block the test forever. `assertTimeoutPreemptively` runs the lambda on a separate thread and interrupts it when the timeout fires. The preemptive form is appropriate when "stuck forever" is one of the failure modes; the regular form is fine for measuring code that's trusted to finish.
+
+<h1 id="lifecycle-hooks">Lifecycle Hooks</h1>
+
+A test class often needs setup work: building a fixture, opening a connection, registering a fake clock. Jupiter has four annotations for that, and the names spell out exactly when they fire.
+
+| Annotation    | Fires                              | Typical use                            |
+| ------------- | ---------------------------------- | -------------------------------------- |
+| `@BeforeEach` | Before every `@Test` method        | Build a fresh fixture per test         |
+| `@AfterEach`  | After every `@Test` method         | Clean up state, reset statics          |
+| `@BeforeAll`  | Once before any test in the class  | Open a connection, start a fake server |
+| `@AfterAll`   | Once after every test in the class | Close the connection, stop the server  |
+
+The `BeforeAll` and `AfterAll` methods must be `static` by default, because Jupiter calls them before any instance of the test class exists. The `BeforeEach` and `AfterEach` methods are instance methods, so they can read and write fields on the test class.
+
+```java
+package com.shop.cart;
+
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+class CartLifecycleTest {
+    private Cart cart;
+
+    @BeforeAll
+    static void setUpClass() {
+        System.out.println("Starting CartLifecycleTest");
+    }
+
+    @BeforeEach
+    void setUp() {
+        cart = new Cart();
+        cart.addItem("Wireless Mouse");
+    }
+
+    @Test
+    void startsWithOneItem() {
+        assertEquals(1, cart.size());
+    }
+
+    @Test
+    void canAddMoreItems() {
+        cart.addItem("USB Cable");
+        assertEquals(2, cart.size());
+    }
+
+    @AfterEach
+    void tearDown() {
+        cart = null;
+    }
+
+    @AfterAll
+    static void tearDownClass() {
+        System.out.println("Finished CartLifecycleTest");
+    }
+}
+```
+
+The `BeforeEach` method runs before each test, so each test sees a cart with exactly one item. The second test adds another item and gets a size of two; the first test isn't affected, because its cart was a different object. This isolation prevents bugs in one test from leaking into another.
+
+The diagram below shows the order in which hooks fire when a class has two test methods.
+
+`BeforeAll` and `AfterAll` bookend the whole class. `BeforeEach` and `AfterEach` bookend every test. If a `BeforeEach` throws, the test is reported as a failure and `AfterEach` still runs, so cleanup is guaranteed even on a broken fixture.
+
+<h3 id="test-instance-lifecycle-per_method-vs-per_class">
+  Test Instance Lifecycle: PER_METHOD vs PER_CLASS
+</h3>
+
+By default, Jupiter creates a new instance of the test class for every `@Test` method. This is why `@BeforeAll` has to be static: there's no instance to hold the state. The default mode is called `PER_METHOD` and is the standard choice, because it forces tests to be independent.
+
+For one instance per whole class (which lets `@BeforeAll` be non-static and lets tests share fields without resetting them), annotate the class with `@TestInstance(Lifecycle.PER_CLASS)`.
+
+```java
+import org.junit.jupiter.api.TestInstance;
+import org.junit.jupiter.api.TestInstance.Lifecycle;
+
+@TestInstance(Lifecycle.PER_CLASS)
+class CartPerClassTest {
+    private int callCount = 0;
+
+    @org.junit.jupiter.api.BeforeAll
+    void openConnection() {
+        // no longer needs to be static
+    }
+
+    @org.junit.jupiter.api.Test
+    void firstTest() {
+        callCount++;
+    }
+}
+```
+
+`PER_CLASS` fits when the per-test setup is expensive (a real database connection, a server process) and the tests do not mutate shared state. Otherwise, leave the default. The default isolation prevents a whole class of "works alone, fails in a suite" bugs.
+
+<h1 id="display-names">Display Names</h1>
+
+By default a test's display name is the method name, which is fine for simple cases but reads awkwardly in reports for anything more interesting. `@DisplayName` overrides the name with a human-friendly string.
+
+```java
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+@DisplayName("Cart behavior")
+class CartDisplayNameTest {
+
+    @Test
+    @DisplayName("an empty cart has zero items")
+    void emptyCart() {
+        assertEquals(0, new Cart().size());
+    }
+
+    @Test
+    @DisplayName("adding an item increases size by one")
+    void addItem() {
+        Cart cart = new Cart();
+        cart.addItem("Wireless Mouse");
+        assertEquals(1, cart.size());
+    }
+}
+```
+
+The class and method names still need to be valid Java identifiers, but the display names can contain spaces, punctuation, and even non-ASCII characters. IDEs and CI reports show the display name when one is set, falling back to the method name when not.
+
+For a project-wide style, `@DisplayNameGeneration(DisplayNameGenerator.ReplaceUnderscores.class)` will turn underscores in method names into spaces automatically, so `void adding_an_item_increases_size()` reads as "adding an item increases size" in reports. The trade-off is method names full of underscores in source. Pick a style and apply it consistently.
+
+<h1 id="disabling-and-conditional-execution">
+  Disabling and Conditional Execution
+</h1>
+
+Sometimes a test needs to be temporarily skipped: it's flaky, the feature isn't shipped yet, or it only makes sense on a particular operating system. Jupiter has annotations for each case.
+
+```java
+import org.junit.jupiter.api.Disabled;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledOnOs;
+import org.junit.jupiter.api.condition.OS;
+
+class DisabledTest {
+
+    @Test
+    @Disabled("Flaky during weekend builds, tracking in ticket SHOP-1421")
+    void weekendOrderProcessing() {
+        // ...
+    }
+
+    @Test
+    @EnabledOnOs(OS.LINUX)
+    void linuxOnlyFilePath() {
+        // ...
+    }
+}
+```
+
+`@Disabled` skips the test and prints the reason in the report. The reason is mandatory in spirit, even when not enforced; a disabled test with no comment becomes a permanent skip. Conditional annotations like `@EnabledOnOs`, `@EnabledOnJre`, `@EnabledIfSystemProperty`, and `@EnabledIfEnvironmentVariable` give finer control.
+
+The skip is visible in the build output, so CI does not hide the fact that the test was skipped.
+
+<h1 id="tagging-tests">Tagging Tests</h1>
+
+`@Tag` attaches arbitrary labels to a test or a whole class. The build can then run only tests with a particular tag, or exclude tests by tag.
+
+```java
+import org.junit.jupiter.api.Tag;
+import org.junit.jupiter.api.Test;
+
+class TaggedTest {
+
+    @Test
+    @Tag("fast")
+    void emptyCartHasZeroItems() {
+        // ...
+    }
+
+    @Test
+    @Tag("slow")
+    @Tag("database")
+    void orderHistoryLoadsFromDatabase() {
+        // ...
+    }
+}
+```
+
+In Maven Surefire, run only `fast` tests with `mvn test -Dgroups=fast`. In Gradle, use `test { useJUnitPlatform { includeTags 'fast' } }`. Tags are useful for separating quick unit tests from slow integration tests, so CI can run the fast suite on every commit and the slow suite once an hour. Keep the tag vocabulary small; a project with twenty tags becomes hard to navigate.
+
+<h1 id="parameterized-tests">Parameterized Tests</h1>
+
+The same test logic often needs to run against many inputs. Writing one method per input is repetitive and obscures the pattern. `@ParameterizedTest` runs the same method body once per value, with each value passed as an argument.
+
+```java
+package com.shop.cart;
+
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
+
+import java.util.stream.Stream;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
+class CartParameterizedTest {
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", " ", "   "})
+    @DisplayName("blank product names are rejected")
+    void blankNamesRejected(String name) {
+        Cart cart = new Cart();
+        assertThrows(IllegalArgumentException.class, () -> cart.addItem(name));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+        "Wireless Mouse, 1",
+        "USB Cable, 2",
+        "Headphones, 3"
+    })
+    void addItemThenCheckSize(String productName, int expectedSize) {
+        Cart cart = new Cart();
+        for (int i = 0; i < expectedSize; i++) {
+            cart.addItem(productName);
+        }
+        assertEquals(expectedSize, cart.size());
+    }
+
+    enum OrderStatus { PLACED, SHIPPED, DELIVERED, CANCELLED }
+
+    @ParameterizedTest
+    @EnumSource(OrderStatus.class)
+    void everyStatusHasAName(OrderStatus status) {
+        assertEquals(status.name(), status.toString());
+    }
+
+    @ParameterizedTest
+    @MethodSource("cartFixtures")
+    void cartSizeMatchesItemCount(Cart cart, int expectedSize) {
+        assertEquals(expectedSize, cart.size());
+    }
+
+    static Stream<org.junit.jupiter.params.provider.Arguments> cartFixtures() {
+        Cart empty = new Cart();
+        Cart oneItem = new Cart();
+        oneItem.addItem("Wireless Mouse");
+        Cart twoItems = new Cart();
+        twoItems.addItem("Wireless Mouse");
+        twoItems.addItem("USB Cable");
+
+        return Stream.of(
+            org.junit.jupiter.params.provider.Arguments.of(empty, 0),
+            org.junit.jupiter.params.provider.Arguments.of(oneItem, 1),
+            org.junit.jupiter.params.provider.Arguments.of(twoItems, 2)
+        );
+    }
+}
+```
+
+Each source annotation is its own micro-language. `@ValueSource` works for a flat list of primitives or strings. `@CsvSource` accepts comma-separated lines, parsing each line into the method's parameter list. `@EnumSource` runs the method once per enum constant. `@MethodSource` calls a static method on the test class that returns a `Stream<Arguments>`, the fallback for arbitrarily complex inputs that the others can't express.
+
+The output names each invocation, so a failure points at the exact input that broke.
+
+For larger CSV fixtures, `@CsvFileSource` reads a CSV file from the test classpath, which keeps the data out of the source file when the table grows past five or ten rows.
+
+<h1 id="repeated-tests">Repeated Tests</h1>
+
+`@RepeatedTest` runs the same test method a given number of times. It can flush out flakiness in tests that depend on timing or random data, although the better fix for a flaky test is usually to remove the source of the flake.
+
+```java
+import org.junit.jupiter.api.RepeatedTest;
+import org.junit.jupiter.api.RepetitionInfo;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+class RepeatedCartTest {
+
+    @RepeatedTest(value = 5, name = "Run {currentRepetition} of {totalRepetitions}")
+    void cartStartsEmpty(RepetitionInfo info) {
+        Cart cart = new Cart();
+        assertEquals(0, cart.size());
+    }
+}
+```
+
+The `name` placeholder values produce report entries like `Run 1 of 5`, `Run 2 of 5`, and so on. The optional `RepetitionInfo` parameter exposes which repetition is running, occasionally useful for skipping the warm-up runs in a benchmark-style test.
+
+<h1 id="nested-tests">Nested Tests</h1>
+
+Real domain objects have multiple behaviors that deserve their own grouping. A `Cart` has add behavior, remove behavior, and total-calculation behavior. Putting all the tests in a flat class with eight methods works, but the relationships between methods are lost. `@Nested` groups tests by behavior in inner classes that still share the outer fixture.
+
+```java
+package com.shop.cart;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
+@DisplayName("Cart")
+class CartNestedTest {
+    private Cart cart;
+
+    @BeforeEach
+    void setUp() {
+        cart = new Cart();
+    }
+
+    @Nested
+    @DisplayName("when newly created")
+    class WhenNew {
+
+        @Test
+        @DisplayName("is empty")
+        void isEmpty() {
+            assertEquals(0, cart.size());
+        }
+    }
+
+    @Nested
+    @DisplayName("when adding items")
+    class WhenAdding {
+
+        @Test
+        @DisplayName("size grows by one per item")
+        void sizeGrows() {
+            cart.addItem("Wireless Mouse");
+            cart.addItem("USB Cable");
+            assertEquals(2, cart.size());
+        }
+
+        @Test
+        @DisplayName("rejects a blank name")
+        void rejectsBlank() {
+            assertThrows(IllegalArgumentException.class, () -> cart.addItem(""));
+        }
+    }
+}
+```
+
+The IDE displays this as a tree:
+
+```text
+Cart
+├── when newly created
+│   └── is empty
+└── when adding items
+    ├── size grows by one per item
+    └── rejects a blank name
+```
+
+Each nested class is a non-static inner class, so it can access the outer class's fields. The outer `@BeforeEach` runs before every test in every nested class, giving each test a fresh cart. Nested classes can have their own `@BeforeEach` for setup that's specific to a behavior group.
+
+Two or three levels of nesting works well; beyond that, the structure becomes harder to read than the flat version it was meant to replace.
+
+<h1 id="test-order">Test Order</h1>
+
+By default, Jupiter runs test methods in a deterministic but unspecified order. The order is stable across runs but isn't the source order, which is a deliberate choice: tests that depend on a specific order are fragile and almost always wrong.
+
+When a specific order is required (a tutorial test class that walks through a workflow, for example), `@TestMethodOrder(MethodOrderer.OrderAnnotation.class)` lets `@Order(int)` on each method set the sequence.
+
+```java
+import org.junit.jupiter.api.MethodOrderer;
+import org.junit.jupiter.api.Order;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestMethodOrder;
+
+@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
+class OrderedTest {
+
+    @Test
+    @Order(1)
+    void createCart() {
+        // ...
+    }
+
+    @Test
+    @Order(2)
+    void addItems() {
+        // ...
+    }
+
+    @Test
+    @Order(3)
+    void checkout() {
+        // ...
+    }
+}
+```
+
+Use this sparingly. A test that depends on the result of the previous test isn't a unit test; it's a workflow split across methods. The healthier alternative is one method that drives the whole workflow, with `assertAll` to report on every step in one go.
+
+<h1 id="assumptions">Assumptions</h1>
+
+An assumption is a check that decides whether a test should run at all. Failing an assumption skips the test rather than failing it, which is the right behavior for "this test only makes sense in environment X." The two main entry points are `Assumptions.assumeTrue` and `Assumptions.assumingThat`.
+
+```java
+import org.junit.jupiter.api.Test;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
+import static org.junit.jupiter.api.Assumptions.assumingThat;
+
+class AssumptionsTest {
+
+    @Test
+    void onlyRunInCi() {
+        assumeTrue("true".equals(System.getenv("CI")),
+            "skipping, only runs in CI");
+
+        // ... test that needs the CI environment
+    }
+
+    @Test
+    void mixedEnvironment() {
+        Cart cart = new Cart();
+        cart.addItem("Wireless Mouse");
+
+        assertEquals(1, cart.size());
+
+        assumingThat("true".equals(System.getenv("CI")), () -> {
+            // extra assertions only meaningful in CI
+            assertEquals(1, cart.items().size());
+        });
+    }
+}
+```
+
+`assumeTrue` short-circuits the test if the condition is false, marking it as skipped with the given message. `assumingThat` runs the lambda only when the condition is true; the rest of the test continues either way. The distinction matters: `assumeTrue` is "this whole test is irrelevant right now," `assumingThat` is "these extra checks only apply in some environments."
+
+Compared to `@Disabled`, an assumption is dynamic: the decision is made at runtime based on whatever state is checked. Use assumptions for "this needs a database that's only available locally" and `@Disabled` for "this test is broken and tracked in ticket X."
+
+<h1 id="mocking-dependencies-with-mockito">
+  Mocking Dependencies with Mockito
+</h1>
+
+Unit tests work best when each test exercises one class in isolation. Real classes pull in dependencies: a service talks to a repository, the repository talks to a database, the controller talks to a payment client. To keep a service test from also testing the database and the payment provider, replace those dependencies with **mocks**: stand-ins that record calls and return pre-programmed values.
+
+Mockito is a separate library, not part of JUnit. Add it as another test dependency.
+
+**Maven:**
+
+```text
+<dependency>
+    <groupId>org.mockito</groupId>
+    <artifactId>mockito-core</artifactId>
+    <version>5.11.0</version>
+    <scope>test</scope>
+</dependency>
+```
+
+**Gradle:**
+
+```text
+testImplementation 'org.mockito:mockito-core:5.11.0'
+```
+
+Suppose the e-commerce app has an `OrderService` that uses a `PaymentClient` interface to charge a customer.
+
+```java
+package com.shop.order;
+
+public interface PaymentClient {
+    boolean charge(String customerId, double amount);
+}
+```
+
+```java
+package com.shop.order;
+
+public class OrderService {
+    private final PaymentClient paymentClient;
+
+    public OrderService(PaymentClient paymentClient) {
+        this.paymentClient = paymentClient;
+    }
+
+    public String placeOrder(String customerId, double amount) {
+        if (amount <= 0) {
+            throw new IllegalArgumentException("amount must be positive: " + amount);
+        }
+        boolean charged = paymentClient.charge(customerId, amount);
+        return charged ? "CONFIRMED" : "DECLINED";
+    }
+}
+```
+
+The test verifies two things: that `placeOrder` calls `paymentClient.charge` with the right arguments, and that the return value reflects the charge outcome. A unit test should not talk to a real payment provider, so the `PaymentClient` is mocked.
+
+```java
+package com.shop.order;
+
+import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.mockito.ArgumentMatchers.anyDouble;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+class OrderServiceTest {
+
+    @Test
+    void confirmsWhenChargeSucceeds() {
+        PaymentClient paymentClient = mock(PaymentClient.class);
+        when(paymentClient.charge(anyString(), anyDouble())).thenReturn(true);
+
+        OrderService service = new OrderService(paymentClient);
+        String status = service.placeOrder("cust-1", 49.99);
+
+        assertEquals("CONFIRMED", status);
+        verify(paymentClient).charge("cust-1", 49.99);
+    }
+
+    @Test
+    void declinesWhenChargeFails() {
+        PaymentClient paymentClient = mock(PaymentClient.class);
+        when(paymentClient.charge(anyString(), anyDouble())).thenReturn(false);
+
+        OrderService service = new OrderService(paymentClient);
+        String status = service.placeOrder("cust-2", 19.99);
+
+        assertEquals("DECLINED", status);
+    }
+
+    @Test
+    void capturesChargeArguments() {
+        PaymentClient paymentClient = mock(PaymentClient.class);
+        when(paymentClient.charge(anyString(), anyDouble())).thenReturn(true);
+
+        OrderService service = new OrderService(paymentClient);
+        service.placeOrder("cust-3", 29.99);
+
+        ArgumentCaptor<Double> amountCaptor = ArgumentCaptor.forClass(Double.class);
+        verify(paymentClient).charge(anyString(), amountCaptor.capture());
+        assertEquals(29.99, amountCaptor.getValue());
+    }
+}
+```
+
+Three Mockito ideas appear here. `mock(PaymentClient.class)` creates a fake implementation of the interface that returns default values (false, 0, null) until programmed otherwise. `when(...).thenReturn(...)` programs the mock to return a specific value when a method is called with the given arguments. `verify(...)` checks that a method was called the expected way. `ArgumentCaptor` is for inspecting an argument that the test would otherwise just match with a wildcard.
+
+The matchers (`anyString`, `anyDouble`, and so on) mean "this argument's exact value doesn't matter." Mixing matchers with literal values in the same call requires every argument to be a matcher, producing code like `verify(paymentClient).charge(eq("cust-1"), anyDouble())` where `eq` wraps the literal.
+
+Mockito creates the mock class at runtime using bytecode generation. The first mock in a test pays a small startup cost. For a single test class this is invisible; for a large suite, the overhead adds up, which is why Mockito 5 switched to a faster engine by default.
+
+The combination of JUnit and Mockito covers the bulk of day-to-day testing. A test class that wires up a mock, drives the class under test, asserts on the result, and verifies the interactions is a common shape of unit test.
+
+<h1 id="running-tests">Running Tests</h1>
+
+From the command line, the build tool runs every test in the project.
+
+```text
+mvn test
+```
+
+```text
+gradle test
+```
+
+Both commands compile the source and test trees, launch the JUnit Platform, run every test, and exit with a non-zero status if any test fails. To run a single test class, both tools have a flag.
+
+```text
+mvn test -Dtest=CartTest
+gradle test --tests com.shop.cart.CartTest
+```
+
+To run one method:
+
+```text
+mvn test -Dtest=CartTest#addingOneItemMakesSizeOne
+gradle test --tests com.shop.cart.CartTest.addingOneItemMakesSizeOne
+```
+
+In an IDE, JUnit-aware editors (IntelliJ IDEA, Eclipse, VS Code with the Java extension) show a green run icon next to test classes and methods. Click it to run that scope; click the line number in the gutter to run a single test. The IDE shows pass/fail in a tree view that mirrors the package structure, with each `@Nested` group as a sub-tree.
+
+<h1 id="test-reports">Test Reports</h1>
+
+Surefire and Gradle both write XML and HTML reports after each test run. Maven puts them in `target/surefire-reports/`, Gradle in `build/reports/tests/test/index.html`. The XML files follow the JUnit XML format, which every CI system (Jenkins, GitHub Actions, CircleCI, GitLab) knows how to parse.
+
+A passing run with two tests produces something like this:
+
+The XML file has one `<testcase>` element per method, with `<failure>` or `<error>` elements for failed tests. CI systems read this and surface the results in the pipeline UI. The text file is the human-readable summary, useful for quick inspection without parsing XML.
+
+When a test fails, the report includes the assertion message, the stack trace, and the values that compared unequal. For `assertEquals(3, cart.size())` against a cart with two items, the message reads `expected: <3> but was: <2>`, which is enough to start investigating without rerunning anything.
+
+<h1 id="assertj-an-alternative-assertion-library">
+  AssertJ: An Alternative Assertion Library
+</h1>
+
+Jupiter's built-in assertions are fine for most cases, but the fluent style of AssertJ reads better for complex objects and collections. A typical AssertJ assertion chains expectations off a single call to `assertThat`, which gives more specific failure messages and IDE autocompletion that points toward the right check. Adding `org.assertj:assertj-core` as a test dependency enables `assertThat(cart.items()).containsExactly("Wireless Mouse", "USB Cable")` instead of `assertIterableEquals(List.of("Wireless Mouse", "USB Cable"), cart.items())`. Many teams adopt AssertJ alongside JUnit for the collections and string assertions, while keeping the JUnit assertions for the simple equality checks. Both can coexist in the same test class without conflict.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,557 @@
+---
+title: "try-with-resources"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "try-with-resources explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="the-problem-manual-try-finally-is-verbose-and-easy-to-get-wrong">
+  The Problem: Manual try / finally Is Verbose and Easy to Get Wrong
+</h1>
+
+Before Java 7, the standard way to close a resource was a `try` / `finally` pair. The `try` block ran the work, and the `finally` block closed the resource. It works, but it has three persistent problems that bite real codebases.
+
+Here's the shape of the pattern, using a custom log file that prints when it opens and closes so the order of operations is visible:
+
+```java
+public class OrderLogFile {
+    private final String name;
+
+    public OrderLogFile(String name) {
+        this.name = name;
+        System.out.println(name + " opened");
+    }
+
+    public void write(String line) {
+        System.out.println(name + " wrote: " + line);
+    }
+
+    public void close() {
+        System.out.println(name + " closed");
+    }
+}
+
+public class ManualCleanupDemo {
+    public static void main(String[] args) {
+        OrderLogFile log = null;
+        try {
+            log = new OrderLogFile("order-log");
+            log.write("ORD-1001 placed");
+            log.write("ORD-1001 shipped");
+        } finally {
+            if (log != null) {
+                log.close();
+            }
+        }
+    }
+}
+```
+
+This code is correct. It also has three problems that show up in every real codebase that writes manual cleanup.
+
+First, the resource has to be declared outside the `try` (as `null`) so it stays in scope for the `finally`. That defeats the natural shape of "the resource lives for the duration of the block."
+
+Second, the `finally` block has to null-check before calling `close`. If the constructor that opens the resource throws, the variable is still `null`, and calling `close()` on `null` produces a `NullPointerException` that hides whatever error actually caused the open to fail.
+
+Third, and worst, the pattern loses exceptions. If the body of the `try` throws, and then `close()` also throws, the second exception replaces the first. The original error (the one that probably matters) gets thrown away, and the caller only sees the cleanup failure. An example follows.
+
+These problems aren't theoretical. They're the reason Java 7 introduced `try`-with-resources as a dedicated language feature.
+
+<h1 id="the-try-with-resources-statement">The try-with-resources Statement</h1>
+
+The `try`-with-resources form puts the resource declaration inside parentheses right after `try`:
+
+```java
+public class OrderLogFile implements AutoCloseable {
+    private final String name;
+
+    public OrderLogFile(String name) {
+        this.name = name;
+        System.out.println(name + " opened");
+    }
+
+    public void write(String line) {
+        System.out.println(name + " wrote: " + line);
+    }
+
+    @Override
+    public void close() {
+        System.out.println(name + " closed");
+    }
+}
+
+public class TryWithResourcesDemo {
+    public static void main(String[] args) {
+        try (OrderLogFile log = new OrderLogFile("order-log")) {
+            log.write("ORD-1001 placed");
+            log.write("ORD-1001 shipped");
+        }
+    }
+}
+```
+
+The output is identical to the manual version, but the code is shorter and the structure says exactly what it does. The resource lives for the duration of the block. When the block ends, by normal completion or by an exception, `close()` runs.
+
+Two changes from the manual version stand out. The `OrderLogFile` class now implements `AutoCloseable`. And the variable `log` is declared inside the `try` header, which means it's only visible inside the block. After the closing brace, the variable is out of scope, which makes it impossible to accidentally use a closed resource later in the method.
+
+The compiler rewrites the `try`-with-resources block into the manual `try` / `finally` form (with extra logic for suppressed exceptions). No control is lost by using it. The compiler writes the boilerplate correctly every time.
+
+<h1 id="the-autocloseable-interface">The AutoCloseable Interface</h1>
+
+For a class to be usable inside `try`-with-resources, it must implement `java.lang.AutoCloseable`. The interface is small:
+
+```java
+public interface AutoCloseable {
+    void close() throws Exception;
+}
+```
+
+That's the whole contract. One method, `close()`, declared to throw `Exception` (the broadest checked exception). Implementations are free to narrow the thrown type or to throw nothing at all. The `OrderLogFile` above declares `close()` without a `throws` clause, which is legal because it doesn't actually throw.
+
+A narrower subinterface, `java.io.Closeable`, exists for I/O resources:
+
+```java
+public interface Closeable extends AutoCloseable {
+    void close() throws IOException;
+}
+```
+
+`Closeable` extends `AutoCloseable` and constrains the thrown type to `IOException`. Most file and stream classes in the JDK (`FileInputStream`, `BufferedReader`, `PrintWriter`, and friends) implement `Closeable`. Database connections and locks usually implement `AutoCloseable` directly so they can throw their own exception types.
+
+For a `try`-with-resources block, either interface works. The compiler only needs to know that `close()` exists and can be called.
+
+Here's a second e-commerce resource: a lock around a shopping cart so two concurrent updates don't corrupt it.
+
+```java
+public class CartLock implements AutoCloseable {
+    private final String cartId;
+
+    public CartLock(String cartId) {
+        this.cartId = cartId;
+        System.out.println("Lock acquired for cart " + cartId);
+    }
+
+    public void mark(String action) {
+        System.out.println("Cart " + cartId + ": " + action);
+    }
+
+    @Override
+    public void close() {
+        System.out.println("Lock released for cart " + cartId);
+    }
+}
+
+public class CartUpdateDemo {
+    public static void main(String[] args) {
+        try (CartLock lock = new CartLock("CART-42")) {
+            lock.mark("add SKU-100");
+            lock.mark("update quantity");
+        }
+    }
+}
+```
+
+The pattern fits locks naturally. Acquiring is opening, releasing is closing, and the bounded scope of the `try` block is the bounded scope of the critical section. Forgetting to release a lock is a class of bug that disappears once you wrap locks in `AutoCloseable`.
+
+A third example: an inventory reservation that holds stock for a checkout. If the checkout fails, the reservation is released; if it succeeds, the reservation is committed. Both paths need cleanup.
+
+```java
+public class InventoryReservation implements AutoCloseable {
+    private final String productId;
+    private final int quantity;
+
+    public InventoryReservation(String productId, int quantity) {
+        this.productId = productId;
+        this.quantity = quantity;
+        System.out.println("Reserved " + quantity + " of " + productId);
+    }
+
+    public void commit() {
+        System.out.println("Committed reservation on " + productId);
+    }
+
+    @Override
+    public void close() {
+        System.out.println("Released reservation on " + productId);
+    }
+}
+```
+
+These three classes (`OrderLogFile`, `CartLock`, `InventoryReservation`) are used for the rest of the lesson. They print as they open and close so every example shows the exact order of operations.
+
+<h1 id="multiple-resources-in-one-try">Multiple Resources in One try</h1>
+
+A single `try`-with-resources can declare more than one resource. Separate the declarations with semicolons:
+
+```java
+public class MultipleResourcesDemo {
+    public static void main(String[] args) {
+        try (
+            OrderLogFile log = new OrderLogFile("order-log");
+            CartLock lock = new CartLock("CART-42");
+            InventoryReservation reservation = new InventoryReservation("SKU-100", 3)
+        ) {
+            log.write("checkout started");
+            lock.mark("locking cart");
+            reservation.commit();
+        }
+    }
+}
+```
+
+Examine the open and close order carefully. Resources are opened in the order they're declared: log, then lock, then reservation. Resources are closed in the reverse order: reservation, then lock, then log. This is **LIFO**, last in first out, the same order locals come off a stack frame.
+
+The reverse order matters when resources depend on each other. If the lock guards the reservation, the reservation must be released before the lock, or another thread could observe the reservation already gone while the lock is still held. The language picks the safe order automatically.
+
+The diagram captures the LIFO close order. Each open step follows declaration order, then the body runs, then closes run in reverse. If the body throws or one of the opens throws, the language still closes everything that was successfully opened, in the same reverse order.
+
+One important case: if the constructor of the second resource throws after the first resource has been successfully opened, the first resource is closed before the exception propagates. The block never enters the body, and the half-built state is cleaned up automatically.
+
+```java
+public class ConstructorFailsDemo {
+    public static void main(String[] args) {
+        try (
+            OrderLogFile log = new OrderLogFile("order-log");
+            CartLock lock = failingLock()
+        ) {
+            System.out.println("body running");
+        } catch (RuntimeException e) {
+            System.out.println("caught: " + e.getMessage());
+        }
+    }
+
+    private static CartLock failingLock() {
+        throw new RuntimeException("could not acquire lock");
+    }
+}
+```
+
+The log opens, the lock acquisition throws, and the language closes the log before the exception escapes the `try`. The body never runs. With a hand-written `try` / `finally`, this pattern would require a nested second `try` to handle the half-open state. `try`-with-resources handles it automatically.
+
+<h1 id="side-by-side-manual-try-finally-vs-try-with-resources">
+  Side by Side: Manual try / finally vs try-with-resources
+</h1>
+
+To see how much code the language writes automatically, here's the same logic written both ways. Open a log, write to it, and close it.
+
+The manual `try` / `finally` version has to declare the resource as `null`, null-check before closing, and accept that any exception inside `close()` will hide whatever the body threw:
+
+```java
+public class ManualVersion {
+    public static void main(String[] args) {
+        OrderLogFile log = null;
+        try {
+            log = new OrderLogFile("order-log");
+            log.write("checkout started");
+        } finally {
+            if (log != null) {
+                log.close();
+            }
+        }
+    }
+}
+```
+
+That's eight lines of cleanup ceremony around two lines of real work. The variable lives longer than it needs to. The null check is a workaround for the fact that the constructor might throw before the assignment completes. And that's before considering the case where both the body and the close throw.
+
+The `try`-with-resources version says the same thing in less space, with the resource scoped to the block, no null check, and proper suppressed-exception handling built in:
+
+```java
+public class ResourceVersion {
+    public static void main(String[] args) {
+        try (OrderLogFile log = new OrderLogFile("order-log")) {
+            log.write("checkout started");
+        }
+    }
+}
+```
+
+Three lines of real code, no ceremony, and the compiler handles every edge case the manual version has to think about. This is the trade most idiomatic Java has settled on: if a class implements `AutoCloseable`, manage it with `try`-with-resources.
+
+<h1 id="suppressed-exceptions">Suppressed Exceptions</h1>
+
+The biggest hidden problem with manual cleanup is what happens when both the body and the close throw. Two exceptions are in flight at the same time, and Java can only propagate one. With a hand-written `finally`, the language picks the most recent one (the close), which is usually the less interesting one. The original error gets dropped on the floor.
+
+`try`-with-resources solves this with **suppressed exceptions**. The body's exception becomes the primary thrown exception. The close's exception is attached to the primary as a "suppressed" exception, retrievable via `Throwable.getSuppressed()`.
+
+To see the difference, here's a log file that fails to close, paired with a body that throws:
+
+```java
+public class FailingLog implements AutoCloseable {
+    private final String name;
+
+    public FailingLog(String name) {
+        this.name = name;
+        System.out.println(name + " opened");
+    }
+
+    public void write(String line) {
+        System.out.println(name + " wrote: " + line);
+    }
+
+    @Override
+    public void close() {
+        System.out.println(name + " close attempted");
+        throw new RuntimeException("close failed for " + name);
+    }
+}
+
+public class SuppressedDemo {
+    public static void main(String[] args) {
+        try (FailingLog log = new FailingLog("order-log")) {
+            log.write("checkout started");
+            throw new RuntimeException("body failed");
+        } catch (RuntimeException e) {
+            System.out.println("primary: " + e.getMessage());
+            for (Throwable suppressed : e.getSuppressed()) {
+                System.out.println("suppressed: " + suppressed.getMessage());
+            }
+        }
+    }
+}
+```
+
+The body throws `"body failed"`. The language then calls `close()`, which throws `"close failed for order-log"`. Instead of replacing the first exception, the close exception is added to the first one's list of suppressed exceptions. The caller sees the original error (the one that probably caused the problem) and can still inspect the close failure if needed.
+
+Now contrast that with the manual version of the same scenario:
+
+```java
+public class ManualSuppressedDemo {
+    public static void main(String[] args) {
+        FailingLog log = null;
+        try {
+            log = new FailingLog("order-log");
+            log.write("checkout started");
+            throw new RuntimeException("body failed");
+        } finally {
+            if (log != null) {
+                log.close();
+            }
+        }
+    }
+}
+```
+
+The output is the problem. The body threw `"body failed"`, which is the error worth debugging. But the `finally` ran, the close failed, and the close exception replaced the body exception. The error log shows `"close failed for order-log"` with no trace of the original error. Inspecting the running code would be the only way to discover the prior failure.
+
+This is the main advantage of `try`-with-resources over hand-written `try` / `finally`. The compiler-generated cleanup uses `addSuppressed` so no exception is ever lost. The primary cause is always visible, with the cleanup failures attached.
+
+**What's wrong with this code?**
+
+```java
+public class LosingTheRealError {
+    public static void main(String[] args) {
+        FailingLog log = null;
+        try {
+            log = new FailingLog("order-log");
+            throw new RuntimeException("inventory check failed");
+        } finally {
+            log.close();
+        }
+    }
+}
+```
+
+This is the classic anti-pattern. The body throws `"inventory check failed"`, the `finally` calls `close()`, the close throws `"close failed for order-log"`, and that's the exception the caller sees. The actual cause of the failure (`"inventory check failed"`) is gone. There's also a latent `NullPointerException` if the constructor had failed before the assignment.
+
+**Fix:** use `try`-with-resources, which records the close exception via `addSuppressed` instead of letting it overwrite the body exception:
+
+```java
+public class KeepingTheRealError {
+    public static void main(String[] args) {
+        try (FailingLog log = new FailingLog("order-log")) {
+            throw new RuntimeException("inventory check failed");
+        }
+    }
+}
+```
+
+Now the primary exception is `"inventory check failed"` (the real bug), and `"close failed for order-log"` rides along as a suppressed exception. Both are available to whatever catches and logs the exception. Nothing is silently dropped.
+
+<h1 id="the-java-9-effectively-final-form">
+  The Java 9 Effectively-Final Form
+</h1>
+
+In Java 7 and 8, the resource had to be a new declaration inside the `try` header. Java 9 relaxed that: an existing final or effectively-final variable holding the resource can be used directly inside the `try` header.
+
+```java
+public class EffectivelyFinalDemo {
+    public static void main(String[] args) {
+        OrderLogFile log = new OrderLogFile("order-log");
+        log.write("before block");
+
+        try (log) {
+            log.write("inside block");
+        }
+    }
+}
+```
+
+The variable `log` is declared outside the `try`. Because it's never reassigned, it's "effectively final," and Java 9 allows just the variable name inside `try (...)`. The language closes the resource when the block ends, exactly as if it had been declared inside.
+
+This form is useful when the resource is built somewhere else (passed in as a parameter, returned from a factory, retrieved from a registry) and only the cleanup behavior is needed. It's a small ergonomic win for cases where re-declaring would just shadow the existing variable.
+
+The variable must be final or effectively final. Reassigning the variable after the `try` header makes it impossible for the compiler to know which resource to close, so it isn't allowed:
+
+```java
+OrderLogFile log = new OrderLogFile("first");
+log = new OrderLogFile("second"); // makes 'log' not effectively final
+
+try (log) { // compile error: 'log' is not effectively final
+    log.write("inside");
+}
+```
+
+In practice, almost every variable used here is effectively final, so the restriction rarely matters.
+
+<h1 id="combining-with-catch-and-finally">Combining With catch and finally</h1>
+
+A `try`-with-resources can still have `catch` and `finally` clauses, just like any other `try`. The order of operations is precise: the body runs, then the language closes the resources in reverse order, then `catch` clauses run if there's an exception, then `finally` runs unconditionally.
+
+```java
+public class FullTryDemo {
+    public static void main(String[] args) {
+        try (OrderLogFile log = new OrderLogFile("order-log")) {
+            log.write("body line 1");
+            throw new RuntimeException("body failed");
+        } catch (RuntimeException e) {
+            System.out.println("caught: " + e.getMessage());
+        } finally {
+            System.out.println("finally ran");
+        }
+    }
+}
+```
+
+Trace the output line by line. The log opens. The body writes one line and throws. The language closes the log (the resource cleanup happens before the catch sees the exception). The `catch` block then runs because the exception is a `RuntimeException`. Finally, the `finally` block runs.
+
+The key takeaway is that **resource close happens first**, before the catch even has a chance to look at the exception. By the time the `catch` block runs, the resources are already closed. A `catch` can't decide to keep the resource open. The cleanup commits before the recovery starts.
+
+The diagram shows the fixed order: open, body, close, catch (only if there was an exception), then finally (always). The arrows are one-directional; there's no path that runs `catch` before the close. With this order in mind, the behavior of any `try`-with-resources block falls out automatically.
+
+One more wrinkle: if the body completes normally and the close throws, the close's exception propagates as the primary exception (there's no body exception to suppress it under). The `catch` block can match it:
+
+```java
+public class CloseFailsAfterCleanBody {
+    public static void main(String[] args) {
+        try (FailingLog log = new FailingLog("order-log")) {
+            log.write("clean body");
+        } catch (RuntimeException e) {
+            System.out.println("caught: " + e.getMessage());
+        }
+    }
+}
+```
+
+The body finishes cleanly. The close runs and throws. With no prior exception to suppress it, the close exception becomes the primary, and the `catch` block catches it. In a hand-written pattern, this case would need a separate `catch` for cleanup failures; `try`-with-resources lets the existing one handle it.
+
+<h1 id="real-world-use-io-and-locks">Real-World Use: I/O and Locks</h1>
+
+The classes that benefit most from `try`-with-resources are I/O resources and locks. File streams, network connections, database connections, and reader / writer pairs in the JDK all implement `Closeable` (which extends `AutoCloseable`). A typical file read looks like this:
+
+```java
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.IOException;
+
+public class FileReadDemo {
+    public static void main(String[] args) throws IOException {
+        try (BufferedReader reader = new BufferedReader(new FileReader("orders.csv"))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                System.out.println(line);
+            }
+        }
+    }
+}
+```
+
+The details of `BufferedReader` and `FileReader` belong to file I/O, a topic in its own right. The pattern is what matters: the readers are `AutoCloseable`, so they go inside `try (...)`, and the language closes them no matter how the block ends. The read logic is application code; the cleanup is the compiler's problem.
+
+The same pattern applies to JDBC connections (`Connection`, `Statement`, `ResultSet`), lock objects in concurrent code (anything with a paired acquire / release), and any custom class that opens a resource in its constructor. If a class implements `AutoCloseable`, the idiomatic way to use it is `try`-with-resources.
+
+The custom `OrderLogFile`, `CartLock`, and `InventoryReservation` classes are the same shape as the JDK classes. The names print on open and close to make the lifecycle visible; in a real codebase, the open might be `new Connection(url)` and the close might be `connection.close()`. The mechanics are identical.
+
+<h1 id="designing-a-class-for-try-with-resources">
+  Designing a Class for try-with-resources
+</h1>
+
+For a custom class that holds a resource, the checklist is short. Implement `AutoCloseable`. Write a `close()` method that releases the resource. Make `close()` idempotent when possible (calling it twice should be safe), so defensive callers don't trigger errors. Avoid throwing from `close()` unless there's a genuine error worth reporting; cleanup errors get suppressed and may be silently dropped if the caller doesn't inspect `getSuppressed()`.
+
+Here's a complete example: an `InventoryReservation` that tracks whether it's been committed and releases stock back on `close` if not.
+
+```java
+public class InventoryReservation implements AutoCloseable {
+    private final String productId;
+    private final int quantity;
+    private boolean committed;
+    private boolean closed;
+
+    public InventoryReservation(String productId, int quantity) {
+        this.productId = productId;
+        this.quantity = quantity;
+        System.out.println("Reserved " + quantity + " of " + productId);
+    }
+
+    public void commit() {
+        if (closed) {
+            throw new IllegalStateException("reservation already closed");
+        }
+        committed = true;
+        System.out.println("Committed " + quantity + " of " + productId);
+    }
+
+    @Override
+    public void close() {
+        if (closed) {
+            return;
+        }
+        closed = true;
+        if (!committed) {
+            System.out.println("Released " + quantity + " of " + productId);
+        } else {
+            System.out.println("Reservation on " + productId + " finalized");
+        }
+    }
+}
+
+public class CheckoutDemo {
+    public static void main(String[] args) {
+        System.out.println("--- successful checkout ---");
+        try (InventoryReservation reservation = new InventoryReservation("SKU-100", 3)) {
+            reservation.commit();
+        }
+
+        System.out.println("--- failed checkout ---");
+        try (InventoryReservation reservation = new InventoryReservation("SKU-200", 1)) {
+            throw new RuntimeException("payment declined");
+        } catch (RuntimeException e) {
+            System.out.println("caught: " + e.getMessage());
+        }
+    }
+}
+```
+
+Two scenarios, one resource class. In the first, the checkout succeeds: commit runs, close finalizes the reservation. In the second, the body throws before commit; close runs anyway and releases the stock back. The caller doesn't need to remember to release manually because the language guarantees `close()` runs.
+
+The `closed` guard makes `close()` idempotent. Calling it twice is harmless, which matters because some frameworks defensively close resources from multiple layers. The `committed` flag lets the same `close()` method handle both the success path (finalize) and the failure path (release).
+
+<h1 id="limits-and-gotchas">Limits and Gotchas</h1>
+
+A few cases where `try`-with-resources doesn't fit:
+
+The resource has to be assigned to a variable inside the `try` header (or be an effectively-final variable for the Java 9 form). Writing `try (someExpression()) { ... }` directly without a variable doesn't work. The language needs a stable reference to close at the end of the block.
+
+If `close()` throws an exception of a type that isn't caught or declared, the method has to declare it. Most JDK `Closeable` types throw `IOException`, which is checked, so the surrounding method needs `throws IOException` or a `catch` block. The compiler enforces this. For `AutoCloseable` types that throw `Exception`, callers have to handle or declare `Exception`. In practice, custom classes usually narrow this down or implement `Closeable` (`IOException`) or a runtime-exception-only `close()`.
+
+A common mistake is wrapping the wrong thing in `try`-with-resources. A `String`, a `List`, or a plain POJO is not a resource. Wrapping one of those produces a compile error because the class doesn't implement `AutoCloseable`. Use `try`-with-resources only when there's something to release.
+
+Another mistake is treating `close()` as a place to do real work. Cleanup methods should release the resource and return. Throwing from `close()` is allowed, but the exception will be suppressed if the body also threw, and code that should report errors loudly is hard to debug when it doesn't. If `close()` needs to flush data or commit a transaction, those should probably be explicit method calls in the body, with `close()` only doing the release.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

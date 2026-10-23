@@ -1,0 +1,278 @@
+---
+title: "Method Resolution Order (MRO)"
+readTime: "10 min read"
+lastUpdated: "June 6, 2026"
+description: "Method Resolution Order (MRO) explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+When a class inherits from several parents, Python needs a precise rule for deciding which class owns an attribute or method name. That rule is the **method resolution order**, or MRO. This lesson covers how to read the MRO, why diamond hierarchies need a careful algorithm, what C3 linearization does in plain language, when Python refuses to build an MRO at all, and how `super()` uses the MRO internally.
+
+<h1 id="what-the-mro-is">What the MRO Is</h1>
+
+Every Python class has an ordered list of classes Python will search when looking up an attribute. That list is the MRO. It always starts with the class itself, walks through parents and grandparents in a specific order, and ends with `object`.
+
+The MRO is available two ways. `ClassName.__mro__` is a tuple. `ClassName.mro()` returns the same sequence as a list. Both come from the same source:
+
+```python
+class Product:
+    pass
+
+class DigitalProduct(Product):
+    pass
+
+class Ebook(DigitalProduct):
+    pass
+
+for cls in Ebook.__mro__:
+    print(cls.__name__)
+```
+
+Read top-to-bottom. Calling `Ebook().some_method()` makes Python check `Ebook` first, then `DigitalProduct`, then `Product`, then `object`. The first class that defines `some_method` wins. The lookup stops as soon as a match is found.
+
+A few details worth knowing:
+
+- The MRO is computed once, at class-creation time. It's not recalculated on every method call. The class object stores it.
+- The MRO is a flat, linear list, even when the inheritance graph is a tree or a diamond. Python flattens the graph into a single search order.
+- `object` always sits at the end. Every class inherits from `object` eventually, even when the declaration omits `class X(object):`.
+
+<h1 id="why-the-order-matters-attribute-lookup">
+  Why the Order Matters: Attribute Lookup
+</h1>
+
+The MRO isn't just trivia. It's the exact order Python uses to resolve every attribute lookup on an instance. If two classes in the chain both define the same method, the one that appears first in the MRO wins, and the rest never run.
+
+A concrete example:
+
+```python
+class Product:
+    def tax_rate(self):
+        return 0.08
+
+class DigitalProduct(Product):
+    def tax_rate(self):
+        return 0.0
+
+class StreamingEbook(DigitalProduct):
+    pass
+
+book = StreamingEbook()
+print(book.tax_rate())
+print([c.__name__ for c in StreamingEbook.__mro__])
+```
+
+`book.tax_rate()` walks the MRO. `StreamingEbook` doesn't define `tax_rate`, so the search moves to `DigitalProduct`, which does. The method on `DigitalProduct` runs and returns `0.0`. `Product.tax_rate` never gets a chance, even though it's still in the chain.
+
+The same rule applies to attributes that weren't overridden on purpose. If `Product` has a class attribute `CURRENCY = "USD"` and `DigitalProduct` defines its own `CURRENCY = "EUR"`, instances of `DigitalProduct` see `"EUR"` because `DigitalProduct` appears first in the MRO. Shadowing at one level hides every later level for that name.
+
+The MRO is the contract that decides which version of a method or attribute the code is actually calling. Reading the MRO is often the fastest way to debug an unexpected method dispatch.
+
+Python caches the result of each method lookup inside the class, so repeated calls to the same method on the same type don't re-walk the MRO. The first call pays for the lookup; the rest are near-free.
+
+<h1 id="diamond-inheritance">Diamond Inheritance</h1>
+
+Single inheritance produces a straight line, so the MRO is trivial. The interesting case is the **diamond**: one class at the top, two in the middle, both inheriting from the top, and one at the bottom that inherits from both middles.
+
+`Ebook` inherits from `DigitalProduct` and `DiscountableProduct`. Both of those inherit from `Product`. There are two paths from `Ebook` up to `Product`, and Python has to pick a single order to walk them.
+
+The naive idea would be "walk the left branch all the way up, then the right branch all the way up". That gives `Ebook, DigitalProduct, Product, DiscountableProduct, Product, object`, with `Product` appearing twice. If a method exists on `Product`, the lookup would find it on the left-side `Product` and skip the right-side classes entirely. Worse, `Product` showing up twice means a cooperative method could run twice.
+
+Python's MRO avoids both problems. It guarantees:
+
+- Every class appears exactly once in the list.
+- A class always appears before any of its parents.
+- Sibling parents appear in their declared order.
+
+For the diamond above, the MRO is:
+
+```python
+class Product:
+    pass
+
+class DigitalProduct(Product):
+    pass
+
+class DiscountableProduct(Product):
+    pass
+
+class Ebook(DigitalProduct, DiscountableProduct):
+    pass
+
+for cls in Ebook.__mro__:
+    print(cls.__name__)
+```
+
+The shared ancestor `Product` waits until after both middle classes. This is the property that makes the diamond resolve cleanly: any method on `Product` runs after both children that depend on it have had a chance to contribute.
+
+The flattened view of the diamond shows the same five classes in their MRO order. The graph had branches, but the search order is a single straight line.
+
+<h1 id="c3-linearization-in-plain-english">
+  C3 Linearization in Plain English
+</h1>
+
+The algorithm Python uses to compute the MRO is called **C3 linearization**. The formal definition is precise but a little dense. The intuition fits in three rules:
+
+1. **A class comes before its parents.** Walking down the MRO, passing `DigitalProduct` means already passing everything `DigitalProduct` inherits from before reaching it. Subclasses always appear earlier in the list than the classes they extend.
+2. **Parents stay in their listed order.** Given `class Ebook(DigitalProduct, DiscountableProduct):`, `DigitalProduct` comes before `DiscountableProduct` in the MRO. Reversing the parent list reverses the order.
+3. **A class appears exactly once.** Even if a class is reachable through several paths, it shows up in the MRO one time. No duplicates.
+
+C3 walks the inheritance graph and produces the unique ordering that satisfies all three rules. When it works, the result is the MRO that appears in `__mro__`.
+
+A slightly bigger example to trace by hand:
+
+```python
+class Product: pass
+class Taxable(Product): pass
+class Shippable(Product): pass
+class Reviewable: pass
+class Laptop(Taxable, Shippable, Reviewable): pass
+
+for cls in Laptop.__mro__:
+    print(cls.__name__)
+```
+
+Walk through it with the rules. `Laptop` is first (rule 1). Its declared parents are `Taxable`, `Shippable`, `Reviewable`, in that order (rule 2). `Taxable` and `Shippable` both inherit from `Product`, but `Reviewable` doesn't, so `Reviewable` can slot in between the two halves of that diamond and `Product`. `Product` waits until after both `Taxable` and `Shippable` (rule 1 again, applied to two classes at once). `object` is the implicit base of every class, so it sits at the end.
+
+Computing MROs by hand isn't usually required. When the hierarchy gets gnarly, print `__mro__` and read it. The rules are mainly useful for predicting what the answer will be before running the code, and for understanding why an MRO conflict is happening when one does.
+
+<h1 id="when-the-mro-breaks">When the MRO Breaks</h1>
+
+C3 can fail. If the rules contradict each other, no valid ordering exists, and Python refuses to create the class. The error happens at class-definition time, not when a method is called, which is helpful because the problem surfaces immediately rather than as a mysterious runtime bug.
+
+The classic failure is two intermediate classes that disagree about the order of their shared bases:
+
+```python
+class A: pass
+class B: pass
+
+class X(A, B): pass   # demands A before B
+class Y(B, A): pass   # demands B before A
+
+class Z(X, Y):        # contradiction: can't satisfy both
+    pass
+```
+
+`X` requires `A` before `B`. `Y` requires `B` before `A`. `Z` inherits from both, so its MRO would have to honor both orderings simultaneously. There's no way to satisfy both rules with a single linear list. C3 detects the contradiction and raises `TypeError`.
+
+This doesn't come up often. When it does, it's almost always a design problem rather than a thing to work around. If two parents disagree about the order of their shared bases, the hierarchy is trying to combine classes whose contracts conflict, and the right fix is to redesign rather than reshuffle the parent list.
+
+A second, subtler way to get an MRO error is when a class lists the same parent twice in its bases:
+
+```python
+class A: pass
+class B(A, A): pass
+```
+
+Python checks for duplicates explicitly before even trying C3. The fix is to remove the duplicate.
+
+<h1 id="super-walks-the-mro">super() Walks the MRO</h1>
+
+In single inheritance, `super()` feels like "my parent class". In multiple inheritance, that picture breaks. `super()` returns a proxy that walks the **MRO of the current instance**, picking up the next class after the one the method lives in.
+
+The difference is invisible until two paths exist. Compare two scenarios with the same class definitions but different instance types:
+
+```python
+class Product:
+    def describe(self):
+        return "product"
+
+class DigitalProduct(Product):
+    def describe(self):
+        return "digital, " + super().describe()
+
+class DiscountableProduct(Product):
+    def describe(self):
+        return "discountable, " + super().describe()
+
+class Ebook(DigitalProduct, DiscountableProduct):
+    pass
+
+# Case 1: a plain DigitalProduct instance
+print(DigitalProduct().describe())
+
+# Case 2: an Ebook instance
+print(Ebook().describe())
+```
+
+The second case is the interesting one. The exact same `DigitalProduct.describe` method runs in both calls. In the first call, `super().describe()` resolves to `Product.describe`. In the second call, `super().describe()` from inside `DigitalProduct.describe` resolves to `DiscountableProduct.describe`, not to `Product`. Same method, different `super()` destination, because the MRO of `Ebook` puts `DiscountableProduct` between `DigitalProduct` and `Product`.
+
+`super()` is dynamic. It doesn't refer to a fixed class. It refers to "the next class after me in the MRO of the actual instance type". For an `Ebook` instance, the MRO is `Ebook, DigitalProduct, DiscountableProduct, Product, object`, so `super()` from inside `DigitalProduct` is `DiscountableProduct`. For a plain `DigitalProduct` instance, the MRO is `DigitalProduct, Product, object`, so `super()` is `Product`.
+
+This dynamic behavior is what makes **cooperative multiple inheritance** work. Each class in the chain calls `super()` without naming a specific parent, trusting the MRO to deliver the call to the next class. As long as every class participates, the call walks the entire MRO and each class contributes once.
+
+Writing `Product.describe(self)` instead of `super().describe()` hard-codes a specific parent and breaks the cooperation. The method would jump straight to `Product` and skip `DiscountableProduct`. The takeaway is that `super()` reads the MRO, not the source code.
+
+<h1 id="visualizing-the-mro-of-a-real-hierarchy">
+  Visualizing the MRO of a Real Hierarchy
+</h1>
+
+A small store hierarchy makes the MRO concrete. Consider a base `Product`, two specializations (`DigitalProduct` and `PhysicalProduct`), and a `Bundle` that combines aspects of both.
+
+```python
+class Product:
+    def kind(self):
+        return "generic"
+
+class DigitalProduct(Product):
+    def kind(self):
+        return "digital"
+
+class PhysicalProduct(Product):
+    def kind(self):
+        return "physical"
+
+class Bundle(DigitalProduct, PhysicalProduct):
+    pass
+
+for cls in Bundle.__mro__:
+    print(cls.__name__)
+
+print()
+print(Bundle().kind())
+```
+
+Three observations. First, `Bundle.__mro__` is the standard diamond ordering: bottom first, declared parents in order, shared ancestor after both, `object` last. Second, `Bundle` doesn't define `kind`, so the lookup walks the MRO and finds `kind` on `DigitalProduct`, which is the first class after `Bundle` that defines it. `PhysicalProduct.kind` is in the MRO too, but the search stops as soon as it finds a match. Third, `Product.kind` never runs at all for a `Bundle` instance, because `DigitalProduct` shadows it.
+
+The diagram shows the MRO as a single path. When `Bundle().kind()` runs, Python walks left to right and uses the first match. Drawing the MRO this way is often clearer than drawing the inheritance graph since the search order is what drives behavior.
+
+Changing the parent list to `class Bundle(PhysicalProduct, DigitalProduct):` makes the MRO `Bundle, PhysicalProduct, DigitalProduct, Product, object`, and `Bundle().kind()` returns `"physical"` instead. The classes haven't changed; only the order. That sensitivity to declaration order is why the parent list isn't a set; it's a sequence.
+
+<h1 id="common-patterns-that-rely-on-the-mro">
+  Common Patterns That Rely on the MRO
+</h1>
+
+Two patterns make heavy use of the MRO, and both show up in Python code.
+
+**Cooperative multiple inheritance.** Each class in the chain calls `super()` and forwards arguments, so a single method call ends up touching every class in the MRO exactly once. The diamond `describe` example above is a small instance. The bigger payoff is in `__init__` chains where each class wants to initialize its own attributes without knowing the full hierarchy. As long as every class forwards `**kwargs` to `super().__init__`, parents can be mixed and matched freely without rewriting any of them.
+
+**Mixins that depend on the MRO for their parent.** A mixin like `LoggingMixin` or `TimestampedMixin` is designed to be combined with other classes. It can call `super().__init__(*args, **kwargs)` or `super().method(...)` without knowing the concrete class it'll end up with, because the MRO of the eventual subclass will determine what `super()` resolves to. The mixin doesn't have to name its eventual sibling, which is the point: the same mixin can plug into many different hierarchies.
+
+```python
+class TimestampedMixin:
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from datetime import datetime
+        self.created_at = datetime.now()
+
+class Product:
+    def __init__(self, name, price):
+        self.name = name
+        self.price = price
+
+class TimestampedProduct(TimestampedMixin, Product):
+    pass
+
+p = TimestampedProduct("Notebook", 4.99)
+print(p.name, p.price, type(p.created_at).__name__)
+```
+
+`TimestampedMixin.__init__` calls `super().__init__(*args, **kwargs)`, which (because of the MRO `TimestampedProduct, TimestampedMixin, Product, object`) forwards to `Product.__init__`. The mixin then sets `self.created_at`. The mixin itself never mentions `Product`; the MRO routes the `super()` call there. This is the flexibility cooperative multiple inheritance provides, and it's only possible because `super()` reads the MRO instead of a hard-coded parent name.
+
+A short way to think about it: the MRO is the contract between a base class and every possible subclass that might be built on top of it. A method that respects the contract (calls `super()` and forwards arguments) keeps working no matter what subclass slots it into a hierarchy later.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

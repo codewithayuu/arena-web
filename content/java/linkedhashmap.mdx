@@ -1,0 +1,214 @@
+---
+title: "LinkedHashMap"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "LinkedHashMap explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="why-order-matters">Why Order Matters</h1>
+
+A plain `HashMap` stores entries in buckets chosen by hash code. Iteration walks the bucket array, which has no relation to insertion order. Two runs of the same program can iterate in different orders if the JVM rearranges entries during resizing. For most lookups that's fine, but it's a problem the moment a stable iteration order is required.
+
+Consider a shopping cart. The user adds a notebook, then a pen, then an eraser. When the cart renders on the page, those rows should appear in the order they were added, not the order the hash function produced. With a plain `HashMap`, the order is unpredictable.
+
+```java
+import java.util.HashMap;
+import java.util.Map;
+
+public class CartHashMap {
+    public static void main(String[] args) {
+        Map<String, Integer> cart = new HashMap<>();
+        cart.put("Notebook", 2);
+        cart.put("Pen", 5);
+        cart.put("Eraser", 3);
+
+        for (Map.Entry<String, Integer> entry : cart.entrySet()) {
+            System.out.println(entry.getKey() + " x " + entry.getValue());
+        }
+    }
+}
+```
+
+The output isn't wrong, it's just not the insertion order. The user added the notebook first, but the eraser printed first. Swap `HashMap` for `LinkedHashMap` and the output lines up with what the user did.
+
+```java
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+public class CartLinkedHashMap {
+    public static void main(String[] args) {
+        Map<String, Integer> cart = new LinkedHashMap<>();
+        cart.put("Notebook", 2);
+        cart.put("Pen", 5);
+        cart.put("Eraser", 3);
+
+        for (Map.Entry<String, Integer> entry : cart.entrySet()) {
+            System.out.println(entry.getKey() + " x " + entry.getValue());
+        }
+    }
+}
+```
+
+Same API, same `Map` interface, same average performance. The only visible difference is that iteration follows the insertion order.
+
+<h1 id="how-linkedhashmap-stores-entries">How LinkedHashMap Stores Entries</h1>
+
+`LinkedHashMap` extends `HashMap`. The bucket array, the hash function, and the resize behavior are all inherited. What `LinkedHashMap` adds is a doubly-linked list that threads through every entry. Each entry remembers the previous entry and the next entry in the order it should be visited. Iteration walks this list from head to tail instead of scanning the bucket array.
+
+The diagram below shows the two structures side by side for a small cart. The buckets on the left are hash-driven, the same as `HashMap`. The arrows at the bottom show the linked list overlay that captures insertion order.
+
+The same three entries appear in both pictures. The bucket layout decides where lookup goes. The linked list decides what iteration sees. A `put("Eraser", 3)` lands the entry in whatever bucket its hash points to, and at the same time appends it to the end of the linked list. A `remove("Pen")` takes the entry out of its bucket and unlinks it from the list at the same time, with the neighbors stitched back together.
+
+Lookup never walks the list. It uses the bucket array, just like `HashMap`, so `get` and `containsKey` stay average O(1). The list is touched only when entries are added, removed, or, in access-order mode, accessed.
+
+Each entry in `LinkedHashMap` carries two extra references (a `before` and an `after` pointer) compared with `HashMap`. For a few thousand entries the overhead is invisible. For tens of millions of entries it adds up, and a plain `HashMap` is the cheaper choice when ordering isn't needed.
+
+<h1 id="insertion-order-vs-access-order">Insertion Order vs Access Order</h1>
+
+The constructor controls which order the linked list follows. The no-argument constructor uses insertion order, the mode shown so far. The three-argument constructor with `accessOrder = true` switches the list to access order, where every `get` or `put` of an existing key moves that entry to the end of the list.
+
+The signature is `LinkedHashMap(int initialCapacity, float loadFactor, boolean accessOrder)`. The first two parameters work the same way they do in `HashMap`. The third controls ordering mode.
+
+```java
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+public class AccessOrderDemo {
+    public static void main(String[] args) {
+        LinkedHashMap<String, Integer> recentlyViewed =
+            new LinkedHashMap<>(16, 0.75f, true);
+
+        recentlyViewed.put("Notebook", 1);
+        recentlyViewed.put("Pen", 1);
+        recentlyViewed.put("Eraser", 1);
+
+        System.out.println("After three inserts: " + recentlyViewed.keySet());
+
+        recentlyViewed.get("Notebook");
+        System.out.println("After viewing Notebook: " + recentlyViewed.keySet());
+
+        recentlyViewed.get("Pen");
+        System.out.println("After viewing Pen: " + recentlyViewed.keySet());
+    }
+}
+```
+
+Each `get` promotes the touched key to the tail of the list, which is treated as "most recently used". The entry at the head hasn't been touched the longest. This is the structure an LRU cache needs.
+
+The diagram below traces the same access-order behavior. The list starts as `Notebook -> Pen -> Eraser`. After `get("Notebook")`, the list becomes `Pen -> Eraser -> Notebook`. The entry physically stays in the same hash bucket; only its position in the linked list overlay changes.
+
+`put` on an existing key counts as an access, so it also moves the entry to the tail. `put` on a new key appends it to the tail (that part is the same as insertion order). `containsKey` and `containsValue` are not considered accesses and don't reorder the list. Neither does iteration through `keySet`, `values`, or `entrySet`.
+
+<h1 id="building-a-bounded-lru-cache">Building a Bounded LRU Cache</h1>
+
+Access-order mode by itself doesn't evict anything. To turn `LinkedHashMap` into a real cache that drops the oldest entries when it fills up, override `removeEldestEntry`. This method is called automatically after every `put` and `putAll`. If it returns `true`, the entry at the head of the list (the least recently used one) is removed before the method returns.
+
+The contract: read the size of the map, compare it with the maximum to enforce, and return `true` to evict.
+
+```java
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+public class RecentlyViewedCache {
+    public static void main(String[] args) {
+        int capacity = 3;
+
+        LinkedHashMap<String, Integer> cache =
+            new LinkedHashMap<>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, Integer> eldest) {
+                    return size() > capacity;
+                }
+            };
+
+        cache.put("Notebook", 1);
+        cache.put("Pen", 1);
+        cache.put("Eraser", 1);
+        System.out.println("After 3 inserts: " + cache.keySet());
+
+        cache.put("Backpack", 1);
+        System.out.println("After 4th insert: " + cache.keySet());
+
+        cache.get("Pen");
+        cache.put("Stapler", 1);
+        System.out.println("After viewing Pen, then inserting Stapler: " + cache.keySet());
+    }
+}
+```
+
+The first three inserts fit within the capacity, so nothing is evicted. The fourth insert pushes the size to 4, `removeEldestEntry` returns `true`, and the head of the list (`Notebook`) is dropped. After that, viewing `Pen` promotes it to the tail. When `Stapler` is inserted, the new head is `Backpack`, which is evicted next.
+
+A few details:
+
+- `removeEldestEntry` is called after the new entry is already inserted. This is why the size check uses `> capacity` rather than `>= capacity`. The map briefly holds `capacity + 1` entries, then drops the oldest one.
+- The `eldest` parameter passed to the method is the entry at the head of the list. The decision usually rests on `size()` alone, ignoring the argument, but the eldest entry's key or value can be consulted when the eviction rule depends on it.
+- The method is on the map itself, so the anonymous subclass syntax shown above is a common way to wire it up. A named subclass works too for reusing the cache type in several places.
+
+Eviction itself is O(1). `removeEldestEntry` is consulted on every `put`, so the implementation should stay cheap. A check that scans the map turns an O(1) operation into something slower.
+
+<h1 id="when-to-use-linkedhashmap">When to Use LinkedHashMap</h1>
+
+`LinkedHashMap` sits between `HashMap` and `TreeMap` in the design space. Pick it for one of the two specific guarantees it provides, and stick with `HashMap` otherwise.
+
+| Goal                                       | Use                                                               |
+| ------------------------------------------ | ----------------------------------------------------------------- |
+| Fastest lookup, iteration order irrelevant | `HashMap`                                                         |
+| Predictable iteration in insertion order   | `LinkedHashMap` (default constructor)                             |
+| LRU eviction policy, bounded size          | `LinkedHashMap` with `accessOrder = true` and `removeEldestEntry` |
+| Keys iterated in sorted order              | `TreeMap`                                                         |
+
+Some concrete situations where `LinkedHashMap` is the natural fit:
+
+- **Rendering an ordered cart or checkout summary.** Items appear in the order the customer added them. A `HashMap` would shuffle them.
+- **A small, bounded session cache.** The last 1,000 user sessions are stored and the least recently active one is dropped when a new session arrives.
+- **A "recently viewed products" panel.** Each product view marks the entry as recent. When the panel only has room for, say, 10 items, the oldest one drops off.
+- **Storing query parameters or HTTP headers where order is visible to the user or to a downstream system.** Some signing schemes hash the headers in the order they were inserted; `LinkedHashMap` preserves that order while keeping fast lookup.
+
+Two situations where `LinkedHashMap` is the wrong tool:
+
+- **Keys in natural or comparator order.** `LinkedHashMap` only knows insertion or access order. For `1, 2, 3, ...` regardless of how keys were inserted, use `TreeMap`.
+- **Millions of entries with no need for iteration order.** The two extra references per entry add up. Use `HashMap` and save the memory.
+
+<h1 id="performance-and-memory-in-practice">
+  Performance and Memory in Practice
+</h1>
+
+For everyday workloads, treat `LinkedHashMap` as having the same big-O behavior as `HashMap`. The list operations on insert, remove, and access are O(1) because the entry already knows its neighbors, so unlinking and relinking is constant time. The only operations that touch every entry are iteration and clearing, both O(n) regardless of map choice.
+
+Memory is the visible cost. A `HashMap.Node` holds the key, value, hash, and next pointer. A `LinkedHashMap.Entry` adds a `before` and `after` reference on top of that. On a 64-bit JVM with compressed oops, that's roughly 16 extra bytes per entry. For a cache of 10,000 items, that's about 160 KB of overhead, which is negligible. For 100 million items, it's 1.6 GB, which is not.
+
+Iteration is one place `LinkedHashMap` actually beats `HashMap`. Walking the linked list visits each entry once with two pointer reads per step. Iterating `HashMap` scans the entire bucket array, including empty buckets, then follows the bucket chains. When the map is sparse (large capacity, few entries), `LinkedHashMap` iteration can be visibly faster than `HashMap` iteration, even though both are O(n) in the size of the map.
+
+```java
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+public class IterationOrder {
+    public static void main(String[] args) {
+        Map<String, Integer> hashCart = new HashMap<>();
+        Map<String, Integer> linkedCart = new LinkedHashMap<>();
+
+        String[] items = {"Notebook", "Pen", "Eraser", "Backpack", "Stapler"};
+        for (int i = 0; i < items.length; i++) {
+            hashCart.put(items[i], i + 1);
+            linkedCart.put(items[i], i + 1);
+        }
+
+        System.out.println("HashMap order:       " + hashCart.keySet());
+        System.out.println("LinkedHashMap order: " + linkedCart.keySet());
+    }
+}
+```
+
+Same five inserts, same key-value pairs, two different orders on iteration. The `HashMap` order depends on the hash codes of the strings and the current bucket array size, neither of which is part of the API contract. The `LinkedHashMap` order is locked to the order the puts happened.
+
+For thread safety, `LinkedHashMap` itself is not synchronized. Wrapping it with `Collections.synchronizedMap` works, but is tricky for an LRU cache, because access-order mode mutates the list on `get`. Two threads reading the same key can race. For concurrent LRU caches, libraries like Caffeine or Guava's cache fit better. `ConcurrentHashMap` appears later in the section; it does not preserve any order.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

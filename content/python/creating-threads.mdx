@@ -1,0 +1,553 @@
+---
+title: "Creating Threads"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "Creating Threads explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="two-ways-to-create-a-thread">Two Ways to Create a Thread</h1>
+
+The `threading.Thread` class is the main entry point. You can use it directly by passing a function to `target=`, or subclass it and override `run`. Both produce a thread; they differ in how you organise the code around it.
+
+The function form is the most common and the easiest to read:
+
+```python
+import threading
+import time
+
+def confirm_order(order_id):
+    print(f"Confirming order {order_id}")
+    time.sleep(0.5)
+    print(f"Order {order_id} confirmed")
+
+worker = threading.Thread(target=confirm_order, args=(101,))
+worker.start()
+worker.join()
+print("Main thread continues")
+```
+
+`target` is the function the new thread runs. `args` is a tuple of positional arguments. `kwargs`, if you need it, is a dict of keyword arguments. The thread object itself does nothing until you call `start()`. After `start()`, the function runs on a fresh OS thread, and the main thread is free to do something else.
+
+The subclass form bundles the thread with its own state. You write a class that inherits from `Thread`, override `run`, and call `super().__init__()` from your constructor:
+
+```python
+import threading
+import time
+
+class OrderConfirmer(threading.Thread):
+    def __init__(self, order_id):
+        super().__init__()
+        self.order_id = order_id
+        self.confirmed = False
+
+    def run(self):
+        print(f"Confirming order {self.order_id}")
+        time.sleep(0.5)
+        self.confirmed = True
+
+worker = OrderConfirmer(101)
+worker.start()
+worker.join()
+print(f"Order {worker.order_id} confirmed: {worker.confirmed}")
+```
+
+`super().__init__()` is mandatory. Without it, the parent class's machinery is uninitialized and `start()` raises `RuntimeError`. Override `run`, not `start`. `start()` is what creates the OS thread and arranges for `run()` to execute inside it. Overriding `start` bypasses the threading mechanism entirely and the code runs in the main thread.
+
+Which form to use? Use the function form for one-off tasks, simple workers, or when spawning many threads with the same target and different arguments. Use the subclass form when each worker needs its own configuration, when results should be exposed as attributes, or when the setup logic is naturally tied to the worker.
+
+If the worker is a pure function call, pass it to `target`. If the worker carries enough state that tracking it in a separate dict or closure would otherwise be needed, a subclass is usually cleaner.
+
+<h1 id="starting-threads-with-start">Starting Threads with start()</h1>
+
+`start()` is the method that makes the thread real. Before `start`, a `Thread` object is just a configuration: a target, some arguments, a name. After `start`, the OS has a new thread of execution running your function.
+
+A `Thread` instance can only be started once. Calling `start` a second time raises `RuntimeError`:
+
+```python
+import threading
+
+def task():
+    print("running")
+
+worker = threading.Thread(target=task)
+worker.start()
+worker.join()
+worker.start()  # error
+```
+
+To run the same work twice, build a new `Thread` instance for the second run. The cost of creating a `Thread` object is low (it's a Python object), but the OS thread it spawns has its own stack and a small kernel-side bookkeeping cost. For high counts of short-lived work, prefer a thread pool.
+
+A subtler point: calling `run()` directly does not start a new thread. It just calls the method on the current thread:
+
+```python
+import threading
+
+def task():
+    print(f"Running on {threading.current_thread().name}")
+
+worker = threading.Thread(target=task, name="worker-1")
+worker.run()  # not what you want
+```
+
+`run()` is a regular Python method. Only `start()` arranges for the OS to create a new thread and invoke `run` from inside it. Mixing the two up is a common early mistake, since `worker.run()` doesn't raise any error.
+
+Each thread allocates a stack (typically 1-8 MB depending on the OS and Python version) and a small bookkeeping structure inside the kernel. Spawning hundreds of threads for short tasks is wasteful. The break-even point depends on how long each task runs, but a reasonable rule of thumb is to reuse threads through a pool once you're past a few dozen.
+
+<h1 id="waiting-with-join">Waiting with join()</h1>
+
+Once a thread is started, the main thread keeps running. If the main thread reaches the end of the script while a non-daemon worker is still running, Python will wait for the worker before exiting, but explicit waiting is usually better so the main thread can observe what the worker did.
+
+`join()` blocks the calling thread until the target thread finishes:
+
+```python
+import threading
+import time
+
+def process_payment(order_id):
+    print(f"Charging card for order {order_id}")
+    time.sleep(1)
+    print(f"Charge complete for order {order_id}")
+
+worker = threading.Thread(target=process_payment, args=(501,))
+worker.start()
+worker.join()
+print("Main thread: payment finished, sending receipt")
+```
+
+The receipt line never prints before the charge completes, because `join()` blocks until the worker exits. This gives the main thread a way to wait for background work and then act on the result.
+
+`join()` accepts an optional `timeout` in seconds. With a timeout, `join` returns after at most that many seconds, whether the thread finished or not. The return value is `None` either way, so checking `is_alive()` tells you which case applies:
+
+```python
+import threading
+import time
+
+def slow_export():
+    time.sleep(3)
+    print("Export complete")
+
+worker = threading.Thread(target=slow_export)
+worker.start()
+
+while worker.is_alive():
+    worker.join(timeout=1.0)
+    if worker.is_alive():
+        print("Still working...")
+
+print("Worker finished")
+```
+
+This pattern is useful for showing progress, checking a cancellation flag, or refreshing a UI while a slow worker runs. The timeout doesn't speed anything up; it gives the main thread a chance to do something between checks.
+
+One thing `join` does not do: it doesn't return the worker function's return value. Whatever `target` returned is discarded by the threading machinery. If the target raised an exception, the thread dies inside itself and the main thread never finds out, unless the exception is caught explicitly inside the target.
+
+<h1 id="the-thread-lifecycle">The Thread Lifecycle</h1>
+
+A `Thread` object moves through three observable states: not started, running, and finished. `is_alive()` is the standard way to check the current state.
+
+```python
+import threading
+import time
+
+def task():
+    time.sleep(1)
+
+worker = threading.Thread(target=task)
+print(f"Before start: is_alive={worker.is_alive()}")
+
+worker.start()
+print(f"After start:  is_alive={worker.is_alive()}")
+
+worker.join()
+print(f"After join:   is_alive={worker.is_alive()}")
+```
+
+A thread is alive from the moment `start()` returns until its target function returns (or raises). Before `start()`, the thread hasn't been created; `is_alive()` returns `False`. After the target finishes, `is_alive()` returns `False` again. The `Thread` object itself sticks around, its attributes can still be read, but it can't be restarted.
+
+A thread enters `Running` exactly once and leaves it exactly once. There's no `Paused`, no `Suspended`, no externally-triggered termination. Python threads run cooperatively until their target finishes or raises.
+
+Every thread has an OS-level integer ID once it starts. The `ident` attribute exposes it, or `threading.get_ident()` from inside the thread:
+
+```python
+import threading
+
+def task():
+    print(f"Inside thread, ident={threading.get_ident()}")
+
+worker = threading.Thread(target=task)
+print(f"Before start, ident={worker.ident}")
+worker.start()
+print(f"After start, ident={worker.ident}")
+worker.join()
+```
+
+Before `start`, the thread doesn't exist yet, so `ident` is `None`. After `start`, the value is a non-zero integer that's unique while the thread is alive. The same value can be reused for a later thread after this one exits. There's also a `native_id` attribute (added in Python 3.8) that returns the OS-assigned ID, which can be handy for matching threads in external tools like `top` or `htop`.
+
+<h1 id="daemon-threads">Daemon Threads</h1>
+
+Every thread is either a **daemon** or a **non-daemon**. The flag controls one thing: what happens when the main thread finishes.
+
+A non-daemon thread keeps the program alive. If the main thread reaches the end of the script while a non-daemon worker is still running, Python waits for that worker before the interpreter exits. Non-daemon is the default.
+
+A daemon thread is the opposite. When the main thread and all other non-daemon threads exit, daemon threads get killed mid-instruction. The program doesn't wait. This is useful for background tasks that should die with the program: a thread polling a metrics endpoint, a thread flushing logs, a heartbeat sender.
+
+```python
+import threading
+import time
+
+def background_metrics():
+    while True:
+        print("Sending metrics...")
+        time.sleep(0.5)
+
+metrics = threading.Thread(target=background_metrics, daemon=True)
+metrics.start()
+
+print("Main thread: doing 2 seconds of work")
+time.sleep(2)
+print("Main thread: exiting")
+```
+
+Without `daemon=True`, that `while True` loop would keep the program running forever. With it, the moment the main thread reaches the end of the script, the daemon is killed and the process exits cleanly.
+
+The daemon flag can also be set through the attribute, but only before `start`:
+
+```python
+import threading
+
+worker = threading.Thread(target=lambda: None)
+worker.daemon = True   # fine, thread hasn't started
+worker.start()
+worker.daemon = False  # raises RuntimeError
+```
+
+Once the OS thread is created, the daemon flag is locked in. The same rule applies whether `daemon=True` is passed to the constructor or set on the attribute later.
+
+Daemon threads die abruptly when the program exits. They don't get a chance to flush buffers, close files, release locks, or finish writing data. Use them for fire-and-forget background tasks. Anything that touches important external state should be a non-daemon thread with a clean shutdown path.
+
+A practical rule: if losing the work mid-step would corrupt something a customer cares about (an order, a payment, a database row), don't make the thread a daemon. If the work is repeated periodically and missing one cycle is harmless (a stats flush, a cache refresh), daemon is fine.
+
+<h1 id="thread-names-and-identifiers">Thread Names and Identifiers</h1>
+
+Every thread has a name. By default, Python gives it something like `Thread-1`, `Thread-2`, and so on. The `name` keyword argument overrides that when constructing the thread, which makes log lines easier to read when several threads are running at once:
+
+```python
+import threading
+import time
+
+def fetch_product(product_id):
+    me = threading.current_thread()
+    print(f"[{me.name}] fetching product {product_id}")
+    time.sleep(0.5)
+    print(f"[{me.name}] done")
+
+worker = threading.Thread(
+    target=fetch_product,
+    args=(101,),
+    name=f"fetcher-101",
+)
+worker.start()
+worker.join()
+```
+
+`threading.current_thread()` returns the `Thread` object for whichever thread calls it. Its `.name` attribute is what appears in the log line. The `name` attribute can be read and written directly:
+
+```python
+import threading
+
+worker = threading.Thread(target=lambda: None)
+print(worker.name)
+worker.name = "email-sender"
+print(worker.name)
+```
+
+In recent Python versions, the default name includes the target function's name in parentheses, which already helps when an explicit name isn't set. Setting a custom name is still worth doing for any worker that runs alongside others, because it shows up in log records that use the `%(threadName)s` formatter and in profiling tools.
+
+The OS-level integer ID lives in two places. `thread.ident` is the Python-level identifier set by the `threading` module. `thread.native_id`, added in Python 3.8, is the ID the operating system itself assigns. The two can be different on some platforms. For matching Python threads with what `top` or `ps` shows, `native_id` is the right one.
+
+| Attribute    | What it is                                           | Example use                           |
+| ------------ | ---------------------------------------------------- | ------------------------------------- |
+| `name`       | A string label, default `Thread-N (target)`          | Log messages, debugging               |
+| `ident`      | An integer assigned by Python, `None` before `start` | Internal identification               |
+| `native_id`  | The OS thread ID (Python 3.8+)                       | Matching with system tools like `top` |
+| `daemon`     | `True` or `False`, locked after `start`              | Lifecycle control                     |
+| `is_alive()` | `True` while the thread is running                   | Polling for completion                |
+
+<h1 id="returning-values-from-threads">Returning Values from Threads</h1>
+
+With `Thread(target=fn)`, whatever `fn` returns is thrown away. The threading machinery has no way to give it back to the caller because the caller and the thread are running concurrently and `join()` doesn't return values.
+
+The workaround is to put the result somewhere the caller can find it. Three patterns cover almost every case.
+
+**Pattern 1: subclass and store on self.** The thread keeps its own result as an attribute, and the caller reads it after `join`:
+
+```python
+import threading
+import time
+
+class ProductFetcher(threading.Thread):
+    def __init__(self, product_id):
+        super().__init__()
+        self.product_id = product_id
+        self.result = None
+
+    def run(self):
+        time.sleep(0.5)
+        self.result = {"id": self.product_id, "price": 29.99}
+
+fetchers = [ProductFetcher(pid) for pid in [101, 102, 103]]
+for f in fetchers:
+    f.start()
+for f in fetchers:
+    f.join()
+
+for f in fetchers:
+    print(f"product {f.product_id}: {f.result}")
+```
+
+The result lives on the thread instance, so there's no shared dict to manage and no coordination between workers. Each worker writes to its own attribute.
+
+**Pattern 2: shared dict keyed by something unique.** Useful with the function form when defining a class is overkill:
+
+```python
+import threading
+import time
+
+def fetch_product(product_id, results):
+    time.sleep(0.5)
+    results[product_id] = {"id": product_id, "price": 29.99}
+
+results = {}
+workers = []
+for product_id in [101, 102, 103]:
+    worker = threading.Thread(target=fetch_product, args=(product_id, results))
+    workers.append(worker)
+    worker.start()
+
+for worker in workers:
+    worker.join()
+
+print(results)
+```
+
+Each thread writes to its own key, so the writes don't collide in practice. This pattern stays safe only as long as every thread writes a different key. The moment two threads can write the same key (or one reads while another writes), a lock around the dict is required.
+
+**Pattern 3: use a queue.** `queue.Queue` is thread-safe by design. Workers put results onto the queue and the main thread pulls them off in any order. This pattern works well when preserving the input order doesn't matter:
+
+```python
+import threading
+import time
+import queue
+
+results = queue.Queue()
+
+def fetch_product(product_id):
+    time.sleep(0.5)
+    results.put({"id": product_id, "price": 29.99})
+
+workers = [
+    threading.Thread(target=fetch_product, args=(pid,))
+    for pid in [101, 102, 103]
+]
+for w in workers:
+    w.start()
+for w in workers:
+    w.join()
+
+while not results.empty():
+    print(results.get())
+```
+
+The queue handles all the synchronization internally. No locks to manage, no per-thread dict keys to design. The order of items reflects the order in which threads finished, not the order in which they were started.
+
+Beyond these patterns, `concurrent.futures` (lesson 10) provides `Future` objects with `.result()` calls that block and return the value, just like a synchronous function. Use it for production code with many workers.
+
+| Pattern                            | Best for                           | Caveat                                                       |
+| ---------------------------------- | ---------------------------------- | ------------------------------------------------------------ |
+| Subclass + `self.result`           | A few stateful workers             | More boilerplate per worker                                  |
+| Shared dict, unique key per thread | Many workers, function form        | Safe only with unique keys                                   |
+| `queue.Queue`                      | Many workers, order doesn't matter | Loses the input-to-output mapping unless you put pairs       |
+| `concurrent.futures.Future`        | Most production code               | Higher-level wrapper around the lower-level mechanisms above |
+
+<h1 id="thread-local-storage">Thread-Local Storage</h1>
+
+Sometimes each thread needs its own copy of a variable, not a shared one. A common case is a per-thread database connection, an HTTP client, or a cache. `threading.local` is the standard way to express this.
+
+A `threading.local()` instance looks like a regular object, but every attribute set on it is visible only to the thread that set it. Different threads see different values for the same attribute name:
+
+```python
+import threading
+
+current = threading.local()
+
+def set_customer(customer_id):
+    current.customer_id = customer_id
+    print(f"[{threading.current_thread().name}] set customer to {current.customer_id}")
+
+def read_customer():
+    name = threading.current_thread().name
+    if hasattr(current, "customer_id"):
+        print(f"[{name}] reads customer {current.customer_id}")
+    else:
+        print(f"[{name}] has no customer set")
+
+def worker(customer_id):
+    set_customer(customer_id)
+    read_customer()
+
+t1 = threading.Thread(target=worker, args=(101,), name="t1")
+t2 = threading.Thread(target=worker, args=(202,), name="t2")
+t1.start()
+t2.start()
+t1.join()
+t2.join()
+
+read_customer()  # main thread
+```
+
+Thread `t1` sets `current.customer_id` to `101`. Thread `t2` sets the same attribute to `202` on the same `current` object. Neither thread overwrites the other's value, because each thread has its own dictionary of attributes inside the `threading.local` instance. When the main thread reads `current.customer_id`, it raises `AttributeError`, because the main thread never set anything on `current`.
+
+A practical use: per-thread cached state. Consider a function that builds a fresh customer-info object the first time it's called and reuses it afterwards. If many threads call it, the goal is one cached object per thread, not one global cached object:
+
+```python
+import threading
+import time
+
+state = threading.local()
+
+def get_customer_session(customer_id):
+    if not hasattr(state, "session"):
+        print(f"[{threading.current_thread().name}] opening session")
+        state.session = {"customer_id": customer_id, "opened_at": time.time()}
+    return state.session
+
+def worker(customer_id):
+    for _ in range(3):
+        session = get_customer_session(customer_id)
+        print(f"[{threading.current_thread().name}] session: {session['customer_id']}")
+
+t1 = threading.Thread(target=worker, args=(101,), name="t1")
+t2 = threading.Thread(target=worker, args=(202,), name="t2")
+t1.start()
+t2.start()
+t1.join()
+t2.join()
+```
+
+Each thread opens its session once and then reuses it. The two threads don't share a session, even though they share the `state` object. This pattern fits when each thread needs to remember something across calls without threading an extra argument through every function.
+
+Some facts about `threading.local`:
+
+- Attributes set in one thread are not visible in another, including the main thread.
+- The first read of an attribute that was never set in this thread raises `AttributeError`.
+- Cleanup is automatic when the thread ends: its slice of the `threading.local` instance is garbage-collected along with the thread.
+- It's the wrong tool when sharing data between threads. For that, use plain variables (with locks) or a queue.
+
+`threading.local` has a small per-access overhead compared to plain attribute access. It's negligible for sessions or one-time setup, but in a tight inner loop, copy the value into a local variable for the duration of the loop.
+
+<h1 id="common-patterns-launching-n-workers">
+  Common Patterns: Launching N Workers
+</h1>
+
+The canonical shape of code that spawns several threads and waits for them all is two passes over a list: one to start each thread, one to join. Doing the start and the join in the same loop runs them serially, which defeats the purpose.
+
+```python
+import threading
+import time
+
+def fetch_review_count(product_id, results):
+    time.sleep(0.5)
+    results[product_id] = 42 + product_id % 7
+
+product_ids = [101, 102, 103, 104, 105]
+results = {}
+
+start = time.perf_counter()
+
+workers = []
+for product_id in product_ids:
+    worker = threading.Thread(
+        target=fetch_review_count,
+        args=(product_id, results),
+        name=f"reviews-{product_id}",
+    )
+    workers.append(worker)
+    worker.start()
+
+for worker in workers:
+    worker.join()
+
+elapsed = time.perf_counter() - start
+print(f"Fetched {len(results)} review counts in {elapsed:.2f}s")
+for product_id in sorted(results):
+    print(f"  product {product_id}: {results[product_id]} reviews")
+```
+
+Five fetches at half a second each take half a second total instead of two and a half. Every thread is waiting at the same time, so the waits overlap.
+
+Swapping the two loops into one (start, join, start, join, ...) serializes the work:
+
+```python
+# This is the wrong way: it runs serially
+for product_id in product_ids:
+    worker = threading.Thread(target=fetch_review_count, args=(product_id, results))
+    worker.start()
+    worker.join()  # blocks here before starting the next one
+```
+
+Each iteration starts a thread and immediately waits for it to finish before moving on. The total time becomes the sum of the per-thread times, not the maximum. The fix is to collect the threads first and join in a separate pass.
+
+<h1 id="common-patterns-fire-and-forget">Common Patterns: Fire-and-Forget</h1>
+
+A fire-and-forget thread is one that's started without any wait on completion. The classic case is sending a metric, writing a log line, or kicking off a side effect that doesn't block the main flow.
+
+```python
+import threading
+import time
+
+def log_event(event_name, customer_id):
+    time.sleep(0.05)
+    print(f"[log] {event_name} for customer {customer_id}")
+
+def add_to_cart(customer_id, product_id):
+    # do the real work
+    print(f"Added product {product_id} for customer {customer_id}")
+    # fire-and-forget logging
+    threading.Thread(
+        target=log_event,
+        args=("cart_add", customer_id),
+        daemon=True,
+    ).start()
+
+add_to_cart(42, 101)
+add_to_cart(42, 102)
+add_to_cart(42, 103)
+
+time.sleep(0.2)  # give the daemons a moment to finish
+print("Main thread exits")
+```
+
+The thread is created, started, and never joined. Marking it as a daemon means it won't keep the program alive if the main thread exits before the logging finishes. The `time.sleep(0.2)` in the example exists only so the daemons have a chance to print before the program exits; a long-running service wouldn't need it.
+
+Two warnings about this pattern:
+
+1. Daemons die abruptly. If the log write needs to actually finish, this pattern can lose entries when the program exits. For important work, use a non-daemon thread with a clean shutdown path, or push to a queue that a dedicated worker drains.
+2. Spawning a fresh thread for every event is wasteful at scale. Past a few events per second, a single background worker pulling from a `queue.Queue` is more efficient than a thread-per-event.
+
+For low-volume background side effects (a few per second at most), fire-and-forget daemon threads are fine. For heavier loads, use thread pools or proper task queues.
+
+<h1 id="putting-it-together">Putting It Together</h1>
+
+Creating a thread in Python comes down to a small set of moving parts. Build a `Thread` instance with a target function or by subclassing. Call `start()` once to launch it, `join()` to wait for it, and `is_alive()` to check if it's still running. Set `daemon=True` for background tasks that should die with the program. Name the thread for log readability. Get values back through attributes, shared dicts, or queues, because `join` doesn't return them. Use `threading.local` when each thread needs its own private state.
+
+These are the mechanics of creating threads.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,504 @@
+---
+title: "async/await"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "async/await explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="async-def-produces-a-coroutine-function">
+  async def Produces a Coroutine Function
+</h1>
+
+A function defined with `async def` is a **coroutine function**. The body is not run when you call it. The call returns a **coroutine object**, which is a paused execution that knows how to resume later.
+
+```python
+import asyncio
+
+async def calculate_cart_total(prices: list[float]) -> float:
+    await asyncio.sleep(0.05)  # simulates a tax lookup
+    return sum(prices)
+
+result = calculate_cart_total([29.99, 14.99, 9.99])
+print(type(result))
+print(result)
+```
+
+Calling the function didn't run the addition. It built a coroutine object and returned it. The `RuntimeWarning` is Python signaling that the coroutine was discarded without being driven.
+
+Compare this with a normal function, which runs its body the moment you call it:
+
+```python
+def calculate_cart_total_sync(prices: list[float]) -> float:
+    return sum(prices)
+
+print(calculate_cart_total_sync([29.99, 14.99, 9.99]))
+```
+
+Same shape, different behavior. The synchronous version runs and returns the number. The async version returns a handle that represents "run this later."
+
+The rule: **calling an `async def` is not calling. It's constructing.** The actual work happens when something `await`s the coroutine or hands it to the event loop.
+
+PEP 492 introduced this syntax in Python 3.5. Before that, asyncio coroutines were written with `@asyncio.coroutine` and `yield from`, which leaned on the generator machinery. Native coroutines are now the standard, and the older generator-based form is deprecated and removed in Python 3.11.
+
+<h1 id="what-native-coroutine-means">What "Native Coroutine" Means</h1>
+
+A native coroutine is an object with its own type, distinct from a generator. You can prove this with `inspect`:
+
+```python
+import asyncio
+import inspect
+
+async def fetch_price(product_id: str) -> float:
+    await asyncio.sleep(0.05)
+    return 29.99
+
+coro = fetch_price("wireless-mouse")
+print(type(coro).__name__)
+print(inspect.iscoroutine(coro))
+print(inspect.iscoroutinefunction(fetch_price))
+
+coro.close()  # avoid the warning since we're not running it
+```
+
+`iscoroutine` checks an object; `iscoroutinefunction` checks a function. The difference is the same one between a value and the thing that produces values.
+
+The key idea is: `async def` defines a coroutine function, calling it produces a coroutine object, and only something that drives the loop turns that object into actual work.
+
+<h1 id="await-pauses-until-an-awaitable-completes">
+  await Pauses Until an Awaitable Completes
+</h1>
+
+`await` is the keyword that resolves an awaitable into a value. The expression `await x` does three things:
+
+1. Asks the event loop to suspend the current coroutine.
+2. Lets the loop run other ready coroutines while `x` is pending.
+3. Resumes the current coroutine when `x` produces a result, and that result becomes the value of the `await` expression.
+
+```python
+import asyncio
+
+async def fetch_price(product_id: str) -> float:
+    await asyncio.sleep(0.1)
+    return 29.99
+
+async def main() -> None:
+    print("before await")
+    price = await fetch_price("wireless-mouse")
+    print(f"after await, price is ${price}")
+
+asyncio.run(main())
+```
+
+The line between "before" and "after" is what `await` adds. While `fetch_price` is inside its own `await asyncio.sleep(0.1)`, the loop is free to run other coroutines. There's nothing else to run in this example, so the loop waits for the timer, but the mechanism is the same when there are ten coroutines on the loop.
+
+A coroutine can `await` many things in a single body. Each `await` is a potential suspension point:
+
+```python
+import asyncio
+
+async def place_order(customer_email: str) -> str:
+    await asyncio.sleep(0.05)  # check stock
+    await asyncio.sleep(0.05)  # charge card
+    await asyncio.sleep(0.05)  # send confirmation email
+    return f"order placed for {customer_email}"
+
+async def main() -> None:
+    result = await place_order("ashish@example.com")
+    print(result)
+
+asyncio.run(main())
+```
+
+Three `await` points, three places where the loop can switch to another coroutine. Between awaits, the body runs straight through with no chance of being interrupted, exactly like a normal function. That property is what makes asyncio reasoning easier than threading: a coroutine can be read top to bottom, and the only places another coroutine can interleave are the `await` expressions.
+
+`await` is a syntax error outside an `async def`:
+
+```python
+def get_price() -> float:
+    return await fetch_price("wireless-mouse")
+```
+
+The parser rejects it before the program runs. There's no runtime trick, no decorator, no flag that makes `await` work in a regular function. To call a coroutine from inside a regular function, either make the function async too or use `asyncio.run` as a bridge (with the caveat that `run` can't be called from inside an already-running loop).
+
+<h1 id="what-counts-as-an-awaitable">What Counts as an Awaitable</h1>
+
+Anything that can appear after `await` is an awaitable. There are three categories, and the rules for each show up in real code.
+
+**Coroutines.** The value returned by calling an `async def`. These are the most common awaitables to write directly.
+
+**Tasks.** Coroutines that have been scheduled on the event loop with `asyncio.create_task(coro)`. Tasks start running immediately on the next loop tick, so awaiting a Task waits for work that's already underway.
+
+**Futures.** Lower-level placeholders for "a value that will be available later." `asyncio.Future` is the base class; Task is a subclass. Futures are rarely built by hand. They appear when calling into a callback-style API like `loop.run_in_executor`, which returns a Future representing the eventual result of a thread.
+
+Any object that implements an `__await__` method is also an awaitable, but this only appears in library internals. The three categories above cover every case beginner and intermediate code runs into.
+
+```python
+import asyncio
+
+async def fetch_price(product_id: str) -> float:
+    await asyncio.sleep(0.05)
+    return 29.99
+
+async def main() -> None:
+    # 1. await a coroutine
+    price_a = await fetch_price("wireless-mouse")
+
+    # 2. await a Task
+    task = asyncio.create_task(fetch_price("usb-cable"))
+    price_b = await task
+
+    # 3. await a Future (returned by run_in_executor)
+    loop = asyncio.get_running_loop()
+    future = loop.run_in_executor(None, lambda: 14.99)
+    price_c = await future
+
+    print(price_a, price_b, price_c)
+
+asyncio.run(main())
+```
+
+All three awaits look the same in the source: `await something`. The differences are how the awaitable was created and what's driving it underneath.
+
+The diagram below shows the relationship between the three awaitable kinds and how they flow into the event loop.
+
+The three awaitables enter `await` through the same syntactic door, but each one has a different relationship with the loop. A coroutine is inert until something drives it. A Task is already running on the loop. A Future is a placeholder for a result that arrives later, typically from a worker thread or a low-level callback API.
+
+Trying to `await` something that isn't an awaitable raises `TypeError`:
+
+```python
+import asyncio
+
+async def main() -> None:
+    await 42
+
+asyncio.run(main())
+```
+
+The error is immediate. It usually means a function expected to return a coroutine actually returned a value, or the parentheses on a coroutine call were omitted (`await fetch_price` instead of `await fetch_price("id")`).
+
+<h1 id="running-async-code-with-asynciorun">
+  Running Async Code with asyncio.run
+</h1>
+
+`asyncio.run(coro)` is the synchronous entry point into asyncio. It creates a new event loop, runs the coroutine to completion, and closes the loop on exit. Almost every async program has exactly one call to it.
+
+```python
+import asyncio
+
+async def main() -> None:
+    print("inside the loop")
+    await asyncio.sleep(0.05)
+    print("loop is closing soon")
+
+asyncio.run(main())
+print("back in sync world")
+```
+
+A few rules apply:
+
+- The argument has to be a coroutine object, not a coroutine function. `asyncio.run(main)` is a bug; `asyncio.run(main())` is correct.
+- Don't call it from inside an already-running loop. That raises `RuntimeError: asyncio.run() cannot be called from a running event loop`. From an async function, `await` the coroutine instead.
+- Each call builds a fresh loop and tears it down. Don't call `asyncio.run` in a tight inner loop, and don't call it from library code that might be imported by an async application.
+
+The standard layout for an async script is small:
+
+```python
+import asyncio
+
+async def main() -> None:
+    # all async work goes here
+    ...
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Everything async lives below `main`. The synchronous `if __name__ == "__main__":` block is the seam between sync and async worlds.
+
+For everyday code, `asyncio.run` is the standard choice over the older `loop.run_until_complete` and the loop-construction APIs.
+
+<h1 id="calling-sync-from-async-run_in_executor-and-to_thread">
+  Calling Sync from Async: run_in_executor and to_thread
+</h1>
+
+Mixing sync and async is unavoidable. Real applications have to call synchronous libraries (database drivers, image processing, file I/O) from inside coroutines, and a naive call blocks the loop.
+
+```python
+import asyncio
+import time
+
+async def fetch_price_blocking(product_id: str) -> float:
+    time.sleep(0.5)  # synchronous library call blocking the loop
+    return 29.99
+
+async def main() -> None:
+    start = time.perf_counter()
+    a, b = await asyncio.gather(
+        fetch_price_blocking("wireless-mouse"),
+        fetch_price_blocking("usb-cable"),
+    )
+    print(f"got ${a} and ${b} in {time.perf_counter() - start:.2f}s")
+
+asyncio.run(main())
+```
+
+Two half-second sleeps that should run concurrently take a full second. The reason is `time.sleep`: it blocks the entire thread, which means it blocks the event loop, which means nothing else on the loop can advance.
+
+The fix is to push the blocking work onto a worker thread. The high-level API is `asyncio.to_thread`, added in Python 3.9:
+
+```python
+import asyncio
+import time
+
+def blocking_lookup(product_id: str) -> float:
+    time.sleep(0.5)
+    return 29.99
+
+async def fetch_price(product_id: str) -> float:
+    return await asyncio.to_thread(blocking_lookup, product_id)
+
+async def main() -> None:
+    start = time.perf_counter()
+    a, b = await asyncio.gather(
+        fetch_price("wireless-mouse"),
+        fetch_price("usb-cable"),
+    )
+    print(f"got ${a} and ${b} in {time.perf_counter() - start:.2f}s")
+
+asyncio.run(main())
+```
+
+`asyncio.to_thread` runs the synchronous function in the default thread pool and returns an awaitable that resolves to the function's return value. The loop is free during the wait, so the two calls actually run concurrently and total time drops to 0.5 seconds.
+
+The lower-level API is `loop.run_in_executor(executor, func, *args)`. `to_thread` is a wrapper that uses the default executor:
+
+```python
+import asyncio
+import concurrent.futures
+
+def blocking_lookup(product_id: str) -> float:
+    return 29.99
+
+async def main() -> None:
+    loop = asyncio.get_running_loop()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        price = await loop.run_in_executor(pool, blocking_lookup, "wireless-mouse")
+    print(price)
+
+asyncio.run(main())
+```
+
+The explicit executor gives control over the worker count and lifecycle, which matters when the default pool shouldn't be shared. For CPU-bound work, swap the `ThreadPoolExecutor` for a `ProcessPoolExecutor` and the same `run_in_executor` call moves the work to a separate process.
+
+`to_thread` is not parallelism for CPU work. The GIL still serializes Python bytecode in the same process, so two CPU-heavy threads don't run in parallel. Use it for blocking I/O, where the thread spends most of its time waiting for the kernel. For CPU-bound work, use `ProcessPoolExecutor` via `run_in_executor`.
+
+<h1 id="calling-async-from-sync-a-trickier-direction">
+  Calling Async from Sync: A Trickier Direction
+</h1>
+
+The reverse direction (calling a coroutine from synchronous code) is where the common bugs live. The standard tool is `asyncio.run`, but it has a sharp restriction: it can only be called when no event loop is running. Inside a coroutine, calling `asyncio.run` raises `RuntimeError`.
+
+```python
+import asyncio
+
+async def fetch_price(product_id: str) -> float:
+    await asyncio.sleep(0.05)
+    return 29.99
+
+async def main() -> None:
+    price = asyncio.run(fetch_price("wireless-mouse"))  # wrong
+    print(price)
+
+asyncio.run(main())
+```
+
+The fix is to `await` directly from inside `main`. `asyncio.run` is for the seam between sync and async, not for plumbing inside the async world:
+
+```python
+async def main() -> None:
+    price = await fetch_price("wireless-mouse")
+    print(price)
+```
+
+The harder case is when a synchronous codebase needs to call a coroutine and the surrounding code can't be made async (legacy libraries, callback APIs, Tkinter event handlers, custom REPL hooks). Three patterns cover most situations.
+
+**Pattern 1: `asyncio.run` at the boundary.** If the synchronous call site is a top-level entry point with no loop running, `asyncio.run` works:
+
+```python
+import asyncio
+
+async def fetch_price(product_id: str) -> float:
+    await asyncio.sleep(0.05)
+    return 29.99
+
+def get_price_sync(product_id: str) -> float:
+    return asyncio.run(fetch_price(product_id))
+
+print(get_price_sync("wireless-mouse"))
+```
+
+Each call builds a fresh loop and tears it down, which is wasteful inside a loop or a hot path. For one-shot scripts and CLIs, it works well.
+
+**Pattern 2: a long-lived loop in another thread.** When calling coroutines from sync code many times, run one event loop in a background thread and submit work to it with `asyncio.run_coroutine_threadsafe`:
+
+```python
+import asyncio
+import threading
+
+async def fetch_price(product_id: str) -> float:
+    await asyncio.sleep(0.05)
+    return 29.99
+
+loop = asyncio.new_event_loop()
+
+def loop_runner() -> None:
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+threading.Thread(target=loop_runner, daemon=True).start()
+
+future = asyncio.run_coroutine_threadsafe(fetch_price("wireless-mouse"), loop)
+print(future.result())  # blocks until coroutine finishes
+```
+
+`run_coroutine_threadsafe` schedules the coroutine on the running loop in the other thread and returns a `concurrent.futures.Future`. Calling `.result()` blocks the current thread until the coroutine is done. This is the pattern GUIs use to integrate asyncio code with their own event loop.
+
+**Pattern 3: don't mix.** The cleanest answer is often to make the sync code async too, so the seam moves to the very top of the program. Once past the boundary, everything inside is awaitable.
+
+There's no single tool in the standard library that runs a coroutine instantly from sync code with no trade-offs. Every option has a cost: a fresh loop per call, a background thread, or restructuring the program. Picking one depends on how often the boundary is crossed and how much of the codebase can become async.
+
+<h1 id="common-pitfall-forgetting-await">Common Pitfall: Forgetting await</h1>
+
+A frequent asyncio bug is omitting an `await`. The code looks right, the function looks right, but the coroutine never runs.
+
+```python
+import asyncio
+
+async def send_order_confirmation(email: str) -> None:
+    await asyncio.sleep(0.05)
+    print(f"sent to {email}")
+
+async def main() -> None:
+    send_order_confirmation("ashish@example.com")  # forgot await
+    print("main is done")
+
+asyncio.run(main())
+```
+
+The confirmation was never sent. The coroutine object was built and immediately garbage-collected. Python emits a `RuntimeWarning` because of the special tracking it does for unawaited coroutines. If warnings are suppressed in production, this bug is silent.
+
+The fix is one keyword:
+
+```python
+async def main() -> None:
+    await send_order_confirmation("ashish@example.com")
+    print("main is done")
+```
+
+A related bug is calling a coroutine inside an `if` or a comprehension and assuming the body ran:
+
+```python
+import asyncio
+
+async def is_in_stock(product_id: str) -> bool:
+    await asyncio.sleep(0.01)
+    return True
+
+async def main() -> None:
+    if is_in_stock("wireless-mouse"):
+        print("in stock")
+    else:
+        print("out of stock")
+
+asyncio.run(main())
+```
+
+The `if` saw a truthy coroutine object (every coroutine object is truthy) and printed "in stock" regardless of whether the function would return `True` or `False`. The `is_in_stock` body never ran. The fix is `if await is_in_stock(...)`.
+
+A missing `await` is one of the asyncio bugs that doesn't change wall-clock time, so timing tests miss it. The `RuntimeWarning` is the only signal, and only if it isn't suppressed. Several lint tools (ruff, mypy, pyright) catch missing awaits statically. Enable them.
+
+<h1 id="performance-why-async-beats-threads-for-io">
+  Performance: Why Async Beats Threads for I/O
+</h1>
+
+The pitch for asyncio is concurrency for I/O-bound work without thread overhead. A direct comparison makes the difference concrete. The code below runs 1000 "fetch" operations that each wait 0.1 seconds, once with threads and once with asyncio.
+
+```python
+import asyncio
+import time
+import threading
+
+def thread_fetch(product_id: str, results: list, index: int) -> None:
+    time.sleep(0.1)
+    results[index] = 29.99
+
+def run_with_threads(n: int) -> float:
+    results = [0.0] * n
+    threads = [
+        threading.Thread(target=thread_fetch, args=(f"product-{i}", results, i))
+        for i in range(n)
+    ]
+    start = time.perf_counter()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return time.perf_counter() - start
+
+async def async_fetch(product_id: str) -> float:
+    await asyncio.sleep(0.1)
+    return 29.99
+
+async def run_with_async(n: int) -> float:
+    start = time.perf_counter()
+    await asyncio.gather(*(async_fetch(f"product-{i}") for i in range(n)))
+    return time.perf_counter() - start
+
+n = 1000
+print(f"threads:  {run_with_threads(n):.2f}s for {n} fetches")
+print(f"asyncio:  {asyncio.run(run_with_async(n)):.2f}s for {n} fetches")
+```
+
+Both finish in roughly the time of one fetch, because both are concurrent. The difference is what each one costs.
+
+The threads version pays for 1000 OS threads, each with its own stack and scheduler entry. asyncio pays for 1000 small Python objects on one thread. For a few hundred connections the difference is invisible. For tens of thousands, threads fall over and asyncio scales.
+
+The catch is that asyncio's advantage shows up only when the workload is mostly waiting. For CPU-heavy work, asyncio offers nothing: a coroutine that computes for five seconds blocks every other coroutine on the loop for five seconds.
+
+<h1 id="the-two-color-problem">The Two-Color Problem</h1>
+
+A tricky property of `async def` and `await` is that they spread. Once any function in the call stack is async, every function above it has to be async too, or the seam must be crossed with `asyncio.run` or `run_coroutine_threadsafe`. This is sometimes called the "function colour problem": sync and async functions can't call each other freely.
+
+```python
+import asyncio
+
+async def fetch_price(product_id: str) -> float:
+    await asyncio.sleep(0.05)
+    return 29.99
+
+async def get_cart_total(product_ids: list[str]) -> float:
+    total = 0.0
+    for product_id in product_ids:
+        total += await fetch_price(product_id)
+    return total
+
+async def main() -> None:
+    total = await get_cart_total(["wireless-mouse", "usb-cable"])
+    print(f"total: ${total:.2f}")
+
+asyncio.run(main())
+```
+
+`fetch_price` is async, so `get_cart_total` had to be async too, so `main` had to be async, so the program needs `asyncio.run` to start it. Adding `async def` at the bottom of the stack forces it all the way up.
+
+There's no silver bullet for this. In practice, the answer is to pick a side: either commit to async (and use async-native libraries throughout) or stay synchronous. Mixing the two in a single codebase tends to produce the worst of both worlds, with `asyncio.run` calls scattered across files and unpredictable performance characteristics.
+
+Once the seam is at the top of the program, the rest of the code reads almost identically to synchronous code. Every function has `async def` and every call has `await`, but the control flow is sequential and easy to follow. That's a big part of why asyncio won over callbacks and `yield from` based libraries: linear code, with a small amount of extra syntax to mark the suspension points.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

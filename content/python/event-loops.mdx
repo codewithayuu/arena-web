@@ -1,0 +1,385 @@
+---
+title: "Event Loops"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Event Loops explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="what-the-event-loop-does">What the Event Loop Does</h1>
+
+The event loop is a single-threaded scheduler that runs ready coroutines until they suspend, then picks the next ready one. There are no OS threads being swapped underneath. There is no preemption. The loop runs one coroutine at a time, on one thread, in a tight cycle of "pick a task, run it, park it, repeat."
+
+The diagram shows one full cycle. The loop maintains two informal queues: a **ready queue** of tasks that can run right now, and a **waiting set** of tasks parked on a timer, a socket, a subprocess pipe, or some other event. On each iteration the loop checks whether anything is in the ready queue. If yes, it runs one task. If no, it asks the operating system to block until something in the waiting set is ready (a timer fires, a socket has data, a file descriptor becomes writable). When the OS hands back control, the loop moves any newly ready tasks into the ready queue and the cycle continues.
+
+The "block on OS-level I/O readiness" step is the load-bearing one. CPython's default event loop wraps the OS's I/O multiplexer: `epoll` on Linux, `kqueue` on macOS and BSDs, and IOCP on Windows. These syscalls let one thread monitor thousands of file descriptors at once and wake up when any of them are ready. That's the technology that lets asyncio scale to tens of thousands of concurrent connections without spawning tens of thousands of threads.
+
+The loop also runs **callbacks**, which are not coroutines. A callback is a plain function the loop has been asked to call later. The loop schedules callbacks alongside coroutines on the same ready queue, which is how primitives like `loop.call_later` and `loop.call_at` work. The next sections cover those.
+
+<h1 id="running-loops-asynciorun-and-friends">
+  Running Loops: asyncio.run and Friends
+</h1>
+
+For new asyncio code, `asyncio.run(coro)` is the only loop runner needed. It builds a fresh loop, drives the coroutine to completion, and closes the loop. The implementation is straightforward:
+
+```python
+# Roughly equivalent to:
+def run(coro):
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+```
+
+The real implementation is more careful (it cancels leftover tasks, finalizes async generators, sets debug mode, etc.), but the shape is the same. Knowing this matters because every older API in asyncio composes from these same building blocks, and they appear in legacy code.
+
+`loop.run_until_complete(coro)` is the older API. It takes a coroutine, schedules it as a task, and runs the loop until that task is done. Many tutorials predating 3.7 used `asyncio.get_event_loop().run_until_complete(...)` directly. The modern equivalent is `asyncio.run`.
+
+`loop.run_forever()` is the "run until somebody tells you to stop" version. It keeps the loop spinning until someone calls `loop.stop()` from inside a callback or another thread. This is how servers and long-lived background runners typically stay alive:
+
+```python
+import asyncio
+import threading
+
+async def heartbeat() -> None:
+    while True:
+        await asyncio.sleep(0.5)
+        print("alive")
+
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+loop.create_task(heartbeat())
+
+# Stop the loop after 1.5 seconds from another thread.
+def stopper(loop_):
+    import time
+    time.sleep(1.5)
+    loop_.call_soon_threadsafe(loop_.stop)
+
+threading.Thread(target=stopper, args=(loop,), daemon=True).start()
+
+try:
+    loop.run_forever()
+finally:
+    loop.close()
+```
+
+The loop runs heartbeat tasks until the stopper thread calls `loop.stop`. After `run_forever` returns, the `finally` block tears down the loop.
+
+For everyday code, `asyncio.run` covers every case `run_until_complete` and `run_forever` do, with less boilerplate. Use the lower-level runners only when long-lived control is needed, like integrating with a GUI or a custom event source.
+
+| Runner                          | When introduced | Use it when                                                        |
+| ------------------------------- | --------------- | ------------------------------------------------------------------ |
+| `asyncio.run(coro)`             | 3.7             | Almost always. New code. Top-level entry point.                    |
+| `loop.run_until_complete(coro)` | 3.4             | Inside legacy code. Driving one coroutine on an existing loop.     |
+| `loop.run_forever()`            | 3.4             | Long-lived loops, servers, GUI integration. Pair with `loop.stop`. |
+
+<h1 id="getting-and-creating-loops">Getting and Creating Loops</h1>
+
+The loop construction APIs have changed several times. The current rules are:
+
+- **From inside a running loop**, use `asyncio.get_running_loop()`. This is the right choice in almost every case, and it raises `RuntimeError` if no loop is running, which is the safety net asyncio code wants.
+- **To create a new loop manually**, use `asyncio.new_event_loop()`. This builds a fresh loop without binding it to any thread.
+- **To bind a loop to the current thread**, use `asyncio.set_event_loop(loop)`. Each thread has its own current loop; the binding is local to that thread.
+
+The older `asyncio.get_event_loop()` is the one to avoid in new code. It tries to be helpful by creating a loop on demand if none is running, but the behavior changed in Python 3.10 (warns) and 3.12 (deprecated), and the helpfulness causes more bugs than it prevents. The replacement pattern is: use `get_running_loop` from inside a coroutine, use `asyncio.run` to build a loop from sync code.
+
+```python
+import asyncio
+
+async def show_loop_info() -> None:
+    loop = asyncio.get_running_loop()
+    print(f"loop type: {type(loop).__name__}")
+    print(f"running:   {loop.is_running()}")
+    print(f"closed:    {loop.is_closed()}")
+    print(f"debug:     {loop.get_debug()}")
+
+asyncio.run(show_loop_info())
+```
+
+The exact class name depends on the platform. On Linux and macOS the default is `_UnixSelectorEventLoop`. On Windows it's `_ProactorEventLoop`. Both implement the same `AbstractEventLoop` interface, so the calling code never has to care which one is underneath.
+
+Calling `asyncio.get_event_loop()` in synchronous code that doesn't already have a loop running emits a `DeprecationWarning` in 3.12 and will raise an error in a future version. Prefer `asyncio.run` for new code, and `asyncio.get_running_loop` from inside a coroutine.
+
+<h1 id="callback-scheduling-call_soon-call_later-call_at">
+  Callback Scheduling: call_soon, call_later, call_at
+</h1>
+
+The loop runs more than coroutines. It also runs **callbacks**: ordinary functions scheduled to be called once on the loop thread. Three methods cover the scheduling cases.
+
+`loop.call_soon(callback, *args)` schedules the callback to run on the next loop iteration. The function runs as soon as the loop is free, but never before the current coroutine yields.
+
+```python
+import asyncio
+
+def update_product_count(remaining: int) -> None:
+    print(f"stock now {remaining}")
+
+async def main() -> None:
+    loop = asyncio.get_running_loop()
+    loop.call_soon(update_product_count, 9)
+    loop.call_soon(update_product_count, 8)
+    print("scheduled two callbacks")
+    await asyncio.sleep(0)  # give the loop a chance to run them
+
+asyncio.run(main())
+```
+
+The print at the bottom of `main` ran before either callback. The two callbacks ran in FIFO order on the next loop iteration, after `main` reached `await asyncio.sleep(0)` and yielded.
+
+`loop.call_later(delay, callback, *args)` schedules the callback to run after a delay measured in seconds. The delay is from the time `call_later` was called, not from when the loop next has nothing to do.
+
+```python
+import asyncio
+import time
+
+def low_stock_alert(product_id: str) -> None:
+    print(f"low stock: {product_id} at {time.perf_counter():.2f}s")
+
+async def main() -> None:
+    start = time.perf_counter()
+    print(f"start: {0:.2f}s")
+    loop = asyncio.get_running_loop()
+    loop.call_later(0.1, low_stock_alert, "wireless-mouse")
+    loop.call_later(0.3, low_stock_alert, "usb-cable")
+    await asyncio.sleep(0.5)
+    print(f"end:   {time.perf_counter() - start:.2f}s")
+
+asyncio.run(main())
+```
+
+The first alert fires at roughly 0.1 seconds in, the second at 0.3 seconds, both while `main` is parked inside `asyncio.sleep(0.5)`. Callbacks interleave with coroutine work; the loop picks whichever is ready first.
+
+`loop.call_at(when, callback, *args)` is the same as `call_later`, except `when` is an absolute time in the loop's clock (`loop.time()`), not a delay:
+
+```python
+import asyncio
+
+async def main() -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 0.2
+    loop.call_at(deadline, lambda: print(f"fired at {loop.time():.2f}"))
+    await asyncio.sleep(0.3)
+
+asyncio.run(main())
+```
+
+`call_at` is useful for scheduling several callbacks at the same wall-clock instant relative to a fixed deadline. `call_later` is the same primitive with a delay-based interface.
+
+All three return a `Handle` (`call_soon` and friends) or a `TimerHandle` (`call_later`, `call_at`). The handle has a `cancel()` method that prevents the callback from running, as long as it hasn't fired yet:
+
+```python
+import asyncio
+
+async def main() -> None:
+    loop = asyncio.get_running_loop()
+    handle = loop.call_later(0.5, lambda: print("this should not print"))
+    await asyncio.sleep(0.1)
+    handle.cancel()
+    await asyncio.sleep(0.6)
+    print("done, no fire")
+
+asyncio.run(main())
+```
+
+| Method                              | Schedules               | Time argument         |
+| ----------------------------------- | ----------------------- | --------------------- |
+| `loop.call_soon(cb, *args)`         | Next loop iteration     | None                  |
+| `loop.call_later(delay, cb, *args)` | After `delay` seconds   | Relative delay        |
+| `loop.call_at(when, cb, *args)`     | At absolute time `when` | Absolute (loop clock) |
+
+Callbacks fit when a side effect needs to fire from a coroutine without writing another coroutine. They are also the bridge between callback-style APIs (like Tkinter, PyQt, or third-party libraries with `on_event(callback)` interfaces) and asyncio. The threadsafe variant `loop.call_soon_threadsafe(callback, *args)` is the one to use when scheduling from a different thread; the others are not thread-safe and behave undefined if called from anywhere but the loop thread.
+
+A callback that blocks the loop is just as bad as a coroutine that does. Don't put `time.sleep`, synchronous database calls, or CPU-heavy work inside a callback. Schedule that work on a thread with `loop.run_in_executor` instead.
+
+<h1 id="alternative-loops-uvloop-and-friends">
+  Alternative Loops: uvloop and Friends
+</h1>
+
+The default event loop is written in pure Python (with a C accelerator for the I/O multiplexing). It's good but not the fastest implementation possible. The most popular alternative is **`uvloop`**, a drop-in replacement built on libuv (the same C library that powers Node.js). Switching to `uvloop` typically gives a 2-4x speedup for I/O-bound workloads with no source code changes.
+
+```python
+# pip install uvloop
+import asyncio
+import uvloop
+
+async def fetch_price(product_id: str) -> float:
+    await asyncio.sleep(0.01)
+    return 29.99
+
+async def main() -> None:
+    results = await asyncio.gather(*(fetch_price(f"product-{i}") for i in range(1000)))
+    print(f"fetched {len(results)} prices")
+
+if __name__ == "__main__":
+    uvloop.install()  # use uvloop as the default event loop policy
+    asyncio.run(main())
+```
+
+`uvloop.install()` swaps the default loop policy for one that produces `uvloop` loops instead of the standard Python ones. After that line, every `asyncio.new_event_loop()` and `asyncio.run` uses `uvloop`. The rest of the code is unchanged.
+
+`uvloop` is the default in many high-throughput frameworks (FastAPI deployments often pair it with Gunicorn or Uvicorn, hence the name). It does not change the API, only the implementation. Code written to the standard asyncio interface can swap loop implementations in one line.
+
+Other implementations exist for specialized purposes. `Trio` is a separate async framework with its own loop and a different concurrency model, primarily focused on structured concurrency. `AnyIO` is an adapter library that lets the same code run on asyncio or trio. For most production work, the choice is between the default loop and `uvloop`.
+
+| Loop                                                | Source           | Speedup vs default | Notes                            |
+| --------------------------------------------------- | ---------------- | ------------------ | -------------------------------- |
+| Default (`SelectorEventLoop` / `ProactorEventLoop`) | Standard library | baseline           | Cross-platform, no extra install |
+| `uvloop`                                            | PyPI (`uvloop`)  | ~2-4x for I/O      | Linux and macOS only             |
+| `Trio`                                              | PyPI (`trio`)    | similar to default | Separate framework, not drop-in  |
+
+`uvloop` is not available on Windows. For Windows servers, the default `ProactorEventLoop` is the only first-party option, and it's already optimized for IOCP. Cross-platform code that wants the `uvloop` speedup on Linux and macOS should wrap the `uvloop.install()` call in a `try/except ImportError:` so the program still runs on Windows with the default loop.
+
+<h1 id="event-loop-policies">Event Loop Policies</h1>
+
+The way asyncio decides which kind of loop to create is governed by an **event loop policy**. The policy is a class that implements `AbstractEventLoopPolicy` and decides:
+
+- What kind of loop to create when something calls `new_event_loop()`.
+- How to find the current loop for a thread when something calls `get_event_loop()`.
+
+For almost all code, policies can be ignored entirely. The default policy works, `asyncio.run` creates fresh loops as needed, and the policy machinery never needs to be touched directly. The policy API exists mostly for frameworks and replacement loops. `uvloop.install()`, for example, is shorthand for setting a custom policy:
+
+```python
+# What uvloop.install() does, roughly:
+import asyncio
+import uvloop
+
+asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+```
+
+The current Python documentation recommends new code use `asyncio.Runner` or `asyncio.run(..., loop_factory=...)` (added in 3.12) instead of touching the global policy. For 3.11 and older, policy-based installation is the standard way to swap loops.
+
+For code that's not a framework and isn't swapping loops, the policy machinery is an asyncio API that can be safely ignored. Mention it in interviews mostly to show awareness that it exists.
+
+<h1 id="integrating-asyncio-with-other-loops">
+  Integrating asyncio with Other Loops
+</h1>
+
+Several libraries come with their own event loops: Tkinter, PyQt, Pygame, glib-based GUIs, some game engines. Running asyncio inside them takes care because only one "main" loop can drive the application at any time.
+
+Three patterns cover most cases.
+
+**Pattern 1: asyncio is the host loop, foreign code runs callbacks.** If the foreign library has a "process pending events" function, call it from a coroutine on a timer. This is how the older approach to mixing Tkinter and asyncio worked:
+
+```python
+# Sketch only; needs tkinter installed.
+import asyncio
+import tkinter
+
+async def tk_main_loop(root: tkinter.Tk) -> None:
+    try:
+        while True:
+            root.update()  # process Tk events without blocking
+            await asyncio.sleep(0.01)
+    except tkinter.TclError:
+        pass
+
+async def main() -> None:
+    root = tkinter.Tk()
+    tkinter.Label(root, text="Order status: shipped").pack()
+    await tk_main_loop(root)
+
+asyncio.run(main())
+```
+
+The Tk app is polled every 10 ms from the asyncio loop. It works, but the 10 ms polling interval is a trade-off between responsiveness and CPU use.
+
+**Pattern 2: the foreign loop is the host, asyncio runs alongside.** Newer integrations work the other way: the GUI loop drives the application, and asyncio is given a way to schedule callbacks onto it. PyQt has `qasync`, an asyncio adapter that swaps the loop policy so asyncio uses Qt's event system underneath. After installation, normal asyncio code runs and Qt handles the actual scheduling.
+
+**Pattern 3: separate threads.** The cleanest option when both loops are large is to run asyncio on a background thread and use `loop.call_soon_threadsafe` and `asyncio.run_coroutine_threadsafe` to cross the boundary:
+
+```python
+import asyncio
+import threading
+import time
+
+async def fetch_price(product_id: str) -> float:
+    await asyncio.sleep(0.05)
+    return 29.99
+
+async_loop = asyncio.new_event_loop()
+
+def run_async_loop() -> None:
+    asyncio.set_event_loop(async_loop)
+    async_loop.run_forever()
+
+threading.Thread(target=run_async_loop, daemon=True).start()
+
+# From the main (sync) thread, submit a coroutine and wait for its result.
+future = asyncio.run_coroutine_threadsafe(fetch_price("wireless-mouse"), async_loop)
+print(future.result())
+
+# Shut down cleanly.
+async_loop.call_soon_threadsafe(async_loop.stop)
+time.sleep(0.1)
+```
+
+The asyncio loop is the only thing on its thread. Sync code on the main thread submits work with `run_coroutine_threadsafe`, which returns a `concurrent.futures.Future`. Calling `.result()` blocks the main thread until the coroutine is done. This is how some HTTP test clients (like `httpx`'s sync wrapper) integrate with sync codebases.
+
+<h1 id="pitfalls">Pitfalls</h1>
+
+A handful of mistakes show up repeatedly in event-loop code.
+
+**Calling `asyncio.run` from inside an already-running loop.** `asyncio.run` builds a new loop, and only one loop can run on a thread at a time. Inside a coroutine, `await` the target coroutine directly.
+
+```python
+import asyncio
+
+async def helper() -> int:
+    return 1
+
+async def main() -> None:
+    result = asyncio.run(helper())  # wrong
+    print(result)
+
+asyncio.run(main())
+```
+
+The same restriction applies to environments that already have a loop running, like Jupyter notebooks or IPython with autoreload. In those, the right answer is to `await` at the top level of a cell.
+
+**Blocking the loop with a synchronous call.** A `time.sleep(2)`, a synchronous `requests.get(...)`, or any heavy `for` loop inside a coroutine stops the entire event loop until it finishes. The symptom is that other coroutines, callbacks, and timers all stall during the offending call. It often surfaces when a request that should complete in 100 ms takes 5 seconds because another coroutine is computing a hash in the background.
+
+```python
+import asyncio
+
+async def computer() -> None:
+    total = 0
+    for i in range(10_000_000):
+        total += i  # CPU work; never awaits
+    print(f"computed {total}")
+
+async def main() -> None:
+    await asyncio.gather(computer(), asyncio.sleep(0.01))
+    print("done")
+
+asyncio.run(main())
+```
+
+`asyncio.sleep(0.01)` is not 0.01 seconds here; it's "however long the CPU loop takes plus 0.01 seconds." The loop can't service the timer until the CPU work releases control. The fix is to push CPU work to `asyncio.to_thread` (for thread-friendly work) or `loop.run_in_executor(ProcessPoolExecutor, ...)` (for parallelism on multiple cores).
+
+**Nested `asyncio.run` calls in tests or notebooks.** Test runners like pytest-asyncio and notebooks set up their own loops. Calling `asyncio.run` inside them sometimes works and sometimes raises, depending on the framework version and configuration. The portable answer is to use `await` inside async test functions or notebook cells, and reserve `asyncio.run` for true top-level entry points.
+
+**Calling loop methods from another thread.** Most loop methods (`call_soon`, `call_later`, `create_task`) are not thread-safe. Calling them from a thread that isn't running the loop produces undefined behavior. The threadsafe variants (`call_soon_threadsafe`, `run_coroutine_threadsafe`) are the correct tools when the calling thread isn't the loop's thread. The library does not check at runtime, which is one reason the bug can sit in production for a long time.
+
+```python
+# Wrong: scheduling a task from a non-loop thread.
+import asyncio
+import threading
+
+loop = asyncio.new_event_loop()
+
+def from_other_thread():
+    loop.call_soon(lambda: print("ran"))  # NOT thread-safe
+
+threading.Thread(target=from_other_thread).start()
+```
+
+The fix is `loop.call_soon_threadsafe(...)`, which wakes the loop and queues the callback safely.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

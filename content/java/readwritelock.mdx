@@ -1,0 +1,530 @@
+---
+title: "ReadWriteLock"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "ReadWriteLock explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+The previous chapter covered `ReentrantLock` and its `Condition` objects in detail. Here we build on that mental model. `ReadWriteLock` doesn't replace `ReentrantLock`; it specializes it for a different access pattern.
+
+<h1 id="when-many-readers-outnumber-one-writer">
+  When Many Readers Outnumber One Writer
+</h1>
+
+Consider an in-memory product catalog. Customer requests hit it thousands of times a second to look up a price. An admin updates a price once an hour. With a `ReentrantLock`, every reader queues behind every other reader, even though none of them are changing the data. The lock is treating the safe case (many threads reading the same value) as if it were the dangerous case (one thread writing while others observe a half-updated value).
+
+A read-write lock splits the access pattern in two:
+
+- **Shared access for readers.** Any number of reader threads can hold the read lock simultaneously, as long as no writer holds the write lock.
+- **Exclusive access for writers.** A writer holds the write lock alone. While it holds the lock, no reader and no other writer is allowed in.
+
+The rule is simple: many readers OR one writer, never both.
+
+In the diagram, four readers hold the read lock at the same time and pull from the catalog in parallel. The writer is dashed because it can't enter while readers are in. The moment all readers release the read lock, the writer acquires the write lock alone, the catalog is updated, and the next batch of readers gets back in.
+
+That pattern is everywhere in production code. Configuration registries, product catalogs, routing tables, in-memory caches, session lookup maps. Read-mostly data structures see thousands of reads for every write, and a plain mutex serializes work that doesn't need to be serialized.
+
+<h1 id="the-readwritelock-interface">The ReadWriteLock Interface</h1>
+
+`java.util.concurrent.locks.ReadWriteLock` is a small interface with exactly two methods. Both return a `Lock` (the same interface we used with `ReentrantLock`).
+
+```java
+public interface ReadWriteLock {
+    Lock readLock();
+    Lock writeLock();
+}
+```
+
+Calling `readLock()` returns the **read view** of the lock. Calling `writeLock()` returns the **write view**. The two views are not separate locks. They are two different lenses onto the same internal state, and the implementation coordinates them. Acquiring the write view excludes everyone (including holders of the read view). Acquiring the read view succeeds as long as no thread holds the write view.
+
+Each view is a regular `Lock`, so you use it with the same `lock()`, `unlock()`, `tryLock()`, `lockInterruptibly()` calls you already know. The familiar try-finally pattern carries over.
+
+```java
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+public class TwoViews {
+    public static void main(String[] args) {
+        ReadWriteLock rwLock = new ReentrantReadWriteLock();
+        Lock readView = rwLock.readLock();
+        Lock writeView = rwLock.writeLock();
+
+        readView.lock();
+        try {
+            System.out.println("Reader has the read view");
+        } finally {
+            readView.unlock();
+        }
+
+        writeView.lock();
+        try {
+            System.out.println("Writer has the write view");
+        } finally {
+            writeView.unlock();
+        }
+    }
+}
+```
+
+The two views are obtained once and reused. You don't call `readLock()` every time you want to read; you cache the `Lock` reference and call `lock()` and `unlock()` on it. Same for the write view. Each view is a long-lived helper, not a freshly allocated object.
+
+<h1 id="reentrantreadwritelock-the-implementation">
+  ReentrantReadWriteLock: The Implementation
+</h1>
+
+`ReentrantReadWriteLock` is the standard implementation of `ReadWriteLock`. The "reentrant" part means a thread that already holds the lock can acquire it again without blocking, just like `ReentrantLock`. A reader holding the read lock can take it again recursively. A writer holding the write lock can take the write lock again recursively. The thread releases it once per acquire, so the hold counts balance out.
+
+A small product catalog cache that uses `ReentrantReadWriteLock` to serve many readers and the occasional admin price update:
+
+```java
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+public class ProductCatalog {
+    private final Map<String, Double> prices = new HashMap<>();
+    private final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
+
+    public double getPrice(String productId) {
+        rwLock.readLock().lock();
+        try {
+            Double price = prices.get(productId);
+            return price == null ? -1.0 : price;
+        } finally {
+            rwLock.readLock().unlock();
+        }
+    }
+
+    public void updatePrice(String productId, double newPrice) {
+        rwLock.writeLock().lock();
+        try {
+            prices.put(productId, newPrice);
+        } finally {
+            rwLock.writeLock().unlock();
+        }
+    }
+
+    public static void main(String[] args) {
+        ProductCatalog catalog = new ProductCatalog();
+        catalog.updatePrice("notebook", 4.99);
+        catalog.updatePrice("pen", 1.49);
+
+        System.out.println("Notebook price: $" + catalog.getPrice("notebook"));
+        System.out.println("Pen price: $" + catalog.getPrice("pen"));
+
+        catalog.updatePrice("notebook", 5.49);
+        System.out.println("Notebook price after update: $" + catalog.getPrice("notebook"));
+    }
+}
+```
+
+`getPrice` takes the read lock, looks up the value, and releases. Multiple threads calling `getPrice` at the same time all hold the read lock together, and they all proceed in parallel. `updatePrice` takes the write lock, mutates the map, and releases. While the writer holds the lock, every reader and every other writer waits.
+
+The unlock calls are inside a `finally` block for a reason. If `prices.get` or `prices.put` threw an exception, control would skip the rest of the method body. Without `finally`, the lock would stay held forever, and the catalog would deadlock the next time anyone touched it. The try-finally idiom is non-negotiable for explicit locks.
+
+The parallelism in action with multiple threads:
+
+```java
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+public class CatalogConcurrent {
+    private static final Map<String, Double> prices = new HashMap<>();
+    private static final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
+
+    public static void main(String[] args) throws InterruptedException {
+        prices.put("notebook", 4.99);
+
+        Runnable reader = () -> {
+            rwLock.readLock().lock();
+            try {
+                System.out.println(Thread.currentThread().getName()
+                    + " sees price $" + prices.get("notebook"));
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                rwLock.readLock().unlock();
+            }
+        };
+
+        Runnable writer = () -> {
+            rwLock.writeLock().lock();
+            try {
+                System.out.println(Thread.currentThread().getName() + " updating price");
+                prices.put("notebook", 5.49);
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                rwLock.writeLock().unlock();
+            }
+        };
+
+        Thread r1 = new Thread(reader, "reader-1");
+        Thread r2 = new Thread(reader, "reader-2");
+        Thread r3 = new Thread(reader, "reader-3");
+        Thread w1 = new Thread(writer, "writer-1");
+
+        r1.start();
+        r2.start();
+        r3.start();
+        Thread.sleep(10);
+        w1.start();
+
+        r1.join();
+        r2.join();
+        r3.join();
+        w1.join();
+
+        System.out.println("Final price: $" + prices.get("notebook"));
+    }
+}
+```
+
+The three readers print their lines essentially together. They share the read lock, so none of them blocks the others. The writer starts a fraction of a second later and waits until all three readers have unlocked. Then it acquires the write lock alone and runs. If the same example used a `ReentrantLock` instead of a read-write lock, the three readers would have to take turns one at a time, slowing the program down for no reason.
+
+<h1 id="a-configuration-registry-example">A Configuration Registry Example</h1>
+
+The same pattern works for any read-mostly data. Consider a configuration registry that an application reads on every request and an admin tool rewrites occasionally:
+
+```java
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+public class ConfigRegistry {
+    private final Map<String, String> settings = new HashMap<>();
+    private final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
+
+    public String get(String key) {
+        rwLock.readLock().lock();
+        try {
+            return settings.getOrDefault(key, "");
+        } finally {
+            rwLock.readLock().unlock();
+        }
+    }
+
+    public void set(String key, String value) {
+        rwLock.writeLock().lock();
+        try {
+            settings.put(key, value);
+        } finally {
+            rwLock.writeLock().unlock();
+        }
+    }
+
+    public void replaceAll(Map<String, String> newSettings) {
+        rwLock.writeLock().lock();
+        try {
+            settings.clear();
+            settings.putAll(newSettings);
+        } finally {
+            rwLock.writeLock().unlock();
+        }
+    }
+
+    public static void main(String[] args) {
+        ConfigRegistry config = new ConfigRegistry();
+        config.set("theme", "dark");
+        config.set("currency", "USD");
+
+        System.out.println("Theme: " + config.get("theme"));
+        System.out.println("Currency: " + config.get("currency"));
+
+        Map<String, String> bulkUpdate = new HashMap<>();
+        bulkUpdate.put("theme", "light");
+        bulkUpdate.put("currency", "EUR");
+        bulkUpdate.put("language", "fr");
+        config.replaceAll(bulkUpdate);
+
+        System.out.println("After bulk update:");
+        System.out.println("Theme: " + config.get("theme"));
+        System.out.println("Currency: " + config.get("currency"));
+        System.out.println("Language: " + config.get("language"));
+    }
+}
+```
+
+`get` takes the read lock for one lookup. `set` and `replaceAll` take the write lock. The `replaceAll` method shows why the write lock has to be exclusive: between `clear()` and `putAll(newSettings)`, the map is empty. A reader that snuck in at that moment would see an empty registry and break. The write lock blocks every reader for the entire duration of `replaceAll`, so the map is never observed in its half-cleared state.
+
+<h1 id="downgrading-write-lock-to-read-lock">
+  Downgrading: Write Lock to Read Lock
+</h1>
+
+A useful trick with `ReentrantReadWriteLock` is **downgrading**: a thread holding the write lock acquires the read lock and then releases the write lock, ending up with just the read lock. This lets you publish a freshly written value to readers without giving up exclusive access in between.
+
+The order is what makes this work. You must acquire the read lock **before** you release the write lock. If you did it the other way around (release write first, then take read), there's a window between the two calls where another writer could sneak in and change the data again before you reread it.
+
+```java
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+public class CatalogDowngrade {
+    private final Map<String, Double> prices = new HashMap<>();
+    private final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
+
+    public double updateAndRead(String productId, double newPrice) {
+        rwLock.writeLock().lock();
+        try {
+            prices.put(productId, newPrice);
+
+            // Downgrade: acquire read lock before releasing write lock
+            rwLock.readLock().lock();
+        } finally {
+            rwLock.writeLock().unlock();
+        }
+
+        // Now we hold only the read lock
+        try {
+            return prices.get(productId);
+        } finally {
+            rwLock.readLock().unlock();
+        }
+    }
+
+    public static void main(String[] args) {
+        CatalogDowngrade catalog = new CatalogDowngrade();
+        double price = catalog.updateAndRead("notebook", 4.99);
+        System.out.println("Just-written price: $" + price);
+    }
+}
+```
+
+The flow has three phases. Phase one, the thread holds the write lock alone and mutates the map. Phase two, while still holding the write lock, it grabs the read lock. Since `ReentrantReadWriteLock` is reentrant, this succeeds for the same thread even though writers are normally exclusive against readers. Phase three, it releases the write lock and now holds only the read lock. Any other readers can join in (or already have), but no other writer can break in.
+
+The orange middle of the diagram is the critical bit. The read lock is taken while the write lock is still held, which means there's no gap where another writer could acquire the lock and change the data behind our back. Once the read lock is in hand, the write lock can be released safely, and the value we just wrote is what we're about to read.
+
+Downgrade is the case where you want both views in succession. Don't use it just because you can. If a method only writes, hold only the write lock and release. If it only reads, hold only the read lock. Downgrade is for the specific pattern of "update, then immediately read the updated value while making sure nobody else writes in between."
+
+<h1 id="upgrading-is-not-supported">Upgrading Is Not Supported</h1>
+
+The opposite move, **upgrading** from a read lock to a write lock, is not allowed in `ReentrantReadWriteLock`. A thread that holds the read lock and then tries to acquire the write lock blocks forever. The reason isn't an oversight in the design. It's a deadlock prevention measure.
+
+Consider two readers, `R1` and `R2`, both holding the read lock. Both decide they want to upgrade to a write lock. `R1` calls `writeLock().lock()` and waits for the read count to drop to zero. The problem is that the read count includes `R1`'s own read lock, plus `R2`'s. `R1` won't release its read lock because it's waiting for the write lock. `R2` does the same. Each reader holds a read lock that the other is waiting for, neither can release, and the program is stuck.
+
+The library chose to reject upgrades rather than try to detect this and recover. If you want to write, the recipe is: release the read lock first, then take the write lock, then reread the data because someone else might have changed it while you were unlocked, then write. The reread step is what makes this safe and what makes upgrade-by-hand uglier than downgrade.
+
+```java
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+public class UpgradeAttempt {
+    public static void main(String[] args) {
+        ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
+
+        rwLock.readLock().lock();
+        try {
+            // Trying to upgrade would block forever:
+            // rwLock.writeLock().lock();  // never returns
+
+            // Correct: release read, acquire write, reread, write
+            System.out.println("Hold read lock, but skip the upgrade attempt");
+        } finally {
+            rwLock.readLock().unlock();
+        }
+
+        rwLock.writeLock().lock();
+        try {
+            System.out.println("Now hold the write lock, freshly acquired");
+        } finally {
+            rwLock.writeLock().unlock();
+        }
+    }
+}
+```
+
+The commented line is what to avoid. If you uncomment it, the program prints the first line and hangs forever, because the same thread is trying to take the write lock while it still owns the read lock. The fix is the two-step pattern after the try block: release the read lock cleanly, then take the write lock fresh.
+
+<h1 id="fair-vs-unfair">Fair vs Unfair</h1>
+
+Like `ReentrantLock`, `ReentrantReadWriteLock` has two flavors: fair and unfair. The constructor takes a boolean. Default is unfair.
+
+```java
+ReentrantReadWriteLock unfair = new ReentrantReadWriteLock();        // unfair, default
+ReentrantReadWriteLock fair = new ReentrantReadWriteLock(true);      // fair
+```
+
+The unfair version optimizes for throughput. When the lock is released, the first thread to try `lock()` wins, regardless of who has been waiting longest. This often lets newly arriving threads cut in front of waiting ones, which sounds bad, but it avoids the context-switching cost of waking up a blocked thread when a running thread can just take the lock and keep going. For most workloads, unfair is appropriate.
+
+The fair version grants the lock in FIFO order. The thread that's been waiting longest gets the lock next. Specifically for read-write locks, fairness has an extra rule: a reader that arrives while there's a queued writer waits for the writer to go first. This protects writers from starvation. In the unfair version, a steady stream of incoming readers can keep the write count at one or more indefinitely, and a waiting writer never gets in.
+
+```java
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+public class FairFlavor {
+    public static void main(String[] args) {
+        ReentrantReadWriteLock fairLock = new ReentrantReadWriteLock(true);
+
+        fairLock.readLock().lock();
+        try {
+            System.out.println("Fair read lock: " + fairLock.isFair());
+        } finally {
+            fairLock.readLock().unlock();
+        }
+
+        ReentrantReadWriteLock unfairLock = new ReentrantReadWriteLock();
+        System.out.println("Unfair read lock: " + unfairLock.isFair());
+    }
+}
+```
+
+`isFair()` reads the constructor flag. The two lock instances behave the same in this single-threaded test; the difference shows up only under contention. If the registry from earlier is hit by a thousand reader threads per second and one writer per second, an unfair lock might let the writer wait minutes for a gap. A fair lock guarantees the writer gets in within one cycle.
+
+<h1 id="where-read-write-locks-lose">Where Read-Write Locks Lose</h1>
+
+Read-write locks aren't free. The bookkeeping needed to track reader counts, queue waiters, and coordinate the two views adds overhead on every acquire and release. For a critical section that does almost nothing (read a single field, return), a `ReentrantLock` or even `synchronized` is cheaper. The fancier machinery only earns back that overhead when readers actually overlap and there are enough of them to fill the saved time.
+
+A `ReentrantReadWriteLock` can be slower than a plain mutex when writes are frequent, critical sections are tiny, or contention is low. The reader bookkeeping has overhead, and a write lock acquisition has to wait for every existing reader to drain. If profiling shows a hot lock and the access pattern is mostly writes or microsecond reads, swap the read-write lock for a `ReentrantLock` and measure again.
+
+There's also a more subtle pitfall. If your "read" operation does anything that takes real time (a network call, a long computation), readers pile up holding the read lock, and writers can wait far longer than expected. Keep critical sections short on both sides, but especially on the read side, where the optimism about parallelism breaks down if each reader holds the lock for half a second.
+
+Concrete signs you've outgrown `ReentrantReadWriteLock`:
+
+- The data is small and read-only after construction. Use a final field or an immutable copy and skip locking entirely.
+- The data is a `Map` and you don't need atomic compound updates. Use `ConcurrentHashMap`, which scales much better.
+- The data is a counter or single value. Use an atomic class (`AtomicLong`, `AtomicReference`).
+- Reads are extremely short and writes are common. Use a plain `ReentrantLock` or `synchronized`.
+
+Use `ReentrantReadWriteLock` when there's a richer data structure (multi-field state, custom invariants) that needs to be updated atomically and read often.
+
+<h1 id="stampedlock-higher-throughput-with-optimistic-reads">
+  StampedLock: Higher Throughput with Optimistic Reads
+</h1>
+
+Java 8 introduced `StampedLock` as a faster alternative for read-heavy workloads. It supports three modes: write, pessimistic read, and an extra **optimistic read** mode that doesn't actually acquire anything. Instead, a reader takes a "stamp" (a long value representing the lock state), does its work without blocking, and then checks whether any writer has appeared during the read. If not, the read is valid. If a writer did appear, the reader falls back to a pessimistic read.
+
+```java
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.locks.StampedLock;
+
+public class StampedExample {
+    private final Map<String, Double> prices = new HashMap<>();
+    private final StampedLock lock = new StampedLock();
+
+    public double getPrice(String productId) {
+        long stamp = lock.tryOptimisticRead();
+        Double price = prices.get(productId);
+        if (!lock.validate(stamp)) {
+            // A writer appeared, retry under a real read lock
+            stamp = lock.readLock();
+            try {
+                price = prices.get(productId);
+            } finally {
+                lock.unlockRead(stamp);
+            }
+        }
+        return price == null ? -1.0 : price;
+    }
+
+    public void updatePrice(String productId, double newPrice) {
+        long stamp = lock.writeLock();
+        try {
+            prices.put(productId, newPrice);
+        } finally {
+            lock.unlockWrite(stamp);
+        }
+    }
+
+    public static void main(String[] args) {
+        StampedExample catalog = new StampedExample();
+        catalog.updatePrice("notebook", 4.99);
+        System.out.println("Price: $" + catalog.getPrice("notebook"));
+    }
+}
+```
+
+The optimistic read avoids the bookkeeping cost of incrementing a reader counter, which is exactly what makes `ReentrantReadWriteLock` slower than ideal at high contention. The trade-off is that `StampedLock` is not reentrant, so a thread that already holds the lock cannot reacquire it (which would cause a hang). It also doesn't support a `Condition`. And the optimistic-read pattern requires careful coding: the work inside the optimistic block must not modify shared state, must not throw on torn reads, and must be ready to retry under a real lock.
+
+`StampedLock` is well-suited when the read critical section is tiny (single field, single map lookup) and reads dominate. For larger reads, the savings shrink. For mixed workloads with reentrancy, conditions, or interruptible locks, stick with `ReentrantReadWriteLock`. The decision is workload-specific, and the answer should come from profiling rather than from a default preference.
+
+<h1 id="putting-it-together">Putting It Together</h1>
+
+A complete example tying the patterns together. A product catalog cache with many simulated readers, a writer that updates a price, and a downgrade-style method that updates and reads atomically.
+
+```java
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+public class CatalogCache {
+    private final Map<String, Double> prices = new HashMap<>();
+    private final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
+
+    public double getPrice(String productId) {
+        rwLock.readLock().lock();
+        try {
+            return prices.getOrDefault(productId, -1.0);
+        } finally {
+            rwLock.readLock().unlock();
+        }
+    }
+
+    public void setPrice(String productId, double newPrice) {
+        rwLock.writeLock().lock();
+        try {
+            prices.put(productId, newPrice);
+        } finally {
+            rwLock.writeLock().unlock();
+        }
+    }
+
+    public double setAndGet(String productId, double newPrice) {
+        rwLock.writeLock().lock();
+        try {
+            prices.put(productId, newPrice);
+            rwLock.readLock().lock();
+        } finally {
+            rwLock.writeLock().unlock();
+        }
+
+        try {
+            return prices.get(productId);
+        } finally {
+            rwLock.readLock().unlock();
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        CatalogCache cache = new CatalogCache();
+        cache.setPrice("notebook", 4.99);
+        cache.setPrice("pen", 1.49);
+
+        Thread[] readers = new Thread[5];
+        for (int i = 0; i < readers.length; i++) {
+            int id = i;
+            readers[i] = new Thread(() -> {
+                double p = cache.getPrice("notebook");
+                System.out.println("reader-" + id + " sees notebook at $" + p);
+            });
+        }
+
+        Thread writer = new Thread(() -> {
+            double newPrice = cache.setAndGet("notebook", 5.99);
+            System.out.println("writer set and read back $" + newPrice);
+        });
+
+        for (Thread r : readers) r.start();
+        writer.start();
+
+        for (Thread r : readers) r.join();
+        writer.join();
+
+        System.out.println("Final notebook price: $" + cache.getPrice("notebook"));
+    }
+}
+```
+
+The exact interleaving of reader lines varies between runs because the threads race against each other. What's stable is that no reader ever sees a half-updated map, the writer's `setAndGet` finishes with the freshly written value (it's holding the read lock when it reads, so nobody else can sneak in a write), and the final price reflects the writer's update. The downgrade in `setAndGet` is what guarantees the write-then-read pair is atomic from the perspective of other writers.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

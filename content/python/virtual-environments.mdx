@@ -1,0 +1,526 @@
+---
+title: "Virtual Environments (venv, conda)"
+readTime: "10 min read"
+lastUpdated: "June 6, 2026"
+description: "Virtual Environments explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+A virtual environment is a self-contained folder that holds its own copy of Python and its own set of installed packages, separate from anything else on your machine. You use one per project so each project gets exactly the dependency versions it needs, without those versions colliding with what other projects need or with what your operating system uses Python for. This lesson covers why virtual environments exist, how to create and use one with the built-in `venv` module, the day-to-day workflow with `pip` and `requirements.txt`, when `conda` is the better tool, and the most common mistakes to avoid.
+
+<h1 id="why-isolate-dependencies">Why Isolate Dependencies</h1>
+
+Picture two projects on your laptop. The first is an e-commerce CLI you started last year that uses `requests` version 2.28 and `rich` version 12. The second is a new e-commerce CLI you're starting today, and the latest `requests` is 2.32 and the latest `rich` is 13. If both projects share a single set of installed packages, you can only have one version of each library at a time. Upgrade for the new project, and the old one might break. Stay on the old version, and the new project misses fixes and features.
+
+That's the core problem virtual environments solve: **different projects need different dependency versions, and there's no good way to reconcile them at the system level**. A virtual environment gives each project its own private package directory, so each one can install whatever versions it wants without affecting any other project.
+
+There are a few related problems that fall out of the same idea:
+
+- **Reproducibility.** A teammate clones your repo and runs your code. If they install the same package versions you used, they get the same behavior. Without a venv, they're installing into whatever soup of packages already lives on their machine, and the results might differ.
+- **No `sudo pip install`.** On macOS and Linux, the system Python is owned by the OS. Installing packages into it with `sudo` can break OS tools that depend on specific versions. A venv sidesteps this entirely. You never need root to install into your own venv.
+- **Clean uninstall.** Done with a project? Delete the venv folder. All its packages are gone. No leftover files scattered across `site-packages`.
+- **CI and production parity.** Your continuous integration server and your production deploy can each build a fresh venv from the same `requirements.txt`. If your local venv was built the same way, all three environments match.
+
+The system Python at the top is shared. Each project gets its own venv (the green boxes), and each venv has its own copy of `pip` and its own `site-packages` directory. The dashed arrows show that the venvs borrow the Python interpreter from the system install (either by symlink or by a small copy), but their installed packages are completely separate.
+
+To make this concrete, imagine you're maintaining two e-commerce CLIs at once. The first is `ecom-cli` from a year ago: it imports `requests` to fetch product data and `rich==12.6.0` to render colored tables. The library author has since released `rich==13.7.0` with a few breaking changes to how table styles are configured. Your new project, `ecom-cli-v2`, was started with the new API in mind and uses `rich==13.7.0`. If both projects shared one global Python, you'd have to pick a single version of `rich` for the whole machine. Pick the new one and the old project's tables crash on import. Pick the old one and the new project misses the features it was written to use. With a venv per project, you install `rich==12.6.0` into `ecom-cli/.venv`, `rich==13.7.0` into `ecom-cli-v2/.venv`, and both projects work without knowing the other exists.
+
+There's one more reason that's easy to miss until it bites you: **safety**. The Python install your operating system ships with often has scripts and tools that depend on specific package versions being present. On many Linux distributions, the package manager itself is written in Python and breaks if you upgrade certain libraries. macOS has similar caveats with the system Python under `/usr/bin/python3`. Installing into a venv means you can experiment freely without risking the OS. The worst case for a venv is "delete it and start over"; the worst case for a contaminated system Python can be "reinstall the OS".
+
+<h1 id="the-mental-model">The Mental Model</h1>
+
+A virtual environment is not magic. It's a folder with three important things inside:
+
+1. A copy (or symlink) of the Python interpreter the venv was built from.
+2. A `pip` that installs into this venv's package directory, not the system's.
+3. A `site-packages` directory where all packages you install end up.
+
+When you "activate" a venv, all that happens is your shell prepends the venv's `bin` (macOS/Linux) or `Scripts` (Windows) directory to `PATH`. After that, typing `python` runs the venv's Python, and typing `pip` runs the venv's `pip`. The interpreter itself knows where its `site-packages` lives, so any `import` inside that Python session looks there.
+
+Here's what's on disk after creating a venv called `.venv` on macOS or Linux:
+
+```text
+.venv/
+âââ bin/
+â   âââ python           -> symlink to your system Python
+â   âââ python3          -> same
+â   âââ pip
+â   âââ pip3
+â   âââ activate         (shell script you 'source')
+âââ lib/
+â   âââ python3.12/
+â       âââ site-packages/  (where installed packages go)
+âââ pyvenv.cfg            (small config file pointing back at the system Python)
+```
+
+On Windows the layout uses `Scripts/` instead of `bin/`, and the executables end in `.exe`. The structure is otherwise the same.
+
+The `pyvenv.cfg` file at the venv root is plain text and worth a peek if you're curious. Open it and you'll see something like:
+
+```text
+home = /usr/local/opt/python@3.12/bin
+include-system-site-packages = false
+version = 3.12.3
+```
+
+The `home` line points at the system Python that created this venv. The `include-system-site-packages = false` line is the important one: it tells the interpreter to ignore the system's `site-packages` entirely. That's why a brand-new venv has no third-party packages installed, even if your system Python has a hundred. Flip that to `true` and your venv would inherit everything from the system; almost no one does this in practice because it defeats the purpose of isolation.
+
+> **Cost:** Creating a venv copies or symlinks the Python binary and writes a fresh `site-packages` directory. That's fast (a second or two). The slower part of setting up a venv is the first `pip install` of large compiled packages like `numpy` or `pandas`, where pip downloads a wheel and unpacks it. Those wheels can be tens of megabytes each.
+
+<h1 id="creating-a-venv-with-python-m-venv">
+  Creating a Venv with python -m venv
+</h1>
+
+The standard library ships with the `venv` module, so you don't need to install anything to create a virtual environment. The command is the same on every operating system:
+
+```text
+python -m venv .venv
+```
+
+That creates a folder called `.venv` in the current directory. The dot prefix is a convention: it's the project's environment, it lives at the project root, and a leading dot signals "tooling, ignore me" to most editors and shells. Other common names are `venv`, `env`, and `.venv`. Pick one and stick with it.
+
+The first argument after `venv` is just a folder name, so you can call it whatever you want:
+
+```text
+# All of these work; pick one convention per team.
+python -m venv .venv
+python -m venv venv
+python -m venv env
+```
+
+The folder doesn't have to be inside the project, either. Some people keep all their venvs in a central location like `~/.virtualenvs/<project-name>`. That keeps the project directory clean. The downside is that the venv is no longer co-located with the code, which is a small annoyance when navigating between machines.
+
+If you have multiple Python versions installed, point at the specific one you want the venv to use:
+
+```text
+python3.12 -m venv .venv      # macOS/Linux, with python3.12 on PATH
+py -3.12 -m venv .venv        # Windows, using the 'py' launcher
+```
+
+A venv is locked to the Python version that created it. If you later install Python 3.13 and want the project to use it, you create a new venv with the new interpreter. You don't upgrade an existing venv in place. The mental model is "venvs are cheap and disposable": when in doubt, delete and recreate.
+
+There are a couple of options worth knowing about for the `venv` command itself:
+
+```text
+# Don't include pip in the new venv (rare; you'd then bootstrap pip manually).
+python -m venv --without-pip .venv
+
+# Upgrade pip and setuptools inside the venv to their latest versions during creation.
+python -m venv --upgrade-deps .venv
+
+# Use system Python's site-packages from inside the venv (almost never what you want).
+python -m venv --system-site-packages .venv
+```
+
+`--upgrade-deps` is the one most people end up using, because the bundled `pip` is often a few versions behind by the time you create the venv. Otherwise the first thing you'd do is `pip install --upgrade pip` by hand. The `--system-site-packages` flag exists for unusual cases (sharing one large data-science install across many small envs, for example); for normal use it defeats the isolation venvs exist to provide.
+
+<h1 id="activating-and-deactivating">Activating and Deactivating</h1>
+
+Activation is the step that tells your current shell session to use the venv's Python and `pip` when you type those commands. The exact command depends on your operating system and shell.
+
+| OS / Shell                | Activate Command                 |
+| ------------------------- | -------------------------------- |
+| macOS / Linux (bash, zsh) | `source .venv/bin/activate`      |
+| macOS / Linux (fish)      | `source .venv/bin/activate.fish` |
+| Windows (PowerShell)      | `.venv\Scripts\Activate.ps1`     |
+| Windows (cmd.exe)         | `.venv\Scripts\activate.bat`     |
+
+Once activated, your shell prompt usually gets a `(.venv)` prefix so you remember which environment you're in:
+
+```text
+$$ source .venv/bin/activate
+(.venv) $ python --version
+Python 3.12.3
+(.venv) $ which python
+/Users/you/ecom-cli/.venv/bin/python
+```
+
+Deactivation works the same everywhere. The activation script defines a shell function called `deactivate`, so you just type:
+
+```text
+(.venv) $ deactivate
+$
+```
+
+The prompt prefix goes away, and `python` and `pip` refer to your system installations again.
+
+**On Windows PowerShell**, you might hit a script-execution policy error the first time you try to activate:
+
+```text
+.venv\Scripts\Activate.ps1 cannot be loaded because running scripts is disabled on this system.
+```
+
+The one-time fix is to allow signed local scripts for your user:
+
+```text
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+```
+
+That's a Windows security setting, not a Python one. After running it, `Activate.ps1` will work normally.
+
+Worth knowing: activation isn't strictly required to use a venv. Every command activation makes available has an equivalent "absolute path" form. Instead of activating and typing `python`, you can call `.venv/bin/python` (or `.venv\Scripts\python.exe` on Windows) directly. Instead of `pip`, you can use `python -m pip` from the venv's interpreter. Scripts and CI systems often prefer this form because it's explicit and doesn't depend on shell state. Activation just makes the interactive case ergonomic.
+
+```text
+# These two commands do the same thing.
+$ source .venv/bin/activate
+(.venv) $ pip install rich
+
+# Equivalent without activation:
+$ .venv/bin/pip install rich
+```
+
+The activation script also sets a `VIRTUAL_ENV` environment variable to the venv's path. Various tools (editors, shell prompts, build systems) read this variable to detect that a venv is active. It's the closest thing Python has to a "current project" marker at the shell level.
+
+That's the full lifecycle. Create the venv once per project, activate it whenever you open a new terminal in that project, install packages as needed, run your code, capture the dependency list with `pip freeze`, and deactivate when you switch contexts. The next time you start work, you re-activate; you don't recreate.
+
+<h1 id="inspecting-the-active-environment">
+  Inspecting the Active Environment
+</h1>
+
+It's easy to lose track of which Python you're using, especially after switching terminals or projects. Three commands answer "where am I?":
+
+```text
+(.venv) $ which python              # macOS/Linux
+/Users/you/ecom-cli/.venv/bin/python
+
+(.venv) $ which pip
+/Users/you/ecom-cli/.venv/bin/pip
+
+(.venv) $ pip -V
+pip 24.0 from /Users/you/ecom-cli/.venv/lib/python3.12/site-packages/pip (python 3.12)
+```
+
+On Windows, the equivalent is `where python` (note the missing `i`):
+
+```text
+C:\Users\you\ecom-cli> where python
+C:\Users\you\ecom-cli\.venv\Scripts\python.exe
+C:\Python312\python.exe
+```
+
+`where` shows every match on `PATH`. The first one is the one that runs when you type `python`. If the venv path isn't first, your activation didn't work.
+
+From inside Python itself, `sys.prefix` and `sys.executable` tell you the same thing:
+
+```python
+import sys
+
+print(sys.executable)
+print(sys.prefix)
+```
+
+`sys.prefix` is the venv root when you're inside a venv, and it's the system Python install location otherwise. That's how `pip` and other tools know where to put new packages.
+
+Another check that's useful when something feels off: `pip list` shows every package installed in the current environment, with versions. In a fresh venv before any installs, it shows almost nothing:
+
+```text
+(.venv) $ pip list
+Package Version
+------- -------
+pip     24.0
+```
+
+Just `pip` itself (and sometimes `setuptools`). That's a sign you really are in a clean, isolated environment. Compare that with your system Python (`deactivate` first), where `pip list` usually shows dozens of packages your OS or earlier projects installed. The contrast makes the isolation visible.
+
+<h1 id="the-day-to-day-workflow">The Day-to-Day Workflow</h1>
+
+Here's the workflow that holds whether you're starting a one-off script or a long-lived project. Say you're building an e-commerce CLI that needs `requests` to call a product API and `rich` to print colored tables in the terminal.
+
+**1. Create the venv at the project root.**
+
+```text
+$$ cd ecom-cli
+$ python -m venv .venv
+```
+
+**2. Activate it.**
+
+```text
+$$ source .venv/bin/activate
+(.venv) $
+```
+
+**3. Install the packages you need.**
+
+```text
+(.venv) $ pip install requests rich
+```
+
+Each install goes into `.venv/lib/python3.12/site-packages/`. Nothing on the system Python is touched.
+
+**4. Write and run your code.**
+
+```python
+# shop.py
+import requests
+from rich.table import Table
+from rich.console import Console
+
+response = requests.get("https://fakestoreapi.com/products?limit=5")
+products = response.json()
+
+table = Table(title="Top Products")
+table.add_column("Title")
+table.add_column("Price")
+for product in products:
+    table.add_row(product["title"], f"${product['price']:.2f}")
+
+Console().print(table)
+```
+
+```text
+(.venv) $ python shop.py
+```
+
+**5. Capture the exact versions so others (and future-you) can reproduce the setup.**
+
+```text
+(.venv) $ pip freeze > requirements.txt
+```
+
+`pip freeze` lists every installed package with its exact version pinned. The result for our small project looks roughly like:
+
+```text
+certifi==2024.7.4
+charset-normalizer==3.3.2
+idna==3.7
+markdown-it-py==3.0.0
+mdurl==0.1.2
+Pygments==2.18.0
+requests==2.32.3
+rich==13.7.1
+urllib3==2.2.2
+```
+
+Notice that the file includes transitive dependencies (the packages your packages depend on), not just `requests` and `rich`. That's intentional: pinning everything is what makes builds reproducible.
+
+**6. Commit `requirements.txt`. Do not commit the venv folder.**
+
+Add a `.gitignore` entry so the venv doesn't sneak in:
+
+```text
+# .gitignore
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+```
+
+The venv folder is large (tens of megabytes), platform-specific, and rebuildable from `requirements.txt` in a few seconds. Committing it bloats the repo and breaks for anyone on a different OS. The `requirements.txt` is small, human-readable, and portable.
+
+If you've ever wondered why so many starter `.gitignore` files include all three of `.venv/`, `venv/`, and `env/`, it's because different developers on the same project sometimes pick different names. Listing all three covers everyone. Some teams settle on one name in a `CONTRIBUTING.md` to keep the project tidy; others just keep the broad `.gitignore` and move on.
+
+**7. Reproduce the environment elsewhere.**
+
+A teammate clones the repo. They run:
+
+```text
+$$ git clone https://github.com/you/ecom-cli.git
+$ cd ecom-cli
+$ python -m venv .venv
+$ source .venv/bin/activate
+(.venv) $ pip install -r requirements.txt
+```
+
+Now they have the same package versions you do. The same three lines work on a fresh CI runner, a new laptop, or a production deploy.
+
+The repo carries the recipe, not the kitchen. Anyone who has Python and a checkout of the code can stand up an identical environment in a minute or two. That's the payoff for the small upfront step of creating the venv.
+
+A small but important detail: `pip freeze` pins to exact versions with `==`, which is what you want for applications and CLIs where reproducibility matters. For libraries you're publishing for others to install, the convention is the opposite: you specify ranges (`requests>=2.28,<3`) in your package metadata so consumers can resolve compatible versions alongside their other dependencies. The first style locks the environment; the second style declares what the library can work with. This lesson focuses on the application-style workflow.
+
+> **Cost:** Resolving and installing a large `requirements.txt` can take a while the first time, especially if any packages need to compile from source. Subsequent installs are usually fast because pip caches downloaded wheels in `~/.cache/pip` (macOS/Linux) or `%LOCALAPPDATA%\pip\Cache` (Windows). If a fresh install in CI feels slow, caching that directory between runs is the standard fix.
+
+<h1 id="when-to-use-conda">When to Use conda</h1>
+
+`conda` is a separate environment-and-package manager developed by Anaconda. It does what `venv` does (isolated environments per project) and more. The key differences are:
+
+- **`conda` manages Python itself**, not just Python packages. A conda env can have its own Python version that doesn't have to be installed system-wide. With `venv`, you need the target Python version already on your machine before you can create an env that uses it.
+- **`conda` handles non-Python dependencies.** It can install C libraries, compilers, CUDA, R, and other native binaries. That's the main reason data scientists reach for it: `numpy`, `scipy`, `pytorch`, and `tensorflow` link against compiled libraries, and `conda` can install pre-built versions that "just work", especially on Windows where compiling from source is painful.
+- **`conda` uses its own package index.** Packages come from `conda-forge` (the main community channel) or `defaults` (Anaconda's curated channel). The PyPI ecosystem you reach with `pip` is separate, though you can still run `pip` inside a conda env if you need a package that isn't on conda-forge.
+
+The basic workflow looks similar to `venv`:
+
+```text
+# Create an environment named 'ecom' with Python 3.12.
+conda create -n ecom python=3.12
+
+# Activate it (works on macOS, Linux, and Windows the same way).
+conda activate ecom
+
+# Install packages from conda-forge.
+conda install -c conda-forge requests rich
+
+# Deactivate when done.
+conda deactivate
+```
+
+Note that conda environments are named, not folder-based. By default they live in a central location (`~/anaconda3/envs/<name>` or similar), not inside your project. You activate by name (`conda activate ecom`) rather than by sourcing a script from a specific folder.
+
+**When to use `conda` instead of `venv`:**
+
+- You're doing data science, machine learning, or scientific computing and your stack includes packages with heavy native dependencies (`numpy`, `pandas`, `scikit-learn`, `pytorch`, `tensorflow`, `opencv`).
+- You're on Windows and you've hit compilation errors trying to `pip install` something with a C extension.
+- Your project mixes Python with R, Julia, or other languages that conda can manage.
+- Your team standardizes on Anaconda for shared reproducibility, often with `environment.yml` files (conda's version of `requirements.txt`).
+
+**When `venv` is the better fit:**
+
+- Pure-Python projects with no native dependencies.
+- Web apps, CLI tools, scripts, most backend code.
+- Anywhere you want zero setup beyond a Python install. `venv` ships with Python; `conda` is a separate download.
+- Containers and CI, where you control the base image and don't need `conda` to manage Python itself.
+
+| Feature                  | `venv` (stdlib)              | `conda`                      |
+| ------------------------ | ---------------------------- | ---------------------------- |
+| Ships with Python?       | Yes                          | No, install separately       |
+| Manages Python version?  | No, uses an existing install | Yes                          |
+| Manages non-Python deps? | No                           | Yes (C libs, CUDA, R, etc.)  |
+| Package source           | PyPI (via `pip`)             | conda-forge / defaults       |
+| Env location             | Project-local folder         | Central, named               |
+| Lock file convention     | `requirements.txt`           | `environment.yml`            |
+| Best for                 | General Python               | Data science, ML, scientific |
+
+You can use both. It's common to use `conda` for the heavy native stack and `pip` (inside the conda env) for pure-Python libraries. The reverse, using `conda` inside a `venv`, doesn't really make sense; pick one as the outer layer.
+
+The closest conda equivalent of `requirements.txt` is `environment.yml`, which looks like:
+
+```text
+name: ecom
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - requests
+  - rich
+  - pip
+  - pip:
+    - some-pypi-only-package
+```
+
+A teammate creates the matching environment with `conda env create -f environment.yml`. The format supports listing a Python version, conda packages, and a nested `pip:` block for packages that only live on PyPI. It's the same idea as `requirements.txt`, just with a richer schema because conda is doing more than `pip` does.
+
+There's also a lighter conda variant called `miniconda` that ships only the `conda` tool plus a minimal Python install, without the hundreds of packages Anaconda bundles. If you want conda's environment management without the bulk of a full Anaconda distribution, miniconda is the usual starting point. A newer drop-in replacement called `mamba` (and its compiled cousin `micromamba`) uses the same commands as `conda` but is dramatically faster at resolving large dependency graphs; if you've ever waited several minutes for `conda` to "solve" an environment, `mamba` is the usual fix.
+
+One subtle difference between `venv` and `conda` that catches people: `venv` activation only changes `PATH`, so the rest of your shell environment is untouched. `conda activate` does more, including setting `CONDA_PREFIX` and modifying `PYTHONPATH` in some configurations. Both are designed not to surprise you, but if a tool starts behaving differently after switching environment managers, environment-variable changes are the first thing to check. Running `env | grep -i -E 'python|conda|virtual'` (macOS/Linux) prints every relevant variable; the equivalent on Windows is `Get-ChildItem env: | Where-Object Name -match 'python|conda|virtual'` in PowerShell.
+
+<h1 id="modern-alternatives-uv-poetry">Modern Alternatives (uv, poetry)</h1>
+
+The Python tooling space has been moving fast. The most notable recent entry is `uv`, a Rust-based tool that bundles venv creation, dependency resolution, and lockfile management into a single fast binary. A workflow that takes `python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt` in classic tooling compresses to `uv sync` in `uv`. `uv` reads dependencies from `pyproject.toml`, resolves them, builds a lockfile (`uv.lock`), and creates the venv automatically the first time, all in a fraction of the time `pip` takes on the same input.
+
+`poetry` is an older alternative in the same space, with similar goals but written in Python rather than Rust. It uses `pyproject.toml` plus a `poetry.lock` file. The big-picture difference between `poetry` and `pip + venv` is that `poetry` resolves the full dependency graph up front and writes a lockfile that records exact resolved versions of everything, which makes installs more deterministic than relying on `pip freeze`. `uv` does the same thing, but faster.
+
+Under the hood, both `uv` and `poetry` create a virtual environment for you. With `uv`, it lives at `.venv` in your project; with `poetry`, by default it lives in a cache directory but can be configured to live in `.venv`. Either way, the venv is still a venv: a folder with its own Python, `pip`, and `site-packages`. The tools just save you from typing the create-activate-install-freeze cycle by hand.
+
+For this lesson, the point is that the underlying concept of a virtual environment is unchanged. Whether you use `venv` + `pip`, `conda`, `uv`, or `poetry`, every Python project should run inside an isolated environment. The differences are about ergonomics, speed, and how much the tool automates, not about what's actually happening on disk.
+
+<h1 id="common-mistakes">Common Mistakes</h1>
+
+These are the venv mistakes that trip up new and experienced Python developers alike. Knowing what they look like saves a lot of debugging time.
+
+**1. Forgetting to activate.**
+
+You open a new terminal, jump into the project, and start installing. Half an hour later, you can't figure out why `python` doesn't see the packages you "just installed". The fix is to check `which python` (or `where python`) and confirm the path runs through your venv. Every new terminal starts un-activated; activation is per-shell, not per-project.
+
+**2. Mixing global and venv installs.**
+
+Running `pip install something` without an active venv installs into the system Python. The package shows up the next time you `import` from system Python but not from your venv's Python. The reverse also happens: you install something into a venv and forget you're activated, then wonder why a different project doesn't see it. Always check `pip -V` before installing if you're unsure where it lands.
+
+**3. Committing the venv folder.**
+
+`.venv/` weighs in around 50-200 MB once you have a few packages installed. It's full of platform-specific binaries (your macOS venv won't run on Windows or Linux). Committing it bloats the repo and breaks for everyone else. The `.gitignore` snippet earlier in this lesson covers the standard venv folder names; add it to every new project.
+
+**4. Moving the venv folder.**
+
+Virtual environments contain hard-coded paths in their `pyvenv.cfg` file and in some installed scripts. If you rename or move the project directory, the venv's Python may still work (because the symlinks resolve relative to the binary), but installed console scripts can break. The safe move is to delete the venv and recreate it from `requirements.txt` after relocating the project.
+
+**5. Using `sudo pip install`.**
+
+If you ever feel the urge to type `sudo pip install ...`, that's a sign you're not in a venv. Don't. `sudo pip install` writes to the OS-owned Python install, which can clobber system tools that depend on specific versions, and you'll have a hard time uninstalling cleanly afterwards. Some modern Python distributions (Python 3.11+ on certain Linux distros, Homebrew Python on macOS) actively block this by raising an `externally-managed-environment` error, which is the OS politely refusing to let you break itself. The fix is always the same: create a venv, activate it, and install without `sudo`.
+
+**6. Forgetting to update `requirements.txt`.**
+
+You install a new package, the code works, you commit and push. The teammate pulls, runs your code, and gets `ModuleNotFoundError`. The fix you forgot is `pip freeze > requirements.txt` after every install (and any time you change a version). Some teams automate this in a pre-commit hook so it can't be forgotten.
+
+**7. Using `pip freeze` from a contaminated env.**
+
+If you installed packages into your venv that aren't actually project dependencies (like a one-off debugging tool), `pip freeze` will pin them too, and your teammate will end up installing things they don't need. Either keep your venv clean (install only what the project uses) or maintain a hand-curated `requirements.txt` with the top-level deps and let `pip` pull the transitive ones automatically.
+
+**8. Activating two venvs in the same shell.**
+
+Each activation script prepends a directory to `PATH`. If you activate venv A and then activate venv B without deactivating A first, your `PATH` now has both venv directories on it, B first. Most of the time this works because B's `python` resolves first, but anything that reads the `VIRTUAL_ENV` environment variable (some tools do) will see the wrong value, and the next `deactivate` only undoes one of the activations. Always `deactivate` before activating a different venv, or open a new terminal.
+
+**9. Assuming venv activation persists across terminals.**
+
+Activation is per-shell-session. Closing the terminal, opening a new tab, or running a script in a different terminal all give you a fresh, un-activated shell. There's no global "this project is using this venv" state; you re-activate every time. Editors like VS Code, PyCharm, and others have settings to do the activation for you when you open a project; using them is the easiest fix if you keep forgetting.
+
+**10. Letting the venv go stale.**
+
+If you don't update dependencies for a long time, the gap between what's in your `requirements.txt` and what's currently safe to use can grow. Security advisories pile up against pinned old versions, and at some point a fresh `pip install -r requirements.txt` might not even resolve cleanly because PyPI has removed broken old releases. The fix is to periodically (every few months for active projects) run `pip list --outdated`, decide which upgrades to take, update the pins, and re-run your tests. Tools like Dependabot and Renovate automate this for repos hosted on GitHub.
+
+<h1 id="quiz">Quiz</h1>
+
+<h1 id="quiz-questions">Quiz Questions</h1>
+
+**Question 1: What is the main reason to use one virtual environment per Python project?**
+
+- [x] It lets each project keep its own dependency versions.
+- [ ] It makes Python execute on a separate CPU core.
+- [ ] It converts Python files into standalone binaries.
+- [ ] It removes the need to document dependencies.
+
+**Question 2: When you activate a virtual environment in a shell, what is the key thing that changes?**
+
+- [ ] All system packages are copied into the project.
+- [x] The venv's scripts directory is prepended to PATH.
+- [ ] Python rewrites imports before running modules.
+- [ ] The operating system replaces its Python install.
+
+**Question 3: After activating a venv, which command style best keeps pip tied to the Python interpreter you are using?**
+
+- [ ] sudo pip install -r requirements.txt
+- [x] python -m pip install -r requirements.txt
+- [ ] pip install --user -r requirements.txt
+- [ ] import pip before importing app modules
+
+**Question 4: In a venv's pyvenv.cfg file, what does include-system-site-packages = false mean?**
+
+- [ ] The venv deletes packages from the system Python.
+- [ ] The venv refuses to install third-party packages.
+- [x] The system site-packages directory is not used.
+- [ ] The Python version is automatically upgraded.
+
+**Question 5: When is conda often a better environment tool than the built-in venv module?**
+
+- [ ] When the project has no third-party packages.
+- [ ] When you want imports to skip site-packages.
+- [x] When compiled native libraries are central.
+- [ ] When requirements.txt must be ignored.
+
+**Question 6: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 7: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 8: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+<QuizCard />
+
+<CommentsSection />
+
+</LessonCard>

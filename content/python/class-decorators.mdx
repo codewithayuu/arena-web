@@ -1,0 +1,658 @@
+---
+title: "Class Decorators"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "Class Decorators explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="meaning-a-a-class-used-as-a-decorator">
+  Meaning A: A Class Used As a Decorator
+</h1>
+
+Function-based decorators close over their state in an enclosing scope. That works fine for one or two variables, but the moment you want to inspect that state from outside, reset it, or subclass the behavior, the closure starts to feel cramped. A class wrapping a function gives you a proper object to hold onto: attributes you can read, methods you can call, a type you can extend.
+
+The mechanics are short. Any class whose instances are callable can stand in for a function-based decorator. Python only needs two things from a callable class: an `__init__` that receives the function being wrapped, and a `__call__` that runs when the instance is invoked.
+
+```python
+class Trace:
+    def __init__(self, fn):
+        self.fn = fn
+
+    def __call__(self, *args, **kwargs):
+        print(f"calling {self.fn.__name__}")
+        return self.fn(*args, **kwargs)
+
+@Trace
+def add_to_cart(product, quantity):
+    return f"added {quantity} x {product}"
+
+print(add_to_cart("mug", 2))
+print(add_to_cart("notebook", 1))
+```
+
+Walk through what happened. The line `@Trace` above `add_to_cart` is the same as writing `add_to_cart = Trace(add_to_cart)` after the function definition. That call runs `Trace.__init__` with the function as the `fn` argument, storing it on the new instance. The name `add_to_cart` in the surrounding module is now bound to that `Trace` instance, not to the original function.
+
+When you write `add_to_cart("mug", 2)`, you are no longer calling a function. You are calling an instance of `Trace`. Python looks up `__call__` on the class, runs it with `self` set to the instance and the rest of the arguments forwarded. Inside `__call__`, `self.fn` is still the original function, so calling it produces the real result.
+
+The diagram traces the path from the decorated definition to a single call. The `@Trace` line builds an instance, and every later call routes through `__call__`, which forwards the real work to the original function held on `self.fn`.
+
+> **Cost:** Calling through `__call__` adds one Python-level attribute lookup and one method invocation per call. For tight inner loops that fire millions of times, that overhead can show up in a profiler; for normal application code it is invisible. Reach for a function-based decorator when raw call speed matters, and a class-based decorator when you need to hold state.
+
+<h3 id="why-a-class-at-all">Why a Class At All?</h3>
+
+The example above could have been a plain function-based decorator. The class form pays for itself the moment you want to do something a closure cannot easily do: expose state, reset it, share it across decorated functions, or build on it through subclassing. Here is a `CallCounter` that records how many times a wrapped function has been called and lets the rest of the program read that count.
+
+```python
+class CallCounter:
+    def __init__(self, fn):
+        self.fn = fn
+        self.count = 0
+
+    def __call__(self, *args, **kwargs):
+        self.count += 1
+        return self.fn(*args, **kwargs)
+
+    def reset(self):
+        self.count = 0
+
+@CallCounter
+def add_to_cart(product):
+    return f"added {product} to cart"
+
+add_to_cart("mug")
+add_to_cart("notebook")
+add_to_cart("lamp")
+
+print(f"add_to_cart was called {add_to_cart.count} times")
+
+add_to_cart.reset()
+print(f"after reset: {add_to_cart.count}")
+```
+
+Two things are happening here that a function-based decorator could not give you for free. First, `add_to_cart.count` is a real attribute on a real object. You read it like any other attribute, no global, no `nonlocal`, no awkward function attributes. Second, `add_to_cart.reset()` is a real method. The decorated function gained a method just by being decorated, and the rest of the codebase can treat it as a counter the same way it would treat any other object.
+
+The same effect with a closure looks like this:
+
+```python
+def call_counter(fn):
+    count = 0
+
+    def wrapper(*args, **kwargs):
+        nonlocal count
+        count += 1
+        return fn(*args, **kwargs)
+
+    def get_count():
+        return count
+
+    def reset():
+        nonlocal count
+        count = 0
+
+    wrapper.count = get_count
+    wrapper.reset = reset
+    return wrapper
+```
+
+It works, but the surface is awkward. `wrapper.count` is now a function you have to call (`wrapper.count()`), or you have to recompute and reassign the attribute on every increment. The class form makes `self.count` a normal attribute that just is the number, and any IDE or `dir()` listing shows it that way.
+
+<h3 id="tracking-state-across-calls">Tracking State Across Calls</h3>
+
+Stateful decorators are where the class form really earns its keep. Picture an admin tool that wants to know which cart operations are getting the most use. A single `CallCounter` instance per function tracks that.
+
+```python
+class CallCounter:
+    def __init__(self, fn):
+        self.fn = fn
+        self.count = 0
+
+    def __call__(self, *args, **kwargs):
+        self.count += 1
+        return self.fn(*args, **kwargs)
+
+@CallCounter
+def add_to_cart(product):
+    return f"added {product}"
+
+@CallCounter
+def remove_from_cart(product):
+    return f"removed {product}"
+
+@CallCounter
+def view_cart():
+    return "cart contents"
+
+add_to_cart("mug")
+add_to_cart("notebook")
+add_to_cart("pen")
+remove_from_cart("notebook")
+view_cart()
+view_cart()
+
+for fn in (add_to_cart, remove_from_cart, view_cart):
+    print(f"{fn.fn.__name__}: {fn.count}")
+```
+
+Each decorated name now holds its own `CallCounter` instance with its own count. The loop at the bottom walks all three and reads their counters directly. Notice `fn.fn.__name__`: the outer `fn` is the `CallCounter`, and `fn.fn` is the original function stored on `self.fn`. The name lookup falls through to the function because the `CallCounter` instance itself does not have a `__name__` attribute by default. We will fix that in a moment with `functools.update_wrapper`.
+
+<h3 id="holding-more-than-just-state-a-simple-rate-limit">
+  Holding More Than Just State: A Simple Rate Limit
+</h3>
+
+State is not the only thing a class can carry. A rate-limiter needs both state (when was the last call?) and configuration (how many calls per second do you allow?). The class form makes both fit naturally.
+
+```python
+import time
+
+class RateLimit:
+    def __init__(self, min_interval_seconds):
+        self.min_interval = min_interval_seconds
+        self.last_call = 0.0
+
+    def __call__(self, fn):
+        def wrapper(*args, **kwargs):
+            elapsed = time.monotonic() - self.last_call
+            if elapsed < self.min_interval:
+                wait = self.min_interval - elapsed
+                raise RuntimeError(
+                    f"rate limited, try again in {wait:.2f}s"
+                )
+            self.last_call = time.monotonic()
+            return fn(*args, **kwargs)
+        return wrapper
+
+@RateLimit(min_interval_seconds=0.5)
+def place_order(cart_total):
+    return f"order placed for ${cart_total}"
+
+print(place_order(29.99))
+try:
+    print(place_order(14.99))
+except RuntimeError as exc:
+    print(f"blocked: {exc}")
+
+time.sleep(0.6)
+print(place_order(9.99))
+```
+
+This decorator is shaped a little differently from `CallCounter`, and the difference matters. `@RateLimit(min_interval_seconds=0.5)` takes a configuration argument. So `RateLimit(0.5)` builds an instance first, and then `@instance` is applied to `place_order`. Python calls the instance with the function as argument, which is why `__call__` here receives `fn`, not the runtime arguments. The class returns a closure (`wrapper`) that does the per-call work and reads `self.min_interval` and `self.last_call` from the enclosing instance.
+
+Compare that to `CallCounter`, which was used as `@CallCounter` (no parentheses). For `CallCounter`, `__init__` got the function and `__call__` ran on every call. For `RateLimit`, `__init__` got the config and `__call__` got the function. Both are class decorators (Meaning A). The shape depends on whether the decorator takes arguments.
+
+| Form                 | Constructor receives | `__call__` receives |
+| -------------------- | -------------------- | ------------------- |
+| `@SomeClass`         | the function `fn`    | runtime args        |
+| `@SomeClass(config)` | the config           | the function `fn`   |
+
+Both are common, and you will see both in the wild. Pick the form that matches whether your decorator needs configuration.
+
+> **Cost:** The argumented form (`@RateLimit(0.5)`) builds two layers of callable on top of the original function: one instance and one closure. The plain form (`@CallCounter`) builds only one. Both are negligible per call, but the difference exists.
+
+<h3 id="keeping-identity-functoolsupdate_wrapper">
+  Keeping Identity: functools.update_wrapper
+</h3>
+
+A function-based decorator usually copies the wrapped function's `__name__`, `__doc__`, and other metadata onto the wrapper using `functools.wraps`. The same care matters for class-based decorators, otherwise debugging output and documentation tools see the class instance instead of the original function.
+
+```python
+@CallCounter
+def add_to_cart(product):
+    """Add a product to the cart."""
+    return f"added {product}"
+
+print(add_to_cart.__name__)
+print(add_to_cart.__doc__)
+```
+
+The instance has no `__name__` at all. The wrapped function does, but it is hiding behind `self.fn`. The fix is `functools.update_wrapper(self, fn)` in `__init__`, which copies the standard set of attributes from the function onto the instance.
+
+```python
+import functools
+
+class CallCounter:
+    def __init__(self, fn):
+        functools.update_wrapper(self, fn)
+        self.fn = fn
+        self.count = 0
+
+    def __call__(self, *args, **kwargs):
+        self.count += 1
+        return self.fn(*args, **kwargs)
+
+@CallCounter
+def add_to_cart(product):
+    """Add a product to the cart."""
+    return f"added {product}"
+
+print(add_to_cart.__name__)
+print(add_to_cart.__doc__)
+add_to_cart("mug")
+print(add_to_cart.count)
+```
+
+`functools.update_wrapper` is the same machinery `functools.wraps` uses internally. The difference is that `wraps` is a decorator factory built for the function-based case, while `update_wrapper` is the underlying function and works on any object, including class instances.
+
+<h3 id="subclassing-for-variants">Subclassing for Variants</h3>
+
+The other big win of the class form is that decorators can inherit from each other. Subclass `CallCounter` and you get a new decorator that adds behavior without rewriting the counter logic.
+
+```python
+import functools
+
+class CallCounter:
+    def __init__(self, fn):
+        functools.update_wrapper(self, fn)
+        self.fn = fn
+        self.count = 0
+
+    def __call__(self, *args, **kwargs):
+        self.count += 1
+        return self.fn(*args, **kwargs)
+
+class LoudCallCounter(CallCounter):
+    def __call__(self, *args, **kwargs):
+        result = super().__call__(*args, **kwargs)
+        print(f"{self.__name__} has been called {self.count} times")
+        return result
+
+@LoudCallCounter
+def remove_from_cart(product):
+    return f"removed {product}"
+
+remove_from_cart("mug")
+remove_from_cart("notebook")
+```
+
+`LoudCallCounter` reuses the counter logic by calling `super().__call__`, then prints a status message. You cannot do this cleanly with a closure-based decorator. Inheritance is the kind of feature that only feels essential when you actually need it, and when you do, the class form is the only one that gives it to you for free.
+
+<h3 id="one-caveat-methods-on-classes">One Caveat: Methods on Classes</h3>
+
+A class-based decorator does not automatically work as a method decorator. Try to put `@CallCounter` on an instance method and the wrapping breaks subtly.
+
+```python
+class Cart:
+    @CallCounter
+    def add(self, product):
+        return f"added {product}"
+
+cart = Cart()
+try:
+    cart.add("mug")
+except TypeError as exc:
+    print(f"error: {exc}")
+```
+
+The error message reads strangely until you see what is happening. When `@CallCounter` runs on the method, it replaces `add` on the class with a `CallCounter` instance. Accessing `cart.add` does not bind `self` to the call, because `CallCounter` is not a function and does not implement the descriptor protocol. So `cart.add("mug")` passes `"mug"` as the first and only argument, with no `self` in sight.
+
+Fixing this requires giving `CallCounter` a `__get__` method that returns a bound version when accessed through an instance. That falls under the descriptor protocol, which is its own topic. If your class-based decorator must work on methods, either add `__get__` (the descriptor approach) or keep the decorator as a function and use the closure pattern, which handles method binding automatically.
+
+<h1 id="meaning-b-a-decorator-applied-to-a-class">
+  Meaning B: A Decorator Applied To a Class
+</h1>
+
+Switch contexts. Everything above was about classes that act as decorators. The other half of "class decorators" is the opposite: decorators that are applied **to** a class definition. The `@` line sits above a `class` block instead of a `def` block, and the decorator receives the class object itself.
+
+```python
+def announce(cls):
+    print(f"defining class: {cls.__name__}")
+    return cls
+
+@announce
+class Order:
+    pass
+
+print(Order)
+```
+
+The pattern is identical to function decoration in shape. The `@announce` line is the same as writing `Order = announce(Order)` after the class block. The decorator receives the freshly-built class as its single argument and returns it (or a replacement). Inside, you can do anything to the class: read its attributes, add methods, register it in a global table, freeze it, wrap its `__init__`.
+
+The diagram captures the lifecycle. Python builds the class object first, runs all the inner `def`s, attaches them as methods, then hands the finished class to the decorator. The decorator does its work after the class exists, not during construction. That timing is what makes class decorators useful: by the time the decorator sees the class, you can inspect it as a finished, fully-populated object.
+
+<h3 id="registering-classes-in-a-lookup-table">
+  Registering Classes in a Lookup Table
+</h3>
+
+One of the most common uses for a class decorator is registration. An e-commerce backend might support several payment methods, each implemented as its own class. Instead of writing a long `if`/`elif` chain that maps strings to classes, you can have each class register itself when it is defined.
+
+```python
+PAYMENT_METHODS = {}
+
+def register_payment_method(name):
+    def decorator(cls):
+        PAYMENT_METHODS[name] = cls
+        return cls
+    return decorator
+
+@register_payment_method("card")
+class CardPayment:
+    def charge(self, amount):
+        return f"charged ${amount} to card"
+
+@register_payment_method("upi")
+class UpiPayment:
+    def charge(self, amount):
+        return f"charged ${amount} via UPI"
+
+@register_payment_method("wallet")
+class WalletPayment:
+    def charge(self, amount):
+        return f"charged ${amount} from wallet"
+
+def pay(method_name, amount):
+    cls = PAYMENT_METHODS[method_name]
+    return cls().charge(amount)
+
+print(pay("card", 49.99))
+print(pay("upi", 14.99))
+print(pay("wallet", 9.99))
+print(list(PAYMENT_METHODS.keys()))
+```
+
+The registry pattern has a few nice properties. New payment methods are added by writing a class and decorating it; no central list to update. The `pay` function does not import the concrete classes directly, it only knows about the registry. The whole dispatch becomes data-driven.
+
+Notice the shape of the decorator. `register_payment_method` takes a `name` argument and returns the real decorator. The real decorator (`decorator`) receives the class, stuffs it into the dict, and returns the class unchanged. Returning the class is important: if you accidentally returned `None`, the name (`CardPayment`, `UpiPayment`, etc.) would be bound to `None` in the surrounding module, and any code that referenced the class directly would break.
+
+<h3 id="adding-methods-to-a-class">Adding Methods to a Class</h3>
+
+A class decorator can also modify the class it receives. Adding a method is the simplest example. Suppose every order class should have a `__repr__` that shows its fields, but writing one for each class is tedious. A decorator can synthesize it.
+
+```python
+def add_repr(cls):
+    def __repr__(self):
+        fields = ", ".join(
+            f"{k}={v!r}" for k, v in self.__dict__.items()
+        )
+        return f"{cls.__name__}({fields})"
+    cls.__repr__ = __repr__
+    return cls
+
+@add_repr
+class Order:
+    def __init__(self, order_id, total, status):
+        self.order_id = order_id
+        self.total = total
+        self.status = status
+
+@add_repr
+class Customer:
+    def __init__(self, name, email):
+        self.name = name
+        self.email = email
+
+order = Order("A-1001", 49.99, "placed")
+customer = Customer("Asha", "asha@example.com")
+
+print(order)
+print(customer)
+```
+
+The decorator defines a `__repr__` function and attaches it to the class via `cls.__repr__ = __repr__`. After the decorator returns, every instance of `Order` and `Customer` has the new `__repr__` available. The function captures `cls` in its closure so it can use the class name in the output.
+
+This pattern is exactly the spirit of what `@dataclass` does at a much grander scale: synthesize methods (`__init__`, `__repr__`, `__eq__`, and more) from the class's annotations.
+
+<h3 id="adding-class-attributes">Adding Class Attributes</h3>
+
+The same write-access works for attributes, not just methods. A decorator can stamp a version number, a default config, a frozen schema, or any other class-level value onto whatever it decorates.
+
+```python
+def tagged(version):
+    def decorator(cls):
+        cls.version = version
+        cls.tagged_at = "v" + version
+        return cls
+    return decorator
+
+@tagged("1.2.0")
+class CheckoutFlow:
+    def run(self):
+        return "running checkout"
+
+@tagged("0.9.0")
+class WishlistFlow:
+    def run(self):
+        return "running wishlist"
+
+print(CheckoutFlow.version, CheckoutFlow.tagged_at)
+print(WishlistFlow.version, WishlistFlow.tagged_at)
+print(CheckoutFlow().run())
+```
+
+The decorator factory `tagged` takes the version string and returns the inner decorator. The inner decorator sets two class attributes and returns the class. Instances inherit the attributes through the usual attribute lookup, so `CheckoutFlow().version` would work just as well as `CheckoutFlow.version`.
+
+<h3 id="modifying-__init__">Modifying __init__</h3>
+
+A class decorator can wrap an existing method, including `__init__`. This is how some validation libraries enforce invariants on construction.
+
+```python
+def validate_total(cls):
+    original_init = cls.__init__
+
+    def __init__(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        if self.total < 0:
+            raise ValueError(
+                f"order total cannot be negative: {self.total}"
+            )
+
+    cls.__init__ = __init__
+    return cls
+
+@validate_total
+class Order:
+    def __init__(self, order_id, total):
+        self.order_id = order_id
+        self.total = total
+
+order = Order("A-1001", 49.99)
+print(order.order_id, order.total)
+
+try:
+    Order("A-1002", -5.00)
+except ValueError as exc:
+    print(f"rejected: {exc}")
+```
+
+The decorator captures the original `__init__` as a local variable, defines a new one that calls the original and then runs the validation, and reassigns it to `cls.__init__`. Every instance constructed after the decoration goes through the wrapper.
+
+The pattern of "save the old method, build a new one that calls it plus extra logic, write it back" is the most common shape of class-modifying decorators. It is the imperative version of inheritance: instead of subclassing and overriding `__init__`, you stamp the override directly onto the class.
+
+<h3 id="freezing-a-class">Freezing a Class</h3>
+
+A class decorator can also enforce a property over the class's runtime behavior, like preventing new attributes from being added after construction. Here is a `freeze` decorator that makes instances refuse new attributes.
+
+```python
+def freeze(cls):
+    original_init = cls.__init__
+
+    def __init__(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self.__dict__["_frozen"] = True
+
+    def __setattr__(self, name, value):
+        if getattr(self, "_frozen", False):
+            raise AttributeError(
+                f"cannot set attribute '{name}' on frozen {cls.__name__}"
+            )
+        object.__setattr__(self, name, value)
+
+    cls.__init__ = __init__
+    cls.__setattr__ = __setattr__
+    return cls
+
+@freeze
+class Order:
+    def __init__(self, order_id, total):
+        self.order_id = order_id
+        self.total = total
+
+order = Order("A-1001", 49.99)
+print(order.order_id)
+
+try:
+    order.total = 0.00
+except AttributeError as exc:
+    print(f"blocked: {exc}")
+```
+
+The decorator overrides both `__init__` (to set the `_frozen` flag after construction) and `__setattr__` (to reject writes once the flag is set). Inside the new `__init__`, assignments to `self.order_id` and `self.total` go through the wrapped `__setattr__`, but `_frozen` is still `False` at that point, so the writes succeed. After `__init__` returns, `_frozen` is `True`, and any further assignment raises.
+
+The detail worth pausing on is `self.__dict__["_frozen"] = True` instead of `self._frozen = True`. The second form would route through our own `__setattr__`, and at that point `_frozen` is already `False` from the original `__init__`, so it would succeed. The direct dict assignment sidesteps the wrapper. The same kind of "trapdoor write" shows up in several real frozen-class implementations.
+
+> **Cost:** Wrapping `__init__` and `__setattr__` adds one extra Python frame per attribute write, which is fine for normal code and noticeable only in hot inner loops. The frozen pattern is best for value objects that are constructed once and read many times.
+
+<h3 id="returning-a-replacement">Returning a Replacement</h3>
+
+A class decorator does not have to return the same class. It can return a different class entirely, which lets the decorator pull tricks like wrapping the class in a proxy or swapping its base class. The common form, however, is to return the original class. Returning something else surprises readers and breaks `isinstance` checks that callers might write against the decorated name.
+
+```python
+def warn_replacement(cls):
+    class Wrapped(cls):
+        pass
+    Wrapped.__name__ = cls.__name__
+    return Wrapped
+
+@warn_replacement
+class Order:
+    pass
+
+print(Order)
+print(Order.__mro__)
+print(Order is not Order.__mro__[1])
+```
+
+(The exact second line of output will include the full method resolution order; the point is that `Order` is no longer the original class, it is a subclass.) Most readers expect `@some_decorator class Order` to leave `Order` as `Order`. Replacing the class works, but it is a stronger move that needs a real reason behind it.
+
+<h3 id="real-world-examples-worth-knowing">
+  Real-World Examples Worth Knowing
+</h3>
+
+A few class decorators in the standard library are worth recognizing. They use exactly the mechanics above to deliver a lot of value.
+
+| Decorator         | What it does                                                        | Where it lives         |
+| ----------------- | ------------------------------------------------------------------- | ---------------------- |
+| `@dataclass`      | Synthesizes `__init__`, `__repr__`, `__eq__` from class annotations | `dataclasses`          |
+| `@total_ordering` | Fills in the rest of the comparison methods from one or two of them | `functools`            |
+| `@register` (abc) | Registers a class as a virtual subclass of an ABC                   | `abc.ABCMeta.register` |
+
+`@total_ordering` is a small helper that saves you from writing all six comparison methods when one or two are enough to derive the others. Both demonstrate the same patterns this lesson covered: inspect the class, add methods, return the class unchanged.
+
+<h1 id="comparing-the-two-meanings-side-by-side">
+  Comparing the Two Meanings Side by Side
+</h1>
+
+The two halves of this lesson share the `@` syntax and almost nothing else. Side-by-side they look like this:
+
+| Aspect                         | Meaning A: class **as** decorator                                 | Meaning B: decorator applied **to** class        |
+| ------------------------------ | ----------------------------------------------------------------- | ------------------------------------------------ |
+| What sits below the `@` line   | A function (`def`)                                                | A class (`class`)                                |
+| What the decorator is          | A class with `__call__`                                           | A function (or callable)                         |
+| What the decorator receives    | The function (in `__init__` or `__call__` depending on form)      | The class object                                 |
+| What the decorator returns     | An instance (or a closure wrapping the function)                  | The class (usually unchanged), or a replacement  |
+| Typical reason to reach for it | Need state, configuration, methods, or subclassing on the wrapper | Need to register, modify, or augment a class     |
+| Typical example                | `@CallCounter`, `@RateLimit(0.5)`                                 | `@register_payment_method("card")`, `@dataclass` |
+
+Both are powerful, and you will write both in real code. The trick is to recognize which one you are looking at when you read someone else's. The shape of what sits below the `@` line tells you immediately.
+
+```python
+@something
+def fn(...):     # Meaning A: 'something' wraps a function. Likely a class with __call__.
+    ...
+
+@something
+class Thing:     # Meaning B: 'something' takes a class. Likely a function.
+    ...
+```
+
+A handful of decorators (notably `@dataclass`) only make sense in Meaning B; they would not work above a function. A handful (notably `@CallCounter` from this lesson) only make sense in Meaning A. Most are clearly one or the other from context.
+
+<h1 id="putting-both-together">Putting Both Together</h1>
+
+Just to drive the point home: you can use both kinds of class decorator in the same program without conflict. They live in different worlds.
+
+```python
+import functools
+
+class CallCounter:
+    def __init__(self, fn):
+        functools.update_wrapper(self, fn)
+        self.fn = fn
+        self.count = 0
+
+    def __call__(self, *args, **kwargs):
+        self.count += 1
+        return self.fn(*args, **kwargs)
+
+PAYMENT_METHODS = {}
+
+def register_payment_method(name):
+    def decorator(cls):
+        PAYMENT_METHODS[name] = cls
+        return cls
+    return decorator
+
+@register_payment_method("card")
+class CardPayment:
+    def charge(self, amount):
+        return f"charged ${amount} to card"
+
+@CallCounter
+def pay(method_name, amount):
+    cls = PAYMENT_METHODS[method_name]
+    return cls().charge(amount)
+
+print(pay("card", 49.99))
+print(pay("card", 14.99))
+print(pay("card", 9.99))
+print(f"pay called {pay.count} times")
+```
+
+`CardPayment` is decorated by `register_payment_method`, a Meaning B decorator that adds the class to the lookup table. `pay` is decorated by `CallCounter`, a Meaning A decorator that wraps the function in a callable instance that counts invocations. Both work, both are read naturally by anyone fluent in Python, neither interferes with the other.
+
+<h1 id="a-common-trap-forgetting-to-return-the-class">
+  A Common Trap: Forgetting to Return the Class
+</h1>
+
+The single most common bug with Meaning B is forgetting to return the class from the decorator.
+
+**What's wrong with this code?**
+
+```python
+def register(cls):
+    PAYMENT_METHODS[cls.__name__] = cls
+    # missing: return cls
+
+PAYMENT_METHODS = {}
+
+@register
+class CardPayment:
+    def charge(self, amount):
+        return f"charged ${amount}"
+
+print(CardPayment)
+try:
+    CardPayment().charge(10)
+except TypeError as exc:
+    print(f"error: {exc}")
+```
+
+The decorator function does not return anything, so it implicitly returns `None`. After `@register`, the name `CardPayment` is bound to `None`, not to the class. The registry still has the class (because we stored a reference in the dict), but every other use of `CardPayment` is broken.
+
+**Fix:**
+
+```python
+def register(cls):
+    PAYMENT_METHODS[cls.__name__] = cls
+    return cls
+```
+
+Always return the class (or a replacement) from a class decorator. The same rule applies to a wrapping decorator from Meaning A: return the wrapper or the instance, never `None`.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

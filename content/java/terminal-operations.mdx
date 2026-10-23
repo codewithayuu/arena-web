@@ -1,0 +1,694 @@
+---
+title: "Terminal Operations"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Terminal Operations explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+Terminal operations are what actually make a stream do something. Intermediate operations build up a pipeline, but until a terminal operation runs, no element is read, no filter is applied, no mapping happens. This lesson covers each terminal operation in depth: what it returns, when it short-circuits, what it does on an empty stream, and the small traps that lead to bugs.
+
+<h1 id="quick-reference-table">Quick Reference Table</h1>
+
+Every terminal operation covered in this lesson at a glance. Keep this table nearby while you read; the rest of the lesson digs into each row.
+
+| Operation                                 | Returns              | Short-Circuits? | Description                                                        |
+| ----------------------------------------- | -------------------- | --------------- | ------------------------------------------------------------------ |
+| `forEach(Consumer)`                       | `void`               | No              | Runs an action on each element, no order guarantee in parallel     |
+| `forEachOrdered(Consumer)`                | `void`               | No              | Like `forEach` but respects encounter order even in parallel       |
+| `count()`                                 | `long`               | No              | Counts elements in the stream                                      |
+| `reduce(BinaryOperator)`                  | `Optional<T>`        | No              | Combines elements into one, empty stream returns empty `Optional`  |
+| `reduce(identity, BinaryOperator)`        | `T`                  | No              | Combines elements with a starting value, returns identity if empty |
+| `reduce(identity, accumulator, combiner)` | `U`                  | No              | Three-arg form for parallel reductions of a different result type  |
+| `min(Comparator)`                         | `Optional<T>`        | No              | Smallest element by the given comparator                           |
+| `max(Comparator)`                         | `Optional<T>`        | No              | Largest element by the given comparator                            |
+| `anyMatch(Predicate)`                     | `boolean`            | Yes             | True if any element matches the predicate                          |
+| `allMatch(Predicate)`                     | `boolean`            | Yes             | True if all elements match, true on empty stream                   |
+| `noneMatch(Predicate)`                    | `boolean`            | Yes             | True if no element matches, true on empty stream                   |
+| `findFirst()`                             | `Optional<T>`        | Yes             | First element in encounter order                                   |
+| `findAny()`                               | `Optional<T>`        | Yes             | Any element, faster in parallel                                    |
+| `toArray()`                               | `Object[]`           | No              | Dumps the stream into an `Object[]`                                |
+| `toArray(IntFunction)`                    | `A[]`                | No              | Dumps the stream into a typed array                                |
+| `toList()`                                | `List<T>`            | No              | Java 16+, unmodifiable list, allows nulls                          |
+| `collect(Collector)`                      | depends on Collector | No              | Flexible reduction into lists, sets, maps, and more                |
+
+<h1 id="foreach-and-foreachordered">forEach and forEachOrdered</h1>
+
+`forEach(Consumer<? super T> action)` runs the given action on every element. It returns `void`, so it's the end of the pipeline. The signature is:
+
+```java
+void forEach(Consumer<? super T> action);
+void forEachOrdered(Consumer<? super T> action);
+```
+
+In a sequential stream, both methods process elements in encounter order. The difference shows up only when the stream is parallel. `forEach` is free to call the action in any order on any thread, which is faster but unordered. `forEachOrdered` forces the runtime to respect encounter order, which costs synchronization but keeps the output predictable.
+
+```java
+import java.util.List;
+
+public class ForEachDemo {
+    public static void main(String[] args) {
+        List<String> productNames = List.of("Headphones", "Notebook", "Keyboard", "Mouse");
+
+        System.out.println("Sequential forEach:");
+        productNames.stream().forEach(name -> System.out.println("  " + name));
+
+        System.out.println("Parallel forEach (order not guaranteed):");
+        productNames.parallelStream().forEach(name -> System.out.println("  " + name));
+
+        System.out.println("Parallel forEachOrdered (order preserved):");
+        productNames.parallelStream().forEachOrdered(name -> System.out.println("  " + name));
+    }
+}
+```
+
+The parallel `forEach` output above is one possible run. The order can change on every execution.
+
+`forEachOrdered` on a parallel stream often defeats the point of parallelism. The pipeline can still split the work, but emitting in order forces re-synchronization at the end. If you need ordered output, ask yourself whether you need parallel at all.
+
+A subtle point: `forEach` is for **side effects**, not for computing values. Mutating a shared list from inside `forEach` works on a sequential stream but breaks on a parallel one because multiple threads write to the same collection. If you want to build a result, use `collect` or `reduce`, not `forEach`.
+
+**What's wrong with this code?**
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class BadForEach {
+    public static void main(String[] args) {
+        List<Integer> prices = List.of(20, 30, 50, 80, 100);
+        List<Integer> expensive = new ArrayList<>();
+
+        prices.parallelStream()
+            .filter(p -> p > 40)
+            .forEach(expensive::add);
+
+        System.out.println(expensive);
+    }
+}
+```
+
+`ArrayList` isn't thread-safe. With a parallel stream, multiple threads call `expensive.add` at the same time, which can corrupt the list, drop elements, or throw `ArrayIndexOutOfBoundsException`.
+
+**Fix:**
+
+```java
+import java.util.List;
+import java.util.stream.Collectors;
+
+public class GoodCollect {
+    public static void main(String[] args) {
+        List<Integer> prices = List.of(20, 30, 50, 80, 100);
+
+        List<Integer> expensive = prices.parallelStream()
+            .filter(p -> p > 40)
+            .collect(Collectors.toList());
+
+        System.out.println(expensive);
+    }
+}
+```
+
+`collect` is built for parallel work. It uses a thread-safe combining strategy internally.
+
+<h1 id="count">count</h1>
+
+`count()` returns the number of elements that reach the end of the pipeline as a `long`. The signature is:
+
+```java
+long count();
+```
+
+It's the simplest terminal operation, but it interacts in useful ways with intermediate operations. After a `filter`, `count` tells you how many items passed.
+
+```java
+import java.util.List;
+
+public class CountDemo {
+    public static void main(String[] args) {
+        List<Double> orderTotals = List.of(15.99, 49.50, 8.25, 120.00, 32.75, 5.00);
+
+        long ordersAbove50 = orderTotals.stream()
+            .filter(total -> total > 50.0)
+            .count();
+
+        long totalOrders = orderTotals.stream().count();
+
+        System.out.println("Total orders: " + totalOrders);
+        System.out.println("Orders above $50: " + ordersAbove50);
+    }
+}
+```
+
+Since Java 9, the runtime can sometimes skip materializing elements just to count them. For a stream backed by a `Collection` with no intermediate operations that change the count, `count()` can return the collection's size directly. Add a `filter`, and the optimization is off; the stream has to inspect each element to know which ones survive.
+
+<h1 id="reduce-the-three-forms">reduce: The Three Forms</h1>
+
+`reduce` is the general workhorse for combining elements into a single result. It comes in three forms, each suited to a different shape of problem.
+
+<h3 id="form-1-reducebinaryoperator">Form 1: reduce(BinaryOperator)</h3>
+
+```java
+Optional<T> reduce(BinaryOperator<T> accumulator);
+```
+
+This form combines elements pairwise using the accumulator. It returns `Optional<T>` because the stream might be empty, in which case there's nothing to return. The result type matches the element type.
+
+```java
+import java.util.List;
+import java.util.Optional;
+
+public class ReduceOptionalDemo {
+    public static void main(String[] args) {
+        List<Double> cartPrices = List.of(19.99, 45.50, 8.75);
+
+        Optional<Double> total = cartPrices.stream()
+            .reduce((a, b) -> a + b);
+
+        System.out.println("Cart total: " + total.orElse(0.0));
+
+        List<Double> emptyCart = List.of();
+        Optional<Double> emptyTotal = emptyCart.stream()
+            .reduce((a, b) -> a + b);
+
+        System.out.println("Empty cart total present? " + emptyTotal.isPresent());
+    }
+}
+```
+
+The returned `Optional` is empty for an empty stream. That's the correct signal: "there was nothing to reduce."
+
+<h3 id="form-2-reduceidentity-binaryoperator">
+  Form 2: reduce(identity, BinaryOperator)
+</h3>
+
+```java
+T reduce(T identity, BinaryOperator<T> accumulator);
+```
+
+The identity is a starting value that also serves as the answer when the stream is empty. For sum, the identity is `0`. For product, it's `1`. For string concatenation, it's `""`. The accumulator combines the running result with the next element.
+
+```java
+import java.util.List;
+
+public class ReduceIdentityDemo {
+    public static void main(String[] args) {
+        List<Double> cartPrices = List.of(19.99, 45.50, 8.75);
+
+        double total = cartPrices.stream()
+            .reduce(0.0, (a, b) -> a + b);
+
+        double maxPrice = cartPrices.stream()
+            .reduce(Double.MIN_VALUE, Double::max);
+
+        System.out.println("Cart total: " + total);
+        System.out.println("Max price: " + maxPrice);
+
+        double emptyTotal = List.<Double>of().stream()
+            .reduce(0.0, (a, b) -> a + b);
+
+        System.out.println("Empty cart total: " + emptyTotal);
+    }
+}
+```
+
+The "identity" name isn't decorative. For the operation to behave correctly, especially in parallel, the identity must satisfy `accumulator(identity, x) == x` for any element `x`. Pick `0` for sum and the math works. Pick `1` for sum and you'll be off by one every time the runtime injects the identity into a partial result.
+
+<h3 id="form-3-reduceidentity-accumulator-combiner">
+  Form 3: reduce(identity, accumulator, combiner)
+</h3>
+
+```java
+<U> U reduce(U identity,
+             BiFunction<U, ? super T, U> accumulator,
+             BinaryOperator<U> combiner);
+```
+
+This is where things get interesting. The three-arg form lets the result type `U` differ from the element type `T`. You provide an `accumulator` that folds a `T` into a `U`, and a `combiner` that merges two `U` partial results together.
+
+The combiner is the key to running in parallel. When the stream splits into chunks, each chunk produces its own partial `U`. The combiner stitches them back together. In a sequential stream the combiner is never called; in a parallel stream it's required.
+
+```java
+import java.util.List;
+
+public class ReduceCombinerDemo {
+    public static void main(String[] args) {
+        List<String> productNames = List.of("Headphones", "Notebook", "Keyboard");
+
+        int totalLength = productNames.stream()
+            .reduce(0,
+                    (runningSum, name) -> runningSum + name.length(),
+                    Integer::sum);
+
+        System.out.println("Total characters in product names: " + totalLength);
+
+        int parallelLength = productNames.parallelStream()
+            .reduce(0,
+                    (runningSum, name) -> runningSum + name.length(),
+                    Integer::sum);
+
+        System.out.println("Same answer in parallel: " + parallelLength);
+    }
+}
+```
+
+Here the elements are `String`s but the result is an `int`. The accumulator folds a `String`'s length into the running int. In parallel, two threads might compute partial sums for `"Headphones"` (10) and `"NotebookKeyboard"` (16 combined), and the combiner adds them with `Integer::sum`. The diagram below shows the split-and-merge structure.
+
+Each chunk applies the accumulator to fold its element into a partial `U`. The combiner merges partials. The accumulator and combiner must agree: `combiner(u, accumulator(identity, t)) == accumulator(u, t)`. If that contract breaks, parallel and sequential results disagree. **What's wrong with this code?**
+
+```java
+import java.util.List;
+
+public class BadReduce {
+    public static void main(String[] args) {
+        List<Integer> quantities = List.of(2, 3, 4);
+
+        int sum = quantities.parallelStream()
+            .reduce(0,
+                    (running, q) -> running + q,
+                    (a, b) -> a);
+
+        System.out.println("Sum: " + sum);
+    }
+}
+```
+
+The combiner ignores `b` and returns just `a`. In a sequential run, the combiner never fires, so the result is correct. In parallel, the runtime splits the work, and the broken combiner throws away whichever partial happens to land on the right. You'll get an answer like `2`, `3`, or `4` instead of `9`.
+
+**Fix:**
+
+```java
+int sum = quantities.parallelStream()
+    .reduce(0,
+            (running, q) -> running + q,
+            Integer::sum);
+```
+
+The combiner must actually combine. `Integer::sum` adds both partials, matching what the accumulator does element-by-element.
+
+<h1 id="min-and-max">min and max</h1>
+
+```java
+Optional<T> min(Comparator<? super T> comparator);
+Optional<T> max(Comparator<? super T> comparator);
+```
+
+Both return `Optional<T>` because a stream might be empty. The comparator decides what "smallest" and "largest" mean. For ascending price, that's `Comparator.comparingDouble(Product::getPrice)`.
+
+```java
+import java.util.Comparator;
+import java.util.List;
+import java.util.Optional;
+
+public class MinMaxDemo {
+    public static void main(String[] args) {
+        List<Product> catalog = List.of(
+            new Product("Headphones", 79.99),
+            new Product("Notebook", 5.50),
+            new Product("Keyboard", 39.99),
+            new Product("Mouse", 19.99)
+        );
+
+        Optional<Product> cheapest = catalog.stream()
+            .min(Comparator.comparingDouble(Product::getPrice));
+
+        Optional<Product> mostExpensive = catalog.stream()
+            .max(Comparator.comparingDouble(Product::getPrice));
+
+        cheapest.ifPresent(p -> System.out.println("Cheapest: " + p));
+        mostExpensive.ifPresent(p -> System.out.println("Most expensive: " + p));
+    }
+}
+
+class Product {
+    private final String name;
+    private final double price;
+
+    public Product(String name, double price) {
+        this.name = name;
+        this.price = price;
+    }
+
+    public double getPrice() {
+        return price;
+    }
+
+    public String toString() {
+        return name + " ($" + price + ")";
+    }
+}
+```
+
+`min` and `max` walk the entire stream. They aren't short-circuiting because the smallest could be the last element. If you need a single value and don't care which way the comparator points, write the comparator once and reuse it for both calls.
+
+Avoid sorting a stream just to take the first or last element. `stream.sorted().findFirst()` is O(n log n) and materializes the whole stream. `stream.min(cmp)` is O(n) with no sort.
+
+<h1 id="anymatch-allmatch-nonematch">anyMatch, allMatch, noneMatch</h1>
+
+These three terminal operations all return `boolean` and all short-circuit. Their signatures:
+
+```java
+boolean anyMatch(Predicate<? super T> predicate);
+boolean allMatch(Predicate<? super T> predicate);
+boolean noneMatch(Predicate<? super T> predicate);
+```
+
+- `anyMatch` returns `true` as soon as it finds one element that matches. If nothing matches, it returns `false`.
+- `allMatch` returns `false` as soon as it finds one that doesn't match. If everything matches, it returns `true`.
+- `noneMatch` returns `false` as soon as it finds one that matches. If nothing matches, it returns `true`.
+
+Short-circuiting means the pipeline stops pulling new elements the moment the answer is known. For a stream of a million items where the first matches, `anyMatch` reads exactly one.
+
+```java
+import java.util.List;
+
+public class MatchDemo {
+    public static void main(String[] args) {
+        List<Integer> stockLevels = List.of(12, 5, 0, 20, 3, 8);
+
+        boolean anyOutOfStock = stockLevels.stream().anyMatch(s -> s == 0);
+        boolean allInStock = stockLevels.stream().allMatch(s -> s > 0);
+        boolean noneNegative = stockLevels.stream().noneMatch(s -> s < 0);
+
+        System.out.println("Any item out of stock? " + anyOutOfStock);
+        System.out.println("All items in stock? " + allInStock);
+        System.out.println("Any negative stock? " + (!noneNegative));
+    }
+}
+```
+
+<h3 id="the-empty-stream-trap-vacuous-truth">
+  The Empty Stream Trap (Vacuous Truth)
+</h3>
+
+The catch that catches everyone at least once. On an empty stream:
+
+- `anyMatch` returns `false`. There's no element that matches.
+- `allMatch` returns `true`. There's no element that fails. This is "vacuous truth."
+- `noneMatch` returns `true`. There's no element that matches.
+
+```java
+import java.util.List;
+
+public class EmptyStreamMatch {
+    public static void main(String[] args) {
+        List<Integer> emptyCart = List.of();
+
+        System.out.println("anyMatch on empty: " + emptyCart.stream().anyMatch(x -> x > 0));
+        System.out.println("allMatch on empty: " + emptyCart.stream().allMatch(x -> x > 0));
+        System.out.println("noneMatch on empty: " + emptyCart.stream().noneMatch(x -> x > 0));
+    }
+}
+```
+
+`allMatch` returning `true` on an empty stream looks wrong at first. The logic is: "for every element in the stream, the predicate holds." If there are no elements, the statement holds trivially. This matches how `forall` works in math and logic.
+
+**What's wrong with this code?**
+
+```java
+import java.util.List;
+
+public class EmptyCartBug {
+    public static void main(String[] args) {
+        List<Double> cart = List.of();
+
+        boolean readyToCheckout = cart.stream().allMatch(price -> price > 0);
+
+        if (readyToCheckout) {
+            System.out.println("Ready to checkout!");
+        }
+    }
+}
+```
+
+The code prints `"Ready to checkout!"` for an empty cart, because `allMatch` returns `true` on an empty stream. That's the opposite of what the author wanted.
+
+**Fix:**
+
+```java
+boolean readyToCheckout = !cart.isEmpty()
+    && cart.stream().allMatch(price -> price > 0);
+```
+
+Add an explicit emptiness check before relying on `allMatch`. The same trap applies to `noneMatch`. Whenever a predicate-based check feels like it should "fail" on empty, write the empty check yourself.
+
+<h1 id="findfirst-and-findany">findFirst and findAny</h1>
+
+```java
+Optional<T> findFirst();
+Optional<T> findAny();
+```
+
+Both return `Optional<T>` because the stream might be empty. Both short-circuit and stop the pipeline once an element is found.
+
+The difference is encounter order. `findFirst` returns the first element in encounter order. `findAny` returns whichever element the runtime can produce most cheaply, which may not be the first.
+
+```java
+import java.util.List;
+import java.util.Optional;
+
+public class FindDemo {
+    public static void main(String[] args) {
+        List<String> productNames = List.of("Headphones", "Notebook", "Keyboard", "Mouse", "Cable");
+
+        Optional<String> first = productNames.stream()
+            .filter(name -> name.startsWith("K"))
+            .findFirst();
+
+        Optional<String> any = productNames.parallelStream()
+            .filter(name -> name.startsWith("K"))
+            .findAny();
+
+        first.ifPresent(name -> System.out.println("findFirst: " + name));
+        any.ifPresent(name -> System.out.println("findAny: " + name));
+    }
+}
+```
+
+In this small example they agree, but in a parallel stream over a large source `findAny` can return any matching element. For an unordered stream (created with `unordered()` or from a `HashSet`), `findFirst` behaves the same as `findAny` because there's no encounter order to respect.
+
+In a parallel pipeline, `findAny` can be much faster than `findFirst` because it doesn't wait for the "leftmost" thread to report in. Use `findFirst` only when you need the first element in encounter order. If any match is fine, prefer `findAny`.
+
+<h1 id="toarray">toArray</h1>
+
+```java
+Object[] toArray();
+<A> A[] toArray(IntFunction<A[]> generator);
+```
+
+The no-arg form returns an `Object[]`. Even if your stream is `Stream<String>`, the raw `toArray()` gives you `Object[]`, not `String[]`. If you want a typed array, use the generator form.
+
+```java
+import java.util.List;
+
+public class ToArrayDemo {
+    public static void main(String[] args) {
+        List<String> productNames = List.of("Headphones", "Notebook", "Keyboard");
+
+        Object[] objects = productNames.stream().toArray();
+        String[] strings = productNames.stream().toArray(String[]::new);
+
+        System.out.println("Object array element 0: " + objects[0]);
+        System.out.println("String array length: " + strings.length);
+
+        for (String name : strings) {
+            System.out.println("  " + name);
+        }
+    }
+}
+```
+
+The `String[]::new` is a method reference to the array constructor. It's an `IntFunction<String[]>`: given a size, it returns a fresh `String[]`. The runtime calls it with the final element count.
+
+**What's wrong with this code?**
+
+```java
+import java.util.List;
+
+public class BadToArray {
+    public static void main(String[] args) {
+        List<String> productNames = List.of("Headphones", "Notebook");
+        String[] names = (String[]) productNames.stream().toArray();
+        System.out.println(names[0]);
+    }
+}
+```
+
+This compiles, but it throws `ClassCastException` at runtime. `toArray()` returns an actual `Object[]` instance, not a `String[]` boxed as `Object[]`. You can't cast between them; the array's runtime type is `Object[]`, period.
+
+**Fix:**
+
+```java
+String[] names = productNames.stream().toArray(String[]::new);
+```
+
+The generator form constructs a real `String[]` with the right runtime type.
+
+<h1 id="tolist-java-16">toList (Java 16+)</h1>
+
+```java
+List<T> toList();
+```
+
+Added in Java 16, `Stream.toList()` is the shortest path from a stream to a `List`. It does three things differently from `collect(Collectors.toList())`:
+
+1. It returns an **unmodifiable** list. Trying to `add`, `remove`, or `set` throws `UnsupportedOperationException`.
+2. It allows `null` elements.
+3. It doesn't need the `Collectors` import.
+
+```java
+import java.util.List;
+
+public class ToListDemo {
+    public static void main(String[] args) {
+        List<Double> prices = List.of(19.99, 45.50, 8.75, 120.00);
+
+        List<Double> expensive = prices.stream()
+            .filter(p -> p > 20.0)
+            .toList();
+
+        System.out.println("Expensive items: " + expensive);
+
+        try {
+            expensive.add(99.99);
+        } catch (UnsupportedOperationException e) {
+            System.out.println("Can't modify: " + e.getClass().getSimpleName());
+        }
+    }
+}
+```
+
+`collect(Collectors.toList())` returns a **mutable** `ArrayList`, which is sometimes what you want and sometimes error-prone. If callers expect to mutate, the unmodifiable list from `Stream.toList()` surprises them. If callers shouldn't mutate, the mutable `Collectors.toList()` lets bugs slip in. Pick the one that matches your contract.
+
+`Stream.toList()` may return a more memory-efficient implementation than `ArrayList`. It's also faster in practice because it can size the result exactly when the stream's count is known.
+
+<h1 id="collect-a-brief-introduction">collect: A Brief Introduction</h1>
+
+```java
+<R, A> R collect(Collector<? super T, A, R> collector);
+```
+
+`collect` is the most flexible terminal operation. It takes a `Collector`, which is a recipe for accumulating elements into some result container: a list, a set, a map, a string, a custom summary object. A small taste of how it's used.
+
+```java
+import java.util.List;
+import java.util.stream.Collectors;
+
+public class CollectIntro {
+    public static void main(String[] args) {
+        List<String> productNames = List.of("Headphones", "Notebook", "Keyboard");
+
+        List<String> uppercased = productNames.stream()
+            .map(String::toUpperCase)
+            .collect(Collectors.toList());
+
+        System.out.println(uppercased);
+    }
+}
+```
+
+`Collectors.toList()` is one collector among many. The `Collectors` class also offers `toSet`, `toMap`, `joining`, `groupingBy`, `partitioningBy`, and `teeing`, and you can compose them for things like "group products by category and sum their prices." For now, remember that `collect` is the call to make whenever the answer is a container, and the `Collectors` class has a factory method for almost every container shape you can imagine.
+
+<h1 id="terminal-operations-on-primitive-streams">
+  Terminal Operations on Primitive Streams
+</h1>
+
+`IntStream`, `LongStream`, and `DoubleStream` add a few terminal operations that don't exist on the object `Stream`. These avoid boxing each element back into `Integer`, `Long`, or `Double` just to do arithmetic on it.
+
+| Operation             | Returns                                         | Description                                   |
+| --------------------- | ----------------------------------------------- | --------------------------------------------- |
+| `sum()`               | `int`, `long`, or `double`                      | Sum of all elements                           |
+| `average()`           | `OptionalDouble`                                | Arithmetic mean, empty if the stream is empty |
+| `min()`               | `OptionalInt`, `OptionalLong`, `OptionalDouble` | Smallest element                              |
+| `max()`               | same as `min()`                                 | Largest element                               |
+| `summaryStatistics()` | `IntSummaryStatistics` etc.                     | Count, sum, min, max, and average in one pass |
+
+```java
+import java.util.IntSummaryStatistics;
+import java.util.List;
+
+public class IntStreamTerminals {
+    public static void main(String[] args) {
+        List<Integer> stockLevels = List.of(12, 5, 0, 20, 3, 8);
+
+        int total = stockLevels.stream()
+            .mapToInt(Integer::intValue)
+            .sum();
+
+        double average = stockLevels.stream()
+            .mapToInt(Integer::intValue)
+            .average()
+            .orElse(0.0);
+
+        IntSummaryStatistics stats = stockLevels.stream()
+            .mapToInt(Integer::intValue)
+            .summaryStatistics();
+
+        System.out.println("Total stock: " + total);
+        System.out.println("Average stock: " + average);
+        System.out.println("Stats: " + stats);
+    }
+}
+```
+
+`summaryStatistics()` is the operation to use when you need several aggregates from one pass. It's a single traversal of the data, no matter how many of count, sum, min, max, and average you read.
+
+`stream.mapToInt(...).sum()` beats `stream.reduce(0, Integer::sum)` for adding ints. The primitive stream skips autoboxing, so a million additions become a million `int` adds instead of a million `Integer` creations.
+
+<h1 id="putting-it-together-a-cart-summary">
+  Putting It Together: A Cart Summary
+</h1>
+
+A small program that uses several terminal operations on a shopping cart:
+
+```java
+import java.util.Comparator;
+import java.util.List;
+import java.util.Optional;
+
+public class CartSummary {
+    public static void main(String[] args) {
+        List<CartItem> cart = List.of(
+            new CartItem("Headphones", 79.99, 1),
+            new CartItem("Notebook", 5.50, 3),
+            new CartItem("Keyboard", 39.99, 1),
+            new CartItem("Mouse", 19.99, 2)
+        );
+
+        long lineCount = cart.stream().count();
+
+        double total = cart.stream()
+            .mapToDouble(item -> item.price() * item.quantity())
+            .sum();
+
+        Optional<CartItem> priciest = cart.stream()
+            .max(Comparator.comparingDouble(CartItem::price));
+
+        boolean hasExpensive = cart.stream().anyMatch(item -> item.price() > 50.0);
+
+        boolean allInStock = cart.stream().allMatch(item -> item.quantity() > 0);
+
+        List<String> names = cart.stream()
+            .map(CartItem::name)
+            .toList();
+
+        System.out.println("Line count: " + lineCount);
+        System.out.println("Cart total: $" + total);
+        System.out.println("Priciest line: " + priciest.orElseThrow());
+        System.out.println("Has anything over $50? " + hasExpensive);
+        System.out.println("All in stock? " + allInStock);
+        System.out.println("Names: " + names);
+    }
+}
+
+record CartItem(String name, double price, int quantity) {}
+```
+
+Each terminal operation answers a different question about the same data. Pick the one that matches the question. Don't use `forEach` and a mutable variable when there's a specific terminal that already does what you want.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

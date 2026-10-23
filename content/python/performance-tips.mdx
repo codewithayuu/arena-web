@@ -1,0 +1,494 @@
+---
+title: "Performance Tips"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Performance Tips explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+Python is slower than C, and that's fine. The reason most Python programs feel slow has very little to do with the interpreter and almost everything to do with the wrong data structure, an O(n^2) loop hiding inside something that looked harmless, or work happening that didn't need to happen at all. This lesson covers how to figure out where the time really goes, the small set of habits that pay off in hot code, and what to reach for when pure Python genuinely is the bottleneck.
+
+<h1 id="measure-first-optimize-second">Measure First, Optimize Second</h1>
+
+Donald Knuth's line about premature optimization gets quoted everywhere, but the part people skip is the rest of the sentence: "we should forget about small efficiencies, say about 97% of the time." The point is not to never optimize. It's to find out where the time is actually being spent before changing anything.
+
+Most performance intuition is wrong. A loop that looks slow is often fine. A one-liner that looks tight often hides a quadratic blow-up. The only reliable way to know is to measure.
+
+A normal workflow looks like this:
+
+1. Write the code in the simple, clear way first.
+2. If it's fast enough, stop.
+3. If it's not, profile to find the hot spot.
+4. Change one thing. Measure again.
+5. Stop when the program meets its target.
+
+Step 4 is the one beginners skip. A change that looks like a speedup can easily make things slower because of cache effects, allocation patterns, or a missed assumption. Always re-measure.
+
+The loop in the diagram is the whole game. Don't guess. Don't optimize the section of code that looks ugly. Optimize the section the profiler says is slow.
+
+<h1 id="profiling-tools">Profiling Tools</h1>
+
+Python ships with two profilers that cover most needs.
+
+<h3 id="timeit-for-microbenchmarks">timeit for Microbenchmarks</h3>
+
+`timeit` runs a snippet many times and reports the best total time. It handles the warm-up, the timer resolution, and the noise of garbage collection for you. Use it when comparing two small alternatives.
+
+```python
+import timeit
+
+# Compare two ways to build a string from a list of product names.
+products = ["headphones", "cable", "mouse", "keyboard", "monitor"] * 100
+
+def with_plus():
+    result = ""
+    for name in products:
+        result += name + ", "
+    return result
+
+def with_join():
+    return ", ".join(products)
+
+t1 = timeit.timeit(with_plus, number=1000)
+t2 = timeit.timeit(with_join, number=1000)
+print(f"+= loop:  {t1:.3f}s")
+print(f".join(): {t2:.3f}s")
+print(f"join is {t1 / t2:.1f}x faster")
+```
+
+From the command line, `timeit` is even shorter:
+
+```text
+python -m timeit -s "names = ['headphones'] * 500" "', '.join(names)"
+```
+
+`-s` is the setup (run once), and the next argument is the code under test (run many times). Use `timeit` for any "is A or B faster?" question that fits in a one-liner.
+
+<h3 id="cprofile-for-whole-program-profiling">
+  cProfile for Whole-Program Profiling
+</h3>
+
+`cProfile` measures every function call in a real program. It tells you which functions consumed the most time, how many times each was called, and how much time was spent inside each function versus inside its callees. It's the right tool when you don't know where to look.
+
+```python
+import cProfile
+import pstats
+
+def slow_cart_total(carts):
+    total = 0.0
+    for cart in carts:
+        for item in cart:
+            # Repeated string formatting on the hot path.
+            label = f"{item['name']} x{item['quantity']}"
+            total += item["price"] * item["quantity"]
+    return total
+
+carts = [
+    [{"name": "headphones", "price": 59.99, "quantity": 1},
+     {"name": "cable", "price": 9.99, "quantity": 2}]
+    for _ in range(50_000)
+]
+
+profiler = cProfile.Profile()
+profiler.enable()
+slow_cart_total(carts)
+profiler.disable()
+
+stats = pstats.Stats(profiler).sort_stats("cumulative")
+stats.print_stats(10)
+```
+
+The output (trimmed) shows where the time went:
+
+```text
+150003 function calls in 0.182 seconds
+
+   Ordered by: cumulative time
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.000    0.000    0.182    0.182 example.py:1(<module>)
+        1    0.182    0.182    0.182    0.182 example.py:4(slow_cart_total)
+```
+
+If you'd rather see the report visually, save the stats to a file with `profiler.dump_stats("out.prof")` and open it with `snakeviz out.prof`, which renders an interactive flame chart in the browser. For a running production process, `py-spy` is the usual pick because it attaches without a code change and has very low overhead.
+
+> **Cost:** `cProfile` adds roughly 30-50% overhead to function call timing. The shape of the bottleneck still shows up correctly, but the absolute numbers run slow. Use `timeit` for precise comparisons.
+
+<h3 id="tracemalloc-for-memory">tracemalloc for Memory</h3>
+
+`tracemalloc` is the standard-library way to find which lines of your code allocated the most memory. Turn it on, run the workload, snapshot, sort.
+
+```python
+import tracemalloc
+
+tracemalloc.start()
+
+products = [{"name": f"product-{i}", "price": float(i)} for i in range(100_000)]
+
+snapshot = tracemalloc.take_snapshot()
+top = snapshot.statistics("lineno")
+for stat in top[:3]:
+    print(stat)
+```
+
+The output points at the exact line that allocated each chunk. Useful when a long-running program's resident memory keeps climbing and you need to find which structure is the culprit.
+
+<h1 id="algorithmic-complexity-wins">Algorithmic Complexity Wins</h1>
+
+Before any micro-optimization, check the algorithm. A loop with an `in` check on a list is O(n) per check; doing that inside another loop turns the whole thing into O(n^2). Switching the inner container to a set or a dict makes the lookup O(1) and turns the program from "minutes" into "milliseconds." No micro-tweak comes close.
+
+A common shape:
+
+```python
+# Slow: O(n*m). For each new product, scan the existing list.
+def dedupe_slow(products):
+    result = []
+    for product in products:
+        if product not in result:
+            result.append(product)
+    return result
+
+# Fast: O(n). Membership check on a set is O(1) on average.
+def dedupe_fast(products):
+    seen = set()
+    result = []
+    for product in products:
+        if product not in seen:
+            seen.add(product)
+            result.append(product)
+    return result
+```
+
+On 50,000 product names, the slow version takes around 8 seconds on a typical laptop. The fast version finishes in about 6 milliseconds. The interpreter didn't get faster; the data structure changed.
+
+A short table of the choices that come up most often:
+
+| Need                              | Wrong choice                             | Right choice                    | Why                                                                                         |
+| --------------------------------- | ---------------------------------------- | ------------------------------- | ------------------------------------------------------------------------------------------- |
+| Append-only queue                 | `list.insert(0, x)`                      | `collections.deque`             | List insert at the front is O(n); deque is O(1) at both ends                                |
+| Membership test in a hot loop     | `x in some_list`                         | `x in some_set`                 | List is O(n); set is O(1) average                                                           |
+| Counting things                   | Dict with manual `if key in d`           | `collections.Counter`           | Single C-level update per key                                                               |
+| Sorted list with frequent inserts | Repeated `list.sort()` after each append | `bisect.insort`                 | Re-sorting is O(n log n) per insert; bisect insert is O(n) for the shift but skips the sort |
+| Group by key                      | Manual `if key in d: d[key].append(x)`   | `collections.defaultdict(list)` | Single line, fewer attribute lookups                                                        |
+
+> **Cost:** `x in some_list` is O(n). If the loop body does it once, fine. If it does it inside another loop, the whole thing is O(n\*m). Convert the list to a set if the membership test runs more than a handful of times.
+
+<h1 id="built-in-functions-are-c-optimized">
+  Built-in Functions Are C-Optimized
+</h1>
+
+A lot of the functions that look like ordinary Python (`sum`, `min`, `max`, `any`, `all`, `len`, `sorted`, `map`, `filter`) are implemented in C inside the CPython source. Calling them on an iterable does one Python-level call and then runs at C speed. Rewriting the same operation as a hand-rolled `for` loop pays the Python-level cost on every iteration.
+
+```python
+import timeit
+
+prices = [19.99] * 100_000
+
+def manual_sum():
+    total = 0.0
+    for price in prices:
+        total += price
+    return total
+
+def builtin_sum():
+    return sum(prices)
+
+print("manual:", timeit.timeit(manual_sum, number=100))
+print("builtin:", timeit.timeit(builtin_sum, number=100))
+```
+
+The pattern holds for the rest of them. `any(stock > 0 for stock in stocks)` is faster than a `for` loop with an early `return True`, partly because the generator side is C-driven and partly because `any` short-circuits inside the C layer.
+
+A subtle case is `min` and `max` with a `key` function. The `key` runs once per element, in Python, so a very expensive key undoes the C advantage. For a simple key like `lambda product: product["price"]`, the built-in is still faster than rolling your own loop.
+
+> **Cost:** `sum(generator)` walks the generator without materializing a list, which keeps memory flat for large inputs. `sum(list(generator))` builds a throwaway list first, doubling allocation. Prefer the generator form unless you need the list for something else.
+
+<h1 id="local-variable-lookup-beats-global">
+  Local Variable Lookup Beats Global
+</h1>
+
+Python looks up names in a fixed order: local scope, enclosing scope, global scope, built-ins. Local lookup is a fast array index into the function's stack frame. Global and built-in lookups are dict lookups. The cost per call is tiny, but in a hot inner loop that runs millions of times it adds up.
+
+Two tricks help in genuinely hot loops:
+
+1. Pull globals you need into a local variable at the top of the function.
+2. Bind frequently called methods to a local name.
+
+```python
+import math
+
+# Slower: every call inside the loop does a global lookup for `math`
+# and an attribute lookup for `sqrt`.
+def distances_slow(points):
+    result = []
+    for x, y in points:
+        result.append(math.sqrt(x * x + y * y))
+    return result
+
+# Faster: `sqrt` is a local name. No global, no attribute access in the loop.
+def distances_fast(points):
+    sqrt = math.sqrt
+    result = []
+    append = result.append
+    for x, y in points:
+        append(sqrt(x * x + y * y))
+    return result
+```
+
+On a million points, the two versions differ by about 15-25% on a typical CPython build. This is the kind of change to make only when a profiler has already pointed at this exact loop. In cold code it's noise, and it makes the code slightly harder to read.
+
+<h1 id="string-concatenation-in-loops">String Concatenation in Loops</h1>
+
+Strings are immutable in Python. `result += chunk` doesn't extend `result`; it allocates a new string with the combined contents and reassigns `result` to it. Inside a loop, that means every iteration allocates a new string whose size grows with the loop count. The total work is O(n^2) in the size of the output.
+
+The fix is to collect the pieces into a list and call `"".join(...)` once at the end. `join` walks the list, sums the lengths, allocates a single result string, and copies each piece in. That's O(n) total.
+
+```python
+import timeit
+
+chunks = ["item-" + str(i) for i in range(10_000)]
+
+def with_plus_equals():
+    result = ""
+    for chunk in chunks:
+        result += chunk
+    return result
+
+def with_join():
+    return "".join(chunks)
+
+print("+=:   ", timeit.timeit(with_plus_equals, number=50))
+print("join: ", timeit.timeit(with_join, number=50))
+```
+
+A real timing comparison for building a 10,000-piece string:
+
+| Method                                   | Time (50 runs) | Allocations       | Notes                                                   |
+| ---------------------------------------- | -------------- | ----------------- | ------------------------------------------------------- |
+| `+=` in a loop                           | ~0.74s         | One per iteration | O(n^2) in output size                                   |
+| `"".join(list)`                          | ~0.018s        | One total         | Recommended default                                     |
+| `io.StringIO().write` then `.getvalue()` | ~0.045s        | Streaming buffer  | Good when you build incrementally and don't want a list |
+| `format` / f-strings used once           | n/a            | One per call      | Fine outside loops, same trap inside                    |
+
+CPython has an optimization that turns some `s += x` loops into in-place buffer growth when the string has a refcount of 1, but the optimization is fragile (it breaks under PyPy, under tracing, under any code that takes another reference to `s`, and so on). Treat it as luck, not a feature, and write `join` from the start.
+
+> **Cost:** `result = result + extra` inside a loop is O(n^2). `"".join(parts)` is O(n). For 10,000 pieces this is the difference between milliseconds and seconds.
+
+<h1 id="caching-with-functoolslru_cache-and-functoolscache">
+  Caching with functools.lru_cache and functools.cache
+</h1>
+
+When a function is pure (same inputs always produce the same output) and gets called with repeated inputs, caching the results turns repeated work into a dict lookup. The standard library ships two decorators for this.
+
+`functools.cache` (Python 3.9+) is an unbounded cache: every call's result is kept forever. `functools.lru_cache(maxsize=N)` bounds the cache to `N` entries and evicts the least-recently-used one when full.
+
+```python
+from functools import cache, lru_cache
+
+@cache
+def shipping_cost(weight_kg: float, zone: str) -> float:
+    # Pretend this is a slow lookup against a rate table.
+    base = {"local": 2.0, "regional": 5.0, "national": 9.0}[zone]
+    return base + weight_kg * 0.5
+
+@lru_cache(maxsize=1024)
+def product_recommendations(user_id: int) -> list[str]:
+    # Pretend this is an expensive call to a recommendation model.
+    return [f"product-{(user_id + i) % 100}" for i in range(5)]
+```
+
+The first call computes the result. Every later call with the same arguments returns the cached value. The classic demo is recursive Fibonacci, which goes from exponential to linear after one decorator:
+
+```python
+import timeit
+from functools import cache
+
+def fib_slow(n):
+    if n < 2:
+        return n
+    return fib_slow(n - 1) + fib_slow(n - 2)
+
+@cache
+def fib_fast(n):
+    if n < 2:
+        return n
+    return fib_fast(n - 1) + fib_fast(n - 2)
+
+print("slow(30):", timeit.timeit(lambda: fib_slow(30), number=5))
+print("fast(30):", timeit.timeit(lambda: fib_fast(30), number=5))
+```
+
+The decorated version computes each `fib_fast(k)` once for `k` from 0 to 30 and reuses the result.
+
+Three rules for caching:
+
+1. The function must be pure. If `shipping_cost` reads a rate table that changes, caching gives stale answers.
+2. Arguments must be hashable. Lists and dicts can't be cache keys; use tuples or frozensets.
+3. Use `lru_cache(maxsize=N)` for anything that could see many distinct keys. An unbounded `@cache` on a function called with random product IDs is a memory leak waiting to happen.
+
+`@cache` and `@lru_cache` are full decorators, so they show up under their wrapped function name in tracebacks and in `cProfile` output. They also expose `cache_info()` and `cache_clear()` for inspection.
+
+```python
+print(fib_fast.cache_info())
+# CacheInfo(hits=27, misses=31, maxsize=None, currsize=31)
+```
+
+<h1 id="avoiding-repeated-attribute-access">
+  Avoiding Repeated Attribute Access
+</h1>
+
+Every `obj.attr` in Python is a lookup. For a regular instance, that's a chain of checks: instance dict, class dict, then the MRO. In a tight loop, doing the same lookup over and over wastes time you can avoid by storing the result in a local name once.
+
+```python
+# Slower: re-resolves cart.items["price"] on every loop iteration,
+# even though the dict reference doesn't change.
+def cart_total_slow(cart):
+    total = 0.0
+    for name in cart.items:
+        total += cart.items[name]["price"] * cart.items[name]["quantity"]
+    return total
+
+# Faster: pull the dict out once, do two lookups per item instead of four.
+def cart_total_fast(cart):
+    total = 0.0
+    items = cart.items
+    for item in items.values():
+        total += item["price"] * item["quantity"]
+    return total
+```
+
+The fast version isn't faster because attribute access is slow in absolute terms. It's faster because the slow version did the same lookup four times per iteration on a structure that never changes. Pulling the lookup outside the loop is the same idea as loop-invariant code motion in a compiler. Python doesn't do it automatically.
+
+The same trick applies to method binding:
+
+```python
+# Inside an inner loop, `seen.add` resolves the method on every call.
+seen = set()
+for item in items:
+    seen.add(item)
+
+# Bind once at the top of the function, call the local name in the loop.
+seen = set()
+add = seen.add
+for item in items:
+    add(item)
+```
+
+This is a hot-loop trick. Don't apply it everywhere; it makes the code harder to read for very little gain in cold paths.
+
+<h1 id="__slots__-for-many-instance-classes">
+  __slots__ for Many-Instance Classes
+</h1>
+
+A regular Python class stores its instance attributes in a per-instance `__dict__`. That's flexible (you can set any attribute at any time) but expensive. Each instance carries a dict of its own, and a dict has overhead even when it's mostly empty.
+
+If you know the full list of attributes a class will ever have, declaring `__slots__` replaces the dict with a fixed array. This makes each instance smaller and attribute access slightly faster, and forbids adding new attributes at runtime.
+
+```python
+class ProductDict:
+    def __init__(self, name, price, stock):
+        self.name = name
+        self.price = price
+        self.stock = stock
+
+class ProductSlots:
+    __slots__ = ("name", "price", "stock")
+
+    def __init__(self, name, price, stock):
+        self.name = name
+        self.price = price
+        self.stock = stock
+```
+
+On CPython 3.12, `ProductDict` instances take roughly 296 bytes each (after `__dict__` and the dict's keys are counted), while `ProductSlots` instances take around 64 bytes. For a million products in memory, that's the difference between 280 MB and 60 MB.
+
+For now, the rule is: if you're going to allocate hundreds of thousands of instances of a class, declare `__slots__` and measure the memory drop. Edge cases include inheritance interactions, weakref support, the `__dict__` slot, and trade-offs like losing dynamic attribute creation and breaking some pickling patterns.
+
+<h1 id="when-pure-python-is-the-bottleneck">
+  When Pure Python Is the Bottleneck
+</h1>
+
+Sometimes the algorithm is right, the data structures are right, the loops are tight, and the program is still too slow. The interpreter overhead per operation has a floor, and numerical or array-heavy work can hit it. At that point, the answer is to drop out of pure Python for the hot section.
+
+A short tour of the options:
+
+| Tool                                       | Use it for                                                      | Notes                                                                                                                       |
+| ------------------------------------------ | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `numpy`                                    | Numerical arrays, linear algebra, vectorized math               | Operations on N elements run in one C call. Often 10-100x faster than a Python loop for the same math                       |
+| `pandas`                                   | Tabular data, joins, group-bys, time series                     | Built on numpy, plus column-oriented operations                                                                             |
+| `numba`                                    | JIT-compiling numerical Python loops to machine code            | `@njit` decorator, mostly transparent; great when you'd love numpy but the loop has too much logic                          |
+| `cython`                                   | Compiling Python-like code to C, with optional type annotations | Heavier setup; gives you C performance with mostly Python syntax                                                            |
+| C extensions (`ctypes`, `cffi`, the C API) | Calling existing C libraries, writing speed-critical extensions | Most overhead is the FFI boundary; useful when libraries already exist in C                                                 |
+| PyPy                                       | Running the same Python code under a tracing JIT                | Drop-in for many programs, often 4-10x faster for long-running pure-Python workloads. Compatibility varies for C extensions |
+
+For numerical work, `numpy` is usually the first stop and often the last:
+
+```python
+import numpy as np
+
+prices = np.array([19.99, 29.99, 9.99, 49.99] * 250_000)
+quantities = np.array([1, 2, 1, 3] * 250_000)
+
+# One C-level multiply-and-sum across a million elements.
+total = float((prices * quantities).sum())
+```
+
+The same calculation as a Python loop is about 50x slower on most laptops. The difference is not the math; it's that numpy's `*` and `sum` are one Python call each, with the work happening in C over a contiguous buffer.
+
+`numba` is the fallback when the loop has branches or accumulators that don't vectorize cleanly:
+
+```python
+from numba import njit
+
+@njit
+def cart_total(prices, quantities):
+    total = 0.0
+    for i in range(len(prices)):
+        if quantities[i] > 0:
+            total += prices[i] * quantities[i]
+    return total
+```
+
+The first call compiles, the rest run at near-C speed. The compatibility surface is smaller than full Python (no arbitrary objects, no dynamic dispatch), but for numerical inner loops it's a clean fit.
+
+C extensions and Cython are the heavier tools. Reach for them when you've measured, none of the above worked, and the hot path is small enough to rewrite in a more careful language.
+
+<h1 id="gil-io-bound-and-cpu-bound">GIL, I/O Bound, and CPU Bound</h1>
+
+The Global Interpreter Lock (GIL) is the rule inside CPython that says only one thread can execute Python bytecode at a time. For performance work, what matters is the consequence: spinning up multiple Python threads to run pure-Python computation does not give you more throughput, because the GIL forces them to take turns.
+
+This makes the difference between I/O-bound and CPU-bound work the central question for any "should I add concurrency?" decision.
+
+**I/O-bound** work spends most of its time waiting: for a network response, a disk read, a database query, a subprocess. While one thread waits, it releases the GIL, which lets another thread run. Threads (and `asyncio`) are the right fit here. Ten threads doing HTTP requests can run roughly in parallel because they're all waiting for sockets most of the time.
+
+**CPU-bound** work spends most of its time computing inside Python: parsing, image transforms, numerical loops written in pure Python, regex on large strings. Threads don't help, because the GIL serializes them. The right answer is `multiprocessing` (separate Python processes, each with its own interpreter and its own GIL) or moving the hot section to numpy / Cython / numba / a C extension, which releases the GIL during the heavy C work.
+
+A simple decision flow:
+
+The diagram is a shorthand. The first question to ask before adding any kind of parallelism is "what is this thread or process going to do while it's running?" If the answer is "wait," threads work. If the answer is "compute in Python," they won't, and the fix is either processes or escaping to native code.
+
+> **Cost:** `multiprocessing` has real overhead per task: spinning up a process, pickling arguments to send to it, and pickling results back. For tasks under a few milliseconds each, the overhead can dominate. Batch small tasks before sending them to a worker pool.
+
+<h1 id="generators-for-large-data">Generators for Large Data</h1>
+
+Materializing a list when you only need to iterate once wastes memory. Generators (and generator expressions) yield one item at a time and never hold the whole sequence in memory. For large inputs, this is the difference between fitting in memory and not.
+
+```python
+# Materializes a 10-million-element list (~80 MB) just to sum it.
+total = sum([price * 1.1 for price in prices])
+
+# Streams one item at a time, allocates nothing extra.
+total = sum(price * 1.1 for price in prices)
+```
+
+The second form drops the square brackets and becomes a generator expression. `sum` consumes it lazily and never builds the intermediate list.
+
+The same pattern applies anywhere a function takes an iterable: `any`, `all`, `max`, `min`, `"".join`, and most things that loop. The exception is when you need the list for indexing, multiple passes, or `len`. Then a list is the right structure.
+
+> **Cost:** A generator expression has tiny per-element overhead compared to a list comprehension (it's a generator object with `__next__` calls), so for very small inputs the list comprehension is a hair faster. The break-even is usually a few hundred elements; past that, the generator wins on memory and roughly ties on CPU.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

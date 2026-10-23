@@ -1,0 +1,516 @@
+---
+title: "@property Decorator"
+readTime: "10 min read"
+lastUpdated: "June 6, 2026"
+description: "@property Decorator explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="why-python-doesnt-need-getters-and-setters">
+  Why Python Doesn't Need Getters and Setters
+</h1>
+
+Most languages teach you to wrap every field in a pair of methods because exposing the field directly locks you in. Once outside code writes `product.price = 30`, you can't later say "wait, I need to reject negative prices" without breaking every caller. So you start with `getPrice()` and `setPrice(value)` from day one, just in case.
+
+Python solves this differently. You can ship a class with a plain attribute today, and tomorrow turn that attribute into a method-backed property. Every line of caller code keeps working unchanged, because the syntax for reading and writing a property is the same as the syntax for reading and writing a plain attribute.
+
+Start with the most boring version of a product:
+
+```python
+class Product:
+    def __init__(self, name, price):
+        self.name = name
+        self.price = price
+
+mouse = Product("Wireless Mouse", 29.99)
+print(mouse.price)
+mouse.price = 24.99
+print(mouse.price)
+```
+
+Both reads and the write go straight to the attribute. There's no method call, no validation, nothing in between. Now suppose three weeks later someone files a bug: a customer was charged `-50.00` for a mouse because an admin tool wrote a negative number into `price`. You need to reject negative prices.
+
+In a language that forces getters and setters, you'd already have `setPrice(value)` everywhere and you'd just add the check inside. In Python, you have `product.price = -50` scattered across the codebase. Rewriting every assignment to call a new method would be painful. So Python lets you keep the attribute syntax and add the validation behind it:
+
+```python
+class Product:
+    def __init__(self, name, price):
+        self.name = name
+        self.price = price
+
+    @property
+    def price(self):
+        return self._price
+
+    @price.setter
+    def price(self, value):
+        if value < 0:
+            raise ValueError("price cannot be negative")
+        self._price = value
+
+mouse = Product("Wireless Mouse", 29.99)
+print(mouse.price)
+mouse.price = 24.99
+print(mouse.price)
+```
+
+The caller's code from the first snippet still works without a single edit. The difference is invisible from outside: `mouse.price` looks like an attribute, behaves like an attribute, but actually runs a method on every read and write. This is the payoff. You don't pay the getter/setter tax up front. You add a property only when you actually need one.
+
+The convention "private name with underscore + public property" is how Python keeps the real value (`self._price`) separate from the public interface (`self.price`). Without that split, the setter would call itself recursively, which we'll see in a moment.
+
+<h1 id="property-make-a-method-look-like-an-attribute">
+  @property: Make a Method Look Like an Attribute
+</h1>
+
+`@property` is a decorator that turns a method into something callers access without parentheses. The method becomes a read-only computed attribute. When someone writes `cart.total`, Python actually runs the `total` method behind the scenes and returns its result.
+
+Start with a cart that computes its total from its items:
+
+```python
+class Cart:
+    def __init__(self):
+        self.items = []
+
+    @property
+    def total(self):
+        return sum(item["price"] * item["quantity"] for item in self.items)
+
+cart = Cart()
+cart.items.append({"name": "Wireless Mouse", "price": 29.99, "quantity": 2})
+cart.items.append({"name": "USB Cable",      "price": 9.99,  "quantity": 1})
+
+print(f"Cart total: ${cart.total:.2f}")
+```
+
+Notice the call site: `cart.total`, not `cart.total()`. The decorator handled that. Inside the class, `total` is still a regular method that takes `self`. Outside, callers see it as an attribute. That asymmetry is exactly what we want; the implementation can be a method, while the interface is an attribute.
+
+What `@property` actually does is replace the function `total` on the class with a special **property object** that knows how to behave when you read or write `cart.total`. When you say `cart.total`, Python doesn't find a normal attribute on `cart`; it finds the property object on the class, and the property object calls the function for you.
+
+Here's the access flow in pictures:
+
+The diagram shows the fork. For a plain attribute (green), Python just reads or writes the instance dictionary. For a property (teal), Python routes through the property object, which calls the method you wrote. Same `cart.price` syntax at the call site, two very different paths underneath.
+
+Because `total` here has only a getter, trying to assign to it fails:
+
+```python
+cart.total = 0
+```
+
+That's read-only behavior, and we'll come back to it deliberately later in the lesson. For now, the takeaway is: `@property` alone gives you a computed attribute that callers read with no parentheses.
+
+<h1 id="namesetter-make-a-property-writable">
+  @&lt;name&gt;.setter: Make a Property Writable
+</h1>
+
+A property with only `@property` is read-only. To allow assignment, you pair the getter with a setter, decorated as `@<name>.setter`. The name has to match the property name, and the setter takes `self` and the value being assigned.
+
+This is the place to put validation. The setter runs on every write, so any rule you want to enforce ("price must be non-negative", "stock can't be a float", "email needs an @ sign") goes here:
+
+```python
+class Product:
+    def __init__(self, name, price):
+        self.name = name
+        self.price = price
+
+    @property
+    def price(self):
+        return self._price
+
+    @price.setter
+    def price(self, value):
+        if not isinstance(value, (int, float)):
+            raise TypeError("price must be a number")
+        if value < 0:
+            raise ValueError("price cannot be negative")
+        self._price = round(value, 2)
+
+mouse = Product("Wireless Mouse", 29.99)
+mouse.price = 24.999
+print(mouse.price)
+
+mouse.price = -5
+```
+
+Three things to notice:
+
+1. **The setter ran on `__init__` too.** When `__init__` writes `self.price = price`, that assignment goes through the setter. So the validation kicks in for the constructor, not just for later edits. This is what you want: no way for a `Product` to exist with a negative price.
+2. **The setter can transform the value.** It stored `round(value, 2)`, not `value` directly. So `24.999` became `24.99`. The caller's view never sees the rounding, only the cleaned value.
+3. **The storage name is different from the public name.** The real value lives in `self._price`, and the property `price` is the public face. If you tried to store it in `self.price` from inside the setter, you'd recurse forever, because `self.price = ...` would call the setter again. The leading underscore is the standard convention for "this is the storage, not the API".
+
+Let's see what happens if you forget the underscore:
+
+**What's wrong with this code?**
+
+```python
+class Product:
+    def __init__(self, price):
+        self.price = price
+
+    @property
+    def price(self):
+        return self.price
+
+    @price.setter
+    def price(self, value):
+        self.price = value
+```
+
+`self.price = value` inside the setter is the same as any other `self.price = ...`. It triggers the setter again, which assigns to `self.price`, which triggers the setter again, and so on. The fix is to store the value under a different name (`self._price`) and have the getter return that same private name.
+
+**Fix:**
+
+```python
+class Product:
+    def __init__(self, price):
+        self.price = price
+
+    @property
+    def price(self):
+        return self._price
+
+    @price.setter
+    def price(self, value):
+        self._price = value
+```
+
+The setter is also the place where you'd raise `ValueError` for bad inputs. Bad type? Raise `TypeError`. Bad value but right type? Raise `ValueError`. Following Python's convention here makes your class feel like the standard library.
+
+<h1 id="namedeleter-the-rare-delete-case">
+  @&lt;name&gt;.deleter: The Rare Delete Case
+</h1>
+
+You can also tell a property what to do when someone writes `del product.price`. The decorator is `@<name>.deleter`, and the method takes only `self`. This is the least-used of the three, but it shows up when "deleting" needs to mean something specific, like resetting to a default or clearing a cached value.
+
+```python
+class Product:
+    def __init__(self, name):
+        self.name = name
+        self._discount = 0.0
+
+    @property
+    def discount(self):
+        return self._discount
+
+    @discount.setter
+    def discount(self, value):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("discount must be between 0 and 1")
+        self._discount = value
+
+    @discount.deleter
+    def discount(self):
+        print(f"clearing discount on {self.name}")
+        self._discount = 0.0
+
+mouse = Product("Wireless Mouse")
+mouse.discount = 0.25
+print(mouse.discount)
+
+del mouse.discount
+print(mouse.discount)
+```
+
+`del mouse.discount` doesn't remove the attribute or the property. It just calls the deleter, which in this case resets the underlying storage to `0.0`. The property itself stays in place; you can read and write `mouse.discount` again right after.
+
+Most of the time you don't need a deleter. The two common reasons to add one are: clearing a cached or derived value so it gets recomputed next time, and resetting a piece of state to a default in a way that's more readable than `obj.field = DEFAULT`. If neither of those matches your case, skip the deleter.
+
+<h1 id="computed-properties-values-calculated-on-the-fly">
+  Computed Properties: Values Calculated on the Fly
+</h1>
+
+The `Cart.total` we saw earlier is a **computed property**: there's no `self._total` stored anywhere. The value is calculated fresh from other attributes each time you read it. This is one of the most useful uses of `@property`, because it keeps related values automatically in sync without any code on your side.
+
+Here's a slightly fuller cart that uses two computed properties:
+
+```python
+class Cart:
+    def __init__(self):
+        self.items = []
+
+    @property
+    def item_count(self):
+        return sum(item["quantity"] for item in self.items)
+
+    @property
+    def total(self):
+        return sum(item["price"] * item["quantity"] for item in self.items)
+
+cart = Cart()
+cart.items.append({"name": "Wireless Mouse", "price": 29.99, "quantity": 2})
+cart.items.append({"name": "USB Cable",      "price": 9.99,  "quantity": 1})
+
+print(f"Items in cart: {cart.item_count}")
+print(f"Cart total:    ${cart.total:.2f}")
+
+cart.items.append({"name": "HDMI Cable", "price": 14.99, "quantity": 1})
+
+print(f"Items in cart: {cart.item_count}")
+print(f"Cart total:    ${cart.total:.2f}")
+```
+
+Nobody told `item_count` or `total` to refresh. They didn't have to. Every read recomputes from the current list of items. There's no `update_total()` to call, no risk of a stale total that doesn't match the items list. The trade-off is that each read does the work again, which matters once the computation gets heavy. We'll see how to cache the result in a moment.
+
+Computed properties pair well with classes whose internal state changes over time:
+
+```python
+class Order:
+    SHIPPING_FEE = 5.99
+    FREE_SHIPPING_THRESHOLD = 50.00
+
+    def __init__(self, items):
+        self.items = items
+
+    @property
+    def subtotal(self):
+        return sum(self.items)
+
+    @property
+    def shipping(self):
+        if self.subtotal >= self.FREE_SHIPPING_THRESHOLD:
+            return 0.0
+        return self.SHIPPING_FEE
+
+    @property
+    def total(self):
+        return self.subtotal + self.shipping
+
+small_order = Order([19.99, 9.99])
+big_order   = Order([29.99, 14.99, 19.99])
+
+print(f"small subtotal: ${small_order.subtotal:.2f}, ship: ${small_order.shipping:.2f}, total: ${small_order.total:.2f}")
+print(f"big   subtotal: ${big_order.subtotal:.2f}, ship: ${big_order.shipping:.2f}, total: ${big_order.total:.2f}")
+```
+
+Three properties, each derived from `self.items`. `total` even depends on another property (`subtotal` and `shipping`). You can build derived values on top of derived values, and each one always reflects the current items list.
+
+<h1 id="read-only-properties-getter-without-a-setter">
+  Read-Only Properties: Getter Without a Setter
+</h1>
+
+Leave off the `@<name>.setter` and you get a **read-only** property. Callers can read it, but any attempt to assign raises `AttributeError`. This is the right tool for fields that should be set once at construction time and never change afterward, like a customer's ID:
+
+```python
+class Customer:
+    def __init__(self, customer_id, name, email):
+        self._customer_id = customer_id
+        self.name = name
+        self.email = email
+
+    @property
+    def customer_id(self):
+        return self._customer_id
+
+alice = Customer(1001, "Alice", "alice@example.com")
+print(alice.customer_id)
+print(alice.name)
+
+alice.name = "Alice B."
+print(alice.name)
+
+alice.customer_id = 9999
+```
+
+`name` is a plain attribute and accepts reassignment. `customer_id` is a read-only property and refuses. The `_customer_id` storage is technically still reachable as `alice._customer_id` (Python doesn't enforce true privacy), but the leading underscore is a strong "do not touch" signal, and going through the property is the only intended way.
+
+Read-only properties also work well with computed values you want to expose but never accept writes for:
+
+```python
+class Cart:
+    def __init__(self):
+        self.items = []
+
+    @property
+    def total(self):
+        return sum(item["price"] * item["quantity"] for item in self.items)
+```
+
+This is exactly the cart from earlier. Because there's no setter, `cart.total = 0` fails. That's the right behavior: a total isn't something you set, it's something derived from the items. Refusing the assignment catches a whole class of bugs where someone tries to "fix" the total instead of fixing the items.
+
+> **Cost:** A property read calls a function under the hood. It's slightly slower than a plain attribute read, maybe a few hundred nanoseconds versus tens of nanoseconds. Imperceptible in normal code. Measurable only inside tight numeric loops that read the same property millions of times. If a benchmark says you have a problem, cache the value in a local variable before the loop instead of reading the property each iteration.
+
+<h1 id="functoolscached_property-when-the-computation-is-expensive">
+  functools.cached_property: When the Computation Is Expensive
+</h1>
+
+A computed property is great until the computation is expensive and the inputs don't change. Reading `cart.total` 50 times in a render loop runs the sum 50 times, even when no items have been added between reads. For a small cart that's fine. For something that scans 10,000 items or hits a database, it isn't.
+
+`functools.cached_property` solves this for cases where the value is computed once and then doesn't need to change. It's a decorator from the standard library that works almost exactly like `@property`, except the first access stores the result on the instance, and every later access reads that stored value directly. No more recomputation.
+
+```python
+from functools import cached_property
+
+class Order:
+    def __init__(self, items):
+        self.items = items
+
+    @cached_property
+    def total(self):
+        print("computing total...")
+        return sum(item["price"] * item["quantity"] for item in self.items)
+
+order = Order([
+    {"name": "Wireless Mouse", "price": 29.99, "quantity": 2},
+    {"name": "USB Cable",      "price": 9.99,  "quantity": 1},
+])
+
+print(order.total)
+print(order.total)
+print(order.total)
+```
+
+`"computing total..."` prints once, not three times. The first read runs the method, stores the result as `order.total` on the instance, and returns it. From then on, attribute lookup finds the stored value directly without calling the method.
+
+The catch is exactly what makes it fast: the cached value doesn't update when the inputs change. If you mutate `order.items` after reading `order.total` once, the cached total stays at the old value. You'd have to delete the cached attribute (`del order.total`) to force a recomputation. So `cached_property` fits values that are effectively immutable for the lifetime of the object, or where you control invalidation yourself. For values that can change at any time, a regular `@property` is safer because it always reflects the current state.
+
+`cached_property` has been in the standard library since Python 3.8. Before that, the common workaround was a manual cache attribute inside a regular `@property`. The standard library version is cleaner and handles the lookup correctly without you writing the cache logic each time.
+
+<h1 id="a-fuller-example-product-cart-customer">
+  A Fuller Example: Product, Cart, Customer
+</h1>
+
+Here's a small e-commerce snippet that pulls every piece of this lesson together: validation in a setter, a computed property, a read-only property, and a deleter that resets to a default.
+
+```python
+from functools import cached_property
+
+class Product:
+    def __init__(self, name, price):
+        self.name = name
+        self.price = price
+
+    @property
+    def price(self):
+        return self._price
+
+    @price.setter
+    def price(self, value):
+        if not isinstance(value, (int, float)):
+            raise TypeError("price must be a number")
+        if value < 0:
+            raise ValueError("price cannot be negative")
+        self._price = round(value, 2)
+
+class Cart:
+    def __init__(self):
+        self.items = []
+
+    @property
+    def total(self):
+        return sum(p.price * qty for p, qty in self.items)
+
+class Customer:
+    def __init__(self, customer_id, name):
+        self._customer_id = customer_id
+        self.name = name
+        self._discount = 0.0
+
+    @property
+    def customer_id(self):
+        return self._customer_id
+
+    @property
+    def discount(self):
+        return self._discount
+
+    @discount.setter
+    def discount(self, value):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("discount must be between 0 and 1")
+        self._discount = value
+
+    @discount.deleter
+    def discount(self):
+        self._discount = 0.0
+
+mouse = Product("Wireless Mouse", 29.99)
+cable = Product("USB Cable",      9.99)
+
+cart = Cart()
+cart.items.append((mouse, 2))
+cart.items.append((cable, 1))
+
+alice = Customer(1001, "Alice")
+alice.discount = 0.10
+
+raw_total = cart.total
+final_total = raw_total * (1 - alice.discount)
+
+print(f"customer:    {alice.name} (id={alice.customer_id})")
+print(f"raw total:   ${raw_total:.2f}")
+print(f"discount:    {alice.discount * 100:.0f}%")
+print(f"final total: ${final_total:.2f}")
+
+del alice.discount
+print(f"discount after del: {alice.discount}")
+```
+
+Every property pulls its weight. `Product.price` validates type and value on every write, including the one inside `__init__`. `Cart.total` is a fresh computation each time, so adding items to the cart is immediately reflected in the total. `Customer.customer_id` is read-only; you can't accidentally renumber a customer. `Customer.discount` validates the range on writes and resets to zero on `del`. The caller code reads all of these the same way: with a dot and no parentheses.
+
+<h1 id="quiz">Quiz</h1>
+
+<h1 id="quiz-questions">Quiz Questions</h1>
+
+**Question 1: What is the main reason Python code often starts with plain attributes instead of writing getter and setter methods immediately?**
+
+- [x] Code can keep using obj.price while validation is added later.
+- [ ] Every attribute read is automatically validated by Python.
+- [ ] Properties remove the need for instance attributes entirely.
+- [ ] Python rewrites get_price() calls into attribute access.
+
+**Question 2: A class has a property named price. Which statement about adding a setter is correct?**
+
+- [x] Use @price.setter and define a method that receives self and value.
+- [ ] Use @property.setter and define a method named set_price.
+- [ ] Define **setattr** because properties cannot handle assignment.
+- [ ] Assign a lambda to self.price inside **init** to validate writes.
+
+**Question 3: Why do property setters usually store the real value in an underscore attribute such as self.\_price?**
+
+- [x] It avoids calling the same property setter recursively.
+- [ ] It makes the value immutable after **init** finishes.
+- [ ] It forces Python to store the value on the class.
+- [ ] It prevents subclasses from reading the stored value.
+
+**Question 4: A @property has a getter but no setter. What happens when user code tries to assign to that property?**
+
+- [x] Python raises AttributeError instead of creating a new value.
+- [ ] Python silently creates a normal instance attribute.
+- [ ] Python calls the getter and replaces its return value.
+- [ ] Python stores the value only until the next attribute read.
+
+**Question 5: Which statement best describes functools.cached_property?**
+
+- [x] It computes once, stores the result, and reuses it on later reads.
+- [ ] It calls the getter each time but caches local variables only.
+- [ ] It validates assignments before storing values in **slots**.
+- [ ] It makes every property thread-safe by using the GIL.
+
+**Question 6: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 7: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+**Question 8: What is the output of this Python program?**
+
+- [ ]
+- [ ]
+- [ ]
+- [ ]
+
+<QuizCard />
+
+<CommentsSection />
+
+</LessonCard>

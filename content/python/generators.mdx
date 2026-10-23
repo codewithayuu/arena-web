@@ -1,0 +1,220 @@
+---
+title: "Generators"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Generators explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+<h1 id="what-yield-actually-does">What yield Actually Does</h1>
+
+A regular function runs from top to bottom every time you call it and produces a single return value. A generator function looks like a regular function with one twist: somewhere inside its body, it uses `yield` instead of (or in addition to) `return`. The presence of `yield` changes everything about how Python treats the function.
+
+```python
+def read_orders():
+    yield "order-1"
+    yield "order-2"
+    yield "order-3"
+```
+
+Two things make this different from a normal function. First, calling `read_orders()` does **not** run any of the body. It builds and returns a generator object instead, with the function's body parked on the very first line.
+
+```python
+>>> gen = read_orders()
+>>> gen
+<generator object read_orders at 0x10a4f3220>
+>>> print("we haven't printed anything from inside read_orders yet")
+we haven't printed anything from inside read_orders yet
+```
+
+Second, when you eventually pull values out, the body runs one `yield` at a time. Each `yield` hands a value back to the caller and pauses the function with all its local variables intact. The next pull resumes from exactly that point.
+
+```python
+>>> next(gen)
+'order-1'
+>>> next(gen)
+'order-2'
+>>> next(gen)
+'order-3'
+>>> next(gen)
+Traceback (most recent call last):
+  ...
+StopIteration
+```
+
+That `StopIteration` at the end is the standard iterator signal. Python raises it automatically when the generator function returns (either by falling off the bottom or by hitting a bare `return`). You did not write a single `if`, you did not increment a counter, you did not raise an exception manually. The generator handled all of it.
+
+To prove the function really did suspend mid-body, drop a `print` between yields:
+
+```python
+def read_orders():
+    print("about to yield order-1")
+    yield "order-1"
+    print("woke up, about to yield order-2")
+    yield "order-2"
+    print("woke up, about to yield order-3")
+    yield "order-3"
+    print("about to fall off the end")
+
+gen = read_orders()
+print("--- pulled nothing yet ---")
+print(next(gen))
+print("--- back in the caller ---")
+print(next(gen))
+```
+
+Notice that the first `print` from inside the function only ran when we called `next(gen)`, not when we called `read_orders()`. The function body is dormant until something asks for a value.
+
+<h1 id="a-generator-is-an-iterator">A Generator IS an Iterator</h1>
+
+The iterator protocol contract: an object is iterable if it has `__iter__`, and that method returns an iterator (an object with `__next__`). A generator object satisfies the contract for free. It implements both methods, and `__iter__` returns the generator itself.
+
+```python
+from collections.abc import Iterator, Iterable
+
+def read_orders():
+    yield "order-1"
+    yield "order-2"
+
+gen = read_orders()
+print(type(gen))
+print(isinstance(gen, Iterator))
+print(isinstance(gen, Iterable))
+print(iter(gen) is gen)
+```
+
+That `iter(gen) is gen` line is the key tell of an iterator. Calling `iter` on a list returns a fresh iterator each time. Calling `iter` on a generator returns the same generator. There is only ever one cursor through a generator's values.
+
+Because a generator is an iterator, you can use it everywhere an iterator works. A `for` loop, the `list` constructor, tuple unpacking, the `in` operator. Python just calls `__next__` until `StopIteration` shows up.
+
+```python
+def read_orders():
+    yield "order-1"
+    yield "order-2"
+    yield "order-3"
+
+for order in read_orders():
+    print(order)
+
+print(list(read_orders()))
+
+a, b, c = read_orders()
+print(a, b, c)
+```
+
+Each of those three uses called `read_orders()` again, which built a fresh generator object. The body of the function ran independently each time.
+
+<h1 id="the-execution-model-pause-resume-pause">
+  The Execution Model: Pause, Resume, Pause
+</h1>
+
+What happens at each `yield` is the part worth slowing down on. The generator function has its own stack frame, just like any function call. When `yield` runs, Python freezes that frame: every local variable, the value of any open loop counter, even the exact bytecode instruction to resume at. The frozen frame stays alive inside the generator object. When `next` is called again, Python thaws the frame, picks up at the instruction after `yield`, and runs forward until the next `yield`, `return`, or end-of-function.
+
+The same generator can have arbitrary code between yields, including loops, conditionals, and exception handling. All of it suspends and resumes correctly.
+
+```python
+def running_total():
+    prices = [29.99, 14.99, 9.99, 49.99, 19.99]
+    total = 0.0
+    for price in prices:
+        total += price
+        yield round(total, 2)
+
+for snapshot in running_total():
+    print(snapshot)
+```
+
+The `total` variable survives across yields. So does the loop's position in `prices`. The first call to `next` runs the function up to the first `yield`, pausing inside the `for` loop. The second call resumes inside that same loop, increments `total`, and yields the new snapshot. Nothing was re-initialized between calls.
+
+This is what makes generators useful for streaming: you can compute a value, hand it back, and pause until the caller actually needs the next one. Memory is bounded because only one item exists at a time.
+
+The diagram traces the back-and-forth between the caller and a generator. Each `next` resumes the frozen frame, runs forward until the next `yield`, and parks again. When the function falls off the end, Python raises `StopIteration` to tell the caller there is nothing left to deliver.
+
+> **Cost:** A generator's state is just its frame: local variables and a bytecode position. That is a few hundred bytes, regardless of how many values it will eventually produce. Building a list of one million order summaries costs about a million times more memory than a generator that yields the same values one at a time.
+
+<h1 id="stopiteration-comes-automatically">
+  StopIteration Comes Automatically
+</h1>
+
+You never raise `StopIteration` by hand inside a generator. Python does it for you the moment the function returns. There are three ways a generator function can return:
+
+1. Execution falls off the bottom of the function.
+2. A bare `return` runs.
+3. A `return value` runs (with `value` attached, more on that next).
+
+In all three cases, the generator object's next `__next__` call raises `StopIteration`.
+
+```python
+def first_three_orders():
+    yield "order-1"
+    yield "order-2"
+    yield "order-3"
+    # falls off the bottom here
+
+g = first_three_orders()
+print(next(g))
+print(next(g))
+print(next(g))
+try:
+    next(g)
+except StopIteration:
+    print("done")
+```
+
+A bare `return` is useful when you want to stop early, for example when a search hits the item you wanted:
+
+```python
+def find_first_in_stock(products):
+    for product in products:
+        if product["stock"] > 0:
+            yield product["name"]
+            return
+        yield f"out of stock: {product['name']}"
+
+catalog = [
+    {"name": "mug", "stock": 0},
+    {"name": "notebook", "stock": 0},
+    {"name": "pen", "stock": 12},
+    {"name": "lamp", "stock": 5},
+]
+
+for status in find_first_in_stock(catalog):
+    print(status)
+```
+
+The `return` runs after yielding `"pen"`. The generator stops there. The lamp is never visited because the function exited.
+
+<h3 id="return-value-attaches-to-stopiteration">
+  return value Attaches to StopIteration
+</h3>
+
+A regular `return value` inside a generator does **not** yield that value. Instead, Python attaches it to the `StopIteration` exception as `StopIteration.value`. You can catch the exception and read it.
+
+```python
+def count_orders(orders):
+    total = 0
+    for order in orders:
+        yield order["id"]
+        total += 1
+    return total
+
+g = count_orders([{"id": "A"}, {"id": "B"}, {"id": "C"}])
+try:
+    while True:
+        print(next(g))
+except StopIteration as stop:
+    print(f"finished, yielded {stop.value} orders")
+```
+
+This is a niche pattern in everyday code. A `for` loop swallows `StopIteration` without exposing `stop.value`, so most callers never see it. The feature exists mainly for coroutine-style generators and for `yield from`. For now, just know that `return value` is legal in a generator and the value rides along on the terminating exception, it does not get yielded.
+
+<h1 id="the-win-over-custom-iterator-classes">
+  The Win Over Custom Iterator Classes
+</h1>
+
+A custom iterator class to walk a list of products one at a time looks roughly like this:
+
+<CommentsSection />
+
+</LessonCard>

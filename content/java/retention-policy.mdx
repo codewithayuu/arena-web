@@ -1,0 +1,457 @@
+---
+title: "Retention Policy"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Retention Policy explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+This lesson walks through where each policy drops off the lifecycle, what `javap` reveals in each case, why `CLASS` is the default, and how to choose between the three when you design your own annotations. Three small E-Commerce annotations carry the examples: `@PriceFormat` for a lint check, `@StorageKey` for a bytecode rewriter, and `@ValidateOrder` for a reflection-based validator.
+
+<h1 id="the-annotation-lifecycle">The Annotation Lifecycle</h1>
+
+An annotation goes through three places: the source file, the compiled `.class` file, and the loaded `Class` object inside a running JVM. Each retention policy decides which of those places the annotation reaches.
+
+Read the diagram left to right. Source code goes into `javac`. The compiler decides, based on each annotation's `@Retention`, whether to write that annotation into the `.class` file. If the policy is `SOURCE`, the compiler reads the annotation, possibly uses it (for warnings or processing), and then throws it away before writing the class file. If the policy is `CLASS` or `RUNTIME`, the annotation lands in the class file. Then the class file is loaded by the JVM. At that point the JVM looks at each annotation in the class file. `CLASS`-retained annotations sit in the file but are not exposed through reflection. `RUNTIME`-retained annotations are kept on the in-memory `Class` object and become visible to `getAnnotations()` and friends.
+
+Three drop-off points, three policies. That's the whole story.
+
+The `@Retention` meta-annotation lives in `java.lang.annotation`. You attach it to an annotation definition like any other meta-annotation:
+
+```java
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+
+@Retention(RetentionPolicy.RUNTIME)
+public @interface ValidateOrder {
+}
+```
+
+If you skip `@Retention` entirely, the default is `RetentionPolicy.CLASS`.
+
+<h1 id="retentionpolicysource">RetentionPolicy.SOURCE</h1>
+
+`SOURCE` means the annotation exists only in `.java` files. The compiler reads it, optionally acts on it, then discards it. Nothing about the annotation makes it into the `.class` file. The class file is byte-for-byte identical to what it would be if the annotation had never been written.
+
+This is what `@Override` and `@SuppressWarnings` use. The compiler checks that `@Override` actually overrides a superclass method, then forgets the annotation existed. Neither IDE warnings nor bytecode tools nor reflection ever need to see those annotations after `javac` runs.
+
+A practical use case: a custom lint annotation that flags fields holding formatted prices, used by an IDE plugin or a custom Checkstyle rule. The check runs at compile time. The runtime ignores it.
+
+```java
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+@Retention(RetentionPolicy.SOURCE)
+@Target(ElementType.FIELD)
+public @interface PriceFormat {
+    String value() default "USD";
+}
+```
+
+Use it on a field:
+
+```java
+public class Product {
+
+    private String name;
+
+    @PriceFormat("USD")
+    private String displayPrice;
+
+    public Product(String name, String displayPrice) {
+        this.name = name;
+        this.displayPrice = displayPrice;
+    }
+}
+```
+
+Compile both files normally with `javac Product.java PriceFormat.java`. The annotation is gone from `Product.class` once compilation finishes. You can prove this by asking `javap` to print everything it knows about the class:
+
+```text
+$$ javap -v -p Product
+...
+  private java.lang.String displayPrice;
+    descriptor: Ljava/lang/String;
+    flags: ACC_PRIVATE
+...
+```
+
+No annotation attribute appears on `displayPrice`. The field looks like an ordinary `String` field. Compare this to the `CLASS` example coming next, where the same `-v` flag shows a `RuntimeInvisibleAnnotations` attribute. Reflection can't see a `SOURCE` annotation either, because there's nothing in the class file to see:
+
+```java
+import java.lang.reflect.Field;
+
+public class CheckPriceFormatAtRuntime {
+    public static void main(String[] args) throws Exception {
+        Field f = Product.class.getDeclaredField("displayPrice");
+        System.out.println("Annotations on displayPrice: " + f.getAnnotations().length);
+    }
+}
+```
+
+Zero annotations. The compiler erased it. To make `@PriceFormat` catch misuse, write a tool that runs at compile time. A simple annotation processor or a custom IDE inspection are the usual choices. Once the compile finishes, the work is done and the annotation has served its purpose.
+
+The benefit of `SOURCE` is zero cost everywhere after compilation. The class file isn't any bigger. The JVM doesn't load anything extra. Reflection has nothing to report. The downside is that no part of the program can react to the annotation past `javac`. That's the right trade for compile-time-only checks, and the wrong trade if a framework needs the metadata at runtime.
+
+<h1 id="retentionpolicyclass">RetentionPolicy.CLASS</h1>
+
+`CLASS` keeps the annotation in the `.class` file but the JVM doesn't expose it through reflection. The annotation sits there as a `RuntimeInvisibleAnnotations` attribute, waiting to be read by bytecode-level tools, but a normal `getAnnotations()` call returns nothing.
+
+This is the default, and it's the policy you use when something needs to read the annotation after compilation but before, or instead of, runtime. Think bytecode rewriters, ahead-of-time tools, code coverage agents, or static analyzers that work on `.class` files rather than source. They all have direct access to the class file and can read its raw attributes. They don't need the annotation to be visible through reflection, and keeping it invisible saves a little space in the JVM's in-memory representation of the class.
+
+An E-Commerce example: a build-time bytecode rewriter that turns fields marked `@StorageKey` into lookups against a key-value store. The rewriter reads `.class` files from the build output, finds the marked fields, and emits new bytecode. By the time the application runs, the annotation has done its job, and the JVM doesn't need to hold it in memory.
+
+```java
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+@Retention(RetentionPolicy.CLASS)
+@Target(ElementType.FIELD)
+public @interface StorageKey {
+    String value();
+}
+```
+
+```java
+public class Cart {
+
+    @StorageKey("cart:items")
+    private String itemsKey;
+
+    @StorageKey("cart:total")
+    private String totalKey;
+
+    public Cart(String itemsKey, String totalKey) {
+        this.itemsKey = itemsKey;
+        this.totalKey = totalKey;
+    }
+}
+```
+
+Now compile and look at `Cart.class` with `javap -v -p Cart`:
+
+```text
+...
+  private java.lang.String itemsKey;
+    descriptor: Ljava/lang/String;
+    flags: ACC_PRIVATE
+    RuntimeInvisibleAnnotations:
+      0: #16(#17=s#18)
+        StorageKey(
+          value="cart:items"
+        )
+
+  private java.lang.String totalKey;
+    descriptor: Ljava/lang/String;
+    flags: ACC_PRIVATE
+    RuntimeInvisibleAnnotations:
+      0: #16(#17=s#18)
+        StorageKey(
+          value="cart:total"
+        )
+...
+```
+
+The annotation is there. It's in the class file under the `RuntimeInvisibleAnnotations` attribute, with its `value` argument fully recorded. A bytecode tool that reads `Cart.class` with ASM or Byte Buddy or the `javap` API can pick this up. The class file size is slightly larger to make room for it.
+
+At runtime, though, reflection sees nothing:
+
+```java
+import java.lang.reflect.Field;
+
+public class CheckStorageKeyAtRuntime {
+    public static void main(String[] args) throws Exception {
+        for (Field f : Cart.class.getDeclaredFields()) {
+            System.out.println(f.getName()
+                + " annotations: " + f.getAnnotations().length);
+        }
+    }
+}
+```
+
+The annotation is in the file. Reflection still reports zero. That's the whole point of "invisible": invisible to reflection, visible to anyone reading the raw class file.
+
+`CLASS` retention adds a few bytes per annotated element to every `.class` file. For one or two fields it's noise. For an annotation applied to every getter and setter across thousands of classes, the class files grow noticeably, even though the JVM never loads the data into memory.
+
+<h3 id="why-class-is-the-default">Why CLASS Is the Default</h3>
+
+A reasonable question is why `CLASS` is the default rather than `RUNTIME`. The answer is the principle of least privilege for metadata. If you mark an annotation `RUNTIME`, you've committed to keeping it loaded in the JVM's class metadata for the lifetime of every annotated class. If you only need it during compilation, that's wasted memory. If you only need it for a static tool, the JVM is doing work no one cares about.
+
+`CLASS` is the middle ground: the annotation survives compilation (so tools can find it later) but doesn't burden the runtime (because the JVM doesn't expose it). The JDK designers picked this as the default because it's the safest assumption when the developer hasn't told the compiler otherwise. Be explicit when you mean `SOURCE` or `RUNTIME`.
+
+<h1 id="retentionpolicyruntime">RetentionPolicy.RUNTIME</h1>
+
+`RUNTIME` is the policy you want when something reflective needs the annotation. Validation frameworks (Bean Validation, custom validators), serialization libraries (Jackson, Gson), dependency injection containers (Spring, Guice), ORMs (Hibernate, JPA), and test runners (JUnit, TestNG) all walk classes at runtime with reflection. They look up annotations on classes, methods, fields, and parameters. Those annotations have to be visible through reflection, which means they have to be `RUNTIME`.
+
+In the class file, a `RUNTIME` annotation is written under a slightly different attribute name, `RuntimeVisibleAnnotations`. The "visible" in the name refers to reflection visibility. When the JVM loads the class, it reads that attribute and exposes the annotation through `Class.getAnnotations()`, `Method.getAnnotations()`, `Field.getAnnotations()`, and the matching `Parameter` and `Constructor` methods.
+
+A concrete example: a reflection-based validator that walks an `Order` object and checks rules tagged on each field.
+
+```java
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.FIELD)
+public @interface ValidateOrder {
+    String message() default "invalid value";
+    double min() default Double.NEGATIVE_INFINITY;
+}
+```
+
+```java
+public class Order {
+
+    @ValidateOrder(message = "order id must be positive", min = 1)
+    private long orderId;
+
+    @ValidateOrder(message = "total must be at least 0.01", min = 0.01)
+    private double total;
+
+    private String customerEmail;
+
+    public Order(long orderId, double total, String customerEmail) {
+        this.orderId = orderId;
+        this.total = total;
+        this.customerEmail = customerEmail;
+    }
+}
+```
+
+And the validator that consumes the annotation:
+
+```java
+import java.lang.reflect.Field;
+import java.util.ArrayList;
+import java.util.List;
+
+public class OrderValidator {
+
+    public static List<String> validate(Object obj) throws IllegalAccessException {
+        List<String> errors = new ArrayList<>();
+        for (Field field : obj.getClass().getDeclaredFields()) {
+            ValidateOrder rule = field.getAnnotation(ValidateOrder.class);
+            if (rule == null) {
+                continue;
+            }
+            field.setAccessible(true);
+            Object value = field.get(obj);
+            if (value instanceof Number number) {
+                if (number.doubleValue() < rule.min()) {
+                    errors.add(field.getName() + ": " + rule.message());
+                }
+            }
+        }
+        return errors;
+    }
+
+    public static void main(String[] args) throws Exception {
+        Order good = new Order(101L, 49.99, "ada@example.com");
+        Order bad = new Order(0L, -5.0, "ada@example.com");
+
+        System.out.println("good errors: " + validate(good));
+        System.out.println("bad errors:  " + validate(bad));
+    }
+}
+```
+
+First, `field.getAnnotation(ValidateOrder.class)` returns the annotation only because `@ValidateOrder` is `RUNTIME`-retained. If it were `CLASS` or `SOURCE`, that call would return `null` for every field. Second, the validator walks every field but only acts on the ones the annotation marks. Fields without `@ValidateOrder`, like `customerEmail`, are skipped naturally.
+
+The same `javap -v` on `Order.class` shows a different attribute name:
+
+```text
+private long orderId;
+    descriptor: J
+    flags: ACC_PRIVATE
+    RuntimeVisibleAnnotations:
+      0: #14(#15=s#16,#17=D#18)
+        ValidateOrder(
+          message="order id must be positive",
+          min=1.0d
+        )
+```
+
+`RuntimeVisibleAnnotations` instead of `RuntimeInvisibleAnnotations`. The two attributes are sibling sections in the class file format, with the only difference being whether the JVM exposes them at runtime. The bytecode payload is identical in shape.
+
+`RUNTIME` retention keeps the annotation type loaded for the lifetime of every annotated class, plus the bytes for each annotation instance in the class metadata. Frameworks that cache annotations during reflection scans add another layer on top. For a couple of annotations per class this cost is irrelevant. For an annotation applied to every getter, setter, and parameter across a 5,000-class codebase, the runtime metadata becomes a measurable share of metaspace.
+
+<h1 id="all-three-side-by-side">All Three Side by Side</h1>
+
+A program that defines three annotations, one for each policy, applies all three to the same class, and asks reflection what it sees.
+
+```java
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+@Retention(RetentionPolicy.SOURCE)
+@Target(ElementType.TYPE)
+@interface SourceTag {
+    String value();
+}
+
+@Retention(RetentionPolicy.CLASS)
+@Target(ElementType.TYPE)
+@interface ClassTag {
+    String value();
+}
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.TYPE)
+@interface RuntimeTag {
+    String value();
+}
+
+@SourceTag("source-only")
+@ClassTag("class-only")
+@RuntimeTag("runtime")
+public class TaggedProduct {
+
+    public static void main(String[] args) {
+        Class<?> c = TaggedProduct.class;
+
+        System.out.println("getAnnotations() visible to reflection:");
+        for (var a : c.getAnnotations()) {
+            System.out.println("  " + a);
+        }
+
+        System.out.println();
+        System.out.println("Specific lookups:");
+        System.out.println("  SourceTag:  " + c.getAnnotation(SourceTag.class));
+        System.out.println("  ClassTag:   " + c.getAnnotation(ClassTag.class));
+        System.out.println("  RuntimeTag: " + c.getAnnotation(RuntimeTag.class));
+    }
+}
+```
+
+The class is annotated three times in source. Reflection sees one. `SourceTag` was discarded by the compiler, so the class file never carried it. `ClassTag` is in the class file but `getAnnotation` returns `null` because the JVM doesn't expose `CLASS`-retained annotations. `RuntimeTag` is what reflection sees.
+
+Now run `javap -v` on `TaggedProduct.class` and skim the output. There are two relevant attribute sections at the class level:
+
+```text
+RuntimeVisibleAnnotations:
+    0: #18(#19=s#20)
+      RuntimeTag(
+        value="runtime"
+      )
+  RuntimeInvisibleAnnotations:
+    0: #22(#19=s#23)
+      ClassTag(
+        value="class-only"
+      )
+```
+
+`RuntimeVisibleAnnotations` holds `RuntimeTag`. `RuntimeInvisibleAnnotations` holds `ClassTag`. `SourceTag` is nowhere in the file. The compiler stripped it. That's the most direct demonstration of where each policy lives.
+
+A picture of how those three annotations end up distributed across the lifecycle makes the same point in a different shape:
+
+The first transition is where `SOURCE` drops off: the compiler reads the annotation, possibly uses it, then leaves it out of the class file. The second transition is where `CLASS` drops off as far as reflection is concerned: the JVM reads the `RuntimeInvisibleAnnotations` attribute but doesn't expose it through `getAnnotations`. Only `RUNTIME` survives both transitions, which is why the final box shows just `@RuntimeTag` in the array reflection returns.
+
+A table makes the contrast easy to look up:
+
+| Policy    | In `.class` file? | In `RuntimeVisibleAnnotations`? | In `RuntimeInvisibleAnnotations`? | Visible to reflection? | Default? |
+| --------- | ----------------- | ------------------------------- | --------------------------------- | ---------------------- | -------- |
+| `SOURCE`  | No                | No                              | No                                | No                     | No       |
+| `CLASS`   | Yes               | No                              | Yes                               | No                     | Yes      |
+| `RUNTIME` | Yes               | Yes                             | No                                | Yes                    | No       |
+
+The single-column answer to "where does this annotation live?" is the row of the table you pick when you write `@Retention(...)`.
+
+<h1 id="choosing-the-right-policy">Choosing the Right Policy</h1>
+
+The choice between the three policies is almost mechanical once you ask one question: who reads this annotation, and when?
+
+| Reader of the annotation                                | Right policy |
+| ------------------------------------------------------- | ------------ |
+| Only `javac` and IDE inspections                        | `SOURCE`     |
+| An annotation processor that runs during compilation    | `SOURCE`     |
+| A static analyzer or linter (Checkstyle, ErrorProne)    | `SOURCE`     |
+| A bytecode rewriter or post-processor (ASM, Byte Buddy) | `CLASS`      |
+| A code coverage / instrumentation agent at build time   | `CLASS`      |
+| A reflection-based framework (Spring, Hibernate, JUnit) | `RUNTIME`    |
+| A custom validator or serializer using reflection       | `RUNTIME`    |
+| A dependency injection or proxy generator               | `RUNTIME`    |
+
+The pattern is "pick the earliest policy that still lets your reader see the annotation". If you can do the work at compile time, `SOURCE` costs nothing afterwards. If you need the data in the class file but not at runtime, `CLASS` keeps the runtime lean. If the framework needs reflection, you have to commit to `RUNTIME`.
+
+There's an asymmetry here. `SOURCE` and `CLASS` are conservative: they say "I don't want this data hanging around in places that don't need it". `RUNTIME` is generous: it says "keep this data visible everywhere, just in case". Conservative choices are usually right when you don't have a concrete runtime need. Generous choices are usually right when you do.
+
+A common mistake is using `RUNTIME` on every custom annotation "just in case". That works, but it pays a forever cost for an option that may go unused. The reverse mistake is worse: writing a `RUNTIME` framework against a `CLASS`-retained annotation, where `getAnnotation` returns `null` and the cause is not obvious.
+
+**What's wrong with this code?**
+
+```java
+@Retention(RetentionPolicy.CLASS)
+@Target(ElementType.METHOD)
+public @interface TestCase {
+    String description();
+}
+
+public class JsonTestRunner {
+    public static void run(Class<?> testClass) {
+        for (var method : testClass.getDeclaredMethods()) {
+            TestCase tc = method.getAnnotation(TestCase.class);
+            if (tc != null) {
+                System.out.println("Running: " + tc.description());
+            }
+        }
+    }
+}
+```
+
+The runner uses reflection to find methods annotated with `@TestCase`, but `@TestCase` is `CLASS`-retained. `method.getAnnotation(TestCase.class)` always returns `null`. No tests run, and no error is reported.
+
+**Fix:** Change the retention policy on `@TestCase` to `RUNTIME`.
+
+```java
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.METHOD)
+public @interface TestCase {
+    String description();
+}
+```
+
+Now `method.getAnnotation(TestCase.class)` returns the real annotation and the runner works.
+
+<h1 id="cost-considerations">Cost Considerations</h1>
+
+`RUNTIME` is the policy that costs you something at scale. It's worth understanding what that cost is, even if for most applications it's negligible.
+
+When the JVM loads a class with `RUNTIME`-retained annotations, it does three things:
+
+1. Loads the annotation type itself (a separate `Class` object that has to be loaded and initialized, just like any other class).
+2. Allocates space in the class metadata for each annotation instance, including its element values (the `String`, `int`, or array arguments you pass).
+3. Materializes a proxy implementing the annotation interface the first time something calls `getAnnotation`.
+
+For a single annotation per class, this is invisible. The annotation type was probably loaded anyway because your framework imports it. The metadata for one annotation is a few dozen bytes. The proxy is cached after the first lookup.
+
+For an annotation applied to every field, every method, and every parameter across thousands of classes, the math changes. A 5,000-class codebase with an average of ten annotations per class is 50,000 annotation instances. Each one carries its element values in metaspace. Each lookup creates a proxy. Annotation-scanning frameworks tend to scan everything at startup, so the proxies pile up early.
+
+Reflection-based annotation lookups synthesize a new proxy object the first time you ask for each annotation. If a hot path repeatedly calls `getAnnotation`, cache the result instead of asking again. The proxy itself is small, but in a tight loop the allocations add up.
+
+`CLASS` retention has a different cost profile. The annotation lives in the `.class` file but is never loaded as runtime metadata. The file grows by the size of the encoded annotation. There's no runtime memory cost beyond the slightly larger class file when it's read off disk. For a tool that processes class files offline, this is essentially free at runtime.
+
+`SOURCE` retention costs nothing past compilation. The class file size is unchanged. The JVM has no work to do. The annotation might as well not exist for any consumer past `javac`.
+
+| Lifecycle stage | `SOURCE` cost                                    | `CLASS` cost                       | `RUNTIME` cost                            |
+| --------------- | ------------------------------------------------ | ---------------------------------- | ----------------------------------------- |
+| Compile         | A few bytes processed by `javac`, then discarded | Annotation written into class file | Annotation written into class file        |
+| Class file size | 0                                                | Small per annotation               | Small per annotation                      |
+| Class loading   | 0                                                | 0 (JVM ignores invisible)          | Annotation type loaded, metadata stored   |
+| Reflection call | 0 (not visible)                                  | 0 (not visible)                    | Proxy object synthesized per first lookup |
+
+Most of the time you don't need to think about any of this. The cases where you do tend to be high-density annotation usage in performance-sensitive code, such as a code generator that decorates every field of every entity, or a logging framework that decorates every public method. In those cases, prefer `CLASS` if a build-time tool can do the work, and cache `getAnnotation` results aggressively if you need `RUNTIME`.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

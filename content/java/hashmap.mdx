@@ -1,0 +1,367 @@
+---
+title: "HashMap"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "HashMap explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="the-internal-structure">The Internal Structure</h1>
+
+A `HashMap` keeps an array called `table`. Each slot in that array is called a bucket. Every bucket holds a chain of entries, where each entry is a `Node` with four fields: the key's hash, the key itself, the value, and a `next` pointer to the next node in the same bucket.
+
+A call to `put(key, value)` does three things. It computes a hash from the key. It uses that hash to pick a bucket index. It walks the chain in that bucket: if a node with an equal key already exists, the value is replaced; if no match is found, a new node is appended to the chain.
+
+The diagram shows a `table` of size 16 with four entries spread across three buckets. Bucket 5 holds a chain of two nodes because two different product IDs hashed to the same index. That collision didn't cause a bug; it just meant the second entry was appended to the first one's chain. Lookup in bucket 5 walks the chain and compares keys with `equals` until it finds the right one.
+
+The default initial capacity is 16 (the size of `table` when the map is created). The default load factor is 0.75. When the number of entries exceeds `capacity * loadFactor`, the table is resized: a new array twice the size is allocated and every existing entry is moved into its new bucket. The resize section below covers this in detail.
+
+A small program that creates a product lookup. Product IDs map to product names. The example adds a few entries and reads them back.
+
+```java
+import java.util.HashMap;
+
+public class ProductCatalog {
+    public static void main(String[] args) {
+        HashMap<String, String> products = new HashMap<>();
+
+        products.put("P-101", "Notebook");
+        products.put("P-220", "Pen");
+        products.put("P-401", "Eraser");
+
+        System.out.println("P-101 -> " + products.get("P-101"));
+        System.out.println("P-220 -> " + products.get("P-220"));
+        System.out.println("Unknown -> " + products.get("P-999"));
+        System.out.println("Size: " + products.size());
+    }
+}
+```
+
+A missing key returns `null`, not an exception. That's an important contract: `get` and `put` never throw for "key not present". They return `null` for absence.
+
+<h1 id="the-hash-function">The Hash Function</h1>
+
+A naive bucket index would be `key.hashCode() % table.length`. Java does something slightly different, for two reasons. First, `%` is slower than a bitwise AND, and the table size is always a power of two, which makes `hash & (table.length - 1)` equivalent and faster. Second, raw `hashCode()` values from common types (especially `Integer` and short strings) tend to vary mostly in their low bits, which would crowd entries into a few buckets and lose the benefit of having many.
+
+`HashMap` applies a small mixing step first. The internal helper:
+
+```java
+static final int hash(Object key) {
+    int h;
+    return (key == null) ? 0 : (h = key.hashCode()) ^ (h >>> 16);
+}
+```
+
+The expression `h ^ (h >>> 16)` XORs the high 16 bits of the hash code into the low 16 bits. That way, when the bucket index is taken from the low bits via `hash & (table.length - 1)`, differences in the high bits still influence which bucket is chosen. For a small table (say 16 buckets, indexed by the bottom 4 bits), this mixing keeps two keys that happen to share the bottom 4 bits of their `hashCode()` from always colliding when their high bits actually differ.
+
+`null` keys are handled specially: their hash is `0`, which means they always land in bucket 0.
+
+A small program that prints both the raw `hashCode()` and the mixed hash for a couple of customer emails to demonstrate the XOR step:
+
+```java
+public class HashMix {
+    static int mix(Object key) {
+        int h = key.hashCode();
+        return h ^ (h >>> 16);
+    }
+
+    public static void main(String[] args) {
+        String emailA = "alice@example.com";
+        String emailB = "alicf@example.com";
+
+        System.out.println("A raw : " + emailA.hashCode());
+        System.out.println("A mix : " + mix(emailA));
+        System.out.println("B raw : " + emailB.hashCode());
+        System.out.println("B mix : " + mix(emailB));
+
+        int capacity = 16;
+        System.out.println("A bucket: " + (mix(emailA) & (capacity - 1)));
+        System.out.println("B bucket: " + (mix(emailB) & (capacity - 1)));
+    }
+}
+```
+
+The two emails differ by one character. Their raw hash codes differ by about thirty thousand, but the bucket index after mixing comes out different (10 vs 9), so they land in separate buckets. Without the mix step, very similar inputs that happen to share low bits would crowd into the same bucket more often.
+
+<h1 id="collisions-and-treeification">Collisions and Treeification</h1>
+
+Two different keys can produce the same bucket index. That's a collision, and it's normal: with 16 buckets and any reasonable number of keys, collisions are unavoidable. The basic strategy for handling them is **separate chaining**: each bucket holds a linked list of nodes, and lookup walks the list comparing keys with `equals`.
+
+For most maps the chains stay short, often just one or two nodes, so the average cost of `get` is still constant. The problem appears when many keys cluster into one bucket. When a bucket's chain grows to length `n`, a `get` on that bucket costs O(n) instead of O(1).
+
+To bound the worst case, `HashMap` switches a bucket's storage from a linked list to a **red-black tree** once two conditions are both met:
+
+1. The bucket's chain length exceeds `TREEIFY_THRESHOLD`, which is `8`.
+2. The overall table size is at least `MIN_TREEIFY_CAPACITY`, which is `64`.
+
+The second condition matters because if the table is small (under 64 buckets), the better fix for a long chain is to resize the table, not to convert the chain to a tree. Resizing redistributes entries and is usually enough to break up clustering.
+
+Once a bucket is treeified, lookups in that bucket cost O(log n) instead of O(n). The bucket can untreeify back to a list if it shrinks below `UNTREEIFY_THRESHOLD` (`6`) during removals.
+
+The before-and-after picture is the heart of the optimization. With nine nodes in a list, finding `k9` walks through all nine. With those nodes balanced as a red-black tree, finding `k9` takes about `log2(9) ≈ 3` comparisons. The improvement only matters when chains get long; for a chain of two or three nodes, a list is faster and uses less memory than a tree, which is why the threshold is 8 rather than something smaller.
+
+Treeification is a defense against pathological hash functions, not a routine occurrence. In a well-tuned map with a good `hashCode`, chains rarely reach 8. The protection exists for the cases where a poor `hashCode` or adversarial inputs would otherwise turn lookups into O(n).
+
+Average `put`, `get`, and `remove` are O(1). With a degenerate hash code that lumps everything into one bucket, those operations become O(log n) after treeification, not O(n). Without treeification, they'd be O(n).
+
+<h1 id="resizing">Resizing</h1>
+
+When the size grows past `capacity * loadFactor`, the table is resized. A new array twice as large replaces the old one, and every entry is moved into its new bucket. With the default load factor of 0.75 and the default capacity of 16, the first resize happens when the 13th entry is inserted. The new capacity becomes 32, and the threshold becomes 24.
+
+The move is faster than it sounds because the table size is always a power of two. When the table doubles, each existing entry either stays in the same bucket index or moves to `oldIndex + oldCapacity`. Java decides which by looking at one specific bit of the hash; no need to recompute bucket indices from scratch.
+
+A small program that watches the size grow past the threshold by tracking how many puts happen before a (deliberately verbose) example would resize:
+
+```java
+import java.util.HashMap;
+
+public class CartGrowth {
+    public static void main(String[] args) {
+        HashMap<String, Integer> stock = new HashMap<>();
+
+        for (int i = 1; i <= 14; i++) {
+            String sku = "SKU-" + i;
+            stock.put(sku, i * 10);
+            System.out.println("Inserted " + sku + ", size = " + stock.size());
+        }
+
+        System.out.println("Final size: " + stock.size());
+    }
+}
+```
+
+Internally, the resize fired when the 13th insertion would have pushed `size` past `16 * 0.75 = 12`. The table grew from 16 buckets to 32, and existing nodes were redistributed. The visible behavior is identical (every `get` still works), but the internal array is twice the size.
+
+When the approximate insert count is known up front, most resizes can be avoided by passing an initial capacity to the constructor: `new HashMap<>(64)`. The internal capacity is rounded up to the next power of two, so 64 actually gives 64, and 100 gives 128. Pre-sizing avoids the cost of repeated array allocations and rehashing, which matters when loading a large catalog into a map.
+
+Each resize is O(n) because every entry has to be placed into the new array. The amortized cost across many inserts is still O(1) per insert, but a single insert that triggers a resize is much more expensive than a normal one.
+
+<h1 id="put-get-and-remove-in-detail">put, get, and remove in Detail</h1>
+
+The three core operations all start the same way: compute the mixed hash, take `hash & (table.length - 1)` to find the bucket, and then work with that bucket's chain or tree.
+
+`get(key)` walks the bucket. It compares each node's hash with the requested key's hash first (a cheap integer compare), and only calls `equals` when the hashes match. This is why a fast, well-distributed `hashCode` matters: it lets `get` reject most non-matches without ever calling `equals`.
+
+`put(key, value)` walks the bucket the same way. If it finds a node with an equal key, it overwrites that node's value and returns the old value. Otherwise it adds a new node, increments the size, and triggers a resize if the threshold is now exceeded.
+
+`remove(key)` walks the bucket, finds the matching node, unlinks it, decrements the size, and returns the removed value. If no match is found, it returns `null`.
+
+A program that uses all three:
+
+```java
+import java.util.HashMap;
+
+public class StockManager {
+    public static void main(String[] args) {
+        HashMap<String, Integer> stock = new HashMap<>();
+
+        stock.put("SKU-101", 50);
+        stock.put("SKU-220", 200);
+        stock.put("SKU-401", 12);
+
+        System.out.println("SKU-220 stock: " + stock.get("SKU-220"));
+
+        Integer previous = stock.put("SKU-220", 175);
+        System.out.println("Replaced SKU-220, previous value: " + previous);
+        System.out.println("SKU-220 stock now: " + stock.get("SKU-220"));
+
+        Integer removed = stock.remove("SKU-401");
+        System.out.println("Removed SKU-401, value was: " + removed);
+
+        Integer missing = stock.remove("SKU-999");
+        System.out.println("Removed missing key, return value: " + missing);
+
+        System.out.println("Final size: " + stock.size());
+    }
+}
+```
+
+Several details: `put` returns the previous value for a key when it overwrites, which is a handy way to detect updates. `remove` returns the value that was removed, or `null` if the key wasn't present. The return type for `remove` is `Integer` (the wrapper) precisely so it can return `null` for absence; with an `int` return type, there'd be no way to distinguish "missing" from "the value was 0".
+
+<h1 id="nulls-in-hashmap">Nulls in HashMap</h1>
+
+`HashMap` permits one null key and any number of null values. That's a deliberate choice that sets it apart from some other map implementations (Hashtable, ConcurrentHashMap, and TreeMap all reject nulls in various ways).
+
+The single null key is stored in bucket 0, because the internal `hash` helper returns `0` for `null`. Looking up `null` walks bucket 0 the same way any other lookup walks its bucket.
+
+```java
+import java.util.HashMap;
+
+public class NullKeyDemo {
+    public static void main(String[] args) {
+        HashMap<String, String> guestCart = new HashMap<>();
+
+        guestCart.put("alice@example.com", "Notebook");
+        guestCart.put(null, "Pen");
+        guestCart.put("bob@example.com", null);
+
+        System.out.println("alice@example.com -> " + guestCart.get("alice@example.com"));
+        System.out.println("null key -> " + guestCart.get(null));
+        System.out.println("bob@example.com -> " + guestCart.get("bob@example.com"));
+        System.out.println("Contains bob? " + guestCart.containsKey("bob@example.com"));
+    }
+}
+```
+
+The third entry shows the trap. `get("bob@example.com")` returns `null`, but `bob@example.com` is in the map; the stored value happens to be `null`. To distinguish "missing" from "present with value null", use `containsKey`. The pair of checks (`get` returning `null`, `containsKey` returning `true`) is the only way to tell the two cases apart.
+
+Storing null values is allowed but often inadvisable, because it forces every reader to do the `containsKey` check. In most cart and catalog code, treating null as "not present" and never inserting null values is simpler and harder to misuse.
+
+<h1 id="equals-and-hashcode">equals and hashCode</h1>
+
+`HashMap` depends on a contract: two keys that are equal according to `equals` must produce the same `hashCode`. Putting a custom class as a key while breaking that rule produces behavior that looks like bugs.
+
+The contract in plain terms:
+
+1. If `a.equals(b)` is `true`, then `a.hashCode() == b.hashCode()`.
+2. If `a.hashCode() == b.hashCode()`, `a.equals(b)` may or may not be true (different keys can share a hash; that's a collision, and the map handles it).
+3. Both methods must be **consistent**: as long as the key's relevant fields don't change, repeated calls must return the same answer.
+
+A common bug is mutating a key after using it. When a key's `hashCode()` changes while the key is sitting in the map, the map can't find it anymore, because the bucket lookup uses the new hash but the entry lives in the bucket chosen by the old hash.
+
+```java
+import java.util.HashMap;
+import java.util.Objects;
+
+public class MutableKeyBug {
+    static class Customer {
+        String email;
+
+        Customer(String email) {
+            this.email = email;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            return o instanceof Customer c && email.equals(c.email);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(email);
+        }
+    }
+
+    public static void main(String[] args) {
+        Customer alice = new Customer("alice@example.com");
+        HashMap<Customer, String> carts = new HashMap<>();
+        carts.put(alice, "Notebook + Pen");
+
+        System.out.println("Before mutation: " + carts.get(alice));
+        alice.email = "alice@new-domain.com";
+        System.out.println("After mutation: " + carts.get(alice));
+        System.out.println("Map still has 1 entry: " + carts.size());
+    }
+}
+```
+
+The cart is still in the map, but it's invisible. Mutating `alice.email` changed `alice.hashCode()`, so the second `get` looks in a different bucket and doesn't find the entry. Use immutable classes (or at least immutable fields participating in `equals`/`hashCode`) for map keys.
+
+A poor `hashCode` that returns the same value for many keys forces every lookup into the same bucket. The bucket becomes a long chain (or a tree after treeification), and operations degrade from O(1) toward O(log n) or O(n). The fix is a balanced `hashCode`, not a bigger table.
+
+<h1 id="iteration-and-fail-fast-behavior">Iteration and Fail-Fast Behavior</h1>
+
+A `HashMap` can be iterated through its `entrySet()`, `keySet()`, or `values()` views. The iteration order is **not** insertion order and not key order; it's roughly bucket order, which depends on hash codes and table size and can change after a resize. For a stable order, use `LinkedHashMap` or `TreeMap`.
+
+```java
+import java.util.HashMap;
+import java.util.Map;
+
+public class IterateMap {
+    public static void main(String[] args) {
+        HashMap<String, Integer> stock = new HashMap<>();
+        stock.put("SKU-101", 50);
+        stock.put("SKU-220", 200);
+        stock.put("SKU-401", 12);
+
+        for (Map.Entry<String, Integer> entry : stock.entrySet()) {
+            System.out.println(entry.getKey() + " -> " + entry.getValue());
+        }
+    }
+}
+```
+
+Don't rely on this order. Running the same program on a different JVM, a different Java version, or with a slightly different set of keys may produce a different listing.
+
+The iterator is **fail-fast**: if the map is structurally modified (a put that adds a new key, a remove, a clear) by anything other than the iterator's own `remove()` method while the iterator is active, the next call to `next()` throws `ConcurrentModificationException`.
+
+```java
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
+
+public class FailFast {
+    public static void main(String[] args) {
+        HashMap<String, Integer> stock = new HashMap<>();
+        stock.put("SKU-101", 50);
+        stock.put("SKU-220", 200);
+        stock.put("SKU-401", 12);
+
+        try {
+            Iterator<Map.Entry<String, Integer>> it = stock.entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<String, Integer> entry = it.next();
+                if (entry.getValue() < 100) {
+                    stock.remove(entry.getKey());
+                }
+            }
+        } catch (Exception e) {
+            System.out.println("Caught: " + e.getClass().getSimpleName());
+        }
+    }
+}
+```
+
+The remove went through the map directly, not through `it.remove()`. The next `it.next()` detected the structural change and threw. The fix is to use `it.remove()` instead, or to collect the keys to remove during iteration and remove them after the loop.
+
+```java
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
+
+public class FailFastFix {
+    public static void main(String[] args) {
+        HashMap<String, Integer> stock = new HashMap<>();
+        stock.put("SKU-101", 50);
+        stock.put("SKU-220", 200);
+        stock.put("SKU-401", 12);
+
+        Iterator<Map.Entry<String, Integer>> it = stock.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<String, Integer> entry = it.next();
+            if (entry.getValue() < 100) {
+                it.remove();
+            }
+        }
+
+        System.out.println("Remaining: " + stock);
+    }
+}
+```
+
+`it.remove()` updates the iterator's internal counter alongside the map's, so no `ConcurrentModificationException` is thrown.
+
+Fail-fast is a debugging aid, not a thread-safety mechanism. The check happens on a best-effort basis. From multiple threads, `HashMap` can corrupt its own internal state in ways the iterator detection won't catch.
+
+<h1 id="thread-safety">Thread Safety</h1>
+
+`HashMap` is **not** thread-safe. Reading from multiple threads is safe as long as nobody writes; the moment any thread modifies the map, all bets are off. Concurrent modifications can produce lost updates, mangled chains, infinite loops during resize on old JVMs, and other corruptions that are notoriously hard to reproduce.
+
+The fix depends on the workload:
+
+| Need                                       | Use                                            |
+| ------------------------------------------ | ---------------------------------------------- |
+| Single-threaded code                       | `HashMap`                                      |
+| Simple synchronization, low contention     | `Collections.synchronizedMap(new HashMap<>())` |
+| High concurrency, many readers and writers | `ConcurrentHashMap`                            |
+
+`Collections.synchronizedMap` wraps every method in a synchronized block. It's correct but serializes all access; only one thread is in the map at a time. `ConcurrentHashMap` is the better choice for any concurrent workload.
+
+A common bug: assuming that because `HashMap` "usually works" in a multi-threaded test, it's safe. The corruption is racy. Tests can pass for months and then crash during a traffic spike.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,445 @@
+---
+title: "Thread Priority"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Thread Priority explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+This is one of the smaller chapters in the multithreading section, on purpose. Priority looks like a powerful lever at first glance, and it's not. Once you understand how thin the guarantees are, leaving priorities at the default becomes the obvious choice.
+
+<h1 id="the-priority-api">The Priority API</h1>
+
+A thread's priority is an `int` in the range `1` to `10`, inclusive. You read it with `getPriority()` and change it with `setPriority(int)`. The `Thread` class exposes three named constants for the boundaries and the midpoint, and those names cover almost every use case in real code.
+
+| Constant               | Value | Typical use                                                 |
+| ---------------------- | ----- | ----------------------------------------------------------- |
+| `Thread.MIN_PRIORITY`  | `1`   | Background work nobody is waiting for                       |
+| `Thread.NORM_PRIORITY` | `5`   | Default for new threads, the value almost every thread uses |
+| `Thread.MAX_PRIORITY`  | `10`  | Foreground work that should get a small nudge ahead         |
+
+The smallest possible example: create a thread, read its default priority, change it, and read it back.
+
+```java
+public class PriorityBasics {
+    public static void main(String[] args) {
+        Thread reportBuilder = new Thread(() -> {
+            System.out.println("Building monthly sales report");
+        }, "report-builder");
+
+        System.out.println("Default priority: " + reportBuilder.getPriority());
+
+        reportBuilder.setPriority(Thread.MIN_PRIORITY);
+        System.out.println("New priority: " + reportBuilder.getPriority());
+
+        System.out.println("MIN=" + Thread.MIN_PRIORITY
+            + " NORM=" + Thread.NORM_PRIORITY
+            + " MAX=" + Thread.MAX_PRIORITY);
+    }
+}
+```
+
+The thread starts at priority `5` because `5` is the default for any thread the `main` thread creates (more on inheritance in a moment). `setPriority(Thread.MIN_PRIORITY)` drops it to `1`. The thread hasn't been started yet, and that's fine. Priority can be set before or after `start()`, and the change takes effect right away.
+
+If you pass a value outside the `1..10` range, you get an `IllegalArgumentException`. Same if you pass a number to a thread whose containing `ThreadGroup` has a lower maximum (a rarely-used cap that a `ThreadGroup` can place on its members). The two boundaries are the only constraints worth remembering.
+
+```java
+public class PriorityOutOfRange {
+    public static void main(String[] args) {
+        Thread orderProcessor = new Thread(() -> {});
+
+        try {
+            orderProcessor.setPriority(11);
+        } catch (IllegalArgumentException e) {
+            System.out.println("Caught: " + e.getClass().getSimpleName());
+        }
+
+        try {
+            orderProcessor.setPriority(0);
+        } catch (IllegalArgumentException e) {
+            System.out.println("Caught: " + e.getClass().getSimpleName());
+        }
+    }
+}
+```
+
+Both `11` and `0` are outside the legal range, so both calls throw. The `IllegalArgumentException` makes the problem clear; the only way to "fix" the call is to pass a value in `1..10`.
+
+<h1 id="priority-is-inherited-from-the-parent">
+  Priority Is Inherited from the Parent
+</h1>
+
+A new thread doesn't start at `NORM_PRIORITY` by default. It starts at _whatever priority the thread that created it has_. That's what "inherited from the parent" means in this context. The `main` thread happens to start at `5`, so threads created from `main` start at `5`. If a thread running at `MIN_PRIORITY` creates another thread, that new thread also starts at `MIN_PRIORITY`.
+
+```java
+public class PriorityInheritance {
+    public static void main(String[] args) throws InterruptedException {
+        System.out.println("main priority: " + Thread.currentThread().getPriority());
+
+        Thread parent = new Thread(() -> {
+            System.out.println("parent priority: " + Thread.currentThread().getPriority());
+
+            Thread child = new Thread(() -> {
+                System.out.println("child priority: " + Thread.currentThread().getPriority());
+            }, "child");
+
+            child.start();
+            try {
+                child.join();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "parent");
+
+        parent.setPriority(Thread.MIN_PRIORITY);
+        parent.start();
+        parent.join();
+    }
+}
+```
+
+`main` runs at `5`. `parent` was explicitly set to `1` before being started. `child` is created inside `parent`, so it inherits `parent`'s priority, which is `1`. The child doesn't "fall back" to `NORM_PRIORITY`. Inheritance is the rule, and `NORM_PRIORITY` is the value the very first thread in a JVM happens to have.
+
+This inheritance is easy to forget when you build a background task that spawns helper threads. If the background task runs at `MIN_PRIORITY`, every helper it creates starts at `MIN_PRIORITY` too. That's usually what you want, but if a helper is doing something time-sensitive (a quick callback to a user-facing component), you may want to bump it back up explicitly.
+
+The diagram shows how priority flows. `main` and the `worker` share priority `5` because `main` created `worker` directly. `parent` was reset to `1`, and `child` inherits that `1` from `parent`, not from `main`. The tree shape matters: priority follows the creator chain, not anything else.
+
+<h1 id="mapping-java-priorities-to-the-os-scheduler">
+  Mapping Java Priorities to the OS Scheduler
+</h1>
+
+The JVM doesn't run threads itself. It hands them to the operating system's thread scheduler, which decides who actually gets CPU time. Java priorities (1 through 10) are a JVM-level concept; the OS scheduler has its own notion of priority that varies by platform.
+
+Each JVM has to translate Java's `1..10` into whatever the underlying OS understands. The translation isn't standardized, and it changes between operating systems and JVM versions.
+
+| Platform          | What the JVM typically does                                                                                |
+| ----------------- | ---------------------------------------------------------------------------------------------------------- |
+| Linux (HotSpot)   | Historically maps all Java priorities to the same OS priority unless `-XX:+UseThreadPriorities` is enabled |
+| macOS (HotSpot)   | Maps Java priorities onto a small range of POSIX thread priorities                                         |
+| Windows (HotSpot) | Maps Java's `1..10` onto Windows' thread priority levels (`THREAD_PRIORITY_LOWEST` through `_HIGHEST`)     |
+
+The honest summary: the same Java priority value can mean very different things on different machines. A program that behaves one way on a Windows laptop may behave differently on a Linux server. On many Linux configurations, setting a Java priority has no measurable effect at all, because the JVM defaults to ignoring it and the OS scheduler treats every thread the same.
+
+The chain has three places where the hint can get diluted. The JVM may map several Java values to the same OS value. The OS scheduler may ignore the OS-level hint when it has other goals (fairness, real-time deadlines, power management). The CPU may have many cores, and with enough cores, every runnable thread runs regardless of priority.
+
+The takeaway: write code that works correctly when every thread has the same priority. Priority is at best a tuning knob, never a correctness mechanism.
+
+<h1 id="why-priority-is-not-a-synchronization-mechanism">
+  Why Priority Is Not a Synchronization Mechanism
+</h1>
+
+A tempting line of reasoning goes like this: "If thread A has higher priority than thread B, A will run first, so I don't need a lock to make sure A finishes before B." This reasoning is wrong on every line.
+
+First, "higher priority" doesn't mean "runs first" on most platforms. Even when it does mean something, the OS scheduler is free to run low-priority threads when high-priority ones are blocked on I/O, sleeping, or unlucky on a multi-core machine. Second, "runs first" wouldn't be the same as "finishes first" anyway. A high-priority thread can be preempted right after it starts, and a low-priority thread can complete its short task before the high-priority one runs again.
+
+A small example that looks like it should work and doesn't.
+
+```java
+public class BadPrioritySync {
+    static String paymentResult = null;
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread payment = new Thread(() -> {
+            // Simulate payment processing
+            paymentResult = "APPROVED";
+        }, "payment");
+
+        Thread orderConfirm = new Thread(() -> {
+            // Reads paymentResult expecting payment thread to have set it
+            System.out.println("Order confirmation sees: " + paymentResult);
+        }, "order-confirm");
+
+        payment.setPriority(Thread.MAX_PRIORITY);
+        orderConfirm.setPriority(Thread.MIN_PRIORITY);
+
+        payment.start();
+        orderConfirm.start();
+
+        payment.join();
+        orderConfirm.join();
+    }
+}
+```
+
+**Output (one possible run):**
+
+```text
+Order confirmation sees: null
+```
+
+The author of this code wanted `payment` to finish first because it has the higher priority, so `orderConfirm` would always see `APPROVED`. The output can be `APPROVED` on some runs, `null` on others, and the difference depends on the OS, the JVM, the machine load, and timing. Priority didn't give the program any ordering guarantee. The correct fix is one of the real synchronization tools: `join()` to wait for `payment` before starting `orderConfirm`, a `synchronized` block with a shared flag, a `CountDownLatch`, or a `volatile` variable with a busy-wait. None of those involve priority.
+
+Treating priority as a synchronization mechanism is the kind of bug that passes ten thousand local tests and fails the first time someone runs the code on a different OS or under load. The cost isn't speed; it's correctness, and the failure modes are intermittent and hard to reproduce.
+
+There's a deeper issue too, called _priority inversion_. A high-priority thread can end up waiting for a lock held by a low-priority thread, which is in turn being starved by a medium-priority thread. The high-priority thread can sit blocked indefinitely, even though it has the highest priority of the three. The JVM doesn't solve this for you automatically; locking primitives are what manage thread ordering. Priority isn't.
+
+<h1 id="where-priority-can-help-a-little">
+  Where Priority Can Help (a Little)
+</h1>
+
+Priority is useful in narrow cases. A hint can be exactly right when:
+
+- You've a clearly background workload that should yield CPU to anything user-facing.
+- You've many CPU-bound threads competing, and you want to bias the scheduler's choice.
+- The behavior you want is "run a little less often" or "run a little more often", not "run before X completes."
+
+A common pattern is a low-priority background indexer or report generator running alongside normal-priority request handlers. Even if the OS only honors the hint loosely, leaning the scheduler toward the request handlers tends to keep latency lower when CPU is contested.
+
+```java
+public class BackgroundReport {
+    public static void main(String[] args) throws InterruptedException {
+        Thread reportBuilder = new Thread(() -> {
+            int processed = 0;
+            for (int i = 0; i < 5; i++) {
+                // Simulate building a chunk of the monthly sales report
+                long busyUntil = System.currentTimeMillis() + 100;
+                while (System.currentTimeMillis() < busyUntil) {
+                    processed++;
+                }
+                System.out.println("Report chunk " + i + " done");
+            }
+        }, "monthly-report");
+
+        Thread orderHandler = new Thread(() -> {
+            for (int i = 0; i < 3; i++) {
+                System.out.println("Order " + (1000 + i) + " processed");
+                try {
+                    Thread.sleep(50);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }, "order-handler");
+
+        reportBuilder.setPriority(Thread.MIN_PRIORITY);
+        orderHandler.setPriority(Thread.NORM_PRIORITY + 1);
+
+        reportBuilder.start();
+        orderHandler.start();
+
+        reportBuilder.join();
+        orderHandler.join();
+    }
+}
+```
+
+**Output (one possible run):**
+
+```text
+Order 1000 processed
+Report chunk 0 done
+Order 1001 processed
+Report chunk 1 done
+Order 1002 processed
+Report chunk 2 done
+Report chunk 3 done
+Report chunk 4 done
+```
+
+The exact interleaving will vary. The intent is clear: the order handler is the user-facing work and should respond promptly, while the report builder is doing bulk background work that can wait if the system is busy. The priorities express that intent. On a Linux box with default JVM flags, the output might look identical to a version where both threads ran at the same priority, and that's fine. The program is still correct either way. Priority nudges the scheduler in a direction that fits the workload's importance, when the scheduler decides to listen.
+
+A few rules of thumb when you do use priority:
+
+- Move _down_ from `NORM_PRIORITY` for background work, rather than moving normal threads _up_. The lowering is the part the OS is most likely to honor.
+- Avoid priority differences smaller than 2 or 3 levels. A meaningful effect from `NORM_PRIORITY - 1` is the JVM mapping being noisy, not a reliable signal.
+- Avoid scattering priority calls through the codebase. Pick a small number of priority "tiers" (background, normal, urgent) and stick to them.
+
+This is a sketch of how the e-commerce backend might bucket its threads. The arrows aren't a hard ordering; they label _workload classes_. The report builder is background work. The order processor is the system's main job. The payment confirm path is the one a customer is staring at on the page. Three tiers, three priorities, no fiddly per-thread tuning.
+
+<h1 id="starvation-the-risk-on-the-other-end">
+  Starvation: The Risk on the Other End
+</h1>
+
+Once you've biased the scheduler, you've also created the possibility of _starvation_: a thread that runs so rarely it effectively never makes progress. In a steady-state system with plenty of CPU, starvation is hard to see; every thread gets time eventually. Under load, with a long queue of high-priority work pouring in, the low-priority threads can sit idle for seconds, minutes, or longer.
+
+```java
+public class StarvationSketch {
+    public static void main(String[] args) throws InterruptedException {
+        Thread analyticsFlush = new Thread(() -> {
+            for (int i = 0; i < 3; i++) {
+                System.out.println("Analytics flush " + i);
+                try {
+                    Thread.sleep(10);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }, "analytics");
+
+        analyticsFlush.setPriority(Thread.MIN_PRIORITY);
+        analyticsFlush.start();
+
+        // Imagine many of these, all hot and CPU-bound
+        for (int i = 0; i < 4; i++) {
+            final int orderId = 2000 + i;
+            Thread t = new Thread(() -> {
+                for (int j = 0; j < 5; j++) {
+                    long busyUntil = System.currentTimeMillis() + 20;
+                    while (System.currentTimeMillis() < busyUntil) {
+                        // tight CPU loop
+                    }
+                    System.out.println("Order " + orderId + " step " + j);
+                }
+            }, "order-" + orderId);
+            t.setPriority(Thread.MAX_PRIORITY);
+            t.start();
+        }
+
+        analyticsFlush.join();
+    }
+}
+```
+
+**Output (one possible run, truncated):**
+
+```text
+Analytics flush 0
+Order 2000 step 0
+Order 2001 step 0
+Order 2002 step 0
+Order 2003 step 0
+Order 2000 step 1
+Order 2001 step 1
+... (many more order lines)
+Analytics flush 1
+... (many more order lines)
+Analytics flush 2
+```
+
+On a multi-core machine with plenty of CPU, the analytics thread finishes fine and the output is interleaved. On a single-core machine, or a CPU-saturated box, the analytics thread can sit waiting for long periods while the high-priority orders run. _If_ the scheduler honors priorities, it can honor them too well: the low-priority thread can be pushed back arbitrarily far. The risk grows the more high-priority work you've queued.
+
+The standard defenses are workload-design defenses, not priority tweaks:
+
+- **Cap the high-priority workload.** Use a bounded thread pool or a queue size limit so urgent work doesn't grow without bound and starve everything else.
+- **Avoid pinning background work to `MIN_PRIORITY` if it has any deadline.** Reserve `MIN_PRIORITY` for work that completes eventually with no timing requirement.
+- **Use the executor framework's scheduling primitives** instead of priority for anything that needs predictable timing.
+
+Priority and starvation are two sides of the same coin: a hint to the scheduler is only useful if the scheduler can deliver on the parts you didn't ask about, which it can't always do.
+
+Starvation is a runtime cost that doesn't show up in CPU graphs the way contention does. Look for it as "this background task is months behind", "this metrics flush never runs", or "this health-check thread is the last to wake up." It's a quality-of-service bug rather than a throughput bug.
+
+<h1 id="daemon-vs-priority-different-concepts">
+  Daemon vs Priority: Different Concepts
+</h1>
+
+Threads have another property that often gets confused with priority: the daemon flag. A thread can be _user_ (non-daemon, the default) or _daemon_, and the JVM treats the two kinds differently when deciding whether to exit. Daemon and priority are independent: a thread has a priority _and_ a daemon status, and the two control different behavior.
+
+The rule on daemon threads is simple. The JVM exits when the last non-daemon thread finishes. Daemon threads don't count; they get killed when the JVM shuts down, even mid-execution.
+
+```java
+public class DaemonVsPriority {
+    public static void main(String[] args) {
+        Thread workThread = new Thread(() -> {
+            System.out.println("Worker started");
+        }, "worker");
+
+        workThread.setDaemon(true);
+        workThread.setPriority(Thread.MIN_PRIORITY);
+
+        System.out.println("Daemon: " + workThread.isDaemon());
+        System.out.println("Priority: " + workThread.getPriority());
+
+        workThread.start();
+    }
+}
+```
+
+The thread is both daemon _and_ low-priority. The two switches don't overlap. Daemon controls "does this thread keep the JVM alive?" Priority controls "how often should this thread run while it's alive?" You can pick any combination of the four:
+
+| Daemon | Priority | Typical use                                                             |
+| ------ | -------- | ----------------------------------------------------------------------- |
+| No     | `5`      | Most application threads                                                |
+| No     | `1`      | A background report generator the program is willing to wait on at exit |
+| Yes    | `5`      | A finalizer or watchdog thread the JVM is willing to abandon            |
+| Yes    | `1`      | A best-effort cache cleaner or metrics ping                             |
+
+Picking one doesn't pick the other. Confusing the two is a frequent source of bugs: a thread marked daemon will be killed at JVM exit, and a developer who expected "low priority" might lose data they thought would still get flushed. Treat the two as independent decisions: whether the work _must_ complete (non-daemon) and _how often it should run_ (priority).
+
+Two independent questions, two independent answers. The diagram pictures them as separate branches because they're separate: there's no rule that low-priority threads "should be" daemons, or that daemons "should be" low-priority.
+
+<h1 id="a-small-e-commerce-sketch">A Small E-Commerce Sketch</h1>
+
+Tying everything together: a tiny program with three threads representing the three workload tiers in a small e-commerce backend. Priority differences are present, but the program would be correct (just slightly less responsive under load) if every priority were the same.
+
+```java
+public class ECommerceTiers {
+    public static void main(String[] args) throws InterruptedException {
+        Thread checkout = new Thread(() -> {
+            System.out.println("Checkout: confirming payment");
+            try {
+                Thread.sleep(40);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            System.out.println("Checkout: order placed");
+        }, "checkout");
+
+        Thread orderProcessor = new Thread(() -> {
+            for (int i = 0; i < 3; i++) {
+                System.out.println("Processor: handling order " + (3000 + i));
+                try {
+                    Thread.sleep(30);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }, "order-processor");
+
+        Thread reportBuilder = new Thread(() -> {
+            for (int i = 0; i < 4; i++) {
+                System.out.println("Report: building section " + i);
+                try {
+                    Thread.sleep(20);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }, "report-builder");
+
+        checkout.setPriority(Thread.NORM_PRIORITY + 2);
+        orderProcessor.setPriority(Thread.NORM_PRIORITY);
+        reportBuilder.setPriority(Thread.MIN_PRIORITY);
+
+        checkout.start();
+        orderProcessor.start();
+        reportBuilder.start();
+
+        checkout.join();
+        orderProcessor.join();
+        reportBuilder.join();
+
+        System.out.println("All tiers finished");
+    }
+}
+```
+
+**Output (one possible run):**
+
+```text
+Checkout: confirming payment
+Processor: handling order 3000
+Report: building section 0
+Report: building section 1
+Processor: handling order 3001
+Checkout: order placed
+Report: building section 2
+Processor: handling order 3002
+Report: building section 3
+All tiers finished
+```
+
+Three threads, three priorities, one program. The exact interleaving changes from run to run and from machine to machine. The program is correct because nothing in it depends on a specific ordering; it depends only on each thread running its own work to completion. The priorities express _what should get nudged forward when CPU is tight_. On an idle machine with three free cores, the priorities effectively do nothing. On a saturated machine, the checkout finishes first more often than the report builder.
+
+This is the shape for using priority in real code. Set the tiers, accept that the OS may ignore them, and rely on synchronization tools (the next several chapters) for any ordering or correctness requirements.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,249 @@
+---
+title: "Block Storage"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Block Storage explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+What the database needs is storage that **behaves like a disk**. It should allow fast reads and writes at any position, and it should let us update small pieces of data in place. That is what block storage provides.
+
+<h1 id="2-what-is-block-storage">2. What is Block Storage?</h1>
+
+Block storage stores data as a sequence of **fixed-size blocks**. Each block has a numeric **address**, and nothing else. There are no file names, no folders, and no metadata describing what the data means.
+
+The storage device only understands two basic operations:
+
+```text
+read(address)          # read the block at this address
+write(address, data)   # write this data to the block at this address
+```
+
+A common block size is **4 KB**. So a 1 TB volume is simply a very long array of roughly **268 million blocks**.
+
+The hard drive or SSD in your laptop is block storage. In the cloud, services like **Amazon EBS**, **Google Cloud Persistent Disk**, and **Azure Managed Disks** provide block storage as virtual disks that you attach to servers.
+
+<h1 id="3-how-files-map-to-blocks">3. How Files Map to Blocks</h1>
+
+If block storage has no concept of files, how does a database work with files? The answer is the **file system**.
+
+When we attach a new block storage volume to a server, the operating system sees it as a **raw disk**. Before we can store files on it, we format it with a file system, such as **ext4** or **XFS** on Linux, or **NTFS** on Windows. The file system keeps track of which blocks belong to which file.
+
+```text
+# A new volume shows up as a raw device, e.g. /dev/nvme1n1
+sudo mkfs.ext4 /dev/nvme1n1                  # create a file system on it
+sudo mount /dev/nvme1n1 /var/lib/postgresql  # make it available as a directory
+```
+
+Now let's follow a single write. Suppose PostgreSQL wants to update one **8 KB page** inside the `orders` table file.
+
+1. PostgreSQL tells the file system: write 8 KB at a specific offset in the `orders` file.
+2. The file system translates that offset into block addresses. With 4 KB blocks, that page maps to **two blocks**, say block 1,000,000 and block 1,000,001.
+3. The file system asks the block device to overwrite **just those two blocks**.
+
+Nothing else on the volume is touched. This is the key strength of block storage. It supports **small, random, in-place updates**, which is the access pattern databases rely on.
+
+Some databases go one step further. They skip parts of the file system's caching (for example with `O_DIRECT`) and manage their own memory buffers, because they know their access patterns better than the operating system does. Either way, the block device underneath sees the same thing: reads and writes to numbered blocks.
+
+<h1 id="4-local-block-storage">4. Local Block Storage</h1>
+
+Block storage comes in two main forms. The first is **local storage**: a disk that is physically attached to the server, such as an **NVMe SSD** inside the machine.
+
+Because the data does not cross a network, local storage offers very low latency, often **well under a millisecond**. It can also deliver very high IOPS and throughput.
+
+But local storage has an important limitation: **the data is tied to that physical machine**. If the server fails, the data may be lost or stuck on that machine.
+
+In the cloud, local disks are often **ephemeral**. For example, the data on an AWS **instance store** disk is lost when the instance is stopped or terminated, or when the underlying hardware fails. It only survives a normal reboot.
+
+So local storage is a good fit for:
+
+- **Caches** that can be rebuilt.
+- **Temporary files**, such as sort spill files or build artifacts.
+- **Systems that already replicate data** across multiple servers, such as Cassandra, Kafka, or Elasticsearch clusters. If one node loses its disk, the data still exists on other nodes and can be copied back.
+
+<h1 id="5-network-attached-block-storage">5. Network-Attached Block Storage</h1>
+
+The second form is **network-attached block storage**. Here, the volume lives on a separate storage system, and the server accesses it over the network.
+
+From the server's point of view, it still looks like a normal local disk. The operating system formats it, mounts it, and reads and writes blocks just as it would with a physical drive.
+
+- In traditional data centers, this is often done with a **Storage Area Network (SAN)**, using protocols like **iSCSI** or **Fibre Channel**.
+- In the cloud, services like **Amazon EBS** work the same way.
+
+The big advantage is that **the storage is independent of the server**. If a server fails, we can start a new server, attach the same volume, and continue where we left off. We can also resize volumes, change their performance tier, and take snapshots without touching the server.
+
+The trade-off is **latency**. Every read and write now involves a network hop, so network block storage is usually slower than a local NVMe drive. A local NVMe read can take tens of microseconds, while a network volume read typically takes from a few hundred microseconds to around a millisecond.
+
+|                         | Local (e.g. NVMe instance store)             | Network-attached (e.g. EBS, SAN)             |
+| ----------------------- | -------------------------------------------- | -------------------------------------------- |
+| Latency                 | Lowest, well under a millisecond             | Higher, includes a network hop               |
+| Survives server failure | No                                           | Yes, attach the volume to a new server       |
+| Resize or change tier   | No, fixed with the machine                   | Yes, often while in use                      |
+| Snapshots               | Not built in                                 | Built in                                     |
+| Good for                | Caches, temp files, self-replicating systems | Databases, boot disks, most stateful servers |
+
+<h1 id="6-measuring-performance-iops-throughput-and-latency">
+  6. Measuring Performance: IOPS, Throughput, and Latency
+</h1>
+
+When choosing block storage, three numbers matter most.
+
+<h3 id="iops">IOPS</h3>
+
+**IOPS** (input/output operations per second) measures how many individual reads and writes the volume can handle each second. Databases with many small random operations care a lot about IOPS.
+
+<h3 id="throughput">Throughput</h3>
+
+**Throughput** measures how many megabytes per second the volume can transfer. Workloads that read large files sequentially, like analytics scans or backups, care more about throughput.
+
+The two are connected:
+
+```javascript
+throughput = IOPS x size of each operation
+
+10,000 IOPS x 16 KB  ≈ 160 MB/s
+10,000 IOPS x 4 KB   ≈  40 MB/s
+```
+
+This is why a volume can hit one limit before the other. A database doing small 4 KB reads may run out of IOPS long before it uses its full throughput, while a backup job reading in 1 MB chunks may hit the throughput limit with only a few hundred IOPS.
+
+<h3 id="latency">Latency</h3>
+
+**Latency** is how long a single read or write takes to complete. Even a volume with high IOPS can feel slow to a database if each individual operation takes too long. A transaction that does five reads one after another waits for all five, so per-operation latency adds up quickly.
+
+Latency also rises when a volume is pushed close to its limits. Requests start to queue, and each one waits longer. It is good practice to watch queue length and latency, not just IOPS.
+
+<h3 id="choosing-the-numbers">Choosing the Numbers</h3>
+
+Cloud providers usually let you choose these numbers. For example, an Amazon EBS **gp3** volume starts with a baseline of **3,000 IOPS** and **125 MB/s**, and you can pay to provision more. Volume types designed for heavy databases, like **io2**, offer much higher IOPS and more consistent latency, at a higher price.
+
+| Metric     | What It Measures      | Who Cares Most                                |
+| ---------- | --------------------- | --------------------------------------------- |
+| IOPS       | Operations per second | Databases with small random reads and writes  |
+| Throughput | MB per second         | Analytics scans, backups, log processing      |
+| Latency    | Time per operation    | Transactional databases, anything user-facing |
+
+<h1 id="7-inside-cloud-block-storage">7. Inside Cloud Block Storage</h1>
+
+So what happens behind a cloud block storage volume?
+
+When we create a volume, the provider **does not dedicate one physical disk** to us. Instead, the volume is split into pieces and stored across many storage servers. Each piece is **replicated** to multiple servers, so a single disk or server failure does not lose data.
+
+When our server writes a block, the request travels over the network to the storage servers responsible for that block. The write is stored on the replicas **before it is acknowledged**.
+
+This replication usually happens **within a single availability zone**. Keeping replicas close together keeps write latency low. But it also means:
+
+- **The volume is tied to that zone.** A server in one availability zone generally cannot attach a volume from another zone.
+- **A zone outage can make the volume unavailable.** If the whole zone goes down, so does access to the volume.
+
+Replication inside a zone also does not make a volume impossible to lose. AWS, for example, designs gp3 volumes for 99.8% to 99.9% durability per year, and io2 volumes for 99.999%. That is why snapshots, and database replicas in other zones, still matter.
+
+<h1 id="8-one-volume-one-server">8. One Volume, One Server</h1>
+
+Another important property of block storage is that a volume is usually **attached to one server at a time**. Why?
+
+Remember that the file system on the server keeps track of which blocks belong to which file. It also **caches** some of that information in memory.
+
+Now imagine two servers attach the same volume, and both write to it with a normal file system like ext4. Each server assumes it is the only one making changes.
+
+1. Server A allocates block 500 for a new file.
+2. Server B, unaware of that change, allocates the same block 500 for a different file.
+3. Both write to it. Very quickly, the file system becomes corrupted.
+
+Some cloud services do offer **multi-attach** for certain volume types, such as EBS io2. But to use it safely, the servers need a **cluster-aware file system** (such as GFS2 or OCFS2) or an application that coordinates access to the blocks itself.
+
+When many servers need to share the same files, **file storage** is usually the simpler choice.
+
+<h1 id="9-snapshots">9. Snapshots</h1>
+
+Block storage volumes often support **snapshots**. A snapshot captures the state of the volume at a specific point in time.
+
+In Amazon EBS, snapshots are **incremental**:
+
+- The **first snapshot** copies all the blocks that contain data.
+- **Later snapshots** only store the blocks that changed since the previous snapshot.
+
+This makes regular snapshots much cheaper than copying the full volume every time. Each snapshot can still restore the complete volume, because it refers back to unchanged blocks stored by earlier snapshots.
+
+EBS stores snapshots in **Amazon S3**, which makes them far more durable than the volume itself. Snapshots are useful in several ways:
+
+- **Backups**: take them on a schedule and keep them for a set period.
+- **Cloning**: create a new volume from a snapshot, for example to copy a production database for testing.
+- **Moving data**: snapshots are not tied to one availability zone, so we can restore a volume in a different zone, or copy the snapshot to a different region.
+
+One thing to keep in mind is **consistency**. If a database is actively writing during a snapshot, some of its data may still be sitting in memory, not yet on disk. The snapshot then captures the disk as if the server had suddenly lost power. For a clean backup, databases usually need to flush writes first, or rely on their own crash recovery (such as replaying the write-ahead log) when restoring.
+
+A volume restored from a snapshot can also be slow at first. Its blocks are loaded from S3 the first time they are read, so the first access to each block takes longer until the volume is fully warmed up.
+
+<h1 id="10-scaling-block-storage">10. Scaling Block Storage</h1>
+
+Block storage mostly scales **vertically**.
+
+- If a volume runs out of space, we can **increase its size**.
+- If it is too slow, we can **move it to a faster tier** or **provision more IOPS**.
+
+On many cloud platforms, both changes can be made while the volume stays attached and in use. After resizing, we still need to **extend the file system** so it can use the new space:
+
+```text
+# after growing the volume in the cloud console or API
+sudo resize2fs /dev/nvme1n1        # ext4
+sudo xfs_growfs /var/lib/postgresql  # XFS (takes the mount point)
+```
+
+But a single volume has limits. Each volume type has a **maximum size, IOPS, and throughput**. And because one volume is typically attached to one server, a single volume cannot absorb unlimited traffic from many machines.
+
+When a system outgrows one volume, the usual next step is to **add more servers, each with its own volume**. For a database, this often means **read replicas** or **sharding**, where each node manages its own block storage.
+
+Another option on a single server is to combine several volumes into one larger device with software RAID 0 (striping). This adds up their IOPS and throughput, but losing any one volume loses the whole array, so it only makes sense when the data is protected some other way.
+
+<h1 id="11-how-block-storage-fits-into-a-system-design">
+  11. How Block Storage Fits into a System Design
+</h1>
+
+In a system design, block storage usually sits **underneath components that manage their own data**:
+
+- **Relational databases** like PostgreSQL and MySQL store their data files and write-ahead logs on block storage.
+- **NoSQL databases** like MongoDB and Cassandra do the same.
+- **Message brokers** like Kafka store their log segments on block volumes attached to each broker.
+- **Search engines** like Elasticsearch keep their indexes on block storage.
+- Every **virtual machine** in the cloud boots from a block storage volume.
+
+In all of these cases, the **application** handles the higher-level logic, like replication across zones and sharding across nodes. **Block storage** provides a fast, reliable disk underneath each individual server.
+
+This split is worth stating clearly in a design discussion. A single EBS volume lives in one zone, so it does not make your database highly available on its own. For that, you still need a replica in another zone, which the database (or a managed service like Amazon RDS) handles.
+
+<h1 id="12-when-should-you-use-block-storage">
+  12. When Should You Use Block Storage?
+</h1>
+
+Block storage is the right choice when **a single server needs fast, low-latency access to data that changes frequently**. Databases, transaction logs, virtual machine disks, and search indexes are classic examples.
+
+- Choose **local block storage** when you need the lowest possible latency and the application can tolerate losing a node, usually because it already replicates data elsewhere.
+- Choose **network-attached block storage** when the data must survive server failures and you want features like snapshots and easy resizing.
+
+Block storage is **not a good fit** when many servers need to share the same files, or when you need to store huge amounts of media, backups, or logs cheaply. In those cases, file storage or object storage usually works better.
+
+| Need                                                              | Best Fit                       |
+| ----------------------------------------------------------------- | ------------------------------ |
+| Fast random reads and writes for one server (databases, VM disks) | Network-attached block storage |
+| Lowest latency, and the data is replicated elsewhere              | Local block storage (NVMe)     |
+| Many servers sharing the same files and folders                   | File storage                   |
+| Huge amounts of media, backups, or logs at low cost               | Object storage                 |
+
+<h1 id="summary">Summary</h1>
+
+- Block storage stores data as **fixed-size blocks**, each identified by an **address**. It has no built-in concept of files.
+- A **file system** on the server (ext4, XFS, NTFS) maps files to blocks.
+- This design allows **fast, random, in-place reads and writes**, which is why databases and virtual machines rely on it.
+- **Local block storage** gives the lowest latency but is tied to one machine. **Network-attached block storage** survives server failures and supports snapshots and resizing, at the cost of a network hop.
+- Performance is measured in **IOPS, throughput, and latency**, and throughput = IOPS x operation size.
+- Cloud volumes are **replicated within one availability zone**, and a volume is usually **attached to one server at a time**.
+- **Incremental snapshots** stored in object storage provide backups, clones, and a way to move data across zones and regions.
+- Block storage scales **vertically**. Past one volume's limits, you add servers with their own volumes, using replicas or sharding.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

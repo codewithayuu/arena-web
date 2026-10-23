@@ -1,0 +1,693 @@
+---
+title: "Accessing Fields & Methods"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Accessing Fields & Methods explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+The pattern is the same for both. You look up the `Field` or `Method`, optionally call `setAccessible(true)` to bypass access checks, then read or write or invoke. The interesting part is the corner cases: static members, final fields, primitives, exception unwrapping, and the cost of doing this on a hot path.
+
+<h1 id="reading-a-fields-value">Reading a Field's Value</h1>
+
+Once you have a `Field` object, you read its value with `field.get(instance)`. The instance is the object whose field you want to read. The return type is `Object`, so primitives come back as their boxed equivalents and you cast or unbox at the call site.
+
+```java
+import java.lang.reflect.Field;
+
+public class ReadFieldExample {
+
+    static class Product {
+        String name;
+        double price;
+
+        Product(String name, double price) {
+            this.name = name;
+            this.price = price;
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Product item = new Product("Wireless Mouse", 24.99);
+
+        Field nameField = Product.class.getDeclaredField("name");
+        Field priceField = Product.class.getDeclaredField("price");
+
+        String name = (String) nameField.get(item);
+        double price = (double) priceField.get(item);
+
+        System.out.println("name=" + name + ", price=" + price);
+    }
+}
+```
+
+Reading the `double` field came back as a boxed `Double`, which auto-unboxed into the `double` variable. That works but it allocates. For a hot loop that reads millions of values, the boxing per call adds up.
+
+The `Field` class also offers typed accessors that skip the box entirely: `getInt`, `getLong`, `getDouble`, `getBoolean`, `getByte`, `getShort`, `getFloat`, `getChar`. Each one matches a primitive type. They throw `IllegalArgumentException` if the field is not of the matching type.
+
+```java
+import java.lang.reflect.Field;
+
+public class TypedFieldReadExample {
+
+    static class Product {
+        String name;
+        double price;
+        int stockQty;
+        boolean inStock;
+
+        Product(String name, double price, int stockQty, boolean inStock) {
+            this.name = name;
+            this.price = price;
+            this.stockQty = stockQty;
+            this.inStock = inStock;
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Product item = new Product("USB Cable", 8.50, 142, true);
+
+        Field priceField = Product.class.getDeclaredField("price");
+        Field stockField = Product.class.getDeclaredField("stockQty");
+        Field inStockField = Product.class.getDeclaredField("inStock");
+
+        double price = priceField.getDouble(item);
+        int stock = stockField.getInt(item);
+        boolean inStock = inStockField.getBoolean(item);
+
+        System.out.println("price=" + price + ", stock=" + stock + ", inStock=" + inStock);
+    }
+}
+```
+
+The typed accessors avoid the autobox-then-unbox round trip you get with `get`. The cost difference is small for one call, but if you are walking every field on every object in a large list, choose the typed variant for primitives.
+
+`field.get(obj)` boxes primitives on every call. For primitive fields read in a tight loop, prefer `field.getInt(obj)` (or the matching primitive variant) to skip the allocation.
+
+<h1 id="writing-a-fields-value">Writing a Field's Value</h1>
+
+`Field.set(instance, value)` writes a new value into the field. The `value` argument is `Object`, so primitives are boxed at the call site, which mirrors the read API.
+
+```java
+import java.lang.reflect.Field;
+
+public class WriteFieldExample {
+
+    static class Product {
+        String name;
+        double price;
+        int stockQty;
+
+        Product(String name, double price, int stockQty) {
+            this.name = name;
+            this.price = price;
+            this.stockQty = stockQty;
+        }
+
+        @Override
+        public String toString() {
+            return name + " @ $" + price + " (" + stockQty + " in stock)";
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Product item = new Product("Notebook", 4.99, 200);
+        System.out.println("Before: " + item);
+
+        Field priceField = Product.class.getDeclaredField("price");
+        priceField.set(item, 3.99);
+
+        Field stockField = Product.class.getDeclaredField("stockQty");
+        stockField.set(item, 180);
+
+        System.out.println("After:  " + item);
+    }
+}
+```
+
+Just like reading, there are primitive-typed setters: `setInt`, `setLong`, `setDouble`, `setBoolean`, `setByte`, `setShort`, `setFloat`, `setChar`. They take the unboxed primitive directly.
+
+```java
+import java.lang.reflect.Field;
+
+public class TypedFieldWriteExample {
+
+    static class Product {
+        String name;
+        double price;
+        int stockQty;
+
+        Product(String name, double price, int stockQty) {
+            this.name = name;
+            this.price = price;
+            this.stockQty = stockQty;
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Product item = new Product("Coffee Mug", 6.50, 75);
+
+        Field priceField = Product.class.getDeclaredField("price");
+        Field stockField = Product.class.getDeclaredField("stockQty");
+
+        priceField.setDouble(item, 5.50);
+        stockField.setInt(item, 60);
+
+        System.out.println("price=" + item.price + ", stock=" + item.stockQty);
+    }
+}
+```
+
+The typed setters check the field's declared type. If you call `setInt` on a `String` field, you get `IllegalArgumentException`. If you call `set` with a value whose type does not match (passing a `String` to a `double` field, for example), you also get `IllegalArgumentException`. The error is at the boundary, not silent.
+
+```java
+import java.lang.reflect.Field;
+
+public class WrongTypeWriteExample {
+
+    static class Product {
+        double price;
+    }
+
+    public static void main(String[] args) throws Exception {
+        Product item = new Product();
+        Field priceField = Product.class.getDeclaredField("price");
+
+        try {
+            priceField.set(item, "free");
+        } catch (IllegalArgumentException e) {
+            System.out.println("Rejected: " + e.getMessage());
+        }
+    }
+}
+```
+
+The exact message text varies by JDK version, but the exception type is stable. If you are writing a generic field setter, catch `IllegalArgumentException` and report which field and which value failed; otherwise the message alone is not always obvious to the caller.
+
+<h1 id="static-fields-pass-null-as-the-target">
+  Static Fields: Pass null as the Target
+</h1>
+
+Static fields belong to the class, not to any instance. The reflection API still requires you to call `get` or `set`, and the convention is to pass `null` as the target object. Reflection sees the field is static, ignores the target, and reads or writes the class-level slot.
+
+```java
+import java.lang.reflect.Field;
+
+public class StaticFieldExample {
+
+    static class PricingConfig {
+        static double taxRate = 0.08;
+        static String currency = "USD";
+    }
+
+    public static void main(String[] args) throws Exception {
+        Field taxField = PricingConfig.class.getDeclaredField("taxRate");
+        Field currencyField = PricingConfig.class.getDeclaredField("currency");
+
+        double tax = taxField.getDouble(null);
+        String currency = (String) currencyField.get(null);
+        System.out.println("Before: tax=" + tax + ", currency=" + currency);
+
+        taxField.setDouble(null, 0.10);
+        currencyField.set(null, "EUR");
+
+        System.out.println("After:  tax=" + PricingConfig.taxRate + ", currency=" + PricingConfig.currency);
+    }
+}
+```
+
+The `null` is not magic, it is a convention that says "no receiver because the field is static." If you pass a real instance for a static field, reflection accepts it and uses the static slot anyway. The reverse is fatal: if you pass `null` for a non-static field, you get `NullPointerException`.
+
+<h1 id="final-fields-and-the-module-system">
+  Final Fields and the Module System
+</h1>
+
+Final fields are designed to be assigned once and never changed. Reflection has historically been able to side-step that by calling `setAccessible(true)` and then `set`, but the rules have tightened over the years and depend on whether the field is instance-final or static-final, and on which Java version you are on.
+
+For a non-static final field, you can usually still write to it through reflection if you call `setAccessible(true)` first. The JVM treats the write as "reflective override" and lets it through, though some JIT optimizations may have already inlined the original value into compiled code, so the change may not be visible everywhere you expect.
+
+```java
+import java.lang.reflect.Field;
+
+public class FinalInstanceFieldExample {
+
+    static class Order {
+        final String orderId;
+
+        Order(String orderId) {
+            this.orderId = orderId;
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Order order = new Order("ORD-1001");
+        System.out.println("Before: " + order.orderId);
+
+        Field idField = Order.class.getDeclaredField("orderId");
+        idField.setAccessible(true);
+        idField.set(order, "ORD-9999");
+
+        System.out.println("After:  " + order.orderId);
+    }
+}
+```
+
+Static final fields are a different story. From Java 9 onward, the JVM blocks reflective writes to static final fields, especially ones the compiler may have folded into constants. Older tricks that modified the `modifiers` flag through reflection no longer work because the `modifiers` field on `Field` itself is now inaccessible to reflection on recent versions.
+
+```java
+import java.lang.reflect.Field;
+
+public class FinalStaticFieldExample {
+
+    static class Config {
+        static final String VERSION = "1.0";
+    }
+
+    public static void main(String[] args) {
+        try {
+            Field versionField = Config.class.getDeclaredField("VERSION");
+            versionField.setAccessible(true);
+            versionField.set(null, "2.0");
+            System.out.println("VERSION = " + Config.VERSION);
+        } catch (Exception e) {
+            System.out.println("Failed: " + e.getClass().getSimpleName());
+        }
+    }
+}
+```
+
+The exception type varies by JDK and the exact configuration of the field, but the takeaway is the same: do not try to modify a `static final` through reflection. The runtime considers it a real constant.
+
+The modern alternative for legitimately mutable shared state with finer control is `VarHandle`, introduced in Java 9. A `VarHandle` lets you read and write a field with explicit memory ordering and without the reflective overhead. For most application code you will not need it, but it is the recommended path when you need atomic or volatile semantics on a field you discovered dynamically. We won't go deeper here; `MethodHandle` and `VarHandle` are a separate topic.
+
+`setAccessible(true)` itself does access checks the first time it is called on a member, then caches the result on the `Field` or `Method`. Call it once during setup, reuse the object forever. Calling `setAccessible` repeatedly inside a loop is wasted work.
+
+<h1 id="invoking-a-method">Invoking a Method</h1>
+
+`Method.invoke(target, args...)` calls a method reflectively. The `target` is the instance to call it on, and the rest is the argument list, varargs-style. The return type is `Object`; primitives come back boxed; `void` methods return `null`.
+
+The full lifecycle of a reflective method call, end to end: every reflective invocation walks the same path: locate the `Method`, open it up if needed, call it, then unwrap any exception it threw.
+
+The rest of this section walks through each step. Lookup and `setAccessible` you have seen already; the new pieces are calling `invoke` and unwrapping `InvocationTargetException` cleanly.
+
+```java
+import java.lang.reflect.Method;
+
+public class InvokeBasicExample {
+
+    static class Cart {
+        double total = 0.0;
+
+        public double addItem(double price, int quantity) {
+            double subtotal = price * quantity;
+            total += subtotal;
+            return total;
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Cart cart = new Cart();
+
+        Method addItem = Cart.class.getDeclaredMethod("addItem", double.class, int.class);
+
+        Object result = addItem.invoke(cart, 9.99, 3);
+        System.out.println("After first call: total=" + result);
+
+        result = addItem.invoke(cart, 4.50, 2);
+        System.out.println("After second call: total=" + result);
+    }
+}
+```
+
+The two arguments to `addItem` are passed positionally. Because `invoke` is varargs, you list them in order after the target. Primitive parameters are accepted as boxed values, and reflection unboxes them before the call. A wrong type, a wrong number of arguments, or a `null` for a primitive parameter raises `IllegalArgumentException`.
+
+For a `void` method, the return value is `null`. There is no separate API for void; you just ignore the result or cast it where you need to.
+
+```java
+import java.lang.reflect.Method;
+
+public class InvokeVoidExample {
+
+    static class Cart {
+        int itemCount = 0;
+
+        public void addOne() {
+            itemCount++;
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Cart cart = new Cart();
+
+        Method addOne = Cart.class.getDeclaredMethod("addOne");
+
+        Object result = addOne.invoke(cart);
+        System.out.println("result=" + result + ", itemCount=" + cart.itemCount);
+    }
+}
+```
+
+The result is always `null` for a `void` method. If you wrote a wrapper that returned different types based on what it found, you would check the return type of the `Method` first and branch.
+
+<h1 id="invoking-static-methods">Invoking Static Methods</h1>
+
+Static methods follow the same `null` convention as static fields. The target argument is ignored when the method is static, but you should pass `null` to be explicit about it.
+
+```java
+import java.lang.reflect.Method;
+
+public class InvokeStaticExample {
+
+    static class PriceUtils {
+        public static double applyDiscount(double price, double rate) {
+            return price * (1 - rate);
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Method applyDiscount = PriceUtils.class.getDeclaredMethod(
+                "applyDiscount", double.class, double.class);
+
+        double result = (double) applyDiscount.invoke(null, 100.0, 0.20);
+        System.out.println("After discount: $" + result);
+    }
+}
+```
+
+The cast `(double) applyDiscount.invoke(...)` works because reflection returned a boxed `Double`, which auto-unboxes. If the method returned `int` you would cast to `Integer` and let it unbox, or cast directly to `int` since Java's casts handle the unbox.
+
+<h1 id="setaccessibletrue-and-private-members">
+  setAccessible(true) and Private Members
+</h1>
+
+By default, reflection respects Java's normal access rules. You can read a `public` field on any class. You cannot read a `private` field on a class you do not have access to. The `setAccessible(true)` call asks the runtime to skip those access checks for this `Field` or `Method` object.
+
+```java
+import java.lang.reflect.Field;
+
+public class PrivateFieldExample {
+
+    static class Customer {
+        private String email;
+
+        Customer(String email) {
+            this.email = email;
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Customer customer = new Customer("alice@example.com");
+
+        Field emailField = Customer.class.getDeclaredField("email");
+
+        try {
+            String value = (String) emailField.get(customer);
+            System.out.println("Read without setAccessible: " + value);
+        } catch (IllegalAccessException e) {
+            System.out.println("Blocked without setAccessible: " + e.getMessage());
+        }
+
+        emailField.setAccessible(true);
+        String value = (String) emailField.get(customer);
+        System.out.println("Read with setAccessible: " + value);
+    }
+}
+```
+
+The first `get` call hits the `private` access modifier and fails with `IllegalAccessException`. After `setAccessible(true)`, the same `get` call works. The same applies to `Method.invoke` on a private method.
+
+`setAccessible` does two things. It bypasses the language-level access modifier check (private, package-private, protected). It also bypasses the module-system access check, **as long as the module that owns the type has opened the relevant package to your code**. If a module has not opened the package, you cannot bypass it from outside, no matter what.
+
+The module system arrived in Java 9 and has caused the most friction here. If you try to read a private field on a JDK internal class (something inside `java.base`, for example), you typically get `InaccessibleObjectException`, a subclass of `RuntimeException`:
+
+```text
+Unable to make field java.util.ArrayList.elementData accessible: module java.base does not "opens java.util" to unnamed module
+```
+
+The fix is not to find a clever workaround; it is to launch with the JVM flag `--add-opens java.base/java.util=ALL-UNNAMED`, which opens the package for deep reflection. Libraries like Spring and Hibernate often document the exact flags they need.
+
+The old escape hatch, `SecurityManager`, is deprecated in Java 17 and removed in Java 24. It used to be the way to lock down reflection in untrusted code. Modern Java leans on the module system and explicit `--add-opens` instead.
+
+`setAccessible(true)` does access checks once per `Field`/`Method` instance, then caches "yes." Cache the `Field`/`Method` itself (not just the lookup) and you pay this cost once for the life of the JVM.
+
+<h1 id="exception-unwrapping-with-invocationtargetexception">
+  Exception Unwrapping with InvocationTargetException
+</h1>
+
+When the method you invoke throws an exception, reflection does not let that exception bubble out directly. It wraps it in `InvocationTargetException` and throws that instead. To get the real exception, you call `getCause()` on the wrapper.
+
+```java
+import java.lang.reflect.Method;
+import java.lang.reflect.InvocationTargetException;
+
+public class ExceptionUnwrapExample {
+
+    static class Cart {
+        public void removeItem(int index) {
+            if (index < 0) {
+                throw new IllegalArgumentException("index cannot be negative: " + index);
+            }
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Cart cart = new Cart();
+        Method removeItem = Cart.class.getDeclaredMethod("removeItem", int.class);
+
+        try {
+            removeItem.invoke(cart, -1);
+        } catch (InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            System.out.println("Wrapped exception: " + e.getClass().getSimpleName());
+            System.out.println("Actual cause:      " + cause.getClass().getSimpleName());
+            System.out.println("Message:           " + cause.getMessage());
+        }
+    }
+}
+```
+
+The wrapper exists for a reason. `Method.invoke` declares `throws InvocationTargetException, IllegalAccessException, IllegalArgumentException`. The first one comes from the target method itself; the latter two come from the reflection machinery. Wrapping the target's exception keeps the two channels separate, so you can tell whether the call failed because reflection refused it or because the method itself blew up.
+
+A clean pattern when you want to rethrow the underlying exception:
+
+```java
+import java.lang.reflect.Method;
+import java.lang.reflect.InvocationTargetException;
+
+public class RethrowCauseExample {
+
+    static class OrderService {
+        public void confirmOrder(String orderId) {
+            if (orderId == null) {
+                throw new IllegalStateException("orderId is required");
+            }
+            System.out.println("confirmed " + orderId);
+        }
+    }
+
+    static void callDynamically(Object target, Method method, Object... args) throws Throwable {
+        try {
+            method.invoke(target, args);
+        } catch (InvocationTargetException e) {
+            throw e.getCause();
+        }
+    }
+
+    public static void main(String[] args) throws Throwable {
+        OrderService svc = new OrderService();
+        Method confirm = OrderService.class.getDeclaredMethod("confirmOrder", String.class);
+
+        try {
+            callDynamically(svc, confirm, (Object) null);
+        } catch (IllegalStateException e) {
+            System.out.println("Caught real exception: " + e.getMessage());
+        }
+    }
+}
+```
+
+The helper rethrows whatever the method actually threw, so the caller catches it the same way they would in a non-reflective call. The `(Object) null` cast on the argument exists because `invoke` takes a varargs `Object[]`; without the cast Java would interpret a bare `null` as the array itself rather than a single `null` argument.
+
+Three exception types you handle when invoking methods or reading fields:
+
+| Exception                   | When it happens                                                                                                            | Typical fix                                                            |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `IllegalAccessException`    | The member is not visible to your code and `setAccessible(true)` was not called or was blocked by the module system        | Call `setAccessible(true)`, or open the module with `--add-opens`      |
+| `IllegalArgumentException`  | Wrong argument type, wrong number of args, wrong field type for a typed accessor, or `null` target for a non-static member | Verify the `Method`/`Field` you looked up matches what you are passing |
+| `InvocationTargetException` | The method ran but threw its own exception                                                                                 | Catch it, call `getCause()`, handle the real exception                 |
+
+<h1 id="a-small-copy-properties-utility">A Small Copy-Properties Utility</h1>
+
+Here is a practical use of everything so far. We will write a utility that copies same-named fields from a source object to a destination object. It is the kind of helper many small frameworks ship. This version handles only fields with matching names and assignable types, which keeps the code short while showing the API in context.
+
+```java
+import java.lang.reflect.Field;
+
+public class CopyPropertiesExample {
+
+    static class Product {
+        String name;
+        double price;
+        int stockQty;
+    }
+
+    static class ProductSnapshot {
+        String name;
+        double price;
+        int stockQty;
+        long capturedAt;
+    }
+
+    static void copyProperties(Object source, Object destination) throws IllegalAccessException {
+        Class<?> srcClass = source.getClass();
+        Class<?> dstClass = destination.getClass();
+
+        for (Field srcField : srcClass.getDeclaredFields()) {
+            try {
+                Field dstField = dstClass.getDeclaredField(srcField.getName());
+                if (dstField.getType().isAssignableFrom(srcField.getType())) {
+                    srcField.setAccessible(true);
+                    dstField.setAccessible(true);
+                    dstField.set(destination, srcField.get(source));
+                }
+            } catch (NoSuchFieldException ignored) {
+                // destination has no matching field; skip
+            }
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Product product = new Product();
+        product.name = "Mechanical Keyboard";
+        product.price = 89.99;
+        product.stockQty = 24;
+
+        ProductSnapshot snapshot = new ProductSnapshot();
+        snapshot.capturedAt = 1700000000L;
+
+        copyProperties(product, snapshot);
+
+        System.out.println("snapshot.name=" + snapshot.name);
+        System.out.println("snapshot.price=" + snapshot.price);
+        System.out.println("snapshot.stockQty=" + snapshot.stockQty);
+        System.out.println("snapshot.capturedAt=" + snapshot.capturedAt);
+    }
+}
+```
+
+This walks each declared field on the source, looks for a same-named field on the destination, and copies the value when the types are compatible. `isAssignableFrom` checks that the destination's declared type accepts the source's declared type. Real utility libraries (Apache Commons `BeanUtils`, Spring's `BeanUtils`) layer in more rules: type coercion, ignore lists, getter/setter access instead of field access. The skeleton, though, is exactly this.
+
+<h1 id="caching-field-and-method-objects">Caching Field and Method Objects</h1>
+
+Reflection has two cost centers: looking up the `Field` or `Method` object, and then calling `get`/`set`/`invoke`. The lookup is by far the more expensive of the two. It walks the class's member table, allocates a new object, and on a JIT-compiled invocation may also do security and module checks.
+
+A naive call site does the lookup every time:
+
+```java
+import java.lang.reflect.Field;
+
+public class UncachedReflectionExample {
+
+    static class Product {
+        double price = 19.99;
+    }
+
+    static double readPriceUncached(Product item) throws Exception {
+        Field f = Product.class.getDeclaredField("price");  // lookup every call
+        return f.getDouble(item);
+    }
+
+    public static void main(String[] args) throws Exception {
+        Product item = new Product();
+        double total = 0;
+        for (int i = 0; i < 5; i++) {
+            total += readPriceUncached(item);
+        }
+        System.out.println("total=" + total);
+    }
+}
+```
+
+Cache the `Field` once and reuse it:
+
+```java
+import java.lang.reflect.Field;
+
+public class CachedReflectionExample {
+
+    static class Product {
+        double price = 19.99;
+    }
+
+    private static final Field PRICE_FIELD;
+
+    static {
+        try {
+            PRICE_FIELD = Product.class.getDeclaredField("price");
+            PRICE_FIELD.setAccessible(true);
+        } catch (NoSuchFieldException e) {
+            throw new ExceptionInInitializerError(e);
+        }
+    }
+
+    static double readPriceCached(Product item) throws IllegalAccessException {
+        return PRICE_FIELD.getDouble(item);
+    }
+
+    public static void main(String[] args) throws Exception {
+        Product item = new Product();
+        double total = 0;
+        for (int i = 0; i < 5; i++) {
+            total += readPriceCached(item);
+        }
+        System.out.println("total=" + total);
+    }
+}
+```
+
+Same result, much less work per call. The lookup happens once in the static initializer; the loop only pays the invocation cost. The same pattern applies to `Method`: resolve it once, store it, reuse it.
+
+`getDeclaredField` and `getDeclaredMethod` are the slow path. Reflective `get`/`set`/`invoke` on a cached, accessible member is much cheaper. If a reflective call sits on a hot path, the cache is what makes it acceptable.
+
+For frameworks that resolve fields and methods once at startup, the runtime cost is dominated by the per-call invoke. That is still slower than a direct call, but on modern JVMs the gap has narrowed because the JIT inlines reflective calls aggressively after enough invocations.
+
+<h1 id="methodhandle-and-varhandle-a-brief-note">
+  MethodHandle and VarHandle: A Brief Note
+</h1>
+
+When reflective invoke ends up on your hottest code path and the JIT inlining isn't enough, the JDK offers two faster alternatives. `MethodHandle` (Java 7+) and `VarHandle` (Java 9+) live in `java.lang.invoke` and give you typed, JIT-friendly handles to methods and fields. The lookup is more verbose, but the runtime call is close to a direct method call.
+
+```java
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
+
+public class MethodHandleSneakPeek {
+
+    static class PriceUtils {
+        public static double applyDiscount(double price, double rate) {
+            return price * (1 - rate);
+        }
+    }
+
+    public static void main(String[] args) throws Throwable {
+        MethodHandles.Lookup lookup = MethodHandles.lookup();
+        MethodHandle handle = lookup.findStatic(
+                PriceUtils.class,
+                "applyDiscount",
+                MethodType.methodType(double.class, double.class, double.class));
+
+        double result = (double) handle.invokeExact(100.0, 0.25);
+        System.out.println("After discount: $" + result);
+    }
+}
+```
+
+You will not use this on a typical day. For application code, `Method.invoke` with a cached `Method` is fine. Use `MethodHandle` only when you can show the reflective call is the bottleneck and you have measured the difference. `VarHandle` plays the same role for fields, with extra support for atomic and volatile semantics. The JDK has a faster lane if reflection's overhead is a real problem.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

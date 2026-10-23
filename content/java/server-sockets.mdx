@@ -1,0 +1,531 @@
+---
+title: "Server Sockets"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Server Sockets explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+A client socket dials out. A server socket sits and waits. The previous lesson built clients that opened a TCP connection to some address and port. This lesson flips the direction and shows how a Java program becomes the thing on the other end: a process that binds to a port, accepts incoming connections, and serves each client. The path starts with the simplest possible server, sees why it cannot handle more than one customer at a time, and grows it into something that can handle thousands.
+
+The running example is an "order status" server for an online store. A client sends an order ID, and the server replies with `PLACED`, `SHIPPED`, or `DELIVERED`. We will build it three times: single-threaded, thread-per-client, and pool-backed. Each rewrite fixes a real problem.
+
+<h1 id="the-serversocket-class">The ServerSocket Class</h1>
+
+`java.net.ServerSocket` is the listening end of a TCP connection. You bind it to a port, and from then on the operating system holds a queue of incoming connection requests for that port. When you call `accept()`, the JVM hands you back a `Socket` representing one client. The `ServerSocket` itself never moves data; it only produces `Socket` objects.
+
+The minimum to stand up a listener is one line:
+
+```java
+import java.net.ServerSocket;
+
+public class MinimalServer {
+    public static void main(String[] args) throws Exception {
+        ServerSocket server = new ServerSocket(9000);
+        System.out.println("Listening on port " + server.getLocalPort());
+        server.close();
+    }
+}
+```
+
+That program binds to port 9000 and immediately closes. Not useful, but it proves the bind works. If port 9000 is already in use, the constructor throws `BindException` with the message "Address already in use". This is the most common error you will see while developing a server, and it usually means a previous run did not shut down cleanly.
+
+Three constructors matter in practice:
+
+| Constructor                                                     | What It Does                                                    |
+| --------------------------------------------------------------- | --------------------------------------------------------------- |
+| `new ServerSocket(int port)`                                    | Binds to the given port on all local addresses                  |
+| `new ServerSocket(int port, int backlog)`                       | Same, with a custom OS-level queue size for pending connections |
+| `new ServerSocket(int port, int backlog, InetAddress bindAddr)` | Binds to a specific network interface only                      |
+
+The `backlog` is the number of completed-but-not-yet-accepted connections the kernel will hold for you. If your server is slow to call `accept()` and `backlog` is small, new clients see "connection refused". Default is 50, which is fine for almost all hand-rolled servers.
+
+The `bindAddr` argument is how you say "only listen on loopback" (`InetAddress.getByName("127.0.0.1")`) versus "listen on every interface" (`null`, the default). On a developer laptop the difference is invisible. On a production box with multiple network cards, it matters: a server bound to `127.0.0.1` is unreachable from any other machine, which is a feature when exposing something only to local processes.
+
+Binding a port is fast, but a port number below 1024 (well-known ports like 80, 443) usually requires root or `CAP_NET_BIND_SERVICE` on Linux. Stick to ports 1024-65535 for unprivileged services.
+
+<h1 id="the-accept-loop">The accept() Loop</h1>
+
+A `ServerSocket` is useless without `accept()`. The method blocks until a client connects, then returns a fresh `Socket` whose input and output streams talk to that client. Call `accept()` in a loop forever:
+
+```java
+import java.net.ServerSocket;
+import java.net.Socket;
+
+public class AcceptLoopSkeleton {
+    public static void main(String[] args) throws Exception {
+        try (ServerSocket server = new ServerSocket(9000)) {
+            System.out.println("Server up on port 9000");
+            while (true) {
+                Socket client = server.accept();
+                System.out.println("Accepted: " + client.getRemoteSocketAddress());
+                client.close();
+            }
+        }
+    }
+}
+```
+
+**Output (after one client connects):**
+
+```text
+Server up on port 9000
+Accepted: /127.0.0.1:54231
+```
+
+The loop never exits on its own. Stop the server by killing the process, closing the `ServerSocket` from another thread, or via a shutdown signal wired in. The `try-with-resources` ensures the listening socket is released when the loop ends, regardless of how it ended.
+
+The diagram shows what every TCP server does at its core: bind once, accept many times. The `accept()` call is where the thread parks; the kernel wakes it up only when there is a connection ready. The handle and close steps are where the actual work happens, and they determine how the server scales.
+
+The returned `Socket` is its own thing. Closing it does not close the `ServerSocket`. Closing the `ServerSocket` does not close any already-accepted `Socket`. They live independently after `accept()` hands them off.
+
+<h1 id="single-threaded-server-iteration-1">
+  Single-Threaded Server (Iteration 1)
+</h1>
+
+The simplest server reads a request, writes a response, closes the socket, and loops back. One client at a time. Here is the order-status server in this style.
+
+```java
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.util.Map;
+
+public class OrderStatusServerV1 {
+
+    static Map<String, String> orders = Map.of(
+        "1001", "PLACED",
+        "1002", "SHIPPED",
+        "1003", "DELIVERED"
+    );
+
+    public static void main(String[] args) throws Exception {
+        try (ServerSocket server = new ServerSocket(9000)) {
+            System.out.println("Order server (single-threaded) on port 9000");
+            while (true) {
+                try (Socket client = server.accept();
+                     BufferedReader in = new BufferedReader(new InputStreamReader(client.getInputStream()));
+                     PrintWriter out = new PrintWriter(client.getOutputStream(), true)) {
+
+                    String orderId = in.readLine();
+                    String status = orders.getOrDefault(orderId, "UNKNOWN");
+                    out.println(status);
+                    System.out.println("Served order " + orderId + " -> " + status);
+                }
+            }
+        }
+    }
+}
+```
+
+**Output (running, with two clients sending `1001` and `1002`):**
+
+```text
+Order server (single-threaded) on port 9000
+Served order 1001 -> PLACED
+Served order 1002 -> SHIPPED
+```
+
+The diagram makes the limitation clear. Until the handle step finishes for client 1, no other client is being served. If handling involves a database call that takes 500 ms, your server's maximum throughput is 2 requests per second. Any client that connects during the handle step waits in the kernel's backlog queue, which holds them but does not serve them.
+
+The single-threaded server is still worth understanding because it is the baseline. It is fine for tools where exactly one client connects at a time: a debugging shell, a control endpoint that only the admin script touches, or a test fixture that one client drives. For anything customer-facing, concurrency is required.
+
+**What's wrong with this code?**
+
+```java
+ServerSocket server = new ServerSocket(9000);
+while (true) {
+    Socket client = server.accept();
+    Thread.sleep(60000); // simulate slow handling
+    client.close();
+}
+```
+
+While the sleep runs, the server is not calling `accept()`. New clients can still connect (the kernel buffers them in the backlog), but they sit idle until this socket finishes. If "slow handling" is a real workload that runs for 60 seconds, the 51st concurrent client (default backlog 50) gets "connection refused" outright.
+
+**Fix:** Move the per-client work off the accept thread. That's what comes next.
+
+<h1 id="thread-per-client-iteration-2">Thread-Per-Client (Iteration 2)</h1>
+
+The fix to the throughput problem is conceptually simple. Hand each `Socket` to a new thread, return to `accept()` immediately, and let the threads do the slow work in parallel.
+
+```java
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.util.Map;
+
+public class OrderStatusServerV2 {
+
+    static Map<String, String> orders = Map.of(
+        "1001", "PLACED",
+        "1002", "SHIPPED",
+        "1003", "DELIVERED"
+    );
+
+    static void handle(Socket client) {
+        try (Socket s = client;
+             BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream()));
+             PrintWriter out = new PrintWriter(s.getOutputStream(), true)) {
+
+            String orderId = in.readLine();
+            String status = orders.getOrDefault(orderId, "UNKNOWN");
+            out.println(status);
+            System.out.println(Thread.currentThread().getName() + " served " + orderId + " -> " + status);
+        } catch (Exception e) {
+            System.err.println("Handler error: " + e.getMessage());
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        try (ServerSocket server = new ServerSocket(9000)) {
+            System.out.println("Order server (thread-per-client) on port 9000");
+            while (true) {
+                Socket client = server.accept();
+                new Thread(() -> handle(client), "client-" + client.getPort()).start();
+            }
+        }
+    }
+}
+```
+
+**Output (with three clients sending `1001`, `1002`, `1003`):**
+
+```text
+Order server (thread-per-client) on port 9000
+client-54231 served 1001 -> PLACED
+client-54232 served 1002 -> SHIPPED
+client-54233 served 1003 -> DELIVERED
+```
+
+The diagram shows the key shift. The accept thread does almost nothing per connection: pull the socket off the queue, hand it to a thread, go back to listening. The handle work happens elsewhere, in parallel with the next `accept()`. A second client connecting while the first is still being handled now sees its own thread spin up and serve it.
+
+This model works well for low to moderate concurrency. Up to a few hundred concurrent clients, on a modern machine, raw thread-per-client is fine. The problem appears when you get to thousands.
+
+Each Java platform thread carries a stack of roughly 1 MB by default (`-Xss` controls it). 1000 threads is around 1 GB just for stacks. Beyond that, the OS scheduler spends real time context-switching between threads, even when most are blocked on `read()`.
+
+The other problem is that nothing limits thread creation. If a burst of 50,000 clients arrives at once (a flash sale, a bot wave, a misconfigured load test), the server tries to spawn 50,000 threads, runs out of memory, and crashes. The fix is to cap how many threads can exist at once. That is what a thread pool does.
+
+**What's wrong with this code?**
+
+```java
+Socket sharedClient = server.accept();
+for (int i = 0; i < 3; i++) {
+    new Thread(() -> {
+        try (PrintWriter out = new PrintWriter(sharedClient.getOutputStream(), true)) {
+            out.println("hello from " + Thread.currentThread().getName());
+        } catch (Exception e) { }
+    }).start();
+}
+```
+
+Three threads share the same `Socket`. They all write to the same `OutputStream`, which interleaves their bytes. The receiving client sees a scrambled message like `helhello from Thread-2lo from Thread-1\n` because each thread does not have exclusive access to the stream.
+
+**Fix:** One thread per `Socket`. If multiple producers need to write to the same client, funnel them through a single dedicated writer thread with a thread-safe queue.
+
+<h1 id="thread-pool-iteration-3">Thread Pool (Iteration 3)</h1>
+
+The fix is to fix the number of worker threads upfront and queue connections that arrive faster than they can be handled. `ExecutorService` from `java.util.concurrent` does exactly that. Submit a task; one of the pool threads picks it up. If all are busy, the task waits.
+
+```java
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+public class OrderStatusServerV3 {
+
+    static Map<String, String> orders = Map.of(
+        "1001", "PLACED",
+        "1002", "SHIPPED",
+        "1003", "DELIVERED"
+    );
+
+    static void handle(Socket client) {
+        try (Socket s = client;
+             BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream()));
+             PrintWriter out = new PrintWriter(s.getOutputStream(), true)) {
+
+            String orderId = in.readLine();
+            String status = orders.getOrDefault(orderId, "UNKNOWN");
+            out.println(status);
+            System.out.println(Thread.currentThread().getName() + " served " + orderId + " -> " + status);
+        } catch (Exception e) {
+            System.err.println("Handler error: " + e.getMessage());
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(20);
+        try (ServerSocket server = new ServerSocket(9000)) {
+            System.out.println("Order server (pool of 20) on port 9000");
+            while (true) {
+                Socket client = server.accept();
+                pool.submit(() -> handle(client));
+            }
+        } finally {
+            pool.shutdown();
+        }
+    }
+}
+```
+
+**Output (with three clients sending `1001`, `1002`, `1003`):**
+
+```text
+Order server (pool of 20) on port 9000
+pool-1-thread-1 served 1001 -> PLACED
+pool-1-thread-2 served 1002 -> SHIPPED
+pool-1-thread-3 served 1003 -> DELIVERED
+```
+
+The diagram shows where the cap comes from. The pool has a fixed number of workers, and a task queue sits in front of them. When all 20 workers are busy, new connections accumulate in the queue. The accept thread is still fast, so the kernel backlog stays short. Once a worker finishes its current client, it pulls the next task and serves it.
+
+The pool size is a knob. Too small, and clients wait in the queue while CPU sits idle. Too large, and you are back to the thread-per-client problem. A reasonable starting point for I/O-bound work is `2 to 4 times the number of CPU cores`. For mostly-blocking work like database calls, the optimal number can be much higher, sometimes 100 to 200, because most threads are blocked anyway. Measure with real load before tuning.
+
+A queued task holds a reference to its `Socket`, which holds a file descriptor. Most operating systems cap open file descriptors per process at around 1024 by default (`ulimit -n` on Linux). If the queue grows into the thousands, file descriptors get exhausted before threads or memory.
+
+`Executors` has other factory methods. `newCachedThreadPool()` creates new threads as needed and reuses idle ones (closer to thread-per-client with reuse). `newSingleThreadExecutor()` is a pool of one, which gives you serialized handling without writing the loop yourself. `newFixedThreadPool(n)` is the default for a TCP server because it gives you a hard ceiling.
+
+<h1 id="virtual-threads-java-21">Virtual Threads (Java 21+)</h1>
+
+Java 21 added virtual threads. A virtual thread looks and feels like a platform thread, but the JVM (not the OS) schedules it onto a much smaller pool of carrier threads. The memory cost per virtual thread is on the order of a few hundred bytes, not 1 MB. Blocking on `read()` does not pin a carrier; the JVM unmounts the virtual thread and uses the carrier for something else.
+
+For a TCP server this changes the calculus. You can go back to thread-per-client without the memory and scheduling penalties. The same `handle()` method, submitted to `Executors.newVirtualThreadPerTaskExecutor()`, scales to tens of thousands of concurrent connections on a single JVM.
+
+```java
+import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorService;
+// ...
+ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor();
+```
+
+That single substitution is the entire migration. The takeaway is that "spawn a thread per client" stopped being a bad idea in Java 21 if you use virtual threads. For Java 17 and earlier, the fixed pool is still the right answer.
+
+<h1 id="proper-shutdown">Proper Shutdown</h1>
+
+Servers run forever, but they still need a way to stop cleanly. The clean way to shut a `ServerSocket` down is to close it from another thread. When `accept()` is blocked in the main loop and another thread calls `server.close()`, the `accept()` call throws `SocketException` with a message like "Socket closed". Catch that, exit the loop, and let `try-with-resources` (or your `finally`) release any pool threads.
+
+```java
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+public class GracefulShutdown {
+
+    public static void main(String[] args) throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(10);
+        ServerSocket server = new ServerSocket(9000);
+
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            System.out.println("Shutdown signal received, closing server");
+            try {
+                server.close();
+                pool.shutdown();
+                pool.awaitTermination(5, TimeUnit.SECONDS);
+            } catch (Exception e) {
+                System.err.println("Shutdown error: " + e.getMessage());
+            }
+        }));
+
+        System.out.println("Server up on port 9000. Press Ctrl+C to stop.");
+        try {
+            while (true) {
+                Socket client = server.accept();
+                pool.submit(() -> {
+                    try (client) {
+                        // handle client
+                    } catch (Exception ignored) { }
+                });
+            }
+        } catch (SocketException e) {
+            System.out.println("Accept loop ended: " + e.getMessage());
+        }
+    }
+}
+```
+
+**Output (when Ctrl+C is pressed):**
+
+```text
+Server up on port 9000. Press Ctrl+C to stop.
+Shutdown signal received, closing server
+Accept loop ended: Socket closed
+```
+
+Two important details. First, the `SocketException` from `accept()` is normal here. It is the JVM's way of signaling "the listening socket was closed, your loop is done." Logging it at error level is misleading; log it at info level or not at all when it happens during a known shutdown. Second, `pool.shutdown()` lets in-flight tasks finish, while `pool.shutdownNow()` interrupts them. For a server that hands back data, `shutdown()` followed by a bounded `awaitTermination` is the polite choice.
+
+<h1 id="setreuseaddress-and-the-time_wait-problem">
+  setReuseAddress and the TIME_WAIT Problem
+</h1>
+
+When a TCP connection closes, the side that issued the final `FIN` ends up in `TIME_WAIT` for roughly two minutes (the duration is OS-tunable but rarely should be). The purpose is to absorb any stray packets that were in flight when the connection ended. While the socket is in `TIME_WAIT`, its local port number is technically still in use.
+
+For clients this is invisible because they get a fresh ephemeral port for each connection. For servers it is highly visible. If you kill your server and try to restart it immediately, the kernel may refuse to bind to the same port because connections that were just terminated are still in `TIME_WAIT`. You see `BindException: Address already in use`, and the obvious workaround (waiting two minutes) is unworkable in development.
+
+The proper fix is `setReuseAddress(true)`:
+
+```java
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+
+public class ReusableServer {
+    public static void main(String[] args) throws Exception {
+        ServerSocket server = new ServerSocket();
+        server.setReuseAddress(true);
+        server.bind(new InetSocketAddress(9000));
+        System.out.println("Server bound to port " + server.getLocalPort());
+        server.close();
+    }
+}
+```
+
+Two things are different from the basic constructor. The `ServerSocket` is created without an immediate bind (no port argument), `reuseAddress` is set on the unbound socket, then `bind(...)` is called. The order matters: you cannot set `reuseAddress` on a socket that is already bound. The single-line `new ServerSocket(9000)` constructor calls `setReuseAddress(true)` on most JVMs, so you usually get this behavior automatically, but writing it explicitly is portable across platforms.
+
+Skipping `setReuseAddress(true)` means a crashed server cannot be restarted for up to two minutes on the same port. In dev, this destroys the feedback loop. In prod, it stretches incident response.
+
+The `TIME_WAIT` problem also shows up on the client side, but in a different shape. A program that makes thousands of short-lived outbound TCP connections (a load tester, a polling script, a misbehaving client) can exhaust the kernel's ephemeral port range (typically 28,232 ports on Linux), because each closed connection holds a port in `TIME_WAIT` for two minutes. The symptom is "cannot assign requested address" errors on `Socket` construction. The fix on the client side is to reuse connections (keep-alive, connection pools) rather than raise `reuseAddress`.
+
+<h1 id="file-descriptor-leaks">File Descriptor Leaks</h1>
+
+Every `Socket` accepted by your server is backed by a file descriptor. The OS gives each process a finite supply of file descriptors, typically 1024 on Linux by default. If your handler throws an exception and you forget to close the `Socket`, the descriptor leaks. Run a million requests through a server with a leak, and you eventually hit "Too many open files," which is fatal: the next `accept()` fails because the kernel cannot allocate a descriptor for the returned socket.
+
+**What's wrong with this code?**
+
+```java
+while (true) {
+    Socket client = server.accept();
+    String orderId = new BufferedReader(new InputStreamReader(client.getInputStream())).readLine();
+    String status = orders.get(orderId);
+    new PrintWriter(client.getOutputStream(), true).println(status);
+}
+```
+
+The `Socket` is never closed. The `BufferedReader` and `PrintWriter` wrap streams that wrap the socket; nothing in this code closes any of them. Each loop iteration leaks a file descriptor. The server runs fine for a while, then suddenly cannot accept new connections.
+
+**Fix:** Use `try-with-resources` on the `Socket`. Closing the `Socket` closes its underlying streams, so wrappers do not need to be closed individually, although `try-with-resources` on all three is the safer habit.
+
+```java
+while (true) {
+    try (Socket client = server.accept();
+         BufferedReader in = new BufferedReader(new InputStreamReader(client.getInputStream()));
+         PrintWriter out = new PrintWriter(client.getOutputStream(), true)) {
+        String orderId = in.readLine();
+        out.println(orders.getOrDefault(orderId, "UNKNOWN"));
+    }
+}
+```
+
+Now any exception still triggers the close. The descriptor count stays flat over time, which is what `lsof` and `ls /proc/<pid>/fd` should show for a healthy server.
+
+<h1 id="inventory-query-server-putting-it-together">
+  Inventory Query Server: Putting It Together
+</h1>
+
+One more end-to-end server to cement the pattern. This one serves an inventory query: the client sends a product ID, the server replies with the stock count. It uses a thread pool, supports graceful shutdown, sets `reuseAddress`, and closes every socket.
+
+```java
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketException;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+public class InventoryServer {
+
+    static final Map<String, Integer> stock = new ConcurrentHashMap<>(Map.of(
+        "P-100", 42,
+        "P-200", 7,
+        "P-300", 0
+    ));
+
+    static void handle(Socket client) {
+        try (Socket s = client;
+             BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream()));
+             PrintWriter out = new PrintWriter(s.getOutputStream(), true)) {
+
+            String productId = in.readLine();
+            if (productId == null) {
+                out.println("ERR empty request");
+                return;
+            }
+            Integer count = stock.get(productId);
+            if (count == null) {
+                out.println("ERR unknown product " + productId);
+            } else {
+                out.println("STOCK " + productId + " = " + count);
+            }
+        } catch (Exception e) {
+            System.err.println("Handler error: " + e.getMessage());
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(20);
+        ServerSocket server = new ServerSocket();
+        server.setReuseAddress(true);
+        server.bind(new InetSocketAddress(9001));
+
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try {
+                server.close();
+                pool.shutdown();
+                pool.awaitTermination(5, TimeUnit.SECONDS);
+            } catch (Exception ignored) { }
+        }));
+
+        System.out.println("Inventory server on port 9001");
+        try {
+            while (true) {
+                Socket client = server.accept();
+                pool.submit(() -> handle(client));
+            }
+        } catch (SocketException e) {
+            System.out.println("Server stopped");
+        }
+    }
+}
+```
+
+**Output (with clients sending `P-100`, `P-200`, `P-999`):**
+
+```text
+Inventory server on port 9001
+```
+
+The clients on the other end see `STOCK P-100 = 42`, `STOCK P-200 = 7`, and `ERR unknown product P-999`. The server itself only logs once at startup and once at shutdown, which is what you want from a production-shaped service.
+
+Every element from this lesson is in play: bind with `setReuseAddress(true)`, fixed thread pool, `try-with-resources` on the socket inside the handler, graceful shutdown via `SocketException`, defensive null handling on the input stream. This is the shape of a real Java TCP server, minus the protocol parser, structured logging, and metrics that production systems add on top.
+
+<h1 id="when-the-protocol-is-text-on-top-of-tcp">
+  When the Protocol Is Text on Top of TCP
+</h1>
+
+Both the order server and the inventory server use a text protocol: line in, line out. That is what HTTP and SMTP do at the wire level. HTTP/1.1 is `GET /orders/1001 HTTP/1.1\r\nHost: shop\r\n\r\n` followed by a `200 OK` response with headers and a body. The framing rules are more elaborate (status line, headers, content length, optional body), but the transport is still a `Socket` with a `BufferedReader` and a `PrintWriter`.
+
+HTTP framing is out of scope here. The foundation is in place. Web servers like Tomcat and Jetty are, at their core, the thread-pool TCP server pattern plus a parser that understands HTTP.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

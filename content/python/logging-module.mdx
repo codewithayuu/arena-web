@@ -1,0 +1,568 @@
+---
+title: "logging Module"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "logging Module explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="why-print-falls-apart-in-production">
+  Why print Falls Apart in Production
+</h1>
+
+A `print` call writes a string to standard output. That's it. There's no severity, no timestamp, no source attribution, no destination control. For a 20-line script you ran by hand, that's enough. For anything that lives longer than the terminal session, you start hitting limits.
+
+Consider a small order-processing job that uses `print` for everything:
+
+```python
+def place_order(customer_email: str, total: float) -> None:
+    print(f"Placing order for {customer_email}, total ${total:.2f}")
+    if total <= 0:
+        print(f"Invalid total: {total}")
+        return
+    print("Order placed")
+
+place_order("priya@example.com", 79.97)
+place_order("aanya@example.com", -5.00)
+```
+
+Four problems show up immediately:
+
+- **No severity.** "Order placed" and "Invalid total" look the same on disk. A log scraper has to grep for keywords.
+- **No timestamps or source.** Which function emitted the line? When? You're guessing.
+- **One destination.** Everything goes to `stdout`. You can't send errors to a file and debug chatter to nowhere.
+- **No volume control.** To silence chatter in production, you have to delete or comment out `print` calls. To get it back during an incident, you redeploy.
+
+The `logging` module solves all four:
+
+```python
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+def place_order(customer_email: str, total: float) -> None:
+    logger.info("Placing order for %s, total $%.2f", customer_email, total)
+    if total <= 0:
+        logger.error("Invalid total: %s", total)
+        return
+    logger.info("Order placed")
+
+place_order("priya@example.com", 79.97)
+place_order("aanya@example.com", -5.00)
+```
+
+Same logic, now with timestamps, levels, and a switch (`level=logging.WARNING` and the `INFO` lines disappear). Nothing else in the function changed.
+
+<h1 id="the-five-levels">The Five Levels</h1>
+
+Logging defines five standard severities. Each one is a method on a logger and has an integer value behind it. A log call goes through only if its level is at least the level the logger is configured for.
+
+| Level    | Value | When to use it                                                                   |
+| -------- | ----- | -------------------------------------------------------------------------------- |
+| DEBUG    | 10    | Fine-grained internal state. Variable dumps, loop counters, intermediate values. |
+| INFO     | 20    | Routine operational events. "Order placed," "User logged in," "Cache warmed."    |
+| WARNING  | 30    | Something unexpected but not yet broken. Retries, deprecated paths, near-limits. |
+| ERROR    | 40    | An operation failed. The program continues, but the request didn't succeed.      |
+| CRITICAL | 50    | The program itself is in trouble. Out of memory, database unreachable, exiting.  |
+
+The default level in `basicConfig` is `WARNING`, which means `DEBUG` and `INFO` are silently dropped unless you explicitly opt in. That default catches new users every time, so it's worth knowing.
+
+```python
+import logging
+
+logging.basicConfig(level=logging.DEBUG, format="%(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+logger.debug("Loaded 3 items into cart")
+logger.info("Cart total computed: $79.97")
+logger.warning("Stock low: only 2 left of 'headphones'")
+logger.error("Payment failed: card declined")
+logger.critical("Database connection lost")
+```
+
+Picking the right level matters because operators filter on it. A noisy `ERROR` log that's actually a transient retry is the kind of thing that wakes someone at 3 AM for nothing. A `DEBUG` log that's actually a failed payment goes unnoticed for weeks.
+
+A practical rule of thumb:
+
+- If a human needs to look at it, it's `WARNING` or worse.
+- If a machine should count it, it's `INFO` or worse.
+- If you'd only want it during local debugging, it's `DEBUG`.
+
+<h1 id="the-logger-hierarchy">The Logger Hierarchy</h1>
+
+Loggers are arranged in a tree. The names are dotted strings (`algomart.carts`, `algomart.orders.shipping`), and the dots define parent-child relationships. At the top of the tree is the **root logger**, which has the empty string as its name.
+
+```python
+import logging
+
+root = logging.getLogger()
+cart_logger = logging.getLogger("algomart.carts")
+ship_logger = logging.getLogger("algomart.orders.shipping")
+
+print(root.name, root.level)
+print(cart_logger.name, cart_logger.parent.name)
+print(ship_logger.name, ship_logger.parent.name)
+```
+
+Two rules make the hierarchy useful:
+
+1. **Logger lookup is global.** `logging.getLogger("algomart.carts")` always returns the same logger object, no matter where it's called from. There's one instance per name.
+2. **Records propagate up.** When `algomart.orders.shipping` emits a record, it walks up the tree (`algomart.orders`, then `algomart`, then root), and every logger along the way gets a chance to handle it. The level check and the handler attachment can happen anywhere on that path.
+
+The convention is to put `logger = logging.getLogger(__name__)` at the top of every module. `__name__` is the module's dotted path, so the logger name lines up with the import path automatically. A log line from `algomart/carts.py` looks like it came from `algomart.carts`, which makes filtering and routing painless.
+
+```python
+# src/algomart/carts.py
+import logging
+
+logger = logging.getLogger(__name__)
+
+def add_to_cart(name: str) -> None:
+    logger.debug("Adding %s to cart", name)
+```
+
+If you only want chatty debug output from the carts module while everything else stays at `INFO`, you set the level on that one logger:
+
+```python
+logging.getLogger("algomart.carts").setLevel(logging.DEBUG)
+```
+
+Every other logger keeps its existing level. That's the payoff of the hierarchy: fine-grained control without touching the code.
+
+<h3 id="why-library-code-should-never-call-basicconfig">
+  Why Library Code Should Never Call basicConfig
+</h3>
+
+`basicConfig` configures the root logger. It's a one-time setup function intended for the application that owns the process. If a library calls it, the library is making choices for the whole program, often before the program has even started its own setup.
+
+The convention for library code is:
+
+1. Get a named logger: `logger = logging.getLogger(__name__)`.
+2. Emit records.
+3. Do not call `basicConfig`, do not add handlers, do not set levels on the root logger.
+
+If a library does want to silence its own logs by default (so importing it doesn't print "No handlers could be found for logger X" on older Pythons), it can attach a `NullHandler` to its top-level logger:
+
+```python
+# src/algomart/__init__.py
+import logging
+
+logging.getLogger(__name__).addHandler(logging.NullHandler())
+```
+
+The `NullHandler` swallows records that reach it without producing any output. If the application sets up its own handlers, those still receive the records via propagation. If it doesn't, the library stays quiet.
+
+<h1 id="the-four-piece-pipeline">The Four-Piece Pipeline</h1>
+
+A log record passes through four kinds of objects on its way out: **Logger**, **Filter**, **Handler**, and **Formatter**. Knowing what each does is the difference between guessing at config and being able to debug it.
+
+- **Logger.** The entry point. You call `logger.info(...)`, it creates a `LogRecord`, checks its own level, and dispatches to handlers (its own and its ancestors').
+- **Filter.** A small object with a `filter(record)` method that returns `True` to keep the record or `False` to drop it. Attached to loggers or handlers. Useful for narrow rules like "only records that mention user `priya@example.com`."
+- **Handler.** A destination. `StreamHandler` writes to stdout/stderr, `FileHandler` to a file, `RotatingFileHandler` to a rotating file set, and so on. Each handler has its own level threshold.
+- **Formatter.** Turns a `LogRecord` into a string. Attached to handlers. Different handlers can use different formatters (terse stderr, verbose file).
+
+Here's the path a single `logger.info(...)` call takes:
+
+The record is checked twice for level (once at the logger, once at each handler) and filtered twice (once at the logger, once at each handler). Either check can drop it. Once a handler accepts it, the formatter renders it and the destination receives the string.
+
+The level filtering decision, in plain terms:
+
+A common mistake is to set the logger to `DEBUG` but leave the handler at the default `WARNING` and wonder why debug records vanish. The handler is the second gate, and both have to be open.
+
+<h1 id="handlers-youll-use">Handlers You'll Use</h1>
+
+The standard library ships handlers for the common destinations. A short tour of the ones that come up often.
+
+`StreamHandler` writes to a stream, defaulting to `sys.stderr`. This is what `basicConfig` adds for you.
+
+```python
+import logging
+import sys
+
+handler = logging.StreamHandler(sys.stdout)
+handler.setLevel(logging.INFO)
+```
+
+`FileHandler` opens a file and appends records to it. Good for short-lived processes; the file grows forever.
+
+```python
+handler = logging.FileHandler("algomart.log", encoding="utf-8")
+```
+
+`RotatingFileHandler` is the version you actually want for long-running services. It rotates based on file size.
+
+```python
+from logging.handlers import RotatingFileHandler
+
+handler = RotatingFileHandler(
+    "algomart.log",
+    maxBytes=5 * 1024 * 1024,   # 5 MB per file
+    backupCount=3,              # keep algomart.log.1, .log.2, .log.3
+    encoding="utf-8",
+)
+```
+
+When `algomart.log` hits 5 MB, it becomes `algomart.log.1` and a fresh `algomart.log` is opened. Older files shift up, and anything beyond `backupCount` is deleted.
+
+`TimedRotatingFileHandler` rotates on a clock instead of size. Pick this when you want one file per day or per hour for log retention rules.
+
+```python
+from logging.handlers import TimedRotatingFileHandler
+
+handler = TimedRotatingFileHandler(
+    "algomart.log",
+    when="midnight",     # rotate at the start of each day
+    backupCount=7,       # keep one week
+    encoding="utf-8",
+)
+```
+
+`SysLogHandler` sends records to a syslog daemon, locally over a Unix socket or remotely over UDP. Useful when ops wants logs in their existing syslog pipeline:
+
+```python
+from logging.handlers import SysLogHandler
+
+handler = SysLogHandler(address="/dev/log")  # local syslog on Linux
+```
+
+`QueueHandler` is for high-throughput or multi-process scenarios. The handler puts records on a `queue.Queue`, and a separate thread (a `QueueListener`) drains the queue and dispatches to real handlers. This keeps log calls in the hot path cheap, since they only enqueue, and moves the expensive I/O off to the listener thread. It's also the recommended way to log from multiple processes safely, since the queue can be shared.
+
+```python
+import logging
+import queue
+from logging.handlers import QueueHandler, QueueListener
+
+log_queue: queue.Queue = queue.Queue(-1)
+queue_handler = QueueHandler(log_queue)
+
+real_handler = logging.StreamHandler()
+listener = QueueListener(log_queue, real_handler)
+listener.start()
+
+logger = logging.getLogger("algomart")
+logger.addHandler(queue_handler)
+logger.setLevel(logging.INFO)
+logger.info("Cart total: $79.97")
+
+listener.stop()
+```
+
+You rarely need `QueueHandler` for a small app, but it's worth knowing exists the moment logging shows up in a profiler.
+
+> **Cost:** Synchronous handlers like `FileHandler` block the calling thread on every record. At a few thousand records per second on a slow disk, that's measurable. `QueueHandler` moves the I/O off the hot path and is the usual fix.
+
+<h1 id="formatters">Formatters</h1>
+
+A formatter turns a `LogRecord` into the string that the handler writes. The default formatter is "just the message," which throws away timestamps, levels, and source. You almost always want to set your own.
+
+The format string uses the old `%`-style placeholders by default, with named keys from the `LogRecord` attributes:
+
+```python
+import logging
+
+fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+formatter = logging.Formatter(fmt, datefmt="%Y-%m-%d %H:%M:%S")
+
+handler = logging.StreamHandler()
+handler.setFormatter(formatter)
+
+logger = logging.getLogger("algomart.carts")
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+logger.info("Added headphones to cart")
+```
+
+The most useful `LogRecord` attributes:
+
+| Attribute       | What it gives you                                               |
+| --------------- | --------------------------------------------------------------- |
+| `%(asctime)s`   | Human-readable timestamp (controlled by `datefmt`)              |
+| `%(levelname)s` | The level name: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
+| `%(name)s`      | The logger's dotted name                                        |
+| `%(message)s`   | The fully-formatted log message                                 |
+| `%(module)s`    | Module name (filename without `.py`)                            |
+| `%(funcName)s`  | Function name that emitted the record                           |
+| `%(lineno)d`    | Source line number                                              |
+| `%(process)d`   | Process ID                                                      |
+| `%(thread)d`    | Thread ID                                                       |
+
+You can use a different placeholder style by passing `style="{"` for `str.format` style or `style="$"` for `string.Template`. `%`-style is the default and the most common in real codebases.
+
+<h1 id="configuring-logging-basicconfig-dictconfig-fileconfig">
+  Configuring Logging: basicConfig, dictConfig, fileConfig
+</h1>
+
+There are three built-in ways to configure logging.
+
+**`basicConfig`** is the one-liner. It sets up the root logger with a single `StreamHandler` and a basic formatter. Good for scripts and the first cut of any program. It silently does nothing if the root logger already has handlers, so calling it twice from different modules doesn't do what you think.
+
+```python
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+```
+
+**`dictConfig`** is the preferred way for anything larger than a script. You hand it a dictionary that describes the entire logging tree: formatters, handlers, loggers, and how they're wired. The configuration is data, which means it can live in a YAML or JSON file alongside the rest of your app config.
+
+```python
+import logging.config
+
+LOGGING_CONFIG = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "standard": {
+            "format": "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            "datefmt": "%Y-%m-%d %H:%M:%S",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "level": "INFO",
+            "formatter": "standard",
+        },
+        "file": {
+            "class": "logging.handlers.RotatingFileHandler",
+            "filename": "algomart.log",
+            "maxBytes": 5 * 1024 * 1024,
+            "backupCount": 3,
+            "level": "DEBUG",
+            "formatter": "standard",
+            "encoding": "utf-8",
+        },
+    },
+    "loggers": {
+        "algomart": {
+            "level": "DEBUG",
+            "handlers": ["console", "file"],
+            "propagate": False,
+        },
+    },
+    "root": {
+        "level": "WARNING",
+        "handlers": ["console"],
+    },
+}
+
+logging.config.dictConfig(LOGGING_CONFIG)
+
+logger = logging.getLogger("algomart.carts")
+logger.info("Cart total computed: $79.97")
+logger.debug("Cart contents: 3 items")
+```
+
+The console handler is at `INFO`, so the debug record is dropped there. The file handler is at `DEBUG`, so both records land in `algomart.log`. `propagate: False` on the `algomart` logger means records aren't bubbled up to the root, so the root's console handler doesn't double up.
+
+A common pattern is to load the dict from a YAML file:
+
+```python
+import logging.config
+import yaml
+from pathlib import Path
+
+with Path("logging.yaml").open() as f:
+    logging.config.dictConfig(yaml.safe_load(f))
+```
+
+The YAML version is identical in structure, just easier on the eyes:
+
+```yaml
+version: 1
+disable_existing_loggers: false
+formatters:
+  standard:
+    format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+handlers:
+  console:
+    class: logging.StreamHandler
+    level: INFO
+    formatter: standard
+loggers:
+  algomart:
+    level: DEBUG
+    handlers: [console]
+    propagate: false
+```
+
+**`fileConfig`** is the legacy INI-format predecessor. It still works, but it's strictly less expressive than `dictConfig` (no filter objects, no programmatic computation, harder to read). New projects pick `dictConfig`.
+
+<h1 id="structured-logging-and-json-output">
+  Structured Logging and JSON Output
+</h1>
+
+Plain text logs are fine until you need to search them. The moment ops asks "show me every record for `order_id=102`," you want logs as structured data, not strings.
+
+The built-in lever for this is the `extra` kwarg, which lets you attach arbitrary fields to a record:
+
+```python
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s order=%(order_id)s: %(message)s",
+)
+logger = logging.getLogger("algomart.orders")
+
+logger.info("Order placed", extra={"order_id": 102})
+logger.info("Order shipped", extra={"order_id": 102})
+```
+
+The fields in `extra` show up as attributes on the `LogRecord`, so the formatter can reference them with `%(order_id)s`. The catch is that every record going through this formatter has to provide `order_id`, or the format call fails with `KeyError`. That's brittle.
+
+The better approach is a JSON formatter. The handler emits one JSON object per line, and every `extra` field is just another key on the object. Ops feeds those lines into a search index and queries by field.
+
+There's no JSON formatter in the standard library, but the third-party `python-json-logger` package fills the gap:
+
+```python
+import logging
+from pythonjsonlogger import jsonlogger
+
+handler = logging.StreamHandler()
+handler.setFormatter(jsonlogger.JsonFormatter(
+    "%(asctime)s %(levelname)s %(name)s %(message)s"
+))
+
+logger = logging.getLogger("algomart.orders")
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+logger.info("Order placed", extra={"order_id": 102, "customer": "priya@example.com"})
+```
+
+For richer structured logging with context that follows a request through call chains (a pattern called "context binding"), the `structlog` package is the popular choice. It wraps the standard library and adds a fluent API for binding key-value pairs:
+
+```python
+import structlog
+
+log = structlog.get_logger()
+log = log.bind(order_id=102, customer="priya@example.com")
+
+log.info("order_placed")
+log.info("order_shipped")
+```
+
+`structlog` can render JSON, key-value pairs, or pretty colored output. It also plays well with `dictConfig`, so you can keep using the standard library's handler ecosystem.
+
+<h1 id="logging-exceptions">Logging Exceptions</h1>
+
+There are two right ways to log an exception, and a popular wrong way.
+
+The right ways:
+
+```python
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+logger = logging.getLogger("algomart.orders")
+
+def charge_card(amount: float) -> None:
+    raise ValueError(f"Card declined for ${amount:.2f}")
+
+try:
+    charge_card(79.97)
+except ValueError:
+    logger.exception("Failed to charge card")
+```
+
+`logger.exception(msg)` is shorthand for `logger.error(msg, exc_info=True)`. Both attach the current exception's traceback to the record, and the formatter renders it after the message. The traceback is preserved in the log file or whatever destination the handler points at, which is the entire point: when something fails in production, you want the stack trace, not just a one-line summary.
+
+`exception` must be called from inside an `except` block, because it pulls the active exception from `sys.exc_info()`. Outside an `except` block, there's no exception to attach, and the record will just say "NoneType: None" where the traceback would be.
+
+The popular wrong way:
+
+```python
+try:
+    charge_card(79.97)
+except ValueError as exc:
+    logger.error(f"Failed to charge card: {exc}")
+```
+
+This logs the exception's `__str__` but throws away the traceback. When you're debugging at 2 AM, you'll wish you had the stack frame where the error originated. Use `logger.exception` or pass `exc_info=True` so the traceback ends up in the logs.
+
+If you want to log an exception at a level other than `ERROR`, use the explicit form:
+
+```python
+try:
+    charge_card(79.97)
+except ValueError:
+    logger.warning("Charge retry needed", exc_info=True)
+```
+
+The `exc_info=True` kwarg works on every log method, so you can attach a traceback at any level.
+
+<h1 id="performance-lazy-formatting-vs-f-strings">
+  Performance: Lazy Formatting vs f-strings
+</h1>
+
+Log calls accept the format string and its arguments separately:
+
+```python
+logger.debug("Processed cart for %s, total $%.2f", customer_email, total)
+```
+
+The string `"Processed cart for %s, total $%.2f"` and the two arguments are passed to the logger. The logger does the level check first. If the level is disabled, it returns immediately without ever formatting the string. The `%`-substitution only happens when the record is actually going to be emitted.
+
+Compare that to the f-string version:
+
+```python
+logger.debug(f"Processed cart for {customer_email}, total ${total:.2f}")
+```
+
+The f-string is built **before** the call, by the interpreter. By the time `logger.debug` sees the argument, it's already a fully formatted string. The level check happens after the work is done, so if `DEBUG` is disabled, the formatting was wasted.
+
+For a single log call, the cost is microseconds. For a debug log inside a tight loop that runs ten thousand times per request, it adds up. The rule of thumb in production code:
+
+- Use `%`-style with separate args (`logger.debug("got %s", x)`) for log calls inside hot paths or at `DEBUG` level.
+- Use f-strings for `INFO` and above, where you almost always emit anyway.
+
+The logger also accepts `str.format` style if you pass `extra={}` carefully, but `%`-style is the convention and the one that works without extra config.
+
+> **Cost:** An f-string inside a disabled `logger.debug` runs the full formatting (string building, `__format__` calls, attribute lookups) and throws the result away. Lazy `%`-style skips all of that. Both styles cost the same when the level is enabled.
+
+<h1 id="common-mistakes">Common Mistakes</h1>
+
+A few traps that catch nearly everyone.
+
+**Calling `basicConfig` twice.** `basicConfig` does nothing if the root logger already has handlers. If two modules call it with different settings, only the first one wins, silently. Either call it once at startup or use `dictConfig` and skip `basicConfig` entirely.
+
+**Library code adding handlers.** A library that calls `logger.addHandler(...)` is configuring the host application's logging. If two libraries both add handlers, the user gets duplicate output and no way to turn it off without touching the libraries. Library code should only emit records via `logging.getLogger(__name__)` and let the application decide where the records go.
+
+**Setting the logger level but forgetting the handler.** You set `logger.setLevel(DEBUG)` and debug records still don't appear. The handler is still at `WARNING`. Both gates have to be open.
+
+**Swallowing exceptions in `except` blocks.** This logs nothing and re-raises nothing:
+
+```python
+try:
+    charge_card(79.97)
+except Exception:
+    pass
+```
+
+The error vanishes. At minimum, log it:
+
+```python
+try:
+    charge_card(79.97)
+except Exception:
+    logger.exception("Unexpected error while charging card")
+    raise
+```
+
+If you intentionally don't want to re-raise (say you've fallen back to a different code path), still log it. Silent failure is the worst kind of bug.
+
+**Mutating handlers from inside library code.** If a library iterates `logger.handlers` and removes or modifies them, it's messing with the host application's setup. The host owns handlers. Libraries own log records.
+
+**Using `print` for "important" output and `logging` for the rest.** Pick one. Either everything goes through `logging` (which is the right answer for any program that runs longer than a few seconds) or you're back to grep-driven debugging.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

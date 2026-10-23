@@ -1,0 +1,528 @@
+---
+title: "Design Patterns"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Design Patterns explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+The classic Gang of Four patterns were written for C++ in 1994, and most of them grew up around problems that don't exist in Python: no first-class functions, no duck typing, no built-in iteration protocol, no context managers. Read those patterns in Python and many of them collapse to "use a function" or "the language already does this for you." A handful still apply, especially in larger codebases, and a few patterns have shapes that Python rewrites in a smaller form. This lesson covers which patterns still matter in Python, which ones become one line of code, and how to avoid dragging Java-shaped scaffolding into a language that doesn't need it.
+
+<h1 id="why-python-reshapes-the-pattern-catalog">
+  Why Python Reshapes the Pattern Catalog
+</h1>
+
+Three Python features replace large parts of the GoF book:
+
+1. **Functions are first-class objects.** You can pass them, return them, store them, and rebind them at runtime. Any pattern whose job was "wrap a single overridable operation in a class" is usually a function.
+2. **Duck typing.** Code calls `obj.process(order)` without caring whether `obj` is a `RealProcessor`, a `FakeProcessor`, or a random object that happens to have a `process` method. Patterns that exist to fake polymorphism in statically typed languages become invisible.
+3. **Built-in protocols.** Iteration, context management, decoration, and comparison are all baked into the language with dunder methods. Patterns that recreate these from scratch are unnecessary.
+
+A quick map of which GoF patterns survive Python, which simplify, and which disappear:
+
+| GoF pattern             | Status in Python         | What replaces it                                            |
+| ----------------------- | ------------------------ | ----------------------------------------------------------- |
+| Singleton               | Use with care            | Module-level state, or a class with a class-level instance  |
+| Factory                 | Simplified               | A function, classmethod, or callable that returns instances |
+| Builder                 | Simplified               | Keyword arguments, dataclasses, fluent return-`self` chains |
+| Strategy                | Mostly dissolves         | Pass a function or callable                                 |
+| Observer                | Simplified               | Callbacks list, or an event bus                             |
+| Iterator                | Built in                 | `__iter__` / `__next__`, generators, `for x in obj`         |
+| Adapter                 | Still useful             | Wrapper class or function that translates the interface     |
+| Decorator               | Built in (as a feature)  | `@decorator` syntax                                         |
+| Context Manager         | Built in (as a protocol) | `with` statement + `__enter__` / `__exit__`                 |
+| Template Method         | Still useful             | Base class with abstract steps                              |
+| Command                 | Simplified               | Function or callable (closures, partials)                   |
+| Chain of Responsibility | Still useful             | List of handlers, middleware lists                          |
+
+The rest of the GoF set (Abstract Factory, Bridge, Composite, Flyweight, Proxy, Visitor, Mediator, Memento, State, Interpreter) shows up rarely in idiomatic Python application code. Some of it appears in frameworks, but rarely in your own modules.
+
+The diagram captures the rough categories. The patterns on the left (built-in and one-line idiom) don't need their own pages of explanation in Python. The middle category is what this lesson focuses on, and the rightmost group is mostly framework territory.
+
+<h1 id="singleton">Singleton</h1>
+
+A singleton is a class that has exactly one instance for the lifetime of the program. The classic use cases are a config object, a connection pool, or a logger.
+
+In most Python codebases, the simplest singleton is a module. Python imports a module once and caches it in `sys.modules`, so any module-level value is shared across every import.
+
+```python
+# config.py
+DEFAULT_TAX_RATE = 0.08
+DEFAULT_CURRENCY = "USD"
+MAX_ITEMS_PER_CART = 50
+
+_active_promotions: dict[str, float] = {}
+
+def set_promotion(code: str, discount: float) -> None:
+    _active_promotions[code] = discount
+
+def get_promotion(code: str) -> float:
+    return _active_promotions.get(code, 0.0)
+```
+
+Anywhere else in the program:
+
+```python
+from config import set_promotion, get_promotion
+
+set_promotion("WELCOME10", 0.10)
+print(get_promotion("WELCOME10"))
+```
+
+That's a singleton. There's one `_active_promotions` dict, every import sees the same object, and there's no class-shaped ceremony.
+
+When a module isn't enough (you want polymorphism, configuration, or to support multiple variants), a small class with a class-level instance is the next step:
+
+```python
+class AppLogger:
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance.entries = []
+        return cls._instance
+
+    def log(self, message: str) -> None:
+        self.entries.append(message)
+
+logger_a = AppLogger()
+logger_b = AppLogger()
+logger_a.log("Order placed")
+print(logger_b.entries)
+print(logger_a is logger_b)
+```
+
+`__new__` is the hook that decides which instance gets returned. By caching the first one on the class and returning it forever after, every `AppLogger()` call hands back the same object.
+
+This works, but it has costs. Singletons are global state in disguise. They make testing harder (the cached instance leaks between tests), they hide dependencies (a function that uses `AppLogger()` looks parameter-free but depends on whatever the singleton holds), and they don't play well with parallel code (every thread shares the same object). When you need a singleton, prefer:
+
+1. A module with module-level state.
+2. Dependency injection: pass the shared object in as a parameter.
+3. The class-level instance only when you need a class.
+
+A singleton makes every function that uses it harder to test in isolation. Tests have to reset the instance between runs, and parallel tests need extra locking. Module-level state has the same issue but is at least obvious.
+
+<h1 id="factory">Factory</h1>
+
+A factory is a callable that produces objects, hiding the decision of which subclass or configuration to return. In Java this usually means a `Factory` class with a `create` method. In Python it's a function, a classmethod, or any callable.
+
+The simplest factory is a function:
+
+```python
+def make_shipping(method: str):
+    if method == "standard":
+        return StandardShipping(cost=4.99, days=5)
+    if method == "express":
+        return ExpressShipping(cost=14.99, days=2)
+    if method == "free":
+        return FreeShipping(threshold=49.99)
+    raise ValueError(f"Unknown shipping method: {method}")
+```
+
+When the variants are bound to a class, a classmethod groups them cleanly:
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class Order:
+    customer_email: str
+    items: list[dict]
+    status: str = "placed"
+
+    @classmethod
+    def from_cart(cls, customer_email: str, cart: list[dict]) -> "Order":
+        return cls(customer_email=customer_email, items=list(cart))
+
+    @classmethod
+    def from_payload(cls, payload: dict) -> "Order":
+        return cls(
+            customer_email=payload["email"],
+            items=payload["items"],
+            status=payload.get("status", "placed"),
+        )
+
+order_a = Order.from_cart("priya@example.com", [{"name": "headphones", "price": 59.99}])
+order_b = Order.from_payload({"email": "aanya@example.com", "items": [], "status": "shipped"})
+```
+
+The pattern here is that `from_cart` and `from_payload` are factories that know how to build an `Order` from different inputs. The constructor stays simple, and each factory method gets a name that tells the caller what kind of input it expects. This is a common factory shape in modern Python.
+
+A registry-based factory is the third common variant. A dict maps a name to a class or callable, and `make_x` looks it up:
+
+```python
+SHIPPING_OPTIONS = {
+    "standard": lambda: StandardShipping(cost=4.99, days=5),
+    "express": lambda: ExpressShipping(cost=14.99, days=2),
+    "free": lambda: FreeShipping(threshold=49.99),
+}
+
+def make_shipping(method: str):
+    try:
+        return SHIPPING_OPTIONS[method]()
+    except KeyError:
+        raise ValueError(f"Unknown shipping method: {method}")
+```
+
+The advantage is that adding a new option is a single line in the dict, not a new `elif` branch. Plugins and frameworks rely on this shape because the registry can be extended at import time.
+
+<h1 id="strategy">Strategy</h1>
+
+The Strategy pattern wraps an interchangeable algorithm in an object so that callers can swap implementations without changing their code. In Java that's an interface and a few classes. In Python it's a function passed as an argument.
+
+```python
+def total_with_discount(prices: list[float], discount_fn) -> float:
+    return sum(price - discount_fn(price) for price in prices)
+
+def no_discount(price: float) -> float:
+    return 0.0
+
+def flat_ten_percent(price: float) -> float:
+    return price * 0.10
+
+def loyalty_discount(price: float) -> float:
+    return price * 0.05 if price < 50 else price * 0.15
+
+cart_prices = [29.99, 14.99, 59.99]
+print(f"No discount:    ${total_with_discount(cart_prices, no_discount):.2f}")
+print(f"Flat 10% off:   ${total_with_discount(cart_prices, flat_ten_percent):.2f}")
+print(f"Loyalty rates:  ${total_with_discount(cart_prices, loyalty_discount):.2f}")
+```
+
+Three different discount strategies, no classes, no interface. Each strategy is a function that takes a price and returns the discount. `total_with_discount` is the "context" in the GoF sense; it accepts the strategy as a parameter and doesn't care which one it got.
+
+A class-based Strategy is worth it when the strategy needs state. If the discount logic has to remember the customer's history, an object makes sense:
+
+```python
+class TieredDiscount:
+    def __init__(self, customer_tier: str):
+        self.rate = {"bronze": 0.05, "silver": 0.10, "gold": 0.15}[customer_tier]
+
+    def __call__(self, price: float) -> float:
+        return price * self.rate
+
+gold_discount = TieredDiscount("gold")
+print(f"Gold tier total: ${total_with_discount(cart_prices, gold_discount):.2f}")
+```
+
+`TieredDiscount` is callable thanks to `__call__`, so `total_with_discount` doesn't have to know it received an object instead of a function. The interface is the same: "something I can call with a price."
+
+The lesson is that the Strategy pattern in Python is usually "accept a callable as a parameter." Use a class only when the strategy needs state, configuration, or its own methods.
+
+<h1 id="observer">Observer</h1>
+
+The Observer pattern lets one object notify a list of subscribers when something changes. Stock systems, event buses, and UI frameworks all use it. In Python, the simplest version is a list of callbacks.
+
+```python
+class OrderStatus:
+    def __init__(self):
+        self._listeners: list = []
+
+    def subscribe(self, callback) -> None:
+        self._listeners.append(callback)
+
+    def update(self, order_id: str, status: str) -> None:
+        for listener in self._listeners:
+            listener(order_id, status)
+
+def email_customer(order_id: str, status: str) -> None:
+    print(f"Email: order {order_id} is now {status}")
+
+def update_dashboard(order_id: str, status: str) -> None:
+    print(f"Dashboard: {order_id} -> {status}")
+
+tracker = OrderStatus()
+tracker.subscribe(email_customer)
+tracker.subscribe(update_dashboard)
+tracker.update("ORDER-101", "shipped")
+```
+
+Two subscribers, no formal interface. Each subscriber is a function that takes the same arguments the publisher sends. This is the Observer pattern in 12 lines.
+
+For larger systems, an event bus generalizes the idea: instead of one publisher with its own subscriber list, a central object routes named events to handlers.
+
+```python
+from collections import defaultdict
+
+class EventBus:
+    def __init__(self):
+        self._handlers: dict[str, list] = defaultdict(list)
+
+    def on(self, event: str, handler) -> None:
+        self._handlers[event].append(handler)
+
+    def emit(self, event: str, *args, **kwargs) -> None:
+        for handler in self._handlers[event]:
+            handler(*args, **kwargs)
+
+bus = EventBus()
+bus.on("order_placed", lambda order_id: print(f"Welcome: {order_id}"))
+bus.on("order_shipped", email_customer)
+bus.emit("order_placed", "ORDER-202")
+bus.emit("order_shipped", "ORDER-202", "shipped")
+```
+
+Either shape (direct subscriber list or central bus) covers most observer use cases without inheriting from any "Subject" base class.
+
+Callbacks fired in a loop run synchronously. If one handler is slow (writes to disk, makes a network call), every subsequent handler waits. For high-traffic event streams, queue events to a background worker instead of firing handlers inline.
+
+<h1 id="adapter">Adapter</h1>
+
+Adapters wrap an object with an incompatible interface so the rest of your code can use a familiar one. This pattern still applies in Python because external libraries rarely match each other's APIs.
+
+A small example. Consider code built around a `PaymentProcessor` interface with a `charge(amount, customer)` method, where the new vendor's library uses `create_payment_intent(amount_cents, email)`:
+
+```python
+class StripeLikeClient:
+    def create_payment_intent(self, amount_cents: int, email: str) -> dict:
+        # Pretend this calls Stripe's API.
+        return {"id": "pi_123", "status": "succeeded"}
+
+class StripeAdapter:
+    def __init__(self, client: StripeLikeClient):
+        self._client = client
+
+    def charge(self, amount: float, customer: dict) -> dict:
+        return self._client.create_payment_intent(
+            amount_cents=int(amount * 100),
+            email=customer["email"],
+        )
+
+client = StripeLikeClient()
+processor = StripeAdapter(client)
+result = processor.charge(59.99, {"email": "priya@example.com"})
+print(result)
+```
+
+The adapter does three things: it owns a reference to the wrapped client, it translates the argument names and shapes, and it presents the interface the rest of the code expects. The code that calls `processor.charge(...)` doesn't know or care that Stripe is the backend. Swap the adapter for `PayPalAdapter` later and nothing else changes.
+
+This is the GoF Adapter pattern almost verbatim. Python doesn't shortcut it because the problem of matching a foreign API to a local interface is real and the solution is small.
+
+<h1 id="decorator-the-built-in-kind">Decorator (The Built-in Kind)</h1>
+
+GoF Decorator is "wrap an object to add behavior without changing its class." Python has a syntax-level decorator (`@decorator`) that does this for functions and methods. They are related but not identical: GoF Decorator decorates instances at runtime, while the Python `@decorator` runs at function definition time. The everyday Python work, though, is the `@decorator` form.
+
+```python
+from functools import wraps
+import time
+
+def log_timing(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        elapsed = time.perf_counter() - start
+        print(f"{func.__name__} took {elapsed:.4f}s")
+        return result
+    return wrapper
+
+@log_timing
+def total_cart_value(cart: list[dict]) -> float:
+    return sum(item["price"] * item["quantity"] for item in cart)
+
+cart = [{"price": 29.99, "quantity": 2}, {"price": 9.99, "quantity": 3}]
+print(f"Total: ${total_cart_value(cart):.2f}")
+```
+
+`@log_timing` wraps `total_cart_value` so every call now also prints the timing. The wrapped function looks like the original to its callers (`@wraps` preserves the name, docstring, and signature) but adds behavior around it. The takeaway is that Python has the Decorator pattern as a language feature, so you rarely need to build one out of classes.
+
+<h1 id="iterator-the-built-in-kind">Iterator (The Built-in Kind)</h1>
+
+GoF Iterator wraps a collection in an object that yields its elements. Python's iteration protocol is so deeply baked in that you usually don't write iterators by hand. Generators express the pattern in two or three lines.
+
+```python
+def paginate(items: list, page_size: int):
+    for start in range(0, len(items), page_size):
+        yield items[start:start + page_size]
+
+orders = [f"ORDER-{i}" for i in range(7)]
+for page in paginate(orders, page_size=3):
+    print(page)
+```
+
+`paginate` is a generator. Every `yield` hands a value to whoever is iterating and pauses; the next `next()` call resumes from where it left off. There's no `__iter__`, no `__next__`, no state class. Python has built-in iteration, so you rarely write the pattern out by hand.
+
+<h1 id="context-manager-the-built-in-kind">
+  Context Manager (The Built-in Kind)
+</h1>
+
+GoF doesn't have a Context Manager pattern. Python does, because resource cleanup is a constant requirement and exceptions make it easy to leak handles. The `with` statement plus `__enter__` / `__exit__` (or `@contextmanager` for the function form) replace the "set up, do work in a try, clean up in a finally" pattern entirely.
+
+```python
+from contextlib import contextmanager
+
+@contextmanager
+def cart_session(customer_email: str):
+    print(f"Opening cart for {customer_email}")
+    cart: list[dict] = []
+    try:
+        yield cart
+    finally:
+        print(f"Saving cart with {len(cart)} items")
+
+with cart_session("priya@example.com") as cart:
+    cart.append({"name": "headphones", "price": 59.99})
+    cart.append({"name": "cable", "price": 9.99})
+```
+
+The setup before `yield` runs when the `with` block starts. The teardown after `yield` runs no matter how the block exits, success or exception. This is the Resource Acquisition Is Initialization (RAII) pattern, expressed natively in the language. Context managers get a full lesson elsewhere.
+
+<h1 id="when-patterns-help-when-they-hurt">
+  When Patterns Help, When They Hurt
+</h1>
+
+A pattern is a tool. Using one when the problem doesn't call for it adds ceremony without adding value. Using one when the problem benefits from a name and a shape makes the code easier to read for the next person.
+
+Three rough heuristics for when a pattern is worth applying:
+
+1. **A team needs a shared vocabulary.** "We use the Adapter pattern here" is shorter than "we have a class that translates between two interfaces." On a large codebase with many contributors, that compression matters.
+2. **A framework or library expects a shape.** When writing a Django middleware, a pytest fixture, or a FastAPI dependency, the pattern is dictated by the framework's API. Use what it asks for.
+3. **The pattern matches the problem.** Need exactly one config object across the program? Singleton (or a module). Need to swap algorithms at runtime? Strategy. Need to broadcast events to subscribers? Observer.
+
+The opposite case looks like a class hierarchy or a factory in a tiny script. If three lines of script-level code would do the job, three lines of code is the right answer.
+
+A common issue for developers coming from Java or C# is recreating Java's habits in Python:
+
+```python
+# Anti-pattern: an interface, a factory, and a class hierarchy for one operation.
+from abc import ABC, abstractmethod
+
+class DiscountStrategy(ABC):
+    @abstractmethod
+    def apply(self, price: float) -> float: ...
+
+class TenPercentOff(DiscountStrategy):
+    def apply(self, price: float) -> float:
+        return price * 0.90
+
+class DiscountFactory:
+    @staticmethod
+    def create(name: str) -> DiscountStrategy:
+        return {"ten": TenPercentOff()}[name]
+
+discount = DiscountFactory.create("ten")
+print(discount.apply(50.0))
+```
+
+This works, but every line is doing the job of a feature Python already has. The same thing as idiomatic Python:
+
+```python
+discounts = {"ten": lambda price: price * 0.90}
+print(discounts["ten"](50.0))
+```
+
+Two lines, no abstract base class, no factory, no inheritance. The "pattern" was a workaround for missing features that Python ships natively. When you find yourself writing scaffolding because a pattern says you should, ask first whether the language already provides the same thing.
+
+That said, on a 50-file project with a dozen contributors and several discount variants that have state, configuration, and tests, the class-based version might be appropriate. The classes give the variants names, the factory gives a single seam for adding new ones, and the abstract base class documents the interface for static analyzers. The right shape depends on the project's size and what the team has decided to standardize on.
+
+<h1 id="a-quick-tour-of-patterns-still-worth-knowing">
+  A Quick Tour of Patterns Still Worth Knowing
+</h1>
+
+Three more patterns appear often enough in idiomatic Python that they're worth a brief mention.
+
+<h3 id="template-method">Template Method</h3>
+
+A base class defines the steps of an algorithm and leaves some steps abstract. Subclasses fill in the gaps. This is one of the few class-shaped patterns Python doesn't rewrite, because the structure is what gives it value.
+
+```python
+from abc import ABC, abstractmethod
+
+class OrderProcessor(ABC):
+    def process(self, order: dict) -> dict:
+        self.validate(order)
+        self.charge(order)
+        self.notify(order)
+        return {"status": "processed", "id": order["id"]}
+
+    def validate(self, order: dict) -> None:
+        if not order.get("items"):
+            raise ValueError("Order is empty")
+
+    @abstractmethod
+    def charge(self, order: dict) -> None: ...
+
+    @abstractmethod
+    def notify(self, order: dict) -> None: ...
+
+class StoreOrder(OrderProcessor):
+    def charge(self, order: dict) -> None:
+        print(f"Charging ${order['total']} to card ending {order['card_last4']}")
+
+    def notify(self, order: dict) -> None:
+        print(f"Email sent to {order['email']}")
+
+StoreOrder().process({
+    "id": "ORDER-303",
+    "items": [{"name": "headphones"}],
+    "total": 59.99,
+    "card_last4": "4242",
+    "email": "priya@example.com",
+})
+```
+
+The base class owns the order of operations. Subclasses control how each step happens. This is useful when you have several variants of a workflow that share the same structure but differ in pieces.
+
+<h3 id="command">Command</h3>
+
+A Command is "wrap an action in an object so you can pass it around, queue it, or undo it." In Python, a function with bound arguments (via `functools.partial`, a closure, or a small object with `__call__`) is usually enough.
+
+```python
+from functools import partial
+
+def send_email(to: str, subject: str) -> None:
+    print(f"Sending '{subject}' to {to}")
+
+queued_commands = [
+    partial(send_email, "priya@example.com", "Order shipped"),
+    partial(send_email, "aanya@example.com", "Order delivered"),
+]
+
+for command in queued_commands:
+    command()
+```
+
+Each `partial` is a Command object: it remembers the function and the bound arguments. When you call it later, it runs as if you had called the original with those arguments.
+
+<h3 id="chain-of-responsibility">Chain of Responsibility</h3>
+
+A request walks through a list of handlers until one of them processes it. Web framework middleware, exception handlers, and request validators all use this shape.
+
+```python
+def validate_items(order: dict) -> dict:
+    if not order.get("items"):
+        return {"ok": False, "reason": "Empty cart"}
+    return {"ok": True}
+
+def validate_total(order: dict) -> dict:
+    if order["total"] <= 0:
+        return {"ok": False, "reason": "Invalid total"}
+    return {"ok": True}
+
+def validate_address(order: dict) -> dict:
+    if not order.get("shipping_address"):
+        return {"ok": False, "reason": "Missing address"}
+    return {"ok": True}
+
+validators = [validate_items, validate_total, validate_address]
+
+def run_validators(order: dict) -> dict:
+    for validator in validators:
+        outcome = validator(order)
+        if not outcome["ok"]:
+            return outcome
+    return {"ok": True}
+
+print(run_validators({"items": [], "total": 0}))
+print(run_validators({"items": ["x"], "total": 50, "shipping_address": "221B"}))
+```
+
+A list of small functions, each doing one check, walked in order. Adding a new validator is appending to the list. Removing one is deleting a line. This kind of "pipeline of small handlers" is how a lot of production Python middleware is structured.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

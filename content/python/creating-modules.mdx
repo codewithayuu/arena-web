@@ -1,0 +1,537 @@
+---
+title: "Creating Modules"
+readTime: "10 min read"
+lastUpdated: "June 6, 2026"
+description: "Creating Modules explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="what-makes-a-py-file-a-module">What Makes a .py File a Module</h1>
+
+A module is any `.py` file Python can find and load. There's no decoration required, no declaration, no tag. Code in a file with a `.py` extension, placed somewhere Python looks, is a module.
+
+The module's name is the filename without the `.py` extension. `pricing.py` is the module `pricing`. `customer_orders.py` is the module `customer_orders`. The name matters because that's what other code writes in `import` statements, so pick filenames that are short, lowercase, and use underscores rather than hyphens (Python's parser reads `cart-utils` as subtraction).
+
+The smallest possible module is a file `pricing.py` next to a main script:
+
+```python
+# pricing.py
+TAX_RATE = 0.08
+
+def cart_total(prices):
+    return sum(prices) * (1 + TAX_RATE)
+```
+
+That's a module. Two lines that matter, plus a top-level constant and a top-level function. Everything inside this file is, in Python's terms, the module's body. When another file writes `import pricing`, Python finds this file, runs the body from top to bottom, and stores the resulting names on a module object.
+
+The act of writing the file is the entire creation step. No registration, no setup, no metadata file. Compare to languages that require a class declaration, registration with a build system, and an entry in a manifest; Python looks at directories on its search path and treats any `.py` file it finds as a module.
+
+A module's body is a one-time setup script that builds up a namespace. The constant `TAX_RATE = 0.08` puts the name `TAX_RATE` on the module. The `def cart_total(...)` puts the name `cart_total` on the module. Anything else done at the top level (open a file, build a dictionary, call a function) also runs at import time and either sets up state or has side effects. Side effects come up again later in this lesson.
+
+Using the module from another file in the same folder:
+
+```python
+# shop.py
+import pricing
+
+cart = [29.99, 14.99, 9.99]
+print(f"Total: ${pricing.cart_total(cart):.2f}")
+```
+
+Two files, one import line. Everything beyond this point in the lesson is about doing the same thing well rather than only making it work.
+
+<h1 id="module-level-code-runs-on-first-import">
+  Module-Level Code Runs on First Import
+</h1>
+
+When Python imports a module for the first time, it runs every top-level statement in the file, in order, from top to bottom. Function bodies don't run (a `def` defines a function; it doesn't call it), but everything else does: assignments, function definitions, class definitions, prints, file reads, anything at the outermost indentation.
+
+This first-time run builds the module's namespace. The names defined at the top level become attributes of the module object. After the body finishes, Python stores the module object in `sys.modules` and hands it back to whoever asked for the import.
+
+The "first time" qualifier matters. Python imports each module exactly once per process. The first `import pricing` runs the file. Every later `import pricing` (regardless of location in the codebase) finds the already-loaded module in `sys.modules` and reuses it. The body doesn't run again.
+
+A print at module level demonstrates this:
+
+```python
+# pricing.py
+print("pricing.py is loading")
+
+TAX_RATE = 0.08
+
+def cart_total(prices):
+    return sum(prices) * (1 + TAX_RATE)
+```
+
+```python
+# shop.py
+print("shop start")
+import pricing
+import pricing
+import pricing
+print("shop end")
+print(pricing.cart_total([10]))
+```
+
+The `print` inside `pricing.py` fires once, between `shop start` and `shop end`. The second and third `import pricing` statements find the module already cached and skip the file entirely. Module-level code is initialization that runs once per process.
+
+Putting expensive work at the top level is a trap. A module that reads a 100 MB file or opens a network connection at the top level forces every program that imports anything from the module to pay that cost on first import, even if only one small constant is needed. Push expensive work into a function the caller invokes explicitly when needed.
+
+```python
+# Bad: every importer pays the cost, whether they need the data or not
+PRODUCTS = load_products_from_disk("products.json")  # 100 MB at import time
+
+# Better: callers explicitly trigger the load
+def load_products():
+    return load_products_from_disk("products.json")
+```
+
+The first version moves the cost to import. The second version lets callers pay it only when they need the products.
+
+Module-level work happens once, but that "once" is at import time, which is often the worst time for it. Imports happen at startup, before any of the calling code starts running. Heavy module-level work delays startup for every script that imports the module, including tools like linters and IDEs that scan code without running it.
+
+The other consequence of "module body runs once" is that the top level can intentionally build shared state. Lookup tables, configuration dicts, regex objects: things that are expensive to build once and cheap to read forever. Be intentional about it. Unintended side effects at module level (printing, writing files, making network calls) are a common source of bugs.
+
+```python
+# pricing.py: deliberate one-time setup
+import re
+
+# Compile a regex once at import time so every call to validate_coupon
+# reuses the same compiled pattern.
+_COUPON_RE = re.compile(r"^[A-Z]{4,8}\d{0,4}$")
+
+TAX_RATE = 0.08
+SHIPPING_THRESHOLD = 50.0
+
+def validate_coupon(code):
+    return bool(_COUPON_RE.match(code))
+
+def cart_total(prices):
+    return sum(prices) * (1 + TAX_RATE)
+```
+
+The underscore-prefixed `_COUPON_RE` is a convention: it's "internal to this module" and not part of the public API. Callers can still reach it (Python doesn't enforce private names), but the underscore signals that the name might change.
+
+<h1 id="if-__name__-__main__-for-dual-use-files">
+  if __name__ == "__main__": for Dual-Use Files
+</h1>
+
+A `.py` file can play two roles. It can be a library that other files import, and it can be a script run directly with `python pricing.py`. Both are legitimate, and Python doesn't force a choice between them.
+
+Running a file as a script and importing it both run the file's top-level code. When the file should do one thing when imported (define functions, set up constants) and a different thing when run directly (print a demo, run tests, start the program), the two cases need a way to be distinguished.
+
+The hook is `__name__`. The first lesson introduced it: a dunder attribute Python sets on every module. For an imported module, it's the import name. For the file Python is running directly, it's the special string `"__main__"`.
+
+The `if __name__ == "__main__":` idiom uses that distinction. Code inside the block only runs when the file is the entry point. When the file is imported by something else, `__name__` is the module's name (like `"pricing"`), the condition is false, and the block is skipped.
+
+A typical layout:
+
+```python
+# pricing.py
+"""Pricing helpers."""
+
+TAX_RATE = 0.08
+
+def cart_total(prices):
+    return sum(prices) * (1 + TAX_RATE)
+
+def apply_discount(price, percent):
+    return price * (1 - percent / 100)
+
+if __name__ == "__main__":
+    sample_cart = [29.99, 14.99, 9.99]
+    print(f"Sample cart total: ${cart_total(sample_cart):.2f}")
+    print(f"50% off $99.99: ${apply_discount(99.99, 50):.2f}")
+```
+
+Running this file directly:
+
+```text
+$$ python pricing.py
+Sample cart total: $59.36
+50% off $99.99: $50.00
+```
+
+Importing it from another file does **not** trigger the demo:
+
+```python
+# shop.py
+import pricing
+
+print(pricing.cart_total([10, 20]))
+```
+
+```text
+$$ python shop.py
+32.4
+```
+
+The `if __name__ == "__main__":` block didn't run during the import because `pricing.__name__` was `"pricing"`, not `"__main__"`. The functions and constants were defined as usual, and `shop.py` used them without seeing the demo output.
+
+The diagram shows the two paths. Both run the file's top-level code (functions and constants get defined either way). The difference is the value of `__name__`, and that one difference controls whether the demo block runs.
+
+Three typical uses for the block:
+
+**Quick demos and smoke tests.** A few lines that exercise the module's main features. Running the file checks it works without needing a separate test file. Convenient during development, easy to leave in place.
+
+**Command-line interfaces.** When a module is useful from the command line (a converter, a calculator, a one-shot tool), the `if __name__` block is where argument parsing and dispatch live:
+
+```python
+# pricing.py
+import sys
+
+TAX_RATE = 0.08
+
+def cart_total(prices):
+    return sum(prices) * (1 + TAX_RATE)
+
+if __name__ == "__main__":
+    args = [float(x) for x in sys.argv[1:]]
+    print(f"${cart_total(args):.2f}")
+```
+
+```text
+$$ python pricing.py 29.99 14.99 9.99
+$59.36
+```
+
+Now `pricing.py` is a library when imported and a small CLI when run.
+
+**Entry points for whole programs.** A larger application often has a `main.py` (or `__main__.py` for packages) whose entire job is the `if __name__` block. It imports everything it needs from other modules and starts the program. The same file can be imported by tests without firing the main function.
+
+```python
+# main.py
+from shop.cart import build_cart
+from shop.pricing import cart_total
+
+def run():
+    cart = build_cart()
+    print(f"Total: ${cart_total(cart):.2f}")
+
+if __name__ == "__main__":
+    run()
+```
+
+Putting the work inside a `run()` function and only calling it from the guard block is a common pattern. It keeps the entry point trivial, makes the program easy to test (call `run()` from a test), and lets other code import `main.py` for its definitions without accidentally running the whole program.
+
+<h1 id="module-attributes">Module Attributes</h1>
+
+The four most common dunder attributes on a module are `__name__`, `__doc__`, `__file__`, and `__loader__`. As a module author, three of them are useful to set or read.
+
+**`__doc__`: the module docstring.** A triple-quoted string at the top of the file becomes `__doc__`. Tools like `help()`, documentation generators, and IDEs read this string to describe a module. Writing one is a one-minute habit that pays off forever:
+
+```python
+# pricing.py
+"""Pricing helpers for the Mindflare store.
+
+Exposes:
+    cart_total(prices) -- subtotal plus tax for a list of prices
+    apply_discount(price, percent) -- price after a percent discount
+    TAX_RATE -- the sales tax rate used by cart_total
+"""
+
+TAX_RATE = 0.08
+
+def cart_total(prices):
+    """Return the total of a cart, including tax."""
+    return sum(prices) * (1 + TAX_RATE)
+```
+
+The module's docstring is the first thing a reader sees. A one-line description plus a brief list of what the module exposes turns a bare file into a self-describing module. Module docstrings also feed directly into Sphinx and similar tools that build a project's API reference automatically.
+
+**`__name__`: the module name (or `"__main__"`).** Already covered. It's read, not written by the module author. The one place it changes behavior is the `if __name__ == "__main__":` idiom.
+
+**`__file__`: the path to the source file.** Useful when a module needs to find files shipped alongside it: a config file in the same directory, a JSON data file, a template. Take the directory of `__file__` and build paths relative to it:
+
+```python
+# pricing.py
+from pathlib import Path
+
+# Find the file next to this module, no matter where the caller runs from.
+_THIS_DIR = Path(__file__).parent
+_TAX_TABLE_PATH = _THIS_DIR / "tax_rates.json"
+
+def load_tax_rates():
+    import json
+    return json.loads(_TAX_TABLE_PATH.read_text())
+```
+
+When a user runs `python /some/other/path/their_script.py`, the current working directory has nothing to do with where `pricing.py` lives. `__file__` resolves that: it's always the path to `pricing.py` itself, so derived paths point to the right place. `pathlib` is covered properly in the file-handling section; here the relevant fact is that `__file__` is the anchor.
+
+A module's full list of dunder attributes is longer (`__package__`, `__spec__`, `__cached__`, `__builtins__`, `__loader__`), but for modules in user code, the three above cover the everyday needs.
+
+<h1 id="documenting-modules">Documenting Modules</h1>
+
+A well-documented module gives a reader three things they need to use it: a sentence about what it's for, a brief list of what it exposes, and per-function docstrings that explain inputs and outputs. None of this takes much time, and the quality difference is large.
+
+A reasonable template:
+
+```python
+"""One-line summary of what this module is for.
+
+Optional longer paragraph that gives context: when to use this module,
+how it relates to other modules in the project, any gotchas.
+
+Public API:
+    cart_total(prices) -- subtotal plus tax for a list of prices
+    apply_discount(price, percent) -- price after a percent discount
+    TAX_RATE -- standard sales tax rate
+
+Example:
+    >>> from pricing import cart_total
+    >>> cart_total([29.99, 14.99])
+    48.5784
+"""
+
+TAX_RATE = 0.08
+
+def cart_total(prices):
+    """Return the total of a cart, including tax.
+
+    Args:
+        prices: An iterable of numeric prices.
+
+    Returns:
+        The sum of all prices multiplied by (1 + TAX_RATE).
+    """
+    return sum(prices) * (1 + TAX_RATE)
+
+def apply_discount(price, percent):
+    """Return a price after a percentage discount.
+
+    Args:
+        price: The original price.
+        percent: The discount percent (0-100).
+
+    Returns:
+        price * (1 - percent / 100)
+    """
+    return price * (1 - percent / 100)
+```
+
+The module docstring is what someone running `help(pricing)` sees. The function docstrings are what they see when they run `help(pricing.cart_total)`. Both are also what an IDE shows on hover. A few minutes of writing saves hours of guessing later.
+
+There are documentation conventions (Google style, NumPy style, reST style) that go into more structure for type information and complex parameter descriptions. For most modules, the "Args / Returns" style above is enough. Pick a convention per project and stick with it.
+
+The `>>> from pricing import ...` lines in the docstring are an example of a doctest: a runnable example that documents how to use the function. They're parsable by the standard `doctest` module, which can run them as part of a test suite to verify the documentation still matches the code. Not every project uses doctests, but the format is readable even without automatic execution.
+
+<h1 id="where-python-looks-for-modules-syspath">
+  Where Python Looks for Modules: sys.path
+</h1>
+
+When `import pricing` runs, Python doesn't scan the whole disk. It walks through a specific, ordered list of directories called `sys.path`. The first directory containing `pricing.py` (or a `pricing/` package) wins.
+
+The list can be inspected directly:
+
+```python
+import sys
+for path in sys.path:
+    print(repr(path))
+```
+
+The exact contents depend on how Python was installed and what's running. The order is what matters. `sys.path` is built from three main sources:
+
+1. **The directory of the running script.** Or an empty string `''` meaning "current working directory" at the REPL. This is what makes "put `pricing.py` next to `shop.py` and import it" work without any setup.
+2. **The directories listed in the `PYTHONPATH` environment variable**, if it's set. Used to add ad-hoc directories without touching the script.
+3. **The standard library directories** that ship with Python.
+4. **The `site-packages` directory** where `pip` installs third-party packages.
+
+The diagram shows the search order. Python stops at the first match. When `pricing.py` exists in both the project directory and somewhere on `PYTHONPATH`, the project directory wins because it comes first.
+
+This ordering has a sharp edge. Naming a local file `math.py` shadows the standard library's `math` module: `import math` finds the local file before reaching the stdlib path. Symptoms include cryptic errors like `AttributeError: module 'math' has no attribute 'sqrt'` caused by accidentally importing a local file. The fix is to rename the file. Standard library names to avoid for local modules include `math`, `random`, `time`, `os`, `sys`, `json`, `re`, `string`, `email`, `socket`, `types`.
+
+`sys.path` can be modified at runtime, though it's usually a sign the layout is wrong:
+
+```python
+import sys
+sys.path.append("/some/other/directory")
+import pricing
+```
+
+This works, but cleaner paths exist: organize the code into packages, install the package with `pip` (covered next), or set `PYTHONPATH` in the shell. Runtime `sys.path` manipulation suggests one of those better options was skipped.
+
+For development inside a single project, the rule of thumb is simpler: put related files in the same directory and run the entry point from there. `python shop.py` (where `shop.py` and `pricing.py` are in the same folder) is the simplest setup, and it works without any configuration.
+
+<h1 id="installing-your-module-locally-editable-installs">
+  Installing Your Module Locally: Editable Installs
+</h1>
+
+Putting all modules in one folder works fine for small scripts. For a larger project, especially one used from anywhere on the machine, install it instead. The Python tool for that is `pip`, and the install mode for development is called an **editable install**.
+
+The full story belongs in a dedicated packaging lesson, but the gist:
+
+Add a small file called `pyproject.toml` at the root of the project:
+
+```text
+my-shop/
+    pyproject.toml
+    pricing.py
+    shop.py
+```
+
+A minimal `pyproject.toml`:
+
+```text
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "my-shop"
+version = "0.1.0"
+
+[tool.setuptools]
+py-modules = ["pricing", "shop"]
+```
+
+Then, from the project root:
+
+```text
+$$ pip install -e .
+```
+
+The `-e` flag means "editable." Pip installs the project in a way that points back to the source files instead of making a copy. Every edit to `pricing.py` is immediately visible to anything that imports it; no reinstall after every change.
+
+After this, `import pricing` works from anywhere on the machine, not only from the same directory. A Python REPL opened anywhere on disk can run `import pricing` and load the code. Tests in a separate directory can import the modules without any path manipulation.
+
+For a package (a directory of modules with an `__init__.py`, which the next two chapters cover), the setup is the same; change `py-modules = [...]` to `packages = [...]` and list the package directory instead.
+
+This is the way to make local code reusable across projects: install it locally with `pip install -e .` rather than copying files around or modifying `PYTHONPATH`. The packaging side comes later; for now, knowing that "install your module locally" is a real, supported thing is enough.
+
+Editable installs are free during development. The overhead is one-time setup (writing `pyproject.toml`, running `pip install -e .`) and removing the install with `pip uninstall my-shop` when the project is abandoned. The payoff is that `import pricing` works from any directory and imports stop being fragile.
+
+<h1 id="module-size-and-cohesion">Module Size and Cohesion</h1>
+
+A module should have one job that can be described in one sentence. Once a module's purpose can't be described without the word "and" twice, split it.
+
+This isn't a hard rule; it's a heuristic that prevents the most common mistake: the giant `utils.py` that grows to 2,000 lines of unrelated functions because nobody decided where each helper belonged. A 2,000-line `utils.py` is the worst kind of module, because the name promises nothing and the file delivers chaos. Finding "where's the date formatter?" requires reading the whole file.
+
+Some practical guidelines:
+
+**Aim for 50-500 lines.** Below 50, the module barely earns its own file; consider merging it with a sibling. Above 500, the file gets hard to scan in one sitting; consider splitting it.
+
+**One coherent topic per module.** `pricing.py` is about pricing. `cart.py` is about carts. `customer.py` is about customers. The name of the module should tell a reader what's inside. Don't use `helpers.py` or `utils.py` as a default home for orphan functions; give each function a real home.
+
+**Group by what changes together.** Functions that always change together (when one needs an update, the other usually does too) belong in the same module. Functions that change for independent reasons belong in different modules.
+
+**Keep the public surface small.** Most modules should expose a handful of public names (functions, classes, constants) and prefix internal helpers with an underscore. A module with 40 public names is doing too much; split it.
+
+**Small modules are fine.** A module with two functions is acceptable when those two functions belong together and nothing else does. The cost of a small module is one extra file; the benefit is a name that tells the reader what's inside.
+
+A typical e-commerce project layout:
+
+```text
+shop/
+    pricing.py        -- cart totals, tax, discounts
+    cart.py           -- cart structure, add and remove
+    customer.py       -- customer records, profile lookups
+    orders.py         -- order placement, status transitions
+    shipping.py       -- shipping cost, delivery estimates
+    reviews.py        -- product reviews, ratings
+    inventory.py      -- stock counts, availability
+    shop.py           -- entry point that ties it together
+```
+
+Each file has a clear job. None of them is more than a few hundred lines. The entry point (`shop.py`) doesn't define much itself; it stitches together work that lives in the other files. When the tax rate changes, only `pricing.py` changes. When the order status workflow changes, only `orders.py` changes. The blast radius of any single change stays small.
+
+<h1 id="putting-it-together-a-reusable-pricing-module">
+  Putting It Together: A Reusable Pricing Module
+</h1>
+
+A complete, well-organized small module that pulls together everything in this lesson:
+
+```python
+# pricing.py
+"""Pricing helpers for the Mindflare store.
+
+Exposes:
+    TAX_RATE -- standard sales tax rate
+    cart_total(prices) -- subtotal plus tax for a list of prices
+    apply_discount(price, percent) -- price after a percent discount
+    apply_coupon(price, code) -- price after applying a known coupon code
+
+Example:
+    >>> from pricing import cart_total
+    >>> cart_total([29.99, 14.99])
+    48.5784
+"""
+
+from pathlib import Path
+
+# Public constants
+TAX_RATE = 0.08
+FREE_SHIPPING_THRESHOLD = 50.00
+
+# Internal: paths and lookup tables built once at import time
+_THIS_DIR = Path(__file__).parent
+_COUPONS = {
+    "WELCOME10": 10,
+    "SUMMER20": 20,
+    "BLACKFRIDAY50": 50,
+}
+
+def cart_total(prices):
+    """Return the total of a cart, including tax.
+
+    Args:
+        prices: An iterable of numeric prices.
+
+    Returns:
+        The sum of all prices multiplied by (1 + TAX_RATE).
+    """
+    return sum(prices) * (1 + TAX_RATE)
+
+def apply_discount(price, percent):
+    """Return a price after a percentage discount."""
+    return price * (1 - percent / 100)
+
+def apply_coupon(price, code):
+    """Return a price after applying a known coupon code.
+
+    If the coupon code is unknown, the original price is returned unchanged.
+    """
+    percent = _COUPONS.get(code, 0)
+    return apply_discount(price, percent)
+
+def _format_price(value):
+    """Internal helper: format a number as a USD-style price."""
+    return f"${value:.2f}"
+
+if __name__ == "__main__":
+    # Quick demo when run directly
+    sample_cart = [29.99, 14.99, 9.99]
+    sample_price = 99.99
+    print(f"Cart total: {_format_price(cart_total(sample_cart))}")
+    print(f"With WELCOME10 coupon: {_format_price(apply_coupon(sample_price, 'WELCOME10'))}")
+    print(f"With unknown coupon: {_format_price(apply_coupon(sample_price, 'NOPE'))}")
+```
+
+Running this directly:
+
+```text
+$$ python pricing.py
+Cart total: $59.36
+With WELCOME10 coupon: $89.99
+With unknown coupon: $99.99
+```
+
+Importing it from another file:
+
+```python
+# shop.py
+from pricing import cart_total, apply_coupon
+
+cart = [29.99, 14.99, 9.99]
+print(f"Total: ${cart_total(cart):.2f}")
+print(f"Sale: ${apply_coupon(99.99, 'SUMMER20'):.2f}")
+```
+
+The module has a docstring, three public functions, one public constant, two underscore-prefixed internal names, and a `__main__` block for ad-hoc use from the command line. It's small enough to read in one sitting, every name is on the module for a reason, and the file works both as a library and a runnable demo.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

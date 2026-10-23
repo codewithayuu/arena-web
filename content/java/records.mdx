@@ -1,0 +1,598 @@
+---
+title: "Records (Modern Java Lens)"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Records (Java 16) explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+We met records earlier with a focus on the basics: declaring one, what the compiler generates, and how compact constructors work. This lesson picks up where that left off and looks at records the way modern Java actually uses them: paired with pattern matching, sealed types, and the real e-commerce flows where data carriers live. The headline shifts from "what is a record" to "what does the rest of the language do with a record once it has one."
+
+<h1 id="a-30-second-refresher">A 30-Second Refresher</h1>
+
+The one-line version: A record is a transparent, immutable data carrier. The single declaration `public record OrderItem(String productName, double price, int quantity) {}` gives you final fields, a canonical constructor, accessors named after the components, and consistent `equals`, `hashCode`, and `toString`. Records are implicitly `final`, can implement interfaces but cannot extend a class, and forbid extra instance fields.
+
+```java
+public class RecordRefresher {
+    public record OrderItem(String productName, double price, int quantity) {}
+
+    public static void main(String[] args) {
+        OrderItem item = new OrderItem("Wireless Mouse", 29.99, 2);
+        System.out.println(item.productName());
+        System.out.println(item);
+    }
+}
+```
+
+That's the starting point. From here, this lesson shows how records fit into the rest of the modern Java toolkit.
+
+<h1 id="records-and-pattern-matching-a-natural-pair">
+  Records and Pattern Matching: A Natural Pair
+</h1>
+
+Pattern matching for `instanceof` (Java 16) and pattern matching for `switch` (Java 21) were both designed with records in mind. The reason is structural: a record's components are public, named, and final. That's exactly the shape a pattern can pull apart. The detailed mechanics of patterns live in lessons 04 and 05 of this section. The point here is that records are the natural payload for those patterns.
+
+Start with the simplest case, the type pattern with `instanceof`. Before records, you'd write `if (obj instanceof Coupon c) { use c.percentOff(); }`. With records you can go one step further and destructure the components directly in the pattern.
+
+```java
+public class DeconstructInstanceof {
+    public record Coupon(String code, double percentOff) {}
+
+    public static void describe(Object value) {
+        if (value instanceof Coupon(String code, double percentOff)) {
+            System.out.println("Coupon " + code + " takes " + percentOff + "% off");
+        } else {
+            System.out.println("Not a coupon");
+        }
+    }
+
+    public static void main(String[] args) {
+        describe(new Coupon("WELCOME10", 10.0));
+        describe("Hello");
+    }
+}
+```
+
+The pattern `Coupon(String code, double percentOff)` is called a **deconstruction pattern**. It matches if `value` is a `Coupon` (or one of its `permits` subtypes when used with sealed types), and at the same time it pulls each component out into a local variable. No `c.code()` calls, no boilerplate. The variable names in the pattern can be anything you like; the compiler matches by position, not by name.
+
+The same idea reaches its full power inside a `switch` expression. A small e-commerce snippet that classifies a discount value and pulls out the structured pieces in one step:
+
+```java
+public class DeconstructSwitch {
+    public sealed interface Discount permits Percent, Flat, Free {}
+    public record Percent(int amount) implements Discount {}
+    public record Flat(double amount) implements Discount {}
+    public record Free() implements Discount {}
+
+    public static String describe(Discount d) {
+        return switch (d) {
+            case Percent(int amount) -> amount + "% off";
+            case Flat(double amount) -> "$" + amount + " off";
+            case Free() -> "Free item";
+        };
+    }
+
+    public static void main(String[] args) {
+        System.out.println(describe(new Percent(10)));
+        System.out.println(describe(new Flat(5.0)));
+        System.out.println(describe(new Free()));
+    }
+}
+```
+
+A few details. The `switch` has no `default` clause, because the compiler proves the `sealed` interface covers every case. Each case destructures the matched record straight into local variables. And the whole thing reads like the domain it models: "a discount is either a percent, a flat amount, or free."
+
+<h1 id="records-sealed-algebraic-data-types">
+  Records + Sealed = Algebraic Data Types
+</h1>
+
+A record gives you a single immutable shape. A `sealed` type lets you say "this type has exactly these subtypes and no others." Put them together and you can model a fixed set of variants in a way that's both type-safe and exhaustively checkable. Functional programming calls this a **sum type** or an **algebraic data type**. In Java, the recipe is `sealed interface X permits A, B, C` where each variant is a record.
+
+The classic e-commerce example is payment. A payment is one of a small, well-known set of options. With sealed plus records you can encode that directly.
+
+The diagram says everything the compiler needs to know. `Payment` is one of three shapes. Each shape carries its own data. Nothing else can claim to be a `Payment`. Now any code that consumes a `Payment` can handle all three cases exhaustively.
+
+```java
+public class PaymentAdt {
+    public sealed interface Payment permits Cash, Card, Wallet {}
+    public record Cash(double amount) implements Payment {}
+    public record Card(String last4, int expiryYear) implements Payment {}
+    public record Wallet(String provider, String accountId) implements Payment {}
+
+    public static String receipt(Payment payment) {
+        return switch (payment) {
+            case Cash(double amount) -> "Paid $" + amount + " in cash";
+            case Card(String last4, int year) -> "Paid by card ending " + last4 + " (exp " + year + ")";
+            case Wallet(String provider, String id) -> "Paid via " + provider + " account " + id;
+        };
+    }
+
+    public static void main(String[] args) {
+        System.out.println(receipt(new Cash(42.50)));
+        System.out.println(receipt(new Card("1234", 2028)));
+        System.out.println(receipt(new Wallet("Apple Pay", "u_8842")));
+    }
+}
+```
+
+The value of this pattern goes beyond saving a few `if` statements. Add a fourth payment type tomorrow, say `record Crypto(String wallet, String chain)`, and every `switch` over `Payment` in the codebase becomes a compile error until you add the new case. The compiler is now actively helping you find every place that needs updating. With a classic class hierarchy plus `instanceof` chains, that same change is a silent invitation to bugs: the old code keeps compiling, but it doesn't know about `Crypto`, and falls into whatever default branch you happened to write.
+
+You can nest the idea, too. An `Order` might hold a `Payment` and the same exhaustive matching keeps working through the nesting.
+
+```java
+import java.util.List;
+
+public class NestedAdt {
+    public sealed interface Payment permits Cash, Card {}
+    public record Cash(double amount) implements Payment {}
+    public record Card(String last4) implements Payment {}
+
+    public record Order(String orderId, Payment payment) {}
+
+    public static String describe(Order order) {
+        return switch (order.payment()) {
+            case Cash(double amount) -> order.orderId() + " paid $" + amount + " cash";
+            case Card(String last4) -> order.orderId() + " paid by card " + last4;
+        };
+    }
+
+    public static void main(String[] args) {
+        List<Order> orders = List.of(
+            new Order("ORD-1", new Cash(20.00)),
+            new Order("ORD-2", new Card("9876"))
+        );
+        orders.forEach(o -> System.out.println(describe(o)));
+    }
+}
+```
+
+Read that example top to bottom. The domain language is right there: an order has a payment, a payment is one of two shapes, and the receipt code spells out exactly what to print for each shape. There's no `instanceof` ladder, no visitor pattern, no enum-plus-fields trick. Just records and a sealed parent.
+
+<h1 id="compact-constructors-revisited-validation-and-normalization">
+  Compact Constructors Revisited: Validation and Normalization
+</h1>
+
+Compact constructors are the standard place for two things in modern Java code: rejecting bad input at the door, and normalizing whatever comes in so the rest of the program doesn't have to. The detail worth re-emphasizing is what compact constructors do **not** do: they do not assign the fields. The compiler adds those assignments after your block runs. Your job is to validate, and if needed, reassign the parameter variables.
+
+A single record that handles both jobs at once:
+
+```java
+public class NormalizingRecord {
+    public record Customer(String email, String name, int loyaltyPoints) {
+        public Customer {
+            if (email == null || !email.contains("@")) {
+                throw new IllegalArgumentException("invalid email");
+            }
+            if (loyaltyPoints < 0) {
+                throw new IllegalArgumentException("loyaltyPoints cannot be negative");
+            }
+            email = email.trim().toLowerCase();
+            name = name == null ? "Guest" : name.trim();
+        }
+    }
+
+    public static void main(String[] args) {
+        Customer c = new Customer("  Alice@Example.COM ", " Alice ", 120);
+        System.out.println(c);
+
+        try {
+            new Customer("not-an-email", "Bob", 0);
+        } catch (IllegalArgumentException e) {
+            System.out.println("Rejected: " + e.getMessage());
+        }
+    }
+}
+```
+
+The compact constructor reassigns `email` and `name` to cleaned-up versions. After the block ends, the compiler writes `this.email = email; this.name = name; this.loyaltyPoints = loyaltyPoints;` automatically. Validation runs before any of those assignments, so a bad input never produces a half-built record. This is the same guarantee a regular constructor gives you, just with less typing.
+
+Validation in a compact constructor runs on every `new Customer(...)`. For a record that's allocated millions of times, expensive checks (regex compilation, network lookups) add up. Push heavy validation to a factory method, or pre-compile reusable patterns into a `static final` field.
+
+<h1 id="customizing-records-accessors-static-factories-derived-methods">
+  Customizing Records: Accessors, Static Factories, Derived Methods
+</h1>
+
+The body of a record can hold more than just compact constructors. The three patterns that come up most often in real code are overriding an accessor for safety, adding static factory methods, and adding instance methods that derive values.
+
+<h3 id="overriding-an-accessor-for-defensive-copies">
+  Overriding an Accessor for Defensive Copies
+</h3>
+
+A subtle trap: a record component of type `List` is not deeply immutable. The reference is final, but the list it points to is whatever was passed in. If the caller keeps a reference and mutates it later, the record's view changes too. The fix is to take a defensive copy at construction, and optionally return one from the accessor as well.
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class DefensiveCopy {
+    public record Order(String orderId, List<String> lineItems) {
+        public Order {
+            lineItems = List.copyOf(lineItems);
+        }
+    }
+
+    public static void main(String[] args) {
+        List<String> source = new ArrayList<>();
+        source.add("Wireless Mouse");
+        source.add("USB Cable");
+
+        Order order = new Order("ORD-1", source);
+        source.add("Headphones");
+
+        System.out.println("Source after mutation: " + source);
+        System.out.println("Order line items:      " + order.lineItems());
+
+        try {
+            order.lineItems().add("Extra Item");
+        } catch (UnsupportedOperationException e) {
+            System.out.println("Order is read-only: cannot add items");
+        }
+    }
+}
+```
+
+`List.copyOf` returns an unmodifiable copy. Two protections in one line. The caller can't sneak in changes through the original reference, and downstream code can't accidentally mutate the list through the accessor. For an immutable data carrier, that's exactly what you want.
+
+`List.copyOf` allocates a new list when the input isn't already unmodifiable. For records that wrap small lists it's negligible. For records that wrap megabyte-sized lists used heavily in hot loops, measure before assuming.
+
+<h3 id="static-factory-methods">Static Factory Methods</h3>
+
+Static factories don't replace the canonical constructor. They sit on top of it and provide friendlier shapes for common cases. A typical use: hide the canonical constructor's verbosity behind a name that reads better at the call site.
+
+```java
+public class StaticFactories {
+    public record Discount(double percentOff, double flatOff) {
+        public static Discount percent(double percent) {
+            return new Discount(percent, 0.0);
+        }
+
+        public static Discount flat(double amount) {
+            return new Discount(0.0, amount);
+        }
+
+        public static final Discount NONE = new Discount(0.0, 0.0);
+    }
+
+    public static void main(String[] args) {
+        System.out.println(Discount.percent(10));
+        System.out.println(Discount.flat(5.0));
+        System.out.println(Discount.NONE);
+    }
+}
+```
+
+`Discount.percent(10)` reads better than `new Discount(10.0, 0.0)` because the name describes intent. The canonical constructor stays available for code that needs full control; factories give you shortcuts for the common shapes.
+
+<h3 id="derived-methods">Derived Methods</h3>
+
+Anything you can compute from the components is fair game as an instance method. The record stays immutable; the method just exposes a calculation.
+
+```java
+import java.util.List;
+
+public class DerivedMethods {
+    public record LineItem(String productName, long priceCents, int quantity) {
+        public long subtotalCents() {
+            return priceCents * quantity;
+        }
+    }
+
+    public record Order(String orderId, List<LineItem> items) {
+        public Order {
+            items = List.copyOf(items);
+        }
+
+        public long totalCents() {
+            return items.stream().mapToLong(LineItem::subtotalCents).sum();
+        }
+    }
+
+    public static void main(String[] args) {
+        Order order = new Order("ORD-1", List.of(
+            new LineItem("Wireless Mouse", 2999, 2),
+            new LineItem("USB Cable", 999, 3),
+            new LineItem("Headphones", 4999, 1)
+        ));
+        System.out.println("Total cents: " + order.totalCents());
+    }
+}
+```
+
+This example uses `long` for cents instead of `double` for dollars. Money in floating-point loses precision in ways that show up as off-by-a-cent bugs. The record format makes it easy to enforce the choice once and never see a floating-point dollar in the codebase again.
+
+<h1 id="records-as-dtos-in-http-and-json-layers">
+  Records as DTOs in HTTP and JSON Layers
+</h1>
+
+A common day-job task: you receive a JSON body over HTTP, parse it into a Java object, and pass it along. Before records, this looked like a Lombok `@Data` class with five annotations, or a hand-written class with fifty lines of getters. Records collapse it.
+
+A sketch of a request payload and a response payload, using only the standard library. The deserialization layer is mocked, since the focus is the shape of the data classes rather than the framework.
+
+```java
+import java.util.List;
+
+public class HttpDtos {
+    public record CreateOrderRequest(
+        String customerId,
+        List<LineItem> items,
+        String couponCode
+    ) {
+        public record LineItem(String productId, int quantity) {}
+
+        public CreateOrderRequest {
+            items = List.copyOf(items);
+        }
+    }
+
+    public record CreateOrderResponse(
+        String orderId,
+        long totalCents,
+        String status
+    ) {}
+
+    public static CreateOrderResponse handle(CreateOrderRequest request) {
+        long total = request.items().stream()
+            .mapToLong(item -> 2999L * item.quantity())
+            .sum();
+        return new CreateOrderResponse("ORD-42", total, "PENDING");
+    }
+
+    public static void main(String[] args) {
+        CreateOrderRequest request = new CreateOrderRequest(
+            "cust-1",
+            List.of(
+                new CreateOrderRequest.LineItem("prod-mouse", 2),
+                new CreateOrderRequest.LineItem("prod-cable", 3)
+            ),
+            "WELCOME10"
+        );
+
+        CreateOrderResponse response = handle(request);
+        System.out.println("Request:  " + request);
+        System.out.println("Response: " + response);
+    }
+}
+```
+
+A few details. The nested `LineItem` record sits inside `CreateOrderRequest` because that's where it conceptually lives, and Java allows nested record declarations. The `toString` chain prints the entire payload readably, which is gold for logging and debugging. Both records are immutable, so handing them to other threads or async callbacks is safe by construction.
+
+Most JSON libraries (Jackson, Gson, the built-in `HttpClient` with custom body handlers, JEP-411-style frameworks) have first-class record support. They look at the canonical constructor, map JSON fields to the parameter names, and invoke the constructor. Validation in a compact constructor runs as part of deserialization, so a malformed payload throws before the controller ever sees it.
+
+<h1 id="records-as-map-keys-and-set-elements">
+  Records as Map Keys and Set Elements
+</h1>
+
+Records get `equals` and `hashCode` automatically. The reason that matters in the modern lens: when a record is your map key, you stop having to invent string keys. A `(customerId, productId)` tuple becomes a real type with a real equality, and the map lookup is exact.
+
+```java
+import java.util.HashMap;
+import java.util.Map;
+
+public class RecordsAsKeys {
+    public record WishlistKey(String customerId, String productId) {}
+
+    public static void main(String[] args) {
+        Map<WishlistKey, Integer> wishlistCounts = new HashMap<>();
+        wishlistCounts.put(new WishlistKey("cust-1", "prod-mouse"), 3);
+        wishlistCounts.put(new WishlistKey("cust-1", "prod-cable"), 1);
+        wishlistCounts.put(new WishlistKey("cust-2", "prod-mouse"), 5);
+
+        WishlistKey lookup = new WishlistKey("cust-1", "prod-mouse");
+        System.out.println("Count: " + wishlistCounts.get(lookup));
+    }
+}
+```
+
+The lookup `WishlistKey` is a fresh object, but the generated `equals` and `hashCode` see equal components and the map finds the entry. Compare this to the old habit of stringifying `customerId + ":" + productId` as the key. The string version works, but it leaks formatting decisions everywhere, breaks the moment a `productId` contains a colon, and erases type information.
+
+The same pattern shows up everywhere there's a natural composite identity: `(year, month)` keys for reports, `(country, currency)` keys for pricing, `(orderId, lineNumber)` keys for line lookups. Each one gets a tiny record and the map does the rest.
+
+<h1 id="whats-wrong-with-this-code">What's Wrong With This Code?</h1>
+
+Records make some mistakes harder to commit, but a few still slip through.
+
+**What's wrong with this code?**
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public record Cart(String customerName, List<String> items) {}
+
+// Caller:
+List<String> backing = new ArrayList<>();
+backing.add("Wireless Mouse");
+Cart cart = new Cart("Alice", backing);
+backing.add("Headphones");
+System.out.println(cart.items());
+```
+
+**Fix:**
+
+The `Cart` looks immutable but isn't. The record stores the same `ArrayList` reference the caller passed in, so the caller can keep mutating it after construction. The print shows `[Wireless Mouse, Headphones]`, not the one-item list the cart "received." The fix is a compact constructor that takes a defensive copy.
+
+```java
+public record Cart(String customerName, List<String> items) {
+    public Cart {
+        items = List.copyOf(items);
+    }
+}
+```
+
+After the fix, the backing list's later `add` doesn't reach into the record, and `cart.items().add(...)` throws `UnsupportedOperationException` because `List.copyOf` returns an unmodifiable view.
+
+**What's wrong with this code?**
+
+```java
+public record OrderItem(String name, double price, int quantity) {
+    public OrderItem withQuantity(int q) {
+        this.quantity = q;
+        return this;
+    }
+}
+```
+
+**Fix:**
+
+The component field `quantity` is `private final`. The compiler rejects the assignment. The intent (returning a new record with a different quantity) requires building a new instance.
+
+```java
+public record OrderItem(String name, double price, int quantity) {
+    public OrderItem withQuantity(int q) {
+        return new OrderItem(name, price, q);
+    }
+}
+```
+
+The original record stays untouched. The "with" pattern is the standard way to express "give me a copy with one field changed."
+
+<h1 id="local-records-throwaway-tuples-inside-a-method">
+  Local Records: Throwaway Tuples Inside a Method
+</h1>
+
+A small but useful feature: a record can be declared inside a method, called a **local record**. It exists only within that method's scope, which makes it well-suited to a quick named tuple that doesn't deserve its own top-level file.
+
+```java
+import java.util.List;
+import java.util.Comparator;
+
+public class LocalRecord {
+    public record Product(String name, double price, int rating) {}
+
+    public static void main(String[] args) {
+        record Scored(Product product, double score) {}
+
+        List<Product> catalog = List.of(
+            new Product("Wireless Mouse", 29.99, 4),
+            new Product("USB Cable", 9.99, 3),
+            new Product("Headphones", 49.99, 5)
+        );
+
+        catalog.stream()
+            .map(p -> new Scored(p, p.rating() * 1.0 / p.price()))
+            .sorted(Comparator.comparingDouble(Scored::score).reversed())
+            .forEach(s -> System.out.println(s.product().name() + " score=" + s.score()));
+    }
+}
+```
+
+`Scored` exists only inside `main`. Outside the method it doesn't exist as a type. That's perfect for the stream-pipeline case, where you need to carry an extra value alongside an item for a few steps and then drop it. Before local records, you'd use a `Map.Entry`, a two-element array, or a hand-rolled inner class. The local record reads better than all three.
+
+<h1 id="what-records-cannot-do-and-why">What Records Cannot Do (and Why)</h1>
+
+Records are focused on one job. That focus comes with limits. The big three:
+
+| You want to...                                     | Records say... | Reason                                                                                                    |
+| -------------------------------------------------- | -------------- | --------------------------------------------------------------------------------------------------------- |
+| Add a mutable field (a counter, a cache, a status) | No             | All instance state lives in the header, and components are final. Mutable state breaks value equality.    |
+| Extend another class                               | No             | A record already extends `java.lang.Record`. Single inheritance means there's no room for another parent. |
+| Be subclassed                                      | No             | Records are implicitly `final`. A subclass could add hidden state that changes equality.                  |
+| Declare extra instance fields                      | No             | Same reason as mutability. The components are the data, full stop.                                        |
+| Implement interfaces                               | Yes            | Interfaces describe behavior, not state. They don't break the record's contract.                          |
+| Have static fields and methods                     | Yes            | Static members aren't instance state, so they don't affect the value semantics.                           |
+
+The reasoning behind every "no" is the same. A record is a value: it's defined entirely by its components, two records with the same components are equal, and that contract should never be subvertible by inheritance or hidden state. The moment you need something a record forbids, you don't have a value, you have an object with identity, and a regular class is appropriate.
+
+<h3 id="smell-records-with-too-many-components">
+  Smell: Records with Too Many Components
+</h3>
+
+Even when records technically fit, they get awkward past a certain size. A `record Order(String id, String customerId, List<LineItem> items, Address shipping, Address billing, Payment payment, String couponCode, Instant placedAt, Instant shippedAt, String trackingNumber, OrderStatus status, String notes)` has twelve components and a constructor call that's hard to read. The fix isn't always "split into smaller records." Sometimes it's "use a builder for construction and a record for the final shape." A common pattern is to write a mutable builder class that ends with a `build()` method returning the record.
+
+```java
+public class BuilderForRecord {
+    public record Order(String id, String customerId, double totalCents, String status) {}
+
+    public static class OrderBuilder {
+        private String id;
+        private String customerId;
+        private double totalCents;
+        private String status = "PENDING";
+
+        public OrderBuilder id(String id) { this.id = id; return this; }
+        public OrderBuilder customerId(String customerId) { this.customerId = customerId; return this; }
+        public OrderBuilder totalCents(double totalCents) { this.totalCents = totalCents; return this; }
+        public OrderBuilder status(String status) { this.status = status; return this; }
+        public Order build() { return new Order(id, customerId, totalCents, status); }
+    }
+
+    public static void main(String[] args) {
+        Order order = new OrderBuilder()
+            .id("ORD-1")
+            .customerId("cust-1")
+            .totalCents(12996)
+            .build();
+        System.out.println(order);
+    }
+}
+```
+
+The builder owns the construction story. The record owns the value story. Each one does what it does best.
+
+<h1 id="putting-it-together-a-cart-flow-with-records-and-sealed-types">
+  Putting It Together: A Cart Flow With Records and Sealed Types
+</h1>
+
+A short closing example that uses everything from this lesson at once: records as data carriers, a sealed interface for payment variants, deconstruction patterns in a `switch`, and a compact constructor with a defensive list copy.
+
+The diagram shows the data shape of the flow. A request carries a list of line items and a payment. The line items produce a subtotal. The payment shape determines a fee surcharge. Both feed a final `PriceQuote`. Every node in the picture is a record, and the whole thing is exhaustively type-checked.
+
+```java
+import java.util.List;
+
+public class CartFlow {
+    public sealed interface Payment permits Cash, Card, Wallet {}
+    public record Cash(double amount) implements Payment {}
+    public record Card(String last4) implements Payment {}
+    public record Wallet(String provider) implements Payment {}
+
+    public record LineItem(String name, long priceCents, int quantity) {
+        public long subtotalCents() { return priceCents * quantity; }
+    }
+
+    public record CreateOrderRequest(String customerId, List<LineItem> items, Payment payment) {
+        public CreateOrderRequest {
+            items = List.copyOf(items);
+        }
+    }
+
+    public record PriceQuote(long subtotalCents, long feeCents, long totalCents) {}
+
+    public static long feeFor(Payment payment) {
+        return switch (payment) {
+            case Cash(double amount) -> 0L;
+            case Card(String last4) -> 30L;
+            case Wallet(String provider) -> 15L;
+        };
+    }
+
+    public static PriceQuote quote(CreateOrderRequest request) {
+        long subtotal = request.items().stream().mapToLong(LineItem::subtotalCents).sum();
+        long fee = feeFor(request.payment());
+        return new PriceQuote(subtotal, fee, subtotal + fee);
+    }
+
+    public static void main(String[] args) {
+        CreateOrderRequest request = new CreateOrderRequest(
+            "cust-1",
+            List.of(
+                new LineItem("Wireless Mouse", 2999, 2),
+                new LineItem("Headphones", 4999, 1)
+            ),
+            new Card("9876")
+        );
+        System.out.println("Quote: " + quote(request));
+    }
+}
+```
+
+Read the program top to bottom. There isn't a single setter, getter, `equals`, `hashCode`, or `toString` written by hand. There's no inheritance ladder, no visitor, no enum-with-fields trick. Every domain shape is a record. The one piece of variation in the system, the payment method, is modeled as a sealed interface with three record subtypes, and the fee logic uses an exhaustive `switch`. Add a fourth payment type and the compiler immediately points to `feeFor` as needing an update.
+
+This is the modern Java lens on records. They aren't just a shorthand for data classes. They're the building block that pattern matching, sealed types, and the JSON/HTTP world depend on.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

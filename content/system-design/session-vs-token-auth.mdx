@@ -1,0 +1,291 @@
+---
+title: "Session-Based vs Token-Based Authentication"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Session vs Token Based Auth explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+The system needs proof the client can present after login. That proof should identify the signed-in user or client, expire, be protected from theft, support logout or revocation when needed, and work for the client type: browser, mobile app, CLI, backend service, or third-party API client.
+
+Sessions and tokens solve this problem differently.
+
+<h1 id="2-session-based-authentication">2. Session-Based Authentication</h1>
+
+In session-based authentication, the server creates a session record and gives the client a random session ID.
+
+The session ID is only a reference, like a claim ticket. The real session data lives on the server.
+
+<h3 id="what-the-server-stores">What the Server Stores</h3>
+
+A session record commonly includes:
+
+| Field                   | Purpose                                     |
+| ----------------------- | ------------------------------------------- |
+| Session ID hash         | Lookup key for the session                  |
+| User ID                 | Signed-in user                              |
+| Tenant or account scope | Current organization or workspace           |
+| Created at              | Session creation time                       |
+| Last seen at            | Activity tracking and idle timeout          |
+| Expires at              | Absolute timeout                            |
+| MFA state               | Whether strong authentication was completed |
+| Device details          | User agent, device ID, approximate location |
+| Revoked at              | Explicit logout or admin revocation         |
+
+Store a hash of the session ID rather than the raw session ID when practical. If the session store leaks, raw active session IDs can be used like passwords.
+
+<h3 id="cookie-settings">Cookie Settings</h3>
+
+Browser sessions are usually carried in cookies.
+
+```text
+Set-Cookie: __Host-session=<random-value>;
+            Path=/;
+            Secure;
+            HttpOnly;
+            SameSite=Lax;
+            Max-Age=3600
+```
+
+Important attributes:
+
+| Attribute             | Why it matters                                       |
+| --------------------- | ---------------------------------------------------- |
+| `Secure`              | Sends the cookie only over HTTPS                     |
+| `HttpOnly`            | Prevents JavaScript from reading the cookie          |
+| `SameSite`            | Reduces CSRF risk for cross-site requests            |
+| `Path=/`              | Required for the `__Host-` prefix                    |
+| `__Host-` prefix      | Prevents Domain scoping and requires Secure + Path=/ |
+| `Max-Age` / `Expires` | Controls cookie lifetime                             |
+
+`SameSite=Lax` is often a practical default for web apps. `Strict` is stronger but can break legitimate navigation from other sites. Sensitive actions should still use CSRF protection, such as CSRF tokens or a well-designed double-submit pattern.
+
+<h3 id="scaling-sessions">Scaling Sessions</h3>
+
+Sessions keep state on the server, but that does not mean they cannot scale.
+
+Common designs:
+
+| Design               | How it works                                    | Tradeoff                            |
+| -------------------- | ----------------------------------------------- | ----------------------------------- |
+| Single server memory | Session lives in application memory             | Simple, but fragile                 |
+| Sticky sessions      | Load balancer keeps user on the same server     | Failover and rebalancing are harder |
+| Shared store         | All servers use Redis, Memcached, or a database | Extra dependency and network hop    |
+| Replicated store     | Session data is copied across nodes             | More operational complexity         |
+
+For most production web apps, a shared store such as Redis is straightforward and fast enough. The session lookup is usually not the bottleneck. Slow database queries, external APIs, template rendering, and over-fetching are more often the real cost.
+
+<h1 id="3-token-based-authentication">3. Token-Based Authentication</h1>
+
+In token-based authentication, the client sends a token with each request.
+
+Tokens come in two broad forms:
+
+- **Opaque tokens:** random strings that must be looked up by a server.
+- **Self-contained tokens:** signed tokens, usually JWTs, that carry facts about the user or client inside the token.
+
+This distinction matters. Not every token is a JWT, and not every token system avoids server-side state.
+
+<h3 id="self-contained-token-flow">Self-Contained Token Flow</h3>
+
+The sequence below follows a self-contained token from login to an API call. The API verifies the token and returns data without looking up a server-side session.
+
+The API can validate the token without a session lookup if it has the issuer's public key or shared secret. That is useful in distributed systems, but it moves complexity into token lifetime, key rotation, token contents, and revocation.
+
+<h3 id="jwt-basics">JWT Basics</h3>
+
+A JWT has three Base64Url-encoded parts:
+
+```text
+header.payload.signature
+```
+
+The payload is encoded, not encrypted. Anyone holding the token can read the claims, which are the facts stored inside the token.
+
+Common claims:
+
+| Claim | Meaning           |
+| ----- | ----------------- |
+| `sub` | User or client ID |
+| `iss` | Issuer            |
+| `aud` | Intended audience |
+| `exp` | Expiration time   |
+| `nbf` | Not valid before  |
+| `iat` | Issued at         |
+| `jti` | Token identifier  |
+
+APIs must validate more than the signature. They should check who issued the token, who it is meant for, whether it has expired, which algorithm and key signed it, and whether it includes the required scopes or permissions.
+
+<h3 id="access-tokens-and-refresh-tokens">Access Tokens and Refresh Tokens</h3>
+
+Production token systems often use two token types:
+
+| Token         | Lifetime | Purpose                          |
+| ------------- | -------- | -------------------------------- |
+| Access token  | Short    | Sent to APIs                     |
+| Refresh token | Longer   | Used to obtain new access tokens |
+
+Access tokens should be short-lived because whoever holds the token can use it. If stolen, the token usually works until it expires or is revoked.
+
+Refresh tokens need stronger protection because they can be used to get new access tokens. For browser apps, many teams store refresh tokens in `HttpOnly`, `Secure`, `SameSite` cookies and keep access tokens in memory. For mobile apps, use platform secure storage. For backend services, use managed workload identity or a secret manager instead of hardcoded long-lived tokens.
+
+<h3 id="token-storage-in-browsers">Token Storage in Browsers</h3>
+
+Browser storage is one of the easiest places to make a token-based design unsafe.
+
+| Storage                      | Main risk                                                  | Notes                                                             |
+| ---------------------------- | ---------------------------------------------------------- | ----------------------------------------------------------------- |
+| JavaScript memory            | Lost on refresh                                            | Safer than persistent storage, but still vulnerable to active XSS |
+| `localStorage`               | Token theft through XSS                                    | Persistent and readable by JavaScript                             |
+| `sessionStorage`             | Token theft through XSS                                    | Cleared when the tab closes, still readable by JavaScript         |
+| `HttpOnly` cookie            | CSRF if not protected                                      | Not readable by JavaScript, but sent automatically                |
+| Backend-for-Frontend session | Server stores tokens; browser stores only a session cookie | Often the safest pattern for browser apps                         |
+
+Do not treat `localStorage` as a safe default for sensitive browser tokens. It is convenient, but an XSS bug can read and steal the token.
+
+For many browser apps, the best design is still cookie-based: either a traditional server-side session or a Backend-for-Frontend that keeps OAuth tokens on the server and gives the browser only an `HttpOnly` session cookie.
+
+<h1 id="4-the-real-tradeoffs">4. The Real Tradeoffs</h1>
+
+The old framing is "sessions are stateful, tokens are stateless." That is partly true, but it hides the real design choices.
+
+The real tradeoffs are practical.
+
+| Concern               | Session-based                  | Token-based                                                    |
+| --------------------- | ------------------------------ | -------------------------------------------------------------- |
+| Server-side state     | Required                       | Optional, depending on token type                              |
+| Logout and revocation | Direct                         | Easy for lookup-based tokens, harder for self-contained tokens |
+| Browser safety        | Strong with `HttpOnly` cookies | Depends heavily on storage design                              |
+| CSRF                  | Relevant for cookies           | Relevant if tokens are stored in cookies                       |
+| XSS token theft       | Reduced by `HttpOnly` cookies  | High if tokens are readable by JavaScript                      |
+| API/service use       | Possible, but less common      | Natural fit                                                    |
+| Claim freshness       | Server can check current state | Claims may be old until token refresh                          |
+| Request size          | Small cookie                   | JWTs can be large                                              |
+| Main dependency       | Session store                  | Token issuer, keys, revocation plan                            |
+
+<h3 id="revocation">Revocation</h3>
+
+Sessions are easy to revoke: delete the session or mark it as revoked.
+
+Self-contained access tokens are harder. If an access token is valid for 30 minutes, removing a user's role may not affect that token until it expires.
+
+Common ways to reduce the risk:
+
+- Short access token lifetime.
+- Refresh token rotation.
+- Revocation list for high-risk tokens.
+- Permission version checked server-side.
+- Server-side token checks for sensitive APIs.
+- Step-up authentication for dangerous actions.
+
+<h3 id="freshness-of-authorization">Freshness of Authorization</h3>
+
+Putting roles and permissions in a JWT avoids a lookup, but it can make authorization old.
+
+If a user loses `billing_admin`, an old token may still contain that role. For low-risk reads, a short delay may be acceptable. For production access, payments, security settings, or user management, check current authorization on the server or use short token lifetimes.
+
+<h3 id="performance">Performance</h3>
+
+Session lookup versus token verification is rarely the deciding factor.
+
+A Redis lookup may add a small network call. JWT verification uses CPU and may require key lookup or key caching. Large JWTs also increase bandwidth on every request.
+
+Choose based on correctness, revocation, client type, and operational simplicity before optimizing for a few milliseconds.
+
+<h1 id="5-when-to-use-sessions">5. When to Use Sessions</h1>
+
+Use session-based authentication when:
+
+- You are building a browser-first web application.
+- You want simple logout and revocation.
+- You need active-session management across devices.
+- You want the browser to store only a random reference.
+- Your app can use first-party cookies.
+- You want to avoid exposing tokens to JavaScript.
+
+Sessions are a strong default for traditional web apps and many modern SaaS apps. They are not old-fashioned. A well-designed Redis-backed session system is easy to reason about and scales well.
+
+<h1 id="6-when-to-use-tokens">6. When to Use Tokens</h1>
+
+Use token-based authentication when:
+
+- You are building public APIs for third-party clients.
+- You have mobile apps, CLIs, or desktop clients.
+- You need OAuth 2.0 delegated access.
+- Multiple services need to validate a token independently.
+- You are doing service-to-service authentication.
+- You want short-lived access tokens with scoped permissions.
+
+Prefer short-lived access tokens. Keep refresh tokens protected and revocable. For service-to-service auth, prefer platform identity such as cloud IAM, workload identity, mTLS, or SPIFFE-style identities over manually shared long-lived bearer tokens.
+
+<h1 id="7-hybrid-patterns">7. Hybrid Patterns</h1>
+
+Many production systems use both.
+
+<h3 id="browser-app-backend-for-frontend">
+  Browser App + Backend-for-Frontend
+</h3>
+
+The browser stores an `HttpOnly` session cookie. The Backend-for-Frontend stores access and refresh tokens on the server and calls the APIs behind it.
+
+This keeps sensitive tokens out of JavaScript while still using token-based authentication between backend components.
+
+<h3 id="short-lived-access-token-refresh-session">
+  Short-Lived Access Token + Refresh Session
+</h3>
+
+The client receives a short-lived access token and uses a protected refresh mechanism to get new tokens.
+
+This limits the damage if an access token is stolen while keeping API calls efficient.
+
+<h3 id="opaque-tokens-server-check">Opaque Tokens + Server Check</h3>
+
+The API receives an opaque token and asks the authorization server whether it is still active.
+
+This improves revocation and keeps authorization current, but it adds a network call unless results are cached.
+
+<h1 id="8-security-checklist">8. Security Checklist</h1>
+
+For sessions:
+
+- Generate hard-to-guess random session IDs.
+- Store only a hash of the session ID when practical.
+- Use `Secure`, `HttpOnly`, and `SameSite` cookies.
+- Rotate session IDs after login and privilege changes.
+- Enforce idle and absolute timeouts.
+- Protect state-changing requests from CSRF.
+- Revoke sessions on logout, password reset, MFA reset, and account disablement.
+
+For tokens:
+
+- Use short-lived access tokens.
+- Validate issuer, audience, expiration, signature, algorithm, and key ID.
+- Rotate signing keys safely.
+- Keep sensitive data out of token payloads.
+- Avoid long-lived bearer tokens.
+- Protect refresh tokens more strongly than access tokens.
+- Plan revocation before launch.
+- Do not store sensitive browser tokens in `localStorage` by default.
+
+For both:
+
+- Use HTTPS everywhere.
+- Log authentication and revocation events.
+- Rate limit login and token endpoints.
+- Require step-up authentication for sensitive actions.
+- Treat internal service calls as authenticated and authorized requests.
+
+<h1 id="summary">Summary</h1>
+
+Session-based authentication stores state on the server and gives the client a random reference. It is a strong default for browser applications because revocation is simple and cookies can be protected from JavaScript.
+
+Token-based authentication gives clients a token they send to APIs. It is a strong fit for APIs, mobile apps, CLIs, service-to-service calls, and OAuth/OIDC systems, but it requires careful handling of storage, expiration, key rotation, and revocation.
+
+Do not choose tokens just because they sound more scalable. Choose based on the client, security risks, revocation needs, and how current authorization must be. In many production systems, the best answer is a hybrid: browser sessions at the edge, short-lived tokens behind the edge.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

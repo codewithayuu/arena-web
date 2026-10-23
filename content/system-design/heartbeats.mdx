@@ -1,0 +1,213 @@
+---
+title: "Heartbeats"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Heartbeats explained with clear examples, visuals, and practice questions in Mindflare's System Design course."
+---
+
+<LessonCard>
+
+The careful word is **suspect**. A heartbeat system should usually move a component through states instead of jumping straight from healthy to dead.
+
+This gives the system room to handle short network hiccups without overreacting.
+
+<h1 id="2-how-heartbeats-work">2. How Heartbeats Work</h1>
+
+A basic heartbeat system has two roles:
+
+- **Sender:** the node or process that sends periodic heartbeats
+- **Watcher:** the monitor, peer, control plane, or coordinator that tracks them
+
+A heartbeat message is usually small. At minimum, it carries a node ID so the watcher knows who sent it. It may also include a timestamp for rough freshness checks and debugging.
+
+A sequence number helps detect missed, duplicated, or reordered heartbeats. Some systems also include the sender's current role (leader, follower, worker, standby), a short health summary like CPU and queue depth, or a replication position that shows whether a replica is still keeping up.
+
+Keep the message small unless the extra data is used for a real decision. In large clusters, even small messages add up quickly.
+
+<h1 id="3-push-pull-and-gossip">3. Push, Pull, and Gossip</h1>
+
+There are several heartbeat models.
+
+<h3 id="push-heartbeats">Push Heartbeats</h3>
+
+Nodes send heartbeats to a monitor or coordinator.
+
+```text
+Every 5 seconds:
+  worker-17 -> coordinator: I am alive
+```
+
+Push is simple and efficient when many nodes report to one control plane. Kubernetes nodes reporting to the API server are an example of this pattern.
+
+The weakness is the central watcher. If the watcher is overloaded or unreachable, many healthy nodes may look unhealthy.
+
+<h3 id="pull-heartbeats">Pull Heartbeats</h3>
+
+The watcher periodically checks each node.
+
+```text
+Every 5 seconds:
+  monitor -> service-12: health check
+  service-12 -> monitor: OK
+```
+
+Pull is common for load balancers and service health checks. It verifies that the node can respond to a specific kind of request.
+
+The weakness is scale. A monitor probing thousands of nodes too often can become a bottleneck.
+
+<h3 id="gossip-heartbeats">Gossip Heartbeats</h3>
+
+Nodes exchange health information with peers instead of reporting only to one monitor.
+
+Gossip scales well because failure information spreads through the cluster gradually. Systems such as Cassandra and Consul use gossip-style membership and failure detection.
+
+The trade-off is that detection is not instant everywhere. Different nodes may briefly have different views of who is alive.
+
+<h1 id="4-intervals-timeouts-and-thresholds">
+  4. Intervals, Timeouts, and Thresholds
+</h1>
+
+Heartbeat behavior is mostly controlled by three settings:
+
+- **Interval**: how often heartbeats are sent. Shorter intervals detect failures faster, but use more network and CPU.
+- **Timeout**: how long the watcher waits before becoming suspicious. Shorter timeouts react faster, but create more false alarms.
+- **Failure threshold**: how many missed heartbeats trigger action. A higher threshold is safer, but slower.
+
+Example:
+
+```text
+Heartbeat interval: 2 seconds
+Failure threshold: 3 missed heartbeats
+Expected detection time: about 6 seconds plus network and processing delay
+```
+
+A common starting point is to declare suspicion after 2-5 missed heartbeats. The right value depends on the network, workload, and cost of being wrong.
+
+<h3 id="fast-detection-vs-false-alarms">Fast Detection vs. False Alarms</h3>
+
+Every choice here is a trade. A short interval and low threshold give fast failover but produce false alarms during latency spikes or garbage collection pauses.
+
+A long interval and high threshold avoid false alarms at the cost of slower recovery from real failures.
+
+An adaptive timeout that adjusts to observed latency fits changing networks better, but is more work to build. A multi-stage suspicion model (`healthy` -> `suspect` -> `unhealthy`) avoids many bad decisions, at the cost of more states to reason about.
+
+There is no perfect timeout. The system is always acting on incomplete evidence. You are choosing how quickly it should act and how much risk of a false alarm you can tolerate.
+
+<h1 id="5-why-missed-heartbeats-happen">5. Why Missed Heartbeats Happen</h1>
+
+Missed heartbeats do not always mean crashes. The process may truly be gone, but many other things can make a heartbeat arrive late or not arrive at all.
+
+A network partition can stop heartbeats from reaching the watcher even though the sender is healthy. A maxed-out CPU can leave the process alive but unable to schedule the heartbeat work.
+
+A garbage collection pause, where the runtime briefly stops application work to clean memory, can freeze the process long enough to miss a deadline. A disk stall can do the same. Packet loss and congestion can delay or drop heartbeats while they are crossing the network.
+
+Even the watcher side matters. An overloaded monitor may receive heartbeats but process them too late, and local clock or timer issues can throw off scheduling on either end.
+
+This is why missed heartbeats should be treated as warning signs, not facts.
+
+The response should match the risk. Removing a backend from a load balancer after missed heartbeats is usually fine. Promoting a new database primary requires stronger safeguards, such as majority agreement and fencing, which blocks the old primary from writing.
+
+<h1 id="6-heartbeats-and-split-brain">6. Heartbeats and Split-Brain</h1>
+
+Heartbeats are often used to trigger failover. That makes them useful, but also dangerous.
+
+Consider replicas that stop receiving heartbeats from the primary. They may conclude the primary is dead and promote a new primary. But the old primary may still be alive and reachable by some clients.
+
+This is how heartbeat-based failure detection can contribute to split-brain if failover is not protected.
+
+Good systems do not promote a new leader only because heartbeats stopped.
+
+They combine heartbeats with stronger safety checks:
+
+- **Majority agreement**: enough nodes must agree before leadership changes.
+- **Leader leases**: leadership is valid only for a limited time.
+- **Fencing**: the old leader is blocked from writing before a new one takes over.
+- **Fencing tokens**: downstream systems reject writes from old leaders.
+- **Epoch or term numbers**: every leadership generation has a newer number than the last one.
+
+Heartbeats can tell you when to investigate or start an election. They should not be the only proof that it is safe to take exclusive ownership.
+
+<h1 id="7-what-happens-after-suspicion">7. What Happens After Suspicion?</h1>
+
+A heartbeat system should define actions for each state.
+
+| State          | Meaning                       | Typical Action                                    |
+| -------------- | ----------------------------- | ------------------------------------------------- |
+| **Healthy**    | Heartbeats arriving normally  | Keep routing work                                 |
+| **Suspect**    | One or more heartbeats missed | Probe again, reduce traffic, gather more evidence |
+| **Unhealthy**  | Threshold exceeded            | Stop routing new work, trigger recovery           |
+| **Recovering** | Node responds again           | Run readiness checks before full traffic          |
+| **Removed**    | Node is no longer trusted     | Require manual or controlled rejoin               |
+
+For stateless services, recovery may be simple: remove the instance from rotation and let the platform restart it.
+
+For stateful systems, recovery needs more care. Check replication lag before promoting a replica. Make sure the old leader is fenced before accepting writes elsewhere.
+
+Rebuild or resync replicas that fell behind before they serve reads. Avoid sending traffic back to a node simply because one heartbeat returned. One message is not strong evidence that the node is ready again.
+
+<h1 id="8-heartbeats-vs-health-checks">8. Heartbeats vs. Health Checks</h1>
+
+Heartbeats and health checks are related, but not identical.
+
+| Mechanism             | Main Question                             | Example                                         |
+| --------------------- | ----------------------------------------- | ----------------------------------------------- |
+| **Heartbeat**         | Is the component still communicating?     | Worker sends "alive" every 5 seconds            |
+| **Liveness check**    | Should this process be restarted?         | Kubernetes liveness probe                       |
+| **Readiness check**   | Should this process receive traffic?      | Service is running but cache warmup is not done |
+| **Deep health check** | Can dependencies and critical paths work? | API checks database and queue connectivity      |
+
+A process can be alive but not ready. It can send heartbeats while its database connection pool is exhausted. It can pass a shallow health check while failing real user requests.
+
+Use the cheapest signal that is safe for the decision being made. Restarting a process, routing traffic to it, and promoting it to leader are different decisions, so they need different levels of confidence.
+
+<h1 id="9-real-world-uses">9. Real-World Uses</h1>
+
+Heartbeats show up almost everywhere distributed systems run.
+
+In Kubernetes, kubelets report node status to the control plane, while liveness and readiness probes decide whether each pod should run and receive traffic. In Kafka consumer groups, consumers send heartbeats to the coordinator to keep their group membership; missing them triggers a partition reassignment.
+
+In Raft-based systems, the leader sends heartbeats to followers to show that it is still the leader and to prevent unnecessary elections. ZooKeeper-style sessions are kept alive by client heartbeats, and session expiry removes temporary state.
+
+Load balancers run periodic health checks to remove unhealthy backends from rotation. Storage systems use heartbeats from data nodes to report whether nodes are alive, how much disk is used, and which data blocks they hold. Even WebSockets rely on ping/pong messages to detect broken long-lived connections.
+
+The details differ, but the pattern is the same: regular communication helps the system decide whether it can still trust a component.
+
+<h1 id="10-best-practices">10. Best Practices</h1>
+
+A few habits separate a reliable heartbeat system from a noisy one.
+
+Always pass through a suspect state before declaring failure, so one missed message does not trigger a recovery action. Tune intervals from observed latency in your environment, since production networks vary by region, workload, and time of day.
+
+Add jitter, meaning a small random delay, so nodes do not all send heartbeats at the same instant and overwhelm the monitor. Include sequence numbers to detect missed, duplicated, or reordered messages.
+
+Beyond the message itself, separate liveness from readiness so traffic is never sent to a process that is alive but not yet able to serve. Protect failover with majority agreement or fencing so missed heartbeats cannot turn into split-brain.
+
+Monitor heartbeat lag and false-alarm rates to learn whether detection is too aggressive. Rate-limit recovery actions so a wave of suspicion does not turn into a restart or failover storm.
+
+<h1 id="11-common-mistakes">11. Common Mistakes</h1>
+
+A missed heartbeat signals a possible problem, not a confirmed one. Treating it as certainty leads to most heartbeat-related failures.
+
+| Mistake                                      | Why It Hurts                                                     |
+| -------------------------------------------- | ---------------------------------------------------------------- |
+| Treating missed heartbeats as proof of death | Slow or cut-off nodes may still be running                       |
+| Using the same timeout everywhere            | Cross-region links and same-rack links behave differently        |
+| Restarting on every missed heartbeat         | Creates churn and can make overload worse                        |
+| Promoting leaders based only on heartbeats   | Can create split-brain                                           |
+| Sending large heartbeat messages             | Adds overhead and can delay the heartbeat itself                 |
+| Ignoring watcher overload                    | The monitor may be the reason heartbeats appear late             |
+| Rejoining nodes immediately                  | A recovered node may have old data or old leadership assumptions |
+
+<h1 id="summary">Summary</h1>
+
+Heartbeats are small messages used to check whether a component is still communicating. A received heartbeat is evidence that a component was recently reachable. A missed heartbeat is a warning sign, not proof of failure.
+
+Short timeouts detect failures faster but raise false alarms. Long timeouts reduce false alarms but slow recovery. Stateful failover needs stronger protection than heartbeats alone.
+
+Use heartbeats to create timely suspicion. Then use majority agreement, fencing, leases, readiness checks, and recovery rules to decide what action is actually safe.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,823 @@
+---
+title: "Intermediate Operations"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Intermediate Operations explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+Intermediate operations are the transformations chained on a stream before a terminal operation kicks them off. Each one returns a new stream and runs lazily, so the work happens once the terminal operation pulls. The previous lesson covered how operations are categorized (intermediate vs terminal, stateful vs stateless, short-circuiting). This lesson walks through every common intermediate operation, what its signature looks like, when to use it, and the pitfalls that show up in real code.
+
+<h1 id="filterpredicate">filter(Predicate)</h1>
+
+`filter` keeps elements that match a predicate and drops the rest. Its signature is `Stream<T> filter(Predicate<? super T> predicate)`. The output stream has the same element type as the input, just with fewer elements.
+
+```java
+import java.util.List;
+import java.util.stream.Collectors;
+
+class Product {
+    String name;
+    double price;
+    String category;
+    int stock;
+
+    Product(String name, double price, String category, int stock) {
+        this.name = name;
+        this.price = price;
+        this.category = category;
+        this.stock = stock;
+    }
+
+    @Override
+    public String toString() {
+        return name + " ($" + price + ")";
+    }
+}
+
+public class FilterDemo {
+    public static void main(String[] args) {
+        List<Product> products = List.of(
+                new Product("Notebook", 4.99, "Stationery", 20),
+                new Product("Pen", 1.49, "Stationery", 0),
+                new Product("Headphones", 89.99, "Electronics", 5),
+                new Product("Backpack", 39.50, "Bags", 12)
+        );
+
+        List<Product> inStock = products.stream()
+                .filter(p -> p.stock > 0)
+                .collect(Collectors.toList());
+
+        inStock.forEach(System.out::println);
+    }
+}
+```
+
+The lambda `p -> p.stock > 0` is a `Predicate<Product>`. Anything that returns `true` stays, anything that returns `false` is skipped.
+
+Multiple filters can be chained, and the result is the same as combining them with `&&`. Each filter adds another check per element.
+
+```java
+List<Product> affordableElectronics = products.stream()
+        .filter(p -> p.category.equals("Electronics"))
+        .filter(p -> p.price < 100)
+        .collect(Collectors.toList());
+```
+
+Two `filter` calls are usually clearer than one filter with a long `&&` chain. The compiler doesn't merge them, but the per-element overhead is small and the readability win is worth it.
+
+**Common pitfall: assuming `filter` runs eagerly.** It doesn't. The predicate isn't invoked until a terminal operation pulls. A stream pipeline without a terminal operation does no filtering.
+
+```java
+// Looks like it filters, but nothing runs.
+products.stream().filter(p -> p.stock > 0);
+```
+
+There's no `collect`, `count`, `forEach`, or any other terminal call, so the predicate never executes. The stream is created and immediately discarded.
+
+<h1 id="mapfunction">map(Function)</h1>
+
+`map` transforms each element. Its signature is `<R> Stream<R> map(Function<? super T, ? extends R> mapper)`. The output stream has one element for every input element, possibly of a different type.
+
+```java
+import java.util.List;
+import java.util.stream.Collectors;
+
+public class MapDemo {
+    public static void main(String[] args) {
+        List<Product> products = List.of(
+                new Product("Notebook", 4.99, "Stationery", 20),
+                new Product("Pen", 1.49, "Stationery", 30),
+                new Product("Backpack", 39.50, "Bags", 12)
+        );
+
+        List<String> names = products.stream()
+                .map(p -> p.name)
+                .collect(Collectors.toList());
+
+        System.out.println(names);
+    }
+}
+```
+
+`map` is one-to-one. Three products in, three names out. The element type changed from `Product` to `String`, which is why the output stream's parameter switched.
+
+A common pattern is extracting a field or computing a derived value.
+
+```java
+List<Double> taxedPrices = products.stream()
+        .map(p -> p.price * 1.08)
+        .collect(Collectors.toList());
+```
+
+Each `price` becomes a `Double` (boxed). The stream is now `Stream<Double>`, which is fine for collecting into a `List<Double>` but inefficient for computing just a sum. Primitive streams handle that case.
+
+**Common pitfall: mutating the source element inside `map`.** `map` should be a pure transformation. A mapper that mutates the element sneaks a side effect into a stage that's not designed for it, and parallel streams produce incorrect results.
+
+**What's wrong with this code?**
+
+```java
+List<Product> bumped = products.stream()
+        .map(p -> {
+            p.price = p.price * 1.10;   // mutates the original
+            return p;
+        })
+        .collect(Collectors.toList());
+```
+
+**Fix:** Return a new object instead of mutating.
+
+```java
+class PricedProduct {
+    String name;
+    double price;
+    PricedProduct(String name, double price) {
+        this.name = name;
+        this.price = price;
+    }
+}
+
+List<PricedProduct> bumped = products.stream()
+        .map(p -> new PricedProduct(p.name, p.price * 1.10))
+        .collect(Collectors.toList());
+```
+
+The original `products` list stays untouched. That's the functional style streams expect.
+
+<h1 id="maptoint-maptolong-maptodouble-and-boxed">
+  mapToInt, mapToLong, mapToDouble, and boxed
+</h1>
+
+Generic streams hold objects. `Stream<Integer>` boxes every `int`, which costs an allocation per element and slows down arithmetic. The primitive stream types `IntStream`, `LongStream`, and `DoubleStream` hold raw primitives and have specialized methods like `sum`, `average`, `min`, and `max`.
+
+`mapToInt`, `mapToLong`, and `mapToDouble` convert a `Stream<T>` into one of those primitive streams.
+
+```java
+import java.util.List;
+
+public class PrimitiveStreams {
+    public static void main(String[] args) {
+        List<Product> products = List.of(
+                new Product("Notebook", 4.99, "Stationery", 20),
+                new Product("Pen", 1.49, "Stationery", 30),
+                new Product("Backpack", 39.50, "Bags", 12)
+        );
+
+        int totalStock = products.stream()
+                .mapToInt(p -> p.stock)
+                .sum();
+
+        double averagePrice = products.stream()
+                .mapToDouble(p -> p.price)
+                .average()
+                .orElse(0.0);
+
+        System.out.println("Total stock: " + totalStock);
+        System.out.printf("Average price: $%.2f%n", averagePrice);
+    }
+}
+```
+
+Without `mapToInt`, summing stock would look like `products.stream().map(p -> p.stock).reduce(0, Integer::sum)`, which boxes every value and allocates a fresh `Integer` per element. `mapToInt` keeps the primitives raw and uses `IntStream.sum()`, which is a tight loop.
+
+A `Stream<Integer>` boxes every value into an `Integer` object. For tight numeric loops over thousands of elements, prefer `mapToInt` / `IntStream` to avoid the allocation churn. The runtime difference is small for short streams and noticeable for long ones.
+
+The reverse direction is `boxed`. It converts an `IntStream` back to a `Stream<Integer>` when methods that only exist on the generic stream are needed (for example, collecting into a `List<Integer>`).
+
+```java
+import java.util.List;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+public class BoxedDemo {
+    public static void main(String[] args) {
+        List<Integer> firstFive = IntStream.rangeClosed(1, 5)
+                .boxed()
+                .collect(Collectors.toList());
+
+        System.out.println(firstFive);
+    }
+}
+```
+
+`IntStream.rangeClosed(1, 5)` produces a primitive stream of `1, 2, 3, 4, 5`. `collect(Collectors.toList())` doesn't work directly on an `IntStream` because `Collectors.toList()` works on object streams. `boxed()` wraps each `int` in an `Integer` so the rest of the pipeline can treat it as a normal `Stream<Integer>`.
+
+| Operation     | Input            | Output                 | Use case                                                    |
+| ------------- | ---------------- | ---------------------- | ----------------------------------------------------------- |
+| `mapToInt`    | `Stream<T>`      | `IntStream`            | Sum, average, min, max over `int` values                    |
+| `mapToLong`   | `Stream<T>`      | `LongStream`           | Same as above for `long`                                    |
+| `mapToDouble` | `Stream<T>`      | `DoubleStream`         | Same as above for `double` (prices, ratings)                |
+| `boxed`       | `IntStream` etc. | `Stream<Integer>` etc. | Get back to object streams to use `collect`, `toList`, etc. |
+
+<h1 id="flatmapfunction">flatMap(Function)</h1>
+
+`map` is one-to-one. `flatMap` is one-to-many. Each input element produces a stream of zero or more output elements, and `flatMap` flattens those streams into a single stream.
+
+The signature is `<R> Stream<R> flatMap(Function<? super T, ? extends Stream<? extends R>> mapper)`. The mapper returns a stream per input element, and `flatMap` concatenates them.
+
+A common e-commerce shape: a list of carts, where each cart holds a list of items, and the goal is one flat stream of every item across every cart.
+
+```java
+import java.util.List;
+import java.util.stream.Collectors;
+
+class CartItem {
+    String name;
+    double price;
+    int quantity;
+
+    CartItem(String name, double price, int quantity) {
+        this.name = name;
+        this.price = price;
+        this.quantity = quantity;
+    }
+
+    @Override
+    public String toString() {
+        return name + " x" + quantity;
+    }
+}
+
+class Cart {
+    String customer;
+    List<CartItem> items;
+
+    Cart(String customer, List<CartItem> items) {
+        this.customer = customer;
+        this.items = items;
+    }
+}
+
+public class FlatMapDemo {
+    public static void main(String[] args) {
+        List<Cart> carts = List.of(
+                new Cart("Alice", List.of(
+                        new CartItem("Notebook", 4.99, 2),
+                        new CartItem("Pen", 1.49, 5))),
+                new Cart("Bob", List.of(
+                        new CartItem("Headphones", 89.99, 1))),
+                new Cart("Carol", List.of(
+                        new CartItem("Backpack", 39.50, 1),
+                        new CartItem("Pen", 1.49, 3)))
+        );
+
+        List<CartItem> allItems = carts.stream()
+                .flatMap(cart -> cart.items.stream())
+                .collect(Collectors.toList());
+
+        allItems.forEach(System.out::println);
+    }
+}
+```
+
+Three carts in, five items out. The shape of the output isn't tied to the shape of the input. An empty cart contributes zero items and the flow continues.
+
+A visualization of `flatMap`:
+
+Three carts enter the `flatMap` stage. Each one is converted to a stream of items. `flatMap` concatenates those inner streams and emits one flat sequence of five items.
+
+Compare this with what `map` would do for the same input.
+
+```java
+// Wrong shape: each element is a stream, not an item.
+Stream<Stream<CartItem>> nested = carts.stream()
+        .map(cart -> cart.items.stream());
+```
+
+`map` produces `Stream<Stream<CartItem>>` because the mapper returns a stream per element. That's almost never the desired shape. `flatMap` peels off the outer layer to produce `Stream<CartItem>`.
+
+Another useful e-commerce shape: one order, many line items. Computing the total revenue across all orders becomes a flat stream of items followed by a sum.
+
+```java
+import java.util.List;
+
+class Order {
+    String orderId;
+    List<CartItem> items;
+
+    Order(String orderId, List<CartItem> items) {
+        this.orderId = orderId;
+        this.items = items;
+    }
+}
+
+public class OrderRevenue {
+    public static void main(String[] args) {
+        List<Order> orders = List.of(
+                new Order("O1", List.of(
+                        new CartItem("Notebook", 4.99, 2),
+                        new CartItem("Pen", 1.49, 5))),
+                new Order("O2", List.of(
+                        new CartItem("Headphones", 89.99, 1)))
+        );
+
+        double revenue = orders.stream()
+                .flatMap(o -> o.items.stream())
+                .mapToDouble(item -> item.price * item.quantity)
+                .sum();
+
+        System.out.printf("Total revenue: $%.2f%n", revenue);
+    }
+}
+```
+
+The pipeline reads top to bottom: take orders, fan each one out into its items, convert each item to a price-times-quantity `double`, sum them. Without `flatMap`, the alternative is nested loops or stitching together intermediate lists.
+
+**Common pitfall: forgetting to flatten.** Writing `map(cart -> cart.items)` instead of `flatMap(cart -> cart.items.stream())` produces a `Stream<List<CartItem>>` and the next stage operates on lists, not items. `flatMap` has primitive variants too: `flatMapToInt`, `flatMapToLong`, `flatMapToDouble`. They behave the same way but emit primitive streams.
+
+<h1 id="distinct">distinct()</h1>
+
+`distinct` removes duplicates. Its signature is `Stream<T> distinct()`. Two elements are duplicates if `Objects.equals` says they are, which means `distinct` relies on the element type's `equals` and `hashCode` methods.
+
+```java
+import java.util.List;
+import java.util.stream.Collectors;
+
+public class DistinctDemo {
+    public static void main(String[] args) {
+        List<String> categories = List.of(
+                "Stationery", "Electronics", "Bags", "Stationery", "Bags");
+
+        List<String> unique = categories.stream()
+                .distinct()
+                .collect(Collectors.toList());
+
+        System.out.println(unique);
+    }
+}
+```
+
+Order is preserved. The first occurrence of each value stays, later duplicates are dropped.
+
+`distinct` works out of the box for `String`, `Integer`, and other types where `equals` and `hashCode` are already defined. For custom classes, both must be overridden.
+
+**What's wrong with this code?**
+
+```java
+import java.util.List;
+import java.util.stream.Collectors;
+
+class Tag {
+    String name;
+    Tag(String name) { this.name = name; }
+}
+
+public class BrokenDistinct {
+    public static void main(String[] args) {
+        List<Tag> tags = List.of(
+                new Tag("featured"),
+                new Tag("sale"),
+                new Tag("featured")
+        );
+
+        List<Tag> unique = tags.stream()
+                .distinct()
+                .collect(Collectors.toList());
+
+        System.out.println(unique.size());
+    }
+}
+```
+
+Three tags came in, three tags went out. `distinct` treated all three as different because `Tag` doesn't override `equals`. The default `Object.equals` only returns `true` for the same instance, and these are three separate `new Tag(...)` calls.
+
+**Fix:** Override `equals` and `hashCode`.
+
+```java
+import java.util.List;
+import java.util.Objects;
+import java.util.stream.Collectors;
+
+class Tag {
+    String name;
+    Tag(String name) { this.name = name; }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof Tag)) return false;
+        Tag tag = (Tag) o;
+        return Objects.equals(name, tag.name);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(name);
+    }
+}
+
+public class FixedDistinct {
+    public static void main(String[] args) {
+        List<Tag> tags = List.of(
+                new Tag("featured"),
+                new Tag("sale"),
+                new Tag("featured")
+        );
+
+        List<Tag> unique = tags.stream()
+                .distinct()
+                .collect(Collectors.toList());
+
+        System.out.println(unique.size());
+    }
+}
+```
+
+Now `distinct` recognizes two `Tag` objects with the same `name` as duplicates. Records (Java 14+) define `equals` and `hashCode` automatically, which makes them a clean fit for any stream that uses `distinct`.
+
+`distinct` is stateful. It has to remember every element it's seen, usually in a `HashSet`, to detect duplicates. On a long unordered stream, memory grows with the number of unique elements. On a parallel stream, `distinct` does extra work to preserve encounter order. When ordering doesn't matter, calling `unordered()` first gives `distinct` more freedom.
+
+<h1 id="sorted-and-sortedcomparator">sorted() and sorted(Comparator)</h1>
+
+`sorted()` returns a stream sorted by the elements' natural ordering. Its signature is `Stream<T> sorted()`. The element type must implement `Comparable`, otherwise a `ClassCastException` fires at runtime.
+
+```java
+import java.util.List;
+import java.util.stream.Collectors;
+
+public class SortedNatural {
+    public static void main(String[] args) {
+        List<String> names = List.of("Pen", "Notebook", "Headphones", "Backpack");
+
+        List<String> sorted = names.stream()
+                .sorted()
+                .collect(Collectors.toList());
+
+        System.out.println(sorted);
+    }
+}
+```
+
+`String` implements `Comparable<String>`, so natural ordering is alphabetical. `Integer`, `Double`, and most boxed primitives are also comparable.
+
+For custom types, the overload `sorted(Comparator<? super T>)` takes an explicit comparator. This is more common in real code because most domain objects don't have an obvious "natural" order.
+
+```java
+import java.util.Comparator;
+import java.util.List;
+import java.util.stream.Collectors;
+
+public class SortedByPrice {
+    public static void main(String[] args) {
+        List<Product> products = List.of(
+                new Product("Headphones", 89.99, "Electronics", 5),
+                new Product("Notebook", 4.99, "Stationery", 20),
+                new Product("Backpack", 39.50, "Bags", 12)
+        );
+
+        List<Product> byPrice = products.stream()
+                .sorted(Comparator.comparingDouble(p -> p.price))
+                .collect(Collectors.toList());
+
+        byPrice.forEach(System.out::println);
+    }
+}
+```
+
+`Comparator.comparingDouble` builds a comparator from a key extractor. Chain with `thenComparing` and reverse with `reversed`.
+
+```java
+List<Product> byCategoryThenPriceDesc = products.stream()
+        .sorted(Comparator.comparing((Product p) -> p.category)
+                .thenComparing(Comparator.comparingDouble((Product p) -> p.price).reversed()))
+        .collect(Collectors.toList());
+```
+
+The cast on `(Product p)` helps the compiler with type inference when mixing `comparing` and `thenComparing`. Skipping it produces "cannot infer type" errors.
+
+`sorted` is **stateful**. It has to buffer the entire stream into memory before it can emit the first element. On an infinite stream, `sorted` never terminates. On a very large stream, it can exhaust memory. For just the top N elements, `sorted` followed by `limit` works (the compiler doesn't optimize this, so the cost is bounded by the stream's size). A heap-backed `PriorityQueue` may be a better fit when N is small relative to the total.
+
+**Common pitfall: sorting unnecessarily.** `sorted` is a heavy operation. To take just the first element, use `min` with a comparator instead. To render a UI list, sort once at the end of the pipeline, not in the middle where every subsequent operation has to live with sorted data.
+
+<h1 id="peekconsumer">peek(Consumer)</h1>
+
+`peek` observes each element as it flows through the stream without changing it. Its signature is `Stream<T> peek(Consumer<? super T> action)`. The consumer runs once per element that passes through.
+
+`peek` exists for debugging. The Javadoc is explicit about this: "This method exists mainly to support debugging." Production code that uses `peek` for side effects is fragile, because `peek` only runs when a terminal operation pulls.
+
+```java
+import java.util.List;
+import java.util.stream.Collectors;
+
+public class PeekDebug {
+    public static void main(String[] args) {
+        List<Product> products = List.of(
+                new Product("Notebook", 4.99, "Stationery", 20),
+                new Product("Pen", 1.49, "Stationery", 0),
+                new Product("Headphones", 89.99, "Electronics", 5)
+        );
+
+        List<Product> result = products.stream()
+                .peek(p -> System.out.println("before filter: " + p))
+                .filter(p -> p.stock > 0)
+                .peek(p -> System.out.println("after filter: " + p))
+                .collect(Collectors.toList());
+
+        System.out.println("result size: " + result.size());
+    }
+}
+```
+
+The output interleaves. The pipeline processes elements one at a time, not stage by stage. That's lazy evaluation: each element is pulled through every stage before the next element starts. `peek` makes this visible, which is its main value when debugging a pipeline that's behaving unexpectedly.
+
+**What's wrong with this code?**
+
+```java
+List<String> names = new ArrayList<>();
+products.stream()
+        .peek(p -> names.add(p.name));   // tries to collect names via side effect
+```
+
+**Fix:** This won't add anything to `names` because there's no terminal operation. `peek` is part of an intermediate pipeline, and intermediate pipelines don't run on their own. Even adding a terminal operation here would be the wrong pattern: side effects in `peek` are a code smell. Use `map` and `collect` instead.
+
+```java
+List<String> names = products.stream()
+        .map(p -> p.name)
+        .collect(Collectors.toList());
+```
+
+That's the same intent, expressed properly. The pipeline declares the transformation, and `collect` materializes the result without anyone reaching outside the stream.
+
+<h1 id="limitn-and-skipn">limit(n) and skip(n)</h1>
+
+`limit(n)` short-circuits the stream after the first `n` elements. `skip(n)` discards the first `n` and emits everything after. Both have signature `Stream<T> limit(long n)` / `Stream<T> skip(long n)`.
+
+```java
+import java.util.List;
+import java.util.stream.Collectors;
+
+public class LimitSkip {
+    public static void main(String[] args) {
+        List<Product> products = List.of(
+                new Product("Notebook", 4.99, "Stationery", 20),
+                new Product("Pen", 1.49, "Stationery", 30),
+                new Product("Headphones", 89.99, "Electronics", 5),
+                new Product("Backpack", 39.50, "Bags", 12),
+                new Product("Bottle", 12.00, "Kitchen", 8)
+        );
+
+        List<Product> firstThree = products.stream()
+                .limit(3)
+                .collect(Collectors.toList());
+
+        List<Product> afterFirstTwo = products.stream()
+                .skip(2)
+                .collect(Collectors.toList());
+
+        System.out.println("first three: " + firstThree);
+        System.out.println("after first two: " + afterFirstTwo);
+    }
+}
+```
+
+Together they're the building blocks of pagination. To grab page 2 with 10 items per page, use `.skip(10).limit(10)`.
+
+```java
+int pageSize = 10;
+int page = 2;
+List<Product> pageItems = products.stream()
+        .skip((long) (page - 1) * pageSize)
+        .limit(pageSize)
+        .collect(Collectors.toList());
+```
+
+The cast to `long` matters when `page * pageSize` could overflow `int`. Small catalogs rarely hit it, but it's the right reflex.
+
+`limit` is short-circuiting. Once it's emitted `n` elements, the stream stops pulling from upstream. This makes `limit` useful on infinite streams.
+
+```java
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class InfiniteLimit {
+    public static void main(String[] args) {
+        var firstFive = Stream.iterate(1, n -> n + 1)
+                .limit(5)
+                .collect(Collectors.toList());
+
+        System.out.println(firstFive);
+    }
+}
+```
+
+`Stream.iterate(1, n -> n + 1)` would generate `1, 2, 3, ...` forever. `limit(5)` cuts it off after five and the terminal operation completes.
+
+`skip` on an ordered parallel stream is expensive because it has to know which elements are first. On a sequential stream, `skip` is cheap (it drops elements). When ordering doesn't matter in a parallel stream, call `unordered()` before `skip` to let it run faster.
+
+<h1 id="takewhilepredicate-and-dropwhilepredicate">
+  takeWhile(Predicate) and dropWhile(Predicate)
+</h1>
+
+Added in Java 9, `takeWhile` and `dropWhile` look like `filter` at first glance, but they behave very differently.
+
+`takeWhile(predicate)` emits elements as long as the predicate is `true`. The first element that returns `false` stops the stream, and nothing after it is emitted, even if later elements would have matched.
+
+`dropWhile(predicate)` skips elements as long as the predicate is `true`. The first element that returns `false` is emitted, along with everything after it (regardless of whether later elements match).
+
+Both stop deciding once they hit the boundary. That's the key difference from `filter`, which checks every single element independently.
+
+```java
+import java.util.List;
+import java.util.stream.Collectors;
+
+public class TakeWhileDrop {
+    public static void main(String[] args) {
+        List<Integer> nums = List.of(1, 2, 3, 4, 1, 2, 5);
+
+        List<Integer> taken = nums.stream()
+                .takeWhile(n -> n < 4)
+                .collect(Collectors.toList());
+
+        List<Integer> dropped = nums.stream()
+                .dropWhile(n -> n < 4)
+                .collect(Collectors.toList());
+
+        List<Integer> filtered = nums.stream()
+                .filter(n -> n < 4)
+                .collect(Collectors.toList());
+
+        System.out.println("takeWhile: " + taken);
+        System.out.println("dropWhile: " + dropped);
+        System.out.println("filter:    " + filtered);
+    }
+}
+```
+
+`takeWhile` stopped at the first `4` and didn't look further. The trailing `1, 2` were dropped even though they match the predicate, because `takeWhile` had already stopped. `dropWhile` skipped the leading `1, 2, 3` and then emitted everything from `4` onward, including the later `1` and `2` that don't match. `filter` checked each element independently and kept every match.
+
+The shape of the data matters. `takeWhile` and `dropWhile` are designed for sequences where the predicate flips at some boundary and stays flipped. Sorted prices, time-ordered events, that kind of thing.
+
+```java
+import java.util.Comparator;
+import java.util.List;
+import java.util.stream.Collectors;
+
+public class CheapProducts {
+    public static void main(String[] args) {
+        List<Product> products = List.of(
+                new Product("Pen", 1.49, "Stationery", 30),
+                new Product("Notebook", 4.99, "Stationery", 20),
+                new Product("Bottle", 12.00, "Kitchen", 8),
+                new Product("Backpack", 39.50, "Bags", 12),
+                new Product("Headphones", 89.99, "Electronics", 5)
+        );
+
+        List<Product> underTen = products.stream()
+                .sorted(Comparator.comparingDouble(p -> p.price))
+                .takeWhile(p -> p.price < 10.0)
+                .collect(Collectors.toList());
+
+        underTen.forEach(System.out::println);
+    }
+}
+```
+
+After sorting by price ascending, `takeWhile(p -> p.price < 10.0)` stops as soon as it hits the first product priced at $10 or more. The remaining products don't even get inspected, which is a real win on long streams.
+
+**Common pitfall: using `takeWhile` on an unsorted stream.** A predicate without a clean boundary causes `takeWhile` to cut off early and produce confusing results.
+
+**What's wrong with this code?**
+
+```java
+List<Product> result = products.stream()
+        .takeWhile(p -> p.price < 50.0)   // products are not sorted by price
+        .collect(Collectors.toList());
+```
+
+If the first product is priced at $89.99, `takeWhile` stops immediately and returns an empty list, even though cheaper products exist later. **Fix:** sort first, or use `filter` to capture every match regardless of position.
+
+```java
+List<Product> result = products.stream()
+        .filter(p -> p.price < 50.0)
+        .collect(Collectors.toList());
+```
+
+<h1 id="chaining-behavior-order-of-operations-matters">
+  Chaining Behavior: Order of Operations Matters
+</h1>
+
+Intermediate operations stack in declaration order, and that order changes how much work the pipeline does. Two pipelines that produce the same result can have very different costs depending on which operation comes first.
+
+A simple example: filter first vs map first.
+
+```java
+import java.util.List;
+import java.util.stream.Collectors;
+
+public class OrderMatters {
+    public static void main(String[] args) {
+        List<Product> products = List.of(
+                new Product("Notebook", 4.99, "Stationery", 20),
+                new Product("Pen", 1.49, "Stationery", 30),
+                new Product("Headphones", 89.99, "Electronics", 5),
+                new Product("Backpack", 39.50, "Bags", 12)
+        );
+
+        // filter first, then map: only mapping the survivors
+        List<String> a = products.stream()
+                .filter(p -> p.category.equals("Stationery"))
+                .map(p -> p.name.toUpperCase())
+                .collect(Collectors.toList());
+
+        // map first, then filter: mapping everything, then filtering
+        List<String> b = products.stream()
+                .map(p -> p.name.toUpperCase())
+                .filter(name -> name.startsWith("N") || name.startsWith("P"))
+                .collect(Collectors.toList());
+
+        System.out.println("a: " + a);
+        System.out.println("b: " + b);
+    }
+}
+```
+
+Both produce the same list, but pipeline `a` runs `map` on 2 elements (the survivors of the filter). Pipeline `b` runs `map` on all 4 elements and then filters. With expensive `map` work (network calls, big string manipulation, etc.), the difference matters.
+
+The rule of thumb: put `filter` before `map` when the filter can reduce the number of elements meaningfully. Put `filter` before `sorted` too, because sorting fewer elements is cheaper than sorting more and then throwing some away.
+
+```java
+// Better: filter, then sort 3 elements
+products.stream()
+        .filter(p -> p.stock > 0)
+        .sorted(Comparator.comparingDouble(p -> p.price))
+        .collect(Collectors.toList());
+
+// Worse: sort all elements, then filter
+products.stream()
+        .sorted(Comparator.comparingDouble(p -> p.price))
+        .filter(p -> p.stock > 0)
+        .collect(Collectors.toList());
+```
+
+Both pipelines return the same list, sorted by price. The second one sorts everything (including out-of-stock products) and then throws some away. The first one filters first and sorts a smaller set.
+
+The same principle applies to `distinct`: filtering first reduces the working set for `distinct`'s internal `HashSet`.
+
+Stateful operations (`sorted`, `distinct`) and short-circuiting operations (`limit`, `takeWhile`) have higher per-element costs than stateless ones (`filter`, `map`, `peek`). Order them so the cheap stages reduce the working set before the expensive stages run.
+
+<h1 id="streams-are-immutable-each-operation-returns-a-new-stream">
+  Streams Are Immutable: Each Operation Returns a New Stream
+</h1>
+
+Every intermediate operation returns a new `Stream` and leaves the original source untouched. The functional style of streams means building pipelines, not in-place edits.
+
+```java
+import java.util.List;
+import java.util.stream.Stream;
+
+public class NewStreamPerOp {
+    public static void main(String[] args) {
+        List<Product> products = List.of(
+                new Product("Notebook", 4.99, "Stationery", 20),
+                new Product("Pen", 1.49, "Stationery", 30)
+        );
+
+        Stream<Product> base = products.stream();
+        Stream<Product> filtered = base.filter(p -> p.price > 2.0);
+
+        // The original list is untouched.
+        System.out.println("source size: " + products.size());
+
+        long count = filtered.count();
+        System.out.println("filtered count: " + count);
+    }
+}
+```
+
+The source `List<Product>` has all 2 products. The filtered stream emits 1 (the `Notebook`). Nothing about `products` changed.
+
+One important caveat: a `Stream` can only be consumed once. After a terminal operation runs, the stream is closed. Reusing it throws `IllegalStateException`.
+
+```java
+Stream<Product> s = products.stream();
+s.count();
+s.count();   // IllegalStateException: stream has already been operated upon or closed
+```
+
+This is a common error when code assigns a stream to a variable and uses it twice. To reuse the pipeline, build it from the source again, or collect the intermediate result into a `List` and stream from there.
+
+<h1 id="operation-summary-table">Operation Summary Table</h1>
+
+| Operation                      | Signature                                                                   | What it does                                                   | Stateful?       | Short-circuiting? |
+| ------------------------------ | --------------------------------------------------------------------------- | -------------------------------------------------------------- | --------------- | ----------------- |
+| `filter`                       | `Stream<T> filter(Predicate<? super T>)`                                    | Keeps elements that match the predicate                        | No              | No                |
+| `map`                          | `<R> Stream<R> map(Function<? super T, ? extends R>)`                       | Transforms each element one-to-one                             | No              | No                |
+| `mapToInt` / `Long` / `Double` | `IntStream mapToInt(ToIntFunction<? super T>)` etc.                         | Converts to a primitive stream                                 | No              | No                |
+| `boxed`                        | `Stream<Integer> boxed()` (on `IntStream`) etc.                             | Converts a primitive stream back to an object stream           | No              | No                |
+| `flatMap`                      | `<R> Stream<R> flatMap(Function<? super T, ? extends Stream<? extends R>>)` | One-to-many: each element produces a stream, all flattened     | No              | No                |
+| `distinct`                     | `Stream<T> distinct()`                                                      | Removes duplicates using `equals` / `hashCode`                 | Yes             | No                |
+| `sorted`                       | `Stream<T> sorted()` / `Stream<T> sorted(Comparator<? super T>)`            | Sorts by natural order or comparator                           | Yes             | No                |
+| `peek`                         | `Stream<T> peek(Consumer<? super T>)`                                       | Observes each element without changing it (debugging)          | No              | No                |
+| `limit`                        | `Stream<T> limit(long n)`                                                   | Truncates to first `n` elements                                | No (sequential) | Yes               |
+| `skip`                         | `Stream<T> skip(long n)`                                                    | Discards first `n` elements                                    | No (sequential) | No                |
+| `takeWhile`                    | `Stream<T> takeWhile(Predicate<? super T>)`                                 | Emits elements until predicate fails, then stops               | No              | Yes               |
+| `dropWhile`                    | `Stream<T> dropWhile(Predicate<? super T>)`                                 | Discards elements while predicate is true, then emits the rest | No              | No                |
+
+`limit` is listed as not stateful for sequential streams because it only needs a counter. On a parallel stream it's effectively stateful (and slower) because it has to maintain encounter order.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

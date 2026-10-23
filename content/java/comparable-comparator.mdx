@@ -1,0 +1,504 @@
+---
+title: "Comparable & Comparator"
+readTime: "10 min read"
+lastUpdated: "June 2026"
+description: "Comparable & Comparator explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+<h1 id="why-sorting-needs-an-ordering">Why Sorting Needs an Ordering</h1>
+
+For primitive numbers and strings, Java has a natural sense of order. For your own classes, it has none. Consider a small `Product` class.
+
+```java
+public class FirstAttempt {
+    public static void main(String[] args) {
+        java.util.List<Product> products = new java.util.ArrayList<>();
+        products.add(new Product("Headphones", 79.99));
+        products.add(new Product("Notebook", 5.50));
+        products.add(new Product("Keyboard", 39.99));
+
+        java.util.Collections.sort(products);
+
+        for (Product p : products) {
+            System.out.println(p);
+        }
+    }
+}
+
+class Product {
+    String name;
+    double price;
+
+    Product(String name, double price) {
+        this.name = name;
+        this.price = price;
+    }
+
+    public String toString() {
+        return name + " ($" + price + ")";
+    }
+}
+```
+
+This won't even compile. The error is:
+
+```text
+error: no suitable method found for sort(List<Product>)
+    method Collections.<T#1>sort(List<T#1>) is not applicable
+      (inferred type does not conform to upper bound(s)
+        inferred: Product
+        upper bound(s): Comparable<? super Product>)
+```
+
+`Collections.sort` needs to know how to compare two `Product` values, and the class doesn't say. There are two ways to fix that. The class can implement `Comparable<Product>` and declare its own natural order. Or the call to `sort` can be passed a `Comparator<Product>` that supplies an order from the outside. The rest of the lesson is about when to pick which one.
+
+<h1 id="comparable-one-natural-ordering-per-class">
+  Comparable: One Natural Ordering Per Class
+</h1>
+
+`Comparable<T>` is a single-method interface. Implementing it says "instances of this class have an obvious default order, and here is how to compute it." The method is `compareTo(T other)`, and it returns an `int`:
+
+- A negative number means `this` comes before `other`.
+- Zero means `this` and `other` are equal for ordering purposes.
+- A positive number means `this` comes after `other`.
+
+The exact magnitudes don't matter, just the sign. Returning `-1`, `-2`, or `Integer.MIN_VALUE + 1` all mean the same thing.
+
+Below is `Product` with price as its natural ordering, so cheaper items sort earlier.
+
+```java
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+public class ProductsByPrice {
+    public static void main(String[] args) {
+        List<Product> products = new ArrayList<>();
+        products.add(new Product("Headphones", 79.99));
+        products.add(new Product("Notebook", 5.50));
+        products.add(new Product("Keyboard", 39.99));
+
+        Collections.sort(products);
+
+        for (Product p : products) {
+            System.out.println(p);
+        }
+    }
+}
+
+class Product implements Comparable<Product> {
+    String name;
+    double price;
+
+    Product(String name, double price) {
+        this.name = name;
+        this.price = price;
+    }
+
+    public int compareTo(Product other) {
+        return Double.compare(this.price, other.price);
+    }
+
+    public String toString() {
+        return name + " ($" + price + ")";
+    }
+}
+```
+
+`Collections.sort` calls `compareTo` repeatedly, using the sign of each return value to decide which item goes first. The body uses `Double.compare(this.price, other.price)`, which returns a negative number when `this.price` is smaller, zero when they're equal, and a positive number when `this.price` is larger. That matches the "smaller price comes first" rule.
+
+A few facts about `compareTo`:
+
+- **Transitive.** If `a.compareTo(b) < 0` and `b.compareTo(c) < 0`, then `a.compareTo(c) < 0`. Sorting algorithms rely on this. A `compareTo` that breaks transitivity can leave a list in an order that depends on the input order.
+- **Antisymmetric.** `a.compareTo(b)` and `b.compareTo(a)` must have opposite signs (or both be zero). If `a` comes before `b`, then `b` must come after `a`.
+- **Consistent across calls.** Calling `compareTo` twice with the same arguments must return values with the same sign. If `compareTo` peeks at a mutable field that other code changes mid-sort, the result is undefined.
+
+The `Comparable` contract also has a _recommendation_, not a hard requirement, that `compareTo` be consistent with `equals`. That means `a.compareTo(b) == 0` should hold exactly when `a.equals(b)` is true. Most classes follow this.
+
+`Double.compare` and `Integer.compare` are cheap, but if `compareTo` does heavy work (network calls, recomputing a hash), every sort pays that cost `O(n log n)` times. Cache expensive sort keys outside the comparator.
+
+<h1 id="the-a-b-trap">The a - b Trap</h1>
+
+A common shortcut for comparing integers is `return this.id - other.id;`. It looks clean and often works, but it has a real bug: integer subtraction can overflow. If `this.id` is `2_000_000_000` and `other.id` is `-2_000_000_000`, the difference doesn't fit in an `int`, and the result wraps around to a number with the wrong sign.
+
+```java
+public class OverflowBug {
+    public static void main(String[] args) {
+        int a = 2_000_000_000;
+        int b = -2_000_000_000;
+
+        System.out.println("Naive a - b: " + (a - b));
+        System.out.println("Integer.compare: " + Integer.compare(a, b));
+    }
+}
+```
+
+The naive subtraction wrapped to a positive number that happens to be correct for these inputs, but flip the values to `a = -2_000_000_000` and `b = 2_000_000_000` and the sign goes the wrong way. `Integer.compare(a, b)` does the same job safely by inspecting the values instead of subtracting them. The same advice applies to `Long.compare`, `Double.compare`, and friends. Use the static `compare` helpers for the type you're sorting, not arithmetic.
+
+`Double.compare` is doubly useful for floating-point. It also handles `NaN` and the difference between `+0.0` and `-0.0` in a way that `<` and `>` don't.
+
+<h1 id="comparator-ordering-from-the-outside">
+  Comparator: Ordering From the Outside
+</h1>
+
+`Comparable` declares one canonical order. But a product list might need to be shown sorted by price on one page, by name on another, and by rating on a third. `Comparator<T>` solves that by letting you pass the ordering rule in from outside the class. The class doesn't have to commit to a single sort key.
+
+The interface has one method:
+
+```java
+int compare(T a, T b);
+```
+
+The return value follows the same negative/zero/positive convention as `compareTo`. The difference is that the comparison logic lives in a separate object instead of being baked into the type.
+
+Below is the `Product` class sorted by name using a `Comparator`. The class itself still has the natural-by-price ordering from before, but the call site overrides it.
+
+```java
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+
+public class ProductsByName {
+    public static void main(String[] args) {
+        List<Product> products = new ArrayList<>();
+        products.add(new Product("Headphones", 79.99));
+        products.add(new Product("Notebook", 5.50));
+        products.add(new Product("Keyboard", 39.99));
+
+        Comparator<Product> byName = new Comparator<Product>() {
+            public int compare(Product a, Product b) {
+                return a.name.compareTo(b.name);
+            }
+        };
+
+        Collections.sort(products, byName);
+
+        for (Product p : products) {
+            System.out.println(p);
+        }
+    }
+}
+
+class Product implements Comparable<Product> {
+    String name;
+    double price;
+
+    Product(String name, double price) {
+        this.name = name;
+        this.price = price;
+    }
+
+    public int compareTo(Product other) {
+        return Double.compare(this.price, other.price);
+    }
+
+    public String toString() {
+        return name + " ($" + price + ")";
+    }
+}
+```
+
+The natural order would have put `Notebook` first because it's the cheapest. The comparator overrode that and sorted alphabetically by name instead. `String.compareTo` was already doing the heavy lifting; the comparator just delegated.
+
+Since `Comparator` is a functional interface (one abstract method), you can write the same thing as a lambda:
+
+```java
+Comparator<Product> byName = (a, b) -> a.name.compareTo(b.name);
+Collections.sort(products, byName);
+```
+
+Or inline:
+
+```java
+Collections.sort(products, (a, b) -> a.name.compareTo(b.name));
+```
+
+A side-by-side mental model is helpful here.
+
+The two approaches answer different questions. `Comparable` answers "what's the default order for this type?" `Comparator` answers "what order do I want right here, right now?"
+
+<h1 id="static-factories-comparing-comparingint-comparingdouble">
+  Static Factories: comparing, comparingInt, comparingDouble
+</h1>
+
+Writing `(a, b) -> a.name.compareTo(b.name)` works, but `Comparator.comparing` says the same thing with less noise. You pass it a **key extractor**, which is a function from the object to the field you want to sort by. It builds a comparator that compares two objects by their extracted keys.
+
+```java
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+
+public class ComparingDemo {
+    public static void main(String[] args) {
+        List<Product> products = new ArrayList<>();
+        products.add(new Product("Headphones", 79.99));
+        products.add(new Product("Notebook", 5.50));
+        products.add(new Product("Keyboard", 39.99));
+
+        Comparator<Product> byName = Comparator.comparing(p -> p.name);
+        Collections.sort(products, byName);
+
+        for (Product p : products) {
+            System.out.println(p);
+        }
+    }
+}
+
+class Product {
+    String name;
+    double price;
+
+    Product(String name, double price) {
+        this.name = name;
+        this.price = price;
+    }
+
+    public String toString() {
+        return name + " ($" + price + ")";
+    }
+}
+```
+
+The key extractor `p -> p.name` returns a `String`, and `Comparator.comparing` uses the natural ordering of `String` to compare those keys. Any type the key extractor returns must itself be `Comparable`, which is why this works for `String`, `Integer`, `Double`, and so on without an explicit comparator.
+
+For primitive keys, there are specialized factories that avoid the cost of autoboxing on every comparison.
+
+```java
+Comparator<Product> byPrice = Comparator.comparingDouble(p -> p.price);
+```
+
+```java
+Comparator<Product> byStock = Comparator.comparingInt(p -> p.stock);
+```
+
+`comparingInt`, `comparingLong`, and `comparingDouble` are equivalent in behavior to `comparing` but skip the wrap-into-`Integer`-or-`Double` step.
+
+`Comparator.comparing(p -> p.price)` boxes the `double` into a `Double` on every call. Use `comparingDouble` when the key is a primitive and the list is large; it can roughly halve comparator work in tight loops.
+
+<h1 id="chaining-thencomparing-reversed-and-null-handling">
+  Chaining: thenComparing, reversed, and Null Handling
+</h1>
+
+Real catalogs rarely sort by just one field. A typical e-commerce listing wants something like "group by category, then within a category sort by rating from high to low, then break ties by name." Writing that as one comparator from scratch is fiddly. The chaining methods on `Comparator` let you compose it from small pieces.
+
+`thenComparing` takes a second comparator (or key extractor) and falls back to it whenever the primary comparator returns zero. `reversed` flips the direction of a comparator. The two combine cleanly.
+
+```java
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+
+public class ChainedSort {
+    public static void main(String[] args) {
+        List<Product> products = new ArrayList<>();
+        products.add(new Product("Notebook", "Stationery", 4.3));
+        products.add(new Product("Pen", "Stationery", 4.6));
+        products.add(new Product("Eraser", "Stationery", 4.6));
+        products.add(new Product("Keyboard", "Electronics", 4.5));
+        products.add(new Product("Headphones", "Electronics", 4.5));
+        products.add(new Product("Mouse", "Electronics", 4.2));
+
+        Comparator<Product> byCategoryThenRatingThenName =
+            Comparator.comparing((Product p) -> p.category)
+                      .thenComparing(Comparator.comparingDouble((Product p) -> p.rating).reversed())
+                      .thenComparing(p -> p.name);
+
+        Collections.sort(products, byCategoryThenRatingThenName);
+
+        for (Product p : products) {
+            System.out.println(p);
+        }
+    }
+}
+
+class Product {
+    String name;
+    String category;
+    double rating;
+
+    Product(String name, String category, double rating) {
+        this.name = name;
+        this.category = category;
+        this.rating = rating;
+    }
+
+    public String toString() {
+        return category + " | " + name + " | " + rating;
+    }
+}
+```
+
+Trace through the output. The list is grouped by category first, with `Electronics` ahead of `Stationery` alphabetically. Within `Electronics`, the two items with rating `4.5` come before the one with `4.2`, because the rating step is reversed (highest first). The two `4.5` items break their tie by name, so `Headphones` precedes `Keyboard`. The `Stationery` group follows the same rules.
+
+The shape of a chained comparator is worth visualizing.
+
+Each step only runs when the previous step returned zero. That short-circuit is how multi-key sorting works: every comparator down the chain is a tiebreaker for the one above it.
+
+The explicit `(Product p) ->` type hint in the first call is a quirk of how Java infers types through chains. The compiler can sometimes lose track once `thenComparing` enters the picture, and writing the parameter type explicitly on the first comparator restores it. If you see "cannot infer type" errors when chaining, this is usually why.
+
+`Comparator` also offers `nullsFirst` and `nullsLast`, which wrap an existing comparator so it tolerates null values. Without them, a null in the list would throw `NullPointerException` the moment the comparator tried to read a field from it.
+
+```java
+Comparator<Product> byName = Comparator.nullsLast(Comparator.comparing(p -> p.name));
+```
+
+This comparator puts any null products at the end of the sorted list and uses the underlying name comparator for everything else. `nullsFirst` does the opposite. Use these when nulls in the input are possible; for lists where they aren't, leaving the comparator strict will catch real bugs.
+
+<h1 id="comparable-vs-comparator-when-to-pick-which">
+  Comparable vs Comparator: When to Pick Which
+</h1>
+
+The choice is usually clear once you ask: does this type have one obvious natural order, or does it need different orderings in different places?
+
+| Question                                   | Comparable                                                          | Comparator                                               |
+| ------------------------------------------ | ------------------------------------------------------------------- | -------------------------------------------------------- |
+| Where does the ordering live?              | Inside the class, in `compareTo`                                    | Outside the class, as a separate object                  |
+| How many orderings?                        | Exactly one per class                                               | As many as you need                                      |
+| Can you change the order at the call site? | No                                                                  | Yes                                                      |
+| Can you sort a class you don't own?        | No (you can't add `Comparable` to a third-party class)              | Yes                                                      |
+| When is it appropriate?                    | Type has a clear canonical order (`Integer`, `String`, `LocalDate`) | Multiple sort views, ad-hoc orderings, third-party types |
+
+Many classes implement `Comparable` for their most obvious ordering and let callers supply a `Comparator` when they want something different. `String` is the classic example: it has a natural lexicographic order, and `String.CASE_INSENSITIVE_ORDER` is a built-in `Comparator` for the case-insensitive variant.
+
+A pragmatic guideline: if you're tempted to write a `Comparable` whose meaning isn't obvious from the name of the class, write a `Comparator` instead. A `Product` that "is naturally ordered by stock count descending, with name as a tiebreaker" is hiding an arbitrary sort behind a misleading interface. A named `Comparator` like `Product.BY_STOCK_THEN_NAME` makes the intent explicit.
+
+<h1 id="consistency-with-equals-and-why-treeset-cares">
+  Consistency With Equals, and Why TreeSet Cares
+</h1>
+
+The `Comparable` contract recommends that `compareTo` be consistent with `equals`: `a.compareTo(b) == 0` should hold exactly when `a.equals(b)` is true. Most of the time, breaking this rule produces no visible effect. Sorted lists still look correct. The trouble starts with `TreeSet` and `TreeMap`, both of which decide whether two elements are duplicates by calling `compareTo` (or a supplied `Comparator`), not `equals`.
+
+A `Product` whose `compareTo` is based on price will treat any two products at the same price as equal for the purposes of a `TreeSet`.
+
+```java
+import java.util.TreeSet;
+
+public class TreeSetTrap {
+    public static void main(String[] args) {
+        TreeSet<Product> catalog = new TreeSet<>();
+        catalog.add(new Product("Headphones", 79.99));
+        catalog.add(new Product("Mouse", 79.99));
+        catalog.add(new Product("Notebook", 5.50));
+
+        System.out.println("Size: " + catalog.size());
+        for (Product p : catalog) {
+            System.out.println(p);
+        }
+    }
+}
+
+class Product implements Comparable<Product> {
+    String name;
+    double price;
+
+    Product(String name, double price) {
+        this.name = name;
+        this.price = price;
+    }
+
+    public int compareTo(Product other) {
+        return Double.compare(this.price, other.price);
+    }
+
+    public String toString() {
+        return name + " ($" + price + ")";
+    }
+}
+```
+
+`Headphones` and `Mouse` are different products by any reasonable definition of equality, but `compareTo` returns zero for them because their prices match. `TreeSet` saw the second insert, asked `compareTo`, got `0`, and treated `Mouse` as a duplicate. Only one of the two survived.
+
+The fix is to make `compareTo` finer-grained so it distinguishes products that aren't really the same.
+
+```java
+public int compareTo(Product other) {
+    int byPrice = Double.compare(this.price, other.price);
+    if (byPrice != 0) {
+        return byPrice;
+    }
+    return this.name.compareTo(other.name);
+}
+```
+
+Or, if you're using a `Comparator`, chain a tiebreaker so it can't collapse two distinct objects to zero:
+
+```java
+Comparator<Product> byPriceThenName =
+    Comparator.comparingDouble((Product p) -> p.price)
+              .thenComparing(p -> p.name);
+```
+
+The general rule: if a value will ever land in a `TreeSet`, `TreeMap`, or any other structure that uses ordering for identity, make sure the comparator can't return zero for objects you'd consider distinct.
+
+<h1 id="putting-it-together">Putting It Together</h1>
+
+A small program that exercises both interfaces: `Product` has a natural order by price (so `Comparable`), and the same list can be re-sorted on the fly with a multi-key comparator.
+
+```java
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+
+public class CatalogSort {
+    public static void main(String[] args) {
+        List<Product> catalog = new ArrayList<>();
+        catalog.add(new Product("Notebook", "Stationery", 4.3, 5.50));
+        catalog.add(new Product("Pen", "Stationery", 4.6, 1.20));
+        catalog.add(new Product("Keyboard", "Electronics", 4.5, 39.99));
+        catalog.add(new Product("Headphones", "Electronics", 4.5, 79.99));
+
+        Collections.sort(catalog);
+        System.out.println("Natural order (by price):");
+        for (Product p : catalog) {
+            System.out.println("  " + p);
+        }
+
+        Comparator<Product> byCategoryThenRatingDesc =
+            Comparator.comparing((Product p) -> p.category)
+                      .thenComparing(Comparator.comparingDouble((Product p) -> p.rating).reversed())
+                      .thenComparing(p -> p.name);
+
+        Collections.sort(catalog, byCategoryThenRatingDesc);
+        System.out.println("Custom order (category, rating desc, name):");
+        for (Product p : catalog) {
+            System.out.println("  " + p);
+        }
+    }
+}
+
+class Product implements Comparable<Product> {
+    String name;
+    String category;
+    double rating;
+    double price;
+
+    Product(String name, String category, double rating, double price) {
+        this.name = name;
+        this.category = category;
+        this.rating = rating;
+        this.price = price;
+    }
+
+    public int compareTo(Product other) {
+        return Double.compare(this.price, other.price);
+    }
+
+    public String toString() {
+        return category + " | " + name + " | rating " + rating + " | $" + price;
+    }
+}
+```
+
+The first sort uses `compareTo` from the class itself, so the catalog comes out cheapest-first. The second sort hands a chained comparator to `Collections.sort`, which overrides the natural order for that call only. The class never changed. The same `Product` objects sit in the same list. Only the rule for arranging them shifted.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

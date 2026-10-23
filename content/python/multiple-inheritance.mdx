@@ -1,0 +1,336 @@
+---
+title: "Multiple Inheritance"
+readTime: "10 min read"
+lastUpdated: "June 6, 2026"
+description: "Multiple Inheritance explained with clear examples, visuals, and practice questions in Mindflare's Python Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+<h1 id="syntax-inheriting-from-more-than-one-class">
+  Syntax: Inheriting From More Than One Class
+</h1>
+
+In single inheritance, every subclass has exactly one parent in the parentheses. Multiple inheritance just means listing more than one:
+
+```python
+class Product:
+    def __init__(self, name, price):
+        self.name = name
+        self.price = price
+
+class DiscountableMixin:
+    def apply_discount(self, percent):
+        return self.price * (1 - percent / 100)
+
+class ShippableMixin:
+    def shipping_cost(self):
+        if self.price > 50:
+            return 0.0
+        return 5.99
+
+class Laptop(Product, DiscountableMixin, ShippableMixin):
+    pass
+
+laptop = Laptop("ThinkPad", 899.00)
+print(f"Sale price: ${laptop.apply_discount(15):.2f}")
+print(f"Shipping:   ${laptop.shipping_cost():.2f}")
+```
+
+`Laptop` doesn't define any methods of its own, yet it has `apply_discount` (from `DiscountableMixin`) and `shipping_cost` (from `ShippableMixin`) and the `__init__` it inherits from `Product`. Python walks the parent classes when it can't find a name on the subclass itself.
+
+The order matters. `class Laptop(Product, DiscountableMixin, ShippableMixin)` and `class Laptop(ShippableMixin, DiscountableMixin, Product)` are not the same class. They share the same set of parents but the order changes how Python resolves names when more than one parent has a match. We'll come back to this when we look at MRO.
+
+<h1 id="the-diamond-problem">The Diamond Problem</h1>
+
+Multiple inheritance gets interesting when two parents share a common ancestor. The shape of the class graph looks like a diamond, with one class at the top, two in the middle, and one at the bottom:
+
+`Laptop` inherits from both `DiscountableMixin` and `ShippableMixin`, and both of those inherit from `Product`. If `Laptop` calls a method that `Product` defines, which path does Python take to find it? If both middle classes override the same method, which one wins?
+
+Here's the problem in code:
+
+```python
+class Product:
+    def describe(self):
+        return "a product"
+
+class DiscountableMixin(Product):
+    def describe(self):
+        return "discountable, " + super().describe()
+
+class ShippableMixin(Product):
+    def describe(self):
+        return "shippable, " + super().describe()
+
+class Laptop(DiscountableMixin, ShippableMixin):
+    pass
+
+print(Laptop().describe())
+```
+
+This is the desirable answer, each class in the chain contributes one piece, and `Product.describe` runs exactly once at the end. Languages without a clear rule for diamond inheritance either reject this setup or call `Product.describe` twice. Python avoids both traps with the MRO.
+
+The mental hook: in a diamond, the shared ancestor (`Product`) should be visited once, after both children that depend on it. The MRO is the algorithm that decides exactly when "once, after both children" means.
+
+<h1 id="method-resolution-order">Method Resolution Order</h1>
+
+When you call `instance.method()`, Python doesn't just guess where `method` lives. It walks a fixed list of classes called the **method resolution order** (MRO) and picks the first class in the list that defines the name. Every class has an MRO, and you can read it.
+
+`ClassName.__mro__` returns a tuple. `ClassName.mro()` returns the same thing as a list. Both show the order Python will use:
+
+```python
+class Product:
+    pass
+
+class DiscountableMixin(Product):
+    pass
+
+class ShippableMixin(Product):
+    pass
+
+class Laptop(DiscountableMixin, ShippableMixin):
+    pass
+
+for cls in Laptop.__mro__:
+    print(cls.__name__)
+```
+
+Read it top-to-bottom. When you call `Laptop().describe()`, Python looks for `describe` on `Laptop` first, then `DiscountableMixin`, then `ShippableMixin`, then `Product`, then `object`. The first class with a matching name wins.
+
+A few details worth noticing:
+
+- `object` is always at the end. Every Python class inherits from `object`, even when you don't write it.
+- The MRO is built once, when the class is created, not on every method call. It's a precomputed lookup order.
+- The MRO is linear. Even with a diamond, the lookup walks a single ordered list, not a tree.
+
+The diagram shows the diamond from earlier flattened into a single chain. The two middle classes (`DiscountableMixin` and `ShippableMixin`) appear once, in the order they were listed in `Laptop`'s parents. `Product` appears once, after both. `object` sits at the very end.
+
+> **Cost:** MRO lookup is O(number of classes in the chain), but Python caches method lookups inside each class, so repeated calls to the same method are effectively O(1) after the first one. You don't pay the walk on every call.
+
+<h1 id="c3-linearization-in-plain-english">
+  C3 Linearization, in Plain English
+</h1>
+
+Python builds the MRO using an algorithm called **C3 linearization**. The full algorithm has formal rules, but the intuition is small enough to hold in your head:
+
+1. A class comes before all of its parents.
+2. Parents stay in the order you listed them in the class declaration.
+3. A class shows up exactly once, no matter how many paths lead to it.
+
+C3 walks the class graph and produces the unique ordering that satisfies all three rules. If no such ordering exists (because two rules contradict each other), Python refuses to create the class and raises `TypeError` at class-definition time.
+
+Here's an order that C3 can't resolve:
+
+```python
+class A: pass
+class B: pass
+
+class X(A, B): pass
+class Y(B, A): pass
+
+class Z(X, Y):
+    pass
+```
+
+`X` wants `A` before `B`. `Y` wants `B` before `A`. `Z` inherits from both, so the MRO would have to honor both orderings at once, which is impossible. C3 catches the contradiction and rejects the class.
+
+You almost never hit this in practice with well-designed hierarchies. When you do, it usually means the design is trying to combine classes in incompatible ways and you should rethink the structure rather than fight the algorithm.
+
+For the diamond case from earlier, C3 gives `Laptop -> DiscountableMixin -> ShippableMixin -> Product -> object`. Notice that `Product` waits until after both `DiscountableMixin` and `ShippableMixin` have appeared, which satisfies rule 1 (a class comes before its parents) for both middle classes at once. That's the property that makes the diamond resolve cleanly.
+
+<h1 id="cooperative-super-each-parent-must-pass-the-baton">
+  Cooperative super(): Each Parent Must Pass the Baton
+</h1>
+
+The diamond example worked because each `describe` called `super().describe()`. That pattern is called **cooperative multiple inheritance**: every class in the chain calls `super()` so the call walks through the entire MRO instead of stopping at one parent.
+
+Inside `DiscountableMixin.describe`, `super()` doesn't mean "my parent class". It means "the next class after me in the MRO of whatever object I'm bound to". For a `Laptop` instance, the MRO is `Laptop -> DiscountableMixin -> ShippableMixin -> Product -> object`, so `super()` from inside `DiscountableMixin` resolves to `ShippableMixin`, not to `Product`. That's how `Product.describe` ends up running after both mixins, even though `DiscountableMixin` inherits from `Product` directly.
+
+```python
+class Product:
+    def describe(self):
+        return "a product"
+
+class DiscountableMixin(Product):
+    def describe(self):
+        print("DiscountableMixin sees super() as:", super().__self_class__.__mro__[1].__name__)
+        return "discountable, " + super().describe()
+
+class ShippableMixin(Product):
+    def describe(self):
+        return "shippable, " + super().describe()
+
+class Laptop(DiscountableMixin, ShippableMixin):
+    pass
+
+print(Laptop().describe())
+```
+
+The same `DiscountableMixin.describe` behaves differently depending on what class it's called from. On a `Laptop` it forwards to `ShippableMixin`. On a plain `DiscountableMixin` instance, it would forward to `Product`. That's the cooperative part: each class trusts the MRO to deliver the call to the right place next, instead of hard-coding a parent name.
+
+Two rules to make cooperative `super()` work:
+
+1. **Every class in the chain must call `super()` for the method**, even classes at the top of the diamond. If `Product.describe` doesn't call `super().describe()`, the chain stops there, which is what we want when `Product` is the shared base. But if you put a class in the middle that forgets to call `super()`, the classes after it in the MRO never run.
+2. **Signatures must agree.** If `DiscountableMixin.describe(self)` passes no arguments to `super().describe()`, but `ShippableMixin.describe(self, verbose=False)` expects a keyword argument, the call breaks. Cooperative chains usually accept and forward `*args, **kwargs` so each class can pick out the arguments it cares about.
+
+Here's a working `__init__` chain that respects both rules:
+
+```python
+class Product:
+    def __init__(self, name, price, **kwargs):
+        super().__init__(**kwargs)
+        self.name = name
+        self.price = price
+
+class DiscountableMixin:
+    def __init__(self, *, discount_eligible=True, **kwargs):
+        super().__init__(**kwargs)
+        self.discount_eligible = discount_eligible
+
+class ShippableMixin:
+    def __init__(self, *, weight_kg=1.0, **kwargs):
+        super().__init__(**kwargs)
+        self.weight_kg = weight_kg
+
+class Laptop(Product, DiscountableMixin, ShippableMixin):
+    pass
+
+laptop = Laptop(name="ThinkPad", price=899.00, discount_eligible=True, weight_kg=1.4)
+print(laptop.name, laptop.price, laptop.discount_eligible, laptop.weight_kg)
+```
+
+Each `__init__` picks the keyword arguments it cares about and forwards the rest with `**kwargs`. The `super().__init__(**kwargs)` line carries the leftover arguments down the MRO. The final stop is `object.__init__`, which accepts no extra arguments, which is why every class in the chain has to consume its own keywords by the time the call reaches `object`.
+
+> **Cost:** Cooperative `super()` is paying for itself at every level of the chain, one Python call per class in the MRO. For chains with two or three classes it's nothing. For deep mixin stacks you'll measure it, but you'll measure it as "still fast enough" almost always.
+
+<h1 id="mixins-small-classes-meant-to-be-mixed-in">
+  Mixins: Small Classes Meant to Be Mixed In
+</h1>
+
+A **mixin** is a class designed to add one focused capability to other classes, not to stand on its own. Mixins follow a simple shape: small, no state of their own (or very little), and named after what they add, often ending in `Mixin` or `able`.
+
+The mixins from earlier (`DiscountableMixin`, `ShippableMixin`) are typical. Each owns one method, has no `__init__` for state of its own (or accepts only what it needs), and doesn't try to be useful on its own. You don't write `DiscountableMixin()` directly; you mix it into a `Product` subclass.
+
+A slightly fuller example:
+
+```python
+class Product:
+    def __init__(self, name, price):
+        self.name = name
+        self.price = price
+
+class TaxableMixin:
+    """Adds tax calculation. Expects self.price."""
+
+    TAX_RATE = 0.08
+
+    def price_with_tax(self):
+        return self.price * (1 + self.TAX_RATE)
+
+class GiftWrappableMixin:
+    """Adds gift wrap option. Expects self.price."""
+
+    GIFT_WRAP_FEE = 4.99
+
+    def price_with_gift_wrap(self):
+        return self.price + self.GIFT_WRAP_FEE
+
+class ReviewableMixin:
+    """Adds review storage. Maintains its own list per instance."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.reviews = []
+
+    def add_review(self, text, stars):
+        self.reviews.append({"text": text, "stars": stars})
+
+    def average_stars(self):
+        if not self.reviews:
+            return 0.0
+        return sum(r["stars"] for r in self.reviews) / len(self.reviews)
+
+class Book(ReviewableMixin, TaxableMixin, GiftWrappableMixin, Product):
+    pass
+
+book = Book("Designing Data-Intensive Applications", 45.00)
+book.add_review("Excellent", 5)
+book.add_review("Solid reference", 4)
+
+print(f"Price with tax:       ${book.price_with_tax():.2f}")
+print(f"Price with gift wrap: ${book.price_with_gift_wrap():.2f}")
+print(f"Average rating:       {book.average_stars()}")
+```
+
+`Book` doesn't define any methods. It composes capabilities from four parents: storage (`Product`), tax, gift wrap, and reviews. If you want a `DigitalBook` that's reviewable and taxable but has no shipping or gift wrap, you list a different set of parents. If you want to add a `FeaturedMixin` that bumps the price in search rankings, you write the mixin once and use it in any product that needs it.
+
+A few practical rules when writing mixins:
+
+| Do                                                                                    | Don't                                              |
+| ------------------------------------------------------------------------------------- | -------------------------------------------------- |
+| Keep each mixin focused on one capability                                             | Bundle five unrelated methods into one mixin       |
+| Document what attributes the mixin expects (`Expects self.price`)                     | Assume the consumer knows what fields you'll touch |
+| Make `__init__` accept `*args, **kwargs` and call `super().__init__(*args, **kwargs)` | Hard-code a parent class in `super()`              |
+| Name the mixin after the capability it adds                                           | Name it like a noun that sounds like a real entity |
+
+The last point matters more than it sounds. `DiscountableMixin` reads as "this thing can be discounted", which tells you it's an add-on. `Pricing` reads like a standalone module or class, which makes a future reader wonder why a `Laptop` "is a" `Pricing`. Good names tell readers which classes are domain types and which are pluggable behaviors.
+
+<h1 id="when-to-avoid-multiple-inheritance">
+  When To Avoid Multiple Inheritance
+</h1>
+
+Multiple inheritance is a sharp tool. It solves real problems when the parents are orthogonal (different axes of behavior, no overlap), but it makes code harder to follow when the parents step on each other.
+
+Reach for it when:
+
+- You're combining small, independent capabilities (logging, serialization, caching) onto a domain class. Mixins are the canonical case.
+- Two parents have clearly different responsibilities that don't overlap in attribute names or method names.
+- You can show the MRO and explain in one sentence why each class is in the chain.
+
+Avoid it when:
+
+- The two parents both feel like "real entities" of the domain. A class that's both a `Product` and a `Customer` is almost always wrong; the right answer is composition (a `Product` has a `Customer` who reviewed it).
+- You find yourself adjusting parent order to make tests pass. That's a sign the MRO is doing something you don't fully understand, and the next person to touch the code won't understand it either.
+- You're using it to inherit a single method. Composing the helper as a regular attribute is usually clearer than inheriting it.
+- Two parents have methods or attributes with the same name and you didn't plan for it. Silent overrides via MRO are a debugging nightmare.
+
+When in doubt, prefer composition: hold an instance of the other class as an attribute instead of inheriting from it. Polymorphism often gives you the flexibility you wanted from multiple inheritance without any of the MRO complexity.
+
+```python
+# Composition over multiple inheritance
+class Inventory:
+    def __init__(self):
+        self.stock = {}
+
+    def add_stock(self, name, count):
+        self.stock[name] = self.stock.get(name, 0) + count
+
+class Reviews:
+    def __init__(self):
+        self.entries = []
+
+    def add(self, text, stars):
+        self.entries.append((text, stars))
+
+class Product:
+    def __init__(self, name, price):
+        self.name = name
+        self.price = price
+        self.inventory = Inventory()
+        self.reviews = Reviews()
+
+book = Product("DDIA", 45.00)
+book.inventory.add_stock("DDIA", 5)
+book.reviews.add("Excellent", 5)
+print(book.inventory.stock, book.reviews.entries)
+```
+
+Same capabilities, no diamond, no MRO to reason about. The trade-off is that calls go through one more dot (`book.inventory.add_stock` instead of `book.add_stock`), which is usually a fair price for the simpler structure.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>

@@ -1,0 +1,161 @@
+---
+title: "Virtual Threads (Project Loom)"
+readTime: "10 min read"
+lastUpdated: "September 21, 2026"
+description: "Virtual Threads (Project Loom) explained with clear examples, visuals, and practice questions in Mindflare's Java Programming course."
+---
+
+<LessonCard>
+
+$L42
+
+The setting is an e-commerce server. The shop is doing well. Concurrent customers went from a few hundred to a hundred thousand, and the server that used to keep up on a single laptop now needs a small fleet to handle the load.
+
+<h1 id="the-wall-we-hit-with-platform-threads">
+  The Wall We Hit With Platform Threads
+</h1>
+
+A platform thread (the regular `Thread` you create with `new Thread(task).start()`) is a Java wrapper around an OS thread. When you do `new Thread(task).start()`, the JVM asks the operating system for a real thread, complete with its own kernel-managed stack of about 1 MB by default and a slot in the OS scheduler's run queue. That thread is the unit the kernel switches between when it runs Java code.
+
+That model works fine when concurrency is modest. A web server with 200 threads handling 200 simultaneous requests is comfortable. Push that number to 10,000 and you start feeling the cost: 10,000 megabytes of stack reserved before any work begins, context-switch overhead growing with the number of runnable threads, and the kernel scheduler spending more time picking who runs next.
+
+The diagram shows the dead end. A hundred thousand customer requests, one platform thread per request, and the math stops working. At 1 MB per stack, you need 100 GB of memory before the threads even start doing anything useful. Most servers don't have that. The OS scheduler also has to keep track of every one of those threads, even though most of them are sitting idle waiting on the network.
+
+The traditional workaround is a thread pool. Instead of one thread per request, you keep a small pool (say, 200) and queue the rest. That fixes the memory problem but introduces a new one: a long-running request blocks one of those 200 slots for its full duration, including the time it spends waiting on the database or the inventory service. If each request blocks for 100 ms waiting on I/O, that pool of 200 threads tops out at 2,000 requests per second, no matter how many CPU cores you have.
+
+The deeper issue is that the **thread-per-request** style, which is the most natural way to write server code, doesn't scale with blocking I/O on platform threads. You can switch to asynchronous APIs (`CompletableFuture`, reactive streams) to claw back throughput, but that means rewriting your code as a chain of callbacks, losing readability, losing stack traces, and inheriting a new family of bugs. Virtual threads exist to make the simple, blocking, thread-per-request style work again at high concurrency.
+
+<h1 id="what-a-virtual-thread-actually-is">
+  What a Virtual Thread Actually Is
+</h1>
+
+A virtual thread is also an instance of `java.lang.Thread`. It runs Java code, it has a name, it can be interrupted, and from the inside, code can't tell the difference. The difference is on the outside: the JVM, not the operating system, decides when a virtual thread runs.
+
+Internally, the JVM keeps a small pool of **carrier threads**. These are regular platform threads, one per CPU core by default (or a number set by `-Djdk.virtualThreadScheduler.parallelism`). When a virtual thread is ready to run Java code, the JVM mounts it on a carrier and lets it execute. When the virtual thread hits a blocking operation (a `Thread.sleep`, a network read, a `BlockingQueue.take`), the JVM unmounts it: it saves the virtual thread's stack onto the Java heap and frees the carrier to run a different virtual thread. When the blocking operation completes, the virtual thread is queued again and eventually remounted, possibly on a different carrier.
+
+The diagram shows five virtual threads sharing two carriers. Only two virtual threads are actually running Java code at any one moment (mounted on the solid arrows). The others are parked, waiting for I/O. When a parked thread becomes runnable, the JVM mounts it on whichever carrier is free. The kernel only knows about the two carrier threads. From the OS's perspective, this is a perfectly ordinary two-thread program.
+
+This is what makes a million virtual threads cheap. A virtual thread's "stack" lives on the heap as a regular Java object, growing and shrinking on demand. There is no fixed 1 MB reservation, no kernel-side bookkeeping, no system call to create one. Creating a virtual thread is closer to allocating an object than to spawning a process.
+
+Virtual threads aren't faster, they're more plentiful. A single virtual thread does not finish a CPU-bound calculation any faster than a platform thread would. What changes is that you can have a hundred thousand of them sitting around waiting on the network without spending a hundred thousand megabytes of stack memory. The performance win is at the system level, in throughput per server, not at the per-task level.
+
+Virtual threads are cheap, but not free. Each one still needs a fresh stack to run on, and the JVM allocates a small object for that stack on the heap. Spinning up ten million virtual threads in a tight loop will still pressure the garbage collector. The right model is one virtual thread per logical task (one per request, one per connection), not one per arithmetic operation.
+
+<h1 id="creating-virtual-threads">Creating Virtual Threads</h1>
+
+Java 21 gives you three common ways to create a virtual thread, depending on how much control you want.
+
+The shortest form is `Thread.startVirtualThread(Runnable)`. It creates a virtual thread, starts it, and returns. Use this when you just want to fire off some work.
+
+The output shows two interesting things. First, the thread name reports itself as `VirtualThread`, which is the JVM's way of saying it's not a regular platform thread. Second, it tells you which carrier it's running on (`ForkJoinPool-1-worker-1`), because internally the default scheduler is a `ForkJoinPool`. The exact carrier may differ across runs.
+
+The second form is `Thread.ofVirtual()`, which returns a builder. The builder lets you set a name, a thread group, an uncaught-exception handler, and then either build the thread (`unstarted` or `start`) or hand back a factory.
+
+`Thread.ofVirtual()` is the counterpart to `Thread.ofPlatform()`. Same builder shape, different kind of thread at the end. The `name("order-handler-", 1)` form gives the thread a name with an auto-incrementing counter, which is handy if you're spinning up many threads in a loop and want sensible names in logs.
+
+The third and most important form for server code is `Executors.newVirtualThreadPerTaskExecutor()`. This is an `ExecutorService` that creates a fresh virtual thread for every submitted task. There's no pool, no queue, no fixed-size limit. The factory just keeps making virtual threads.
+
+The order of lines can vary because the five virtual threads run concurrently. The `try-with-resources` block matters here: `ExecutorService` implements `AutoCloseable` since Java 19, and closing it waits for all submitted tasks to finish (it calls `shutdown` then `awaitTermination`). This is why the `All tasks submitted, executor closed.` line appears only after every customer is handled.
+
+`newVirtualThreadPerTaskExecutor` is the most common API for high-concurrency server code. It gives you the executor framework's familiar shape, `submit`, `invokeAll`, `Future`, `try-with-resources`, while making each task its own virtual thread. The pool is effectively unbounded because virtual threads are cheap.
+
+The bottom row is the primary API for high-concurrency server code. Everything else is a variation.
+
+<h1 id="the-e-commerce-server-100000-concurrent-customers">
+  The E-Commerce Server: 100,000 Concurrent Customers
+</h1>
+
+The clearest place to see the benefit is a server that handles many concurrent connections, each doing mostly I/O. Each customer connection runs the same shape: read the request, call the database, call the inventory service, call the payment service, write the response. Most of that time is spent waiting on the network.
+
+With a fixed platform-thread pool of 200, only 200 customers can be in-flight at once. A 101st customer waits in the queue until a thread frees up. With virtual threads, you spin up one virtual thread per customer, and the JVM rotates them through the small carrier pool as their I/O completes.
+
+The exact elapsed time will vary by machine, but it will be a fraction of a second, not minutes. The 100,000 virtual threads spend almost all of their time parked. Each one only needs the carrier for the few microseconds of Java code between sleeps. Two or four carrier threads, rotating that quickly, can keep all 100,000 logical tasks moving forward.
+
+Try the same loop with platform threads (`Executors.newFixedThreadPool(200)` or `new Thread(...)` per task) and the picture changes. The fixed pool serializes the work into batches of 200, and the elapsed time grows roughly linearly. The unbounded `new Thread(...)` per task version often fails outright with `OutOfMemoryError: unable to create native thread` somewhere between 5,000 and 30,000 threads, depending on the OS.
+
+A successful 100,000-virtual-thread run still allocates 100,000 stack objects, 100,000 task records, and whatever heap state each task touches. Memory matters, just not in megabyte-per-stack chunks. If you find yourself spinning up millions of virtual threads, profile the heap, not just the elapsed time.
+
+The thread-per-request style is back. Each request gets its own thread, the code inside each request is plain blocking code with stack traces that mean something, and the server scales without an async rewrite. That's the main result of Project Loom.
+
+<h1 id="fan-out-1000-parallel-inventory-calls">
+  Fan-Out: 1,000 Parallel Inventory Calls
+</h1>
+
+The other shape that benefits is **fan-out**, where one request needs results from many downstream calls. Consider a product page that pulls inventory levels from 1,000 warehouses to show the customer "available in 47 locations near you." Doing those calls one after another is hopeless: 1,000 calls at 50 ms each is 50 seconds. Doing them on a fixed pool of 50 threads is 1 second of pool-bottlenecked work. Doing them with 1,000 virtual threads is closer to a single 50 ms round trip.
+
+The total elapsed time is roughly one I/O round trip plus a bit of overhead, not 1,000 times one round trip. Each `callWarehouse` runs on its own virtual thread, all parked at the same time, all woken up when their respective sleeps end. The carriers shuffle them through in microseconds.
+
+The key change is the cost of submission. With a platform-thread pool, submitting 1,000 tasks at once means either huge memory pressure (one OS thread each) or queue contention (fewer threads than tasks). With virtual threads, submitting 1,000 tasks is fine, submitting 10,000 is fine, and the elapsed time is still bounded by the slowest downstream call, not by your pool size.
+
+The diagram lays out the shape. One request fans out to 1,000 parallel calls, each on its own virtual thread. The aggregate step waits for all of them and the response comes back when the slowest call returns. The carrier pool (only a few threads) handles all of this comfortably because every call spends most of its time parked.
+
+<h1 id="pinning-when-a-virtual-thread-gets-stuck-on-a-carrier">
+  Pinning: When a Virtual Thread Gets Stuck on a Carrier
+</h1>
+
+The core mechanism of virtual threads, unmounting on a blocking call, has a small list of exceptions. In those cases, the virtual thread **pins** to its carrier, meaning the carrier can't be reused for other virtual threads until the blocking call finishes. Pinning isn't a crash. It's a performance problem: while a virtual thread is pinned, one of your few carrier threads is held hostage.
+
+The most common cause of pinning in Java 21 is calling a blocking operation **inside a `synchronized` block or method**. The JVM tracks `synchronized` monitor ownership at the carrier level. If a virtual thread holds a monitor and then tries to park, the JVM can't safely move it off the carrier, because the monitor is tied to that specific OS thread. So it pins until the synchronized region exits.
+
+**What's wrong with this code?**
+
+The intent looks reasonable: protect the `count` field while reading from a remote service. The trouble is that `Thread.sleep(50)` (a stand-in for any real blocking I/O) happens inside the `synchronized` method. When 1,000 virtual threads call `fetchAndCache` concurrently, the first one mounts on a carrier, enters the synchronized region, and pins. The other 999 wait outside the monitor as usual, but because pinning prevents the carrier from being reused even during the `sleep`, your carrier pool is partly frozen during every call.
+
+**Fix:**
+
+Two changes. First, the blocking call (`remoteCall`) happens outside any lock at all. The remote work doesn't touch the shared `count`, so there's no reason to hold a lock while waiting. Second, the critical section uses `ReentrantLock` instead of `synchronized`. `ReentrantLock` is implemented in pure Java, the JVM knows how to unmount a virtual thread that's blocked on a `Lock.lock()` call, and there's no pinning.
+
+The general rule, in Java 21, is: keep `synchronized` blocks small and CPU-only. If you have a long critical section, or a critical section that contains blocking I/O, use `ReentrantLock` instead. Future Java releases (JEP 491, targeted at Java 24 and beyond) plan to remove the pinning behavior of `synchronized` entirely, so this guidance may relax over time. For now, on Java 21, it matters.
+
+You can detect pinning at runtime by setting `-Djdk.tracePinnedThreads=full` on the command line. The JVM will print a stack trace every time a virtual thread pins, showing the synchronized frame that caused it. This is the diagnostic switch for cases where virtual threads aren't delivering the expected throughput.
+
+The middle two rows are the safe cases. The bottom two are the ones to watch for. A short synchronized block that does no I/O isn't a problem in practice; the pinning is over before it matters. It's the long, I/O-holding synchronized blocks that hurt.
+
+<h1 id="cpu-bound-work-when-virtual-threads-dont-help">
+  CPU-Bound Work: When Virtual Threads Don't Help
+</h1>
+
+Virtual threads work best when tasks spend most of their time waiting. They don't help, and can even hurt, when tasks spend most of their time computing.
+
+Consider a report generator that computes a price index across the catalog. Each calculation is pure CPU: no network, no database, no sleep. The work cannot be parked. A virtual thread runs the calculation on a carrier exactly the way a platform thread would, except now you've added a layer of scheduling overhead the platform-thread version didn't have.
+
+**What's wrong with this code?**
+
+A million virtual threads, each doing 10 million arithmetic operations, with no blocking calls anywhere. The tasks never park, so they never give up the carrier. The carriers run flat-out, queuing the rest. Two things go wrong:
+
+- **The carriers don't multiply.** Even though you spawned a million virtual threads, only a handful are actually running at any moment (one per CPU core). The other 999,994 sit on the runqueue. You don't get more CPU time; you just get more queue.
+- **You starve the carriers.** A CPU-bound virtual thread holds its carrier for the entire computation. While it runs, every other virtual thread on that carrier (including all the I/O-bound ones you might also have) waits. A mixed server doing CPU-heavy report work alongside customer requests can see request latency spike when reports start.
+
+**Fix:** keep CPU-bound work on a dedicated `ForkJoinPool` or fixed `ThreadPoolExecutor`, sized to the number of cores you want to assign to it. Use virtual threads for the I/O-bound parts of the application.
+
+A small platform-thread pool, sized to the cores you have, is the appropriate tool for crunching numbers. The pool naturally caps concurrency at the CPU's parallel capacity. There's nothing for the scheduler to gain by adding more threads, virtual or otherwise; you can't compute faster than the silicon allows.
+
+The dividing line is: **I/O-bound work scales with virtual threads, CPU-bound work scales with the number of cores.** Virtual threads improve the first by an order of magnitude. They do nothing for the second. Pick the tool by the kind of work, not by which API is newer.
+
+CPU-bound code has a different home.
+
+<h1 id="a-side-by-side-picture">A Side-By-Side Picture</h1>
+
+Putting both kinds of threads in one program makes the difference concrete. The shop has two background jobs running every minute: a "send promotional emails" job (I/O-bound, makes one SMTP call per customer) and a "compute popularity scores" job (CPU-bound, runs a calculation per product).
+
+Two executors, two strategies. The email job creates 10,000 virtual threads and lets the carrier pool rotate through them as each `Thread.sleep` (the SMTP call stand-in) completes. The popularity-score job uses a small platform-thread pool sized to the cores so the CPU work runs at native parallelism without overcommitting the scheduler.
+
+One strategy does not fit both jobs. A platform-thread pool sized for CPU work would bottleneck the email job at the pool size. A virtual-thread executor for the CPU work would scatter a million tiny units of computation across a handful of carriers and gain nothing. Match the executor to the workload.
+
+<h1 id="whats-the-same-whats-new">What's the Same, What's New</h1>
+
+Virtual threads are designed to drop into existing Java code with as few surprises as possible. The list of what behaves the same is long: `Thread.currentThread()`, `Thread.sleep`, `Thread.interrupt`, `Thread.join`, `ThreadLocal`, the lock and concurrency classes from `java.util.concurrent`, `ExecutorService` methods, `Future`, `CompletableFuture`, and so on. All of them work on virtual threads. The shape of your code doesn't change.
+
+A few things behave differently or come with new caveats:
+
+The daemon default matters. If `main` finishes while virtual threads are still running, the JVM exits, taking the virtual threads with it. With platform threads, a still-running non-daemon thread keeps the JVM alive. This is why the examples above use `executor.close()` (which waits for tasks) or `Thread.join()` (which waits for one specific thread) before letting `main` return.
+
+`ThreadLocal` is the other gotcha. Each `ThreadLocal` instance allocates per-thread state. With 200 platform threads, that's 200 copies of each local. With 100,000 virtual threads, that's 100,000 copies. For per-request state stored in `ThreadLocal`, the per-instance memory adds up. Java 21 ships `ScopedValue` (still incubating in some forms; finalized in Java 23) as a lighter-weight replacement for the common "request-scoped value" pattern. Occasional `ThreadLocal` use is fine.
+
+A `ThreadLocal` with a 1 KB value sitting in 100,000 virtual threads is 100 MB of unplanned heap usage. For `ThreadLocal<SomethingLarge>` in a virtual-thread-heavy app, prefer a `ScopedValue` or pass the value as an explicit argument.
+
+<h1 id="quiz">Quiz</h1>
+
+<CommentsSection />
+
+</LessonCard>
