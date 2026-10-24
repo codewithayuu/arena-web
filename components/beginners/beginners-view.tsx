@@ -513,8 +513,8 @@ export function BeginnersView({
           </div>
 
           {/* Hub Navigation Tabs Bar */}
-          <div className="flex items-center justify-center mb-8 border-b border-white/10 pb-4 overflow-x-auto no-scrollbar">
-            <div className="flex items-center gap-1.5 sm:gap-2 p-1.5 rounded-2xl bg-black border border-white/10 shadow-lg">
+          <div className="flex items-center justify-start lg:justify-center mb-8 border-b border-white/10 pb-4 overflow-x-auto no-scrollbar">
+            <div className="flex w-max shrink-0 items-center gap-1.5 sm:gap-2 p-1.5 rounded-2xl bg-black border border-white/10 shadow-lg">
               <button
                 type="button"
                 onClick={() => setActiveTab("tracks")}
