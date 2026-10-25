@@ -2,6 +2,7 @@ import { auth } from "@clerk/nextjs/server";
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseRequest, supabaseRestUrl, supabaseRpcUrl } from "@/lib/supabase-rest.server";
 import { prepareProfileViewCount } from "@/lib/profile-view-cookie.server";
+import { getProfileContestHistory } from "@/lib/profile-contest-history.server";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -58,7 +59,10 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
       profile_id: `eq.${profile.id}`,
       order: "platform.asc",
     }).toString();
-    const platformsResponse = await supabaseRequest(platformsUrl, { method: "GET" });
+    const [platformsResponse, contestHistory] = await Promise.all([
+      supabaseRequest(platformsUrl, { method: "GET" }),
+      getProfileContestHistory(profile.id, profile.handle),
+    ]);
     if (!platformsResponse.ok) throw new Error("Profile platforms lookup failed");
     const isOwner = Boolean(userId && profile.clerk_user_id === userId);
     const viewAttempt = isOwner ? { shouldCount: false } : prepareProfileViewCount(request, profile.id);
@@ -106,6 +110,8 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
       },
       details,
       platforms: await platformsResponse.json(),
+      arenaContests: contestHistory.items,
+      arenaContestHistoryStatus: contestHistory.status,
       isOwner,
     });
     if (viewAttempt.cookie && viewRecorded) {

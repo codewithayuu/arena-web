@@ -691,7 +691,7 @@ export function ProblemSolvingPanel({ profile, onOpenConnect }: ProblemSolvingPa
                 <p className="text-xs text-zinc-400 mt-0.5">Competitive ratings & division tiers</p>
               </div>
               <span className="text-xs font-mono font-bold text-zinc-400">
-                {profile.contests.length} Contests
+                {profile.contests.length + profile.arenaContests.length} Contests
               </span>
             </div>
 

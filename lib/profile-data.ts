@@ -49,6 +49,21 @@ export interface ContestHistoryItem {
   ratingChange?: number;
 }
 
+export interface ArenaContestHistoryItem {
+  contestId: string;
+  slug: string;
+  name: string;
+  endsAt: string;
+  rank: number;
+  solved: number;
+  points: number;
+  penaltyMinutes: number;
+  state: "published" | "archived";
+  executionMode?: "participant_local" | "server_judged";
+}
+
+export type ArenaContestHistoryStatus = "available" | "partial" | "unavailable";
+
 export interface BadgeItem {
   id: string;
   badgeName: string;
@@ -122,6 +137,8 @@ export interface UserProfileData {
   personalDetails: UserPersonalDetails;
   platforms: PlatformProfile[];
   contests: ContestHistoryItem[];
+  arenaContests: ArenaContestHistoryItem[];
+  arenaContestHistoryStatus: ArenaContestHistoryStatus;
   badges: BadgeItem[];
   github: GitHubStats;
   education: EducationItem[];
@@ -163,6 +180,8 @@ function createEmptyProfile(username: string): UserProfileData {
     },
     platforms: [],
     contests: [],
+    arenaContests: [],
+    arenaContestHistoryStatus: "available",
     badges: [],
     github: {
       githubProfile: "",

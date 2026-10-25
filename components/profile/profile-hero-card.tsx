@@ -157,7 +157,7 @@ export function ProfileHeroCard({
               <Trophy className="w-3.5 h-3.5 text-amber-400" />
               <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400">Contests</span>
             </div>
-            <div className="text-xl font-black text-white font-mono tabular-nums">{profile.contests.length}</div>
+            <div className="text-xl font-black text-white font-mono tabular-nums">{profile.contests.length + profile.arenaContests.length}</div>
           </div>
         </div>
 

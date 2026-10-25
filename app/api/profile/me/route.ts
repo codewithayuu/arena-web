@@ -1,24 +1,13 @@
-import { auth } from "@clerk/nextjs/server";
+import { auth, currentUser } from "@clerk/nextjs/server";
 import { NextRequest, NextResponse } from "next/server";
+import { ensureClerkProfileData } from "@/lib/clerk-profile.server";
+import { getProfileContestHistory } from "@/lib/profile-contest-history.server";
 import { supabaseRequest, supabaseRestUrl } from "@/lib/supabase-rest.server";
 import type { SupportedVerificationPlatform } from "@/lib/platform-verification";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-type ProfileRow = { id: string; handle: string; display_name: string };
-type DetailsRow = {
-  first_name: string;
-  second_name: string;
-  bio: string;
-  country: string;
-  college: string;
-  degree: string;
-  branch: string;
-  image_url: string;
-  year_of_graduation: number;
-  job_preference: number;
-};
 type PlatformRow = {
   platform: SupportedVerificationPlatform;
   handle: string;
@@ -31,32 +20,6 @@ type PlatformRow = {
   profile_stats: Record<string, unknown>;
 };
 
-const EMPTY_DETAILS: DetailsRow = {
-  first_name: "",
-  second_name: "",
-  bio: "",
-  country: "",
-  college: "",
-  degree: "",
-  branch: "",
-  image_url: "",
-  year_of_graduation: 0,
-  job_preference: 0,
-};
-
-async function ownedProfile(clerkUserId: string): Promise<ProfileRow | null> {
-  const url = supabaseRestUrl("profiles");
-  url.search = new URLSearchParams({
-    select: "id,handle,display_name",
-    clerk_user_id: `eq.${clerkUserId}`,
-    limit: "1",
-  }).toString();
-  const response = await supabaseRequest(url, { method: "GET" });
-  if (!response.ok) throw new Error("Profile lookup failed");
-  const rows = (await response.json()) as ProfileRow[];
-  return rows[0] ?? null;
-}
-
 function responseError() {
   return NextResponse.json({ error: "Profile service is temporarily unavailable" }, { status: 503 });
 }
@@ -66,28 +29,23 @@ export async function GET() {
   if (!userId) return NextResponse.json({ error: "Sign in to access your profile" }, { status: 401 });
 
   try {
-    const profile = await ownedProfile(userId);
-    if (!profile) return NextResponse.json({ error: "Profile is still being provisioned" }, { status: 404 });
-    const url = supabaseRestUrl("profile_details");
-    url.search = new URLSearchParams({
-      select: "first_name,second_name,bio,country,college,degree,branch,image_url,year_of_graduation,job_preference",
-      profile_id: `eq.${profile.id}`,
-      limit: "1",
-    }).toString();
+    const identity = await currentUser();
+    if (!identity || identity.id !== userId) {
+      return NextResponse.json({ error: "Your Clerk session could not be confirmed" }, { status: 401 });
+    }
+    const { profile, details } = await ensureClerkProfileData(identity);
     const platformsUrl = supabaseRestUrl("profile_platform_accounts");
     platformsUrl.search = new URLSearchParams({
       select: "platform,handle,total_questions_solved,current_rating,max_rating,rank,verified_at,last_synced_at,profile_stats",
       profile_id: `eq.${profile.id}`,
       order: "platform.asc",
     }).toString();
-    const [detailsResponse, platformsResponse] = await Promise.all([
-      supabaseRequest(url, { method: "GET" }),
+    const [platformsResponse, contestHistory] = await Promise.all([
       supabaseRequest(platformsUrl, { method: "GET" }),
+      getProfileContestHistory(profile.id, profile.handle),
     ]);
-    if (!detailsResponse.ok || !platformsResponse.ok) return responseError();
-    const rows = (await detailsResponse.json()) as DetailsRow[];
+    if (!platformsResponse.ok) return responseError();
     const platforms = (await platformsResponse.json()) as PlatformRow[];
-    const details = rows[0] ?? EMPTY_DETAILS;
     let profileViews: number | null = null;
     try {
       const viewsUrl = supabaseRestUrl("profile_view_counts");
@@ -103,12 +61,15 @@ export async function GET() {
     }
     return NextResponse.json({
       profile: {
-        ...profile,
+        id: profile.id,
+        handle: profile.handle,
         display_name: [details.first_name, details.second_name].filter(Boolean).join(" ") || profile.display_name,
         views: profileViews,
       },
       details,
       platforms,
+      arenaContests: contestHistory.items,
+      arenaContestHistoryStatus: contestHistory.status,
     });
   } catch {
     return responseError();
@@ -172,8 +133,11 @@ export async function PUT(request: NextRequest) {
   }
 
   try {
-    const profile = await ownedProfile(userId);
-    if (!profile) return NextResponse.json({ error: "Profile is still being provisioned" }, { status: 404 });
+    const identity = await currentUser();
+    if (!identity || identity.id !== userId) {
+      return NextResponse.json({ error: "Your Clerk session could not be confirmed" }, { status: 401 });
+    }
+    const { profile } = await ensureClerkProfileData(identity);
     const detailsUrl = supabaseRestUrl("profile_details");
     detailsUrl.search = "on_conflict=profile_id";
     const detailsResponse = await supabaseRequest(detailsUrl, {

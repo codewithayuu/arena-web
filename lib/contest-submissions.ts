@@ -108,16 +108,25 @@ export class ContestSubmissionError extends Error {
 
 /** Read only the gateway's public, freeze-masked standings projection. The
  * gateway remains authoritative for ranking, scoring and freeze visibility. */
-export async function getPublicContestStandings(contestId: string): Promise<PublicContestStandings> {
+export async function getPublicContestStandings(
+  contestId: string,
+  options: { revalidateSeconds?: number } = {},
+): Promise<PublicContestStandings> {
   if (!isUuid(contestId)) throw new ContestSubmissionError(400, "INVALID_CONTEST_ID");
   const url = gatewayUrl();
   if (!url) throw new ContestSubmissionError(503, "CONTEST_AUTHORITY_UNAVAILABLE");
   try {
-    const response = await fetch(new URL(`/v1/contests/${contestId}/standings`, url), {
+    const requestInit: RequestInit & { next?: { revalidate: number } } = {
       method: "GET", mode: "cors", credentials: "omit", referrerPolicy: "no-referrer",
       headers: { Accept: "application/json" },
-      cache: "no-store", redirect: "error", signal: AbortSignal.timeout(7000),
-    });
+      redirect: "error", signal: AbortSignal.timeout(7000),
+    };
+    if (Number.isSafeInteger(options.revalidateSeconds) && Number(options.revalidateSeconds) > 0) {
+      requestInit.next = { revalidate: Number(options.revalidateSeconds) };
+    } else {
+      requestInit.cache = "no-store";
+    }
+    const response = await fetch(new URL(`/v1/contests/${contestId}/standings`, url), requestInit);
     const payload = await boundedJson(response, 2 * 1024 * 1024);
     if (response.status !== 200 || !isPublicContestStandings(payload, contestId)) {
       if (response.status === 200) throw new ContestSubmissionError(502, "INVALID_AUTHORITY_RESPONSE");

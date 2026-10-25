@@ -30,6 +30,7 @@ export function ProfileView({ initialUsername, initialTab = "problemSolving" }: 
   const [isOwner, setIsOwner] = useState(false);
   const [isProfileLoading, setIsProfileLoading] = useState(true);
   const [profileLoadError, setProfileLoadError] = useState<string | null>(null);
+  const [reloadVersion, setReloadVersion] = useState(0);
   const [activeTab, setActiveTab] = useState<ProfileTabKey>(initialTab);
 
   // Modals state
@@ -76,6 +77,7 @@ export function ProfileView({ initialUsername, initialTab = "problemSolving" }: 
           hackerrank: { name: "HackerRank", color: "#10b981", url: "https://www.hackerrank.com/profile/" },
           github: { name: "GitHub", color: "#ffffff", url: "https://github.com/" },
         } as const;
+        const ratedContestPlatforms = new Set(["codeforces", "leetcode", "codechef", "atcoder"]);
         const platforms: PlatformProfile[] = (Array.isArray(data.platforms) ? data.platforms : []).map((row: {
           platform: keyof typeof platformMeta;
           handle: string;
@@ -146,6 +148,7 @@ export function ProfileView({ initialUsername, initialTab = "problemSolving" }: 
           }
           if (Array.isArray(stats.contestHistory)) {
             for (const item of stats.contestHistory) {
+              if (!ratedContestPlatforms.has(platform.platform)) continue;
               if (!item || typeof item !== "object") continue;
               const row = item as Record<string, unknown>;
               if (typeof row.contestName !== "string" || typeof row.rating !== "number" || typeof row.rank !== "number" || typeof row.contestDate !== "number") continue;
@@ -182,6 +185,34 @@ export function ProfileView({ initialUsername, initialTab = "problemSolving" }: 
           }
         }
         const fallbackName = String(data.profile.display_name || "Member").trim().split(/\s+/);
+        const arenaContests: UserProfileData["arenaContests"] = (Array.isArray(data.arenaContests) ? data.arenaContests : [])
+          .filter((item: unknown) => {
+            if (!item || typeof item !== "object") return false;
+            const row = item as Record<string, unknown>;
+            return typeof row.contestId === "string" && typeof row.slug === "string" &&
+              typeof row.name === "string" && typeof row.endsAt === "string" && Number.isFinite(Date.parse(row.endsAt)) &&
+              Number.isSafeInteger(row.rank) && Number(row.rank) > 0 &&
+              Number.isSafeInteger(row.solved) && Number(row.solved) >= 0 &&
+              typeof row.points === "number" && Number.isFinite(row.points) && row.points >= 0 &&
+              Number.isSafeInteger(row.penaltyMinutes) && Number(row.penaltyMinutes) >= 0 &&
+              (row.state === "published" || row.state === "archived") &&
+              (row.executionMode === undefined || row.executionMode === "participant_local" || row.executionMode === "server_judged");
+          })
+          .map((item: Record<string, unknown>) => ({
+            contestId: item.contestId as string,
+            slug: item.slug as string,
+            name: item.name as string,
+            endsAt: item.endsAt as string,
+            rank: item.rank as number,
+            solved: item.solved as number,
+            points: item.points as number,
+            penaltyMinutes: item.penaltyMinutes as number,
+            state: item.state as "published" | "archived",
+            ...(item.executionMode ? { executionMode: item.executionMode as "participant_local" | "server_judged" } : {}),
+          }));
+        const arenaContestHistoryStatus = ["available", "partial", "unavailable"].includes(data.arenaContestHistoryStatus)
+          ? data.arenaContestHistoryStatus as UserProfileData["arenaContestHistoryStatus"]
+          : "unavailable";
         const synced: UserProfileData = {
           ...stored,
           id: data.profile.id || stored.id,
@@ -202,6 +233,8 @@ export function ProfileView({ initialUsername, initialTab = "problemSolving" }: 
           },
           platforms,
           contests,
+          arenaContests,
+          arenaContestHistoryStatus,
           badges,
           submissionHeatmap,
           topicDistribution,
@@ -251,7 +284,7 @@ export function ProfileView({ initialUsername, initialTab = "problemSolving" }: 
       })
       .finally(() => { if (!cancelled) setIsProfileLoading(false); });
     return () => { cancelled = true; };
-  }, [initialUsername, isClerkLoaded, clerkUserId, clerkUsername, clerkFirstName]);
+  }, [initialUsername, isClerkLoaded, clerkUserId, clerkUsername, clerkFirstName, reloadVersion]);
 
   const handleTabChange = (tab: ProfileTabKey) => {
     setActiveTab(tab);
@@ -298,7 +331,18 @@ export function ProfileView({ initialUsername, initialTab = "problemSolving" }: 
   }
 
   if (profileLoadError) {
-    return <div role="alert" className="mx-auto max-w-4xl px-6 py-24 text-center text-sm text-zinc-300">{profileLoadError}</div>;
+    return (
+      <div role="alert" className="mx-auto max-w-4xl px-6 py-24 text-center text-sm text-zinc-300">
+        <p>{profileLoadError}</p>
+        <button
+          type="button"
+          onClick={() => setReloadVersion((version) => version + 1)}
+          className="mt-4 rounded-lg border border-white/15 bg-white/5 px-4 py-2 font-medium text-white transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#ff1018]"
+        >
+          Try again
+        </button>
+      </div>
+    );
   }
 
   return (
@@ -323,7 +367,7 @@ export function ProfileView({ initialUsername, initialTab = "problemSolving" }: 
               activeTab={activeTab}
               onSelectTab={handleTabChange}
               solvedCount={profile.totalQuestionsSolved ?? 0}
-              contestsCount={profile.contests.length}
+              contestsCount={profile.contests.length + profile.arenaContests.length}
               contributionsCount={profile.github.totalContributions}
               badgesCount={profile.badges.length}
             />
