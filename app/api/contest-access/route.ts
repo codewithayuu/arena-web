@@ -12,12 +12,16 @@ export async function POST(request:NextRequest) {
  try {
   const input=await readBoundedRequestJson(request,2048);
   if(typeof input.key!=="string" || !/^mf_[A-Za-z0-9_-]{43}$/.test(input.key.trim()))return NextResponse.json({code:"INVALID_ACCESS_KEY"},{status:400});
-  const response=await supabaseRequest(supabaseRpcUrl("consume_contest_temporary_key"),{method:"POST",headers:{"Content-Type":"application/json"},
-   body:JSON.stringify({p_key_sha256:createHash("sha256").update(input.key.trim()).digest("hex")})});
+  const keyDigest=createHash("sha256").update(input.key.trim()).digest("hex");
+  const response=await supabaseRequest(supabaseRpcUrl("resolve_contest_temporary_key"),{method:"POST",headers:{"Content-Type":"application/json"},
+   body:JSON.stringify({p_key_sha256:keyDigest})});
   if(!response.ok)return NextResponse.json({code:"INVALID_EXPIRED_OR_USED_KEY"},{status:403});
   const value=await response.json();
   const client=await clerkClient();
   const signIn=await client.signInTokens.createSignInToken({userId:value.clerk_user_id,expiresInSeconds:60});
+  const consumed=await supabaseRequest(supabaseRpcUrl("consume_contest_temporary_key"),{method:"POST",headers:{"Content-Type":"application/json"},
+   body:JSON.stringify({p_key_sha256:keyDigest})});
+  if(!consumed.ok)return NextResponse.json({code:"INVALID_EXPIRED_OR_USED_KEY"},{status:403,headers:{"Cache-Control":"no-store"}});
   const url=new URL(signIn.url);
   if(url.protocol!=="https:")throw new Error();
   url.searchParams.set("redirect_url",new URL(`/contests/${value.contest_id}`,request.url).toString());

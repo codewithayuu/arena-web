@@ -7,6 +7,15 @@ export async function adminGatewayRequest(path:string,init:RequestInit={}):Promi
   const session=await auth();
   if(!session.userId) return NextResponse.json({code:"UNAUTHORIZED"},{status:401});
   const token=await session.getToken();
+  if(!token) return NextResponse.json({code:"UNAUTHORIZED"},{status:401});
+  return adminGatewayRequestWithToken(path,token,init);
+}
+
+/** The native Admin Companion supplies its short-lived Clerk session token in memory.
+ * The gateway still verifies the token, AAL2 freshness, and server-owned admin role. */
+export async function adminGatewayRequestWithToken(path:string,token:string,init:RequestInit={}):Promise<Response> {
+  if(typeof token!=="string"||token.length<32||token.length>16384||/\s/.test(token))
+    return NextResponse.json({code:"UNAUTHORIZED"},{status:401});
   let base:URL;
   try {
     base=new URL(process.env.MINDFLARE_GATEWAY_ORIGIN||"");
@@ -14,7 +23,6 @@ export async function adminGatewayRequest(path:string,init:RequestInit={}):Promi
       || isIP(base.hostname) || base.hostname.endsWith(".localhost") || base.hostname==="localhost") throw new Error();
     if(!/^\/v1\/admin\/contests(?:\/(?:import-local|[0-9a-f-]{36}(?:\/[a-z0-9/-]+)?))?(?:\?[a-z0-9=&]+)?$/i.test(path)) throw new Error();
   } catch {return NextResponse.json({code:"ADMIN_AUTHORITY_UNAVAILABLE"},{status:503});}
-  if(!token) return NextResponse.json({code:"UNAUTHORIZED"},{status:401});
   try {
     const headers=new Headers(init.headers);headers.set("Authorization",`Bearer ${token}`);headers.set("Accept","application/json");
     const response=await fetch(new URL(path,base),{...init,headers,cache:"no-store",redirect:"error",signal:AbortSignal.timeout(60000)});
