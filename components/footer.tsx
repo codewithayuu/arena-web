@@ -100,7 +100,11 @@ export function Footer() {
               <ul className="mt-4 space-y-3">
                 {[
                   {
-                    title: "DSA",
+                    title: "Beginners Learning Hub",
+                    href: "/learn/beginners",
+                  },
+                  {
+                    title: "Interactive Course",
                     href: "/learn/dsa/course-introduction",
                   },
                   {
@@ -111,6 +115,10 @@ export function Footer() {
                     title: "Roadmaps",
                     href: "/roadmaps",
                   },
+                  {
+                    title: "Topic List",
+                    href: "/topic-list",
+                  }
                 ].map((item) => (
                   <li key={item.title}>
                     <Link
@@ -139,6 +147,10 @@ export function Footer() {
                     title: "DSA Patterns",
                     href: "/practice/dsa-patterns",
                   },
+                  {
+                    title: "Contests",
+                    href: "/coming-soon",
+                  },
                 ].map((item) => (
                   <li key={item.title}>
                     <Link
@@ -160,8 +172,12 @@ export function Footer() {
               <ul className="mt-4 space-y-3">
                 {[
                   {
-                    title: "Visit Official Website",
-                    href: "https://mindflare.tech/",
+                    title: "Terms & Conditions",
+                    href: "/terms",
+                  },
+                  {
+                    title: "Privacy Policy",
+                    href: "/privacy",
                   },
                 ].map((item) => (
                   <li key={item.title}>
@@ -184,8 +200,6 @@ export function Footer() {
         <div className="container mx-auto flex flex-col-reverse items-center justify-center gap-4 px-4 py-6 md:flex-row">
           <div className="flex flex-wrap items-center justify-center gap-x-5 gap-y-2">
             <p className="text-xs text-zinc-500">© 2026 Mindflare. All rights reserved.</p>
-            <Link href="/terms" className="text-xs text-zinc-500 underline decoration-zinc-800 underline-offset-4 hover:text-zinc-200">Terms</Link>
-            <Link href="/privacy" className="text-xs text-zinc-500 underline decoration-zinc-800 underline-offset-4 hover:text-zinc-200">Privacy</Link>
           </div>
         </div>
       </div>

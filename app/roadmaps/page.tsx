@@ -15,9 +15,9 @@ import { Navbar } from "@/components/navbar";
 import { Footer } from "@/components/footer";
 
 export const metadata: Metadata = {
-  title: "Web Development & Competitive Programming Roadmaps | Mindflare",
+  title: "App Development, Web Development & Competitive Programming Roadmaps | Mindflare",
   description:
-    "Explore and download the Web Development Roadmap and Competitive Programming Syllabus in high-resolution PDF format with interactive practice tracks.",
+    "Explore and download app development, web development, and competitive programming roadmaps in high-resolution PDF format.",
 };
 
 interface Roadmap {
@@ -38,6 +38,66 @@ interface Roadmap {
 }
 
 const ROADMAPS: Roadmap[] = [
+    {
+    id: "competitive-programming-roadmap",
+    title: "Competitive Programming Syllabus",
+    subtitle:
+      "A structured syllabus for algorithmic problem solving and high-stakes contest preparation",
+    duration: "Self-paced",
+    badge: "Competitive Programming",
+    description:
+      "Use the syllabus to build a rock-solid foundation in data structures, mathematical fundamentals, and algorithms, then progress toward solving national and global contest problems.",
+    image: "/images/icpc-syllabus.png",
+    imageAlt: "Competitive Programming Syllabus cover",
+    pdfUrl: "/roadmaps/Competitive-Programming-Syllabus.pdf",
+    fileName: "Competitive-Programming-Syllabus.pdf",
+    practiceHref: "/practice/dsa-patterns",
+    practiceLabel: "Practice DSA Patterns",
+    milestones: [
+      "Strengthen C++ STL, asymptotic complexity analysis, and mathematical foundations",
+      "Master core linear & non-linear data structures, binary search, and number theory",
+      "Develop deep problem-solving skills across graphs, trees, strings, and dynamic programming",
+      "Apply mental models through regular timed contest practice and advanced heuristics",
+    ],
+    keyTopics: [
+      "C++",
+      "Data Structures",
+      "Algorithms",
+      "Graphs",
+      "Strings",
+      "Dynamic Programming",
+    ],
+  },
+  {
+    id: "app-development-roadmap",
+    title: "Complete Mobile App Developer Roadmap",
+    subtitle:
+      "Go from programming foundations to building, testing, and shipping AI-ready mobile apps",
+    duration: "12-15 months",
+    badge: "App Development",
+    description:
+      "Follow a practical Dart and Flutter learning path covering app fundamentals, backend services, production engineering, and thoughtfully built AI features.",
+    image: "/images/appdev.png",
+    imageAlt: "The Complete Mobile App Developer Roadmap cover",
+    pdfUrl: "/roadmaps/Mindflare-App-Developer-Roadmap.pdf",
+    fileName: "Mindflare-App-Developer-Roadmap.pdf",
+    practiceHref: "/topic-list",
+    practiceLabel: "Explore Learning Topics",
+    milestones: [
+      "Build programming, Git, and mobile development foundations with Dart",
+      "Create polished Flutter apps with navigation, state management, and networking",
+      "Connect apps to backend and cloud services, authentication, and persistent data",
+      "Test, secure, and ship production apps, then explore AI-powered features",
+    ],
+    keyTopics: [
+      "Dart",
+      "Flutter",
+      "Firebase",
+      "APIs",
+      "Testing",
+      "AI",
+    ],
+  },
   {
     id: "web-development-roadmap",
     title: "Complete Web Developer Roadmap",
@@ -66,36 +126,6 @@ const ROADMAPS: Roadmap[] = [
       "Frontend",
       "Backend",
       "Deployment",
-    ],
-  },
-  {
-    id: "competitive-programming-roadmap",
-    title: "Competitive Programming Syllabus",
-    subtitle:
-      "A structured syllabus for algorithmic problem solving and high-stakes contest preparation",
-    duration: "Self-paced",
-    badge: "Competitive Programming",
-    description:
-      "Use the syllabus to build a rock-solid foundation in data structures, mathematical fundamentals, and algorithms, then progress toward solving national and global contest problems.",
-    image: "/images/icpc-syllabus.png",
-    imageAlt: "Competitive Programming Syllabus cover",
-    pdfUrl: "/roadmaps/Competitive-Programming-Syllabus.pdf",
-    fileName: "Competitive-Programming-Syllabus.pdf",
-    practiceHref: "/practice/dsa-patterns",
-    practiceLabel: "Practice DSA Patterns",
-    milestones: [
-      "Strengthen C++ STL, asymptotic complexity analysis, and mathematical foundations",
-      "Master core linear & non-linear data structures, binary search, and number theory",
-      "Develop deep problem-solving skills across graphs, trees, strings, and dynamic programming",
-      "Apply mental models through regular timed contest practice and advanced heuristics",
-    ],
-    keyTopics: [
-      "C++",
-      "Data Structures",
-      "Algorithms",
-      "Graphs",
-      "Strings",
-      "Dynamic Programming",
     ],
   },
 ];
