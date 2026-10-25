@@ -302,7 +302,7 @@ export function ProblemSolvingPanel({
                       {...props}
                       fill={ACTIVITY_PANEL_COLOR_LEVELS[level] ?? ACTIVITY_PANEL_COLORS[0]}
                       rx={2}
-                      title={label}
+                      // title={label}
                       aria-label={label}
                     />
                   );

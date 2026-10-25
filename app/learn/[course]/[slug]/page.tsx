@@ -62,6 +62,7 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
 
 export default async function GenericCourseLessonPage({ params }: PageProps) {
   const { course, slug } = await params;
+  const courseTitle = getCourseTitle(course);
   const mdxPath = getMdxPath(course, slug);
 
   if (!mdxPath) {

@@ -89,7 +89,7 @@ export const MeterIndicator = ({
         "block h-full rounded-full bg-brand",
         shouldReduceMotion
           ? null
-          : "transition-[width] duration-[250ms] ease-out motion-reduce:transition-none",
+          : "transition-[width] duration-[time:250ms] ease-out motion-reduce:transition-none",
         className
       )}
       data-slot="meter-indicator"

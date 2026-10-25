@@ -105,7 +105,7 @@ const DrawerOverlay = ({
 }: ComponentProps<typeof DrawerPrimitive.Backdrop>) => (
   <DrawerPrimitive.Backdrop
     className={cn(
-      "fixed inset-0 z-50 bg-black/50 opacity-[calc(1-var(--drawer-swipe-progress,0))] transition-opacity duration-[400ms] ease-[cubic-bezier(0.32,0.72,0,1)] data-ending-style:opacity-0 data-starting-style:opacity-0 data-swiping:duration-0",
+      "fixed inset-0 z-50 bg-black/50 opacity-[calc(1-var(--drawer-swipe-progress,0))] transition-opacity duration-[time:400ms] ease-[cubic-bezier(0.32,0.72,0,1)] data-ending-style:opacity-0 data-starting-style:opacity-0 data-swiping:duration-0",
       className
     )}
     data-slot="drawer-overlay"
@@ -127,7 +127,7 @@ const DrawerContent = ({
     >
       <DrawerPrimitive.Popup
         className={cn(
-          "flex flex-col bg-background outline-none transition-transform duration-[400ms] ease-[cubic-bezier(0.32,0.72,0,1)] data-swiping:select-none data-swiping:duration-0",
+          "flex flex-col bg-background outline-none transition-transform duration-[time:400ms] ease-[cubic-bezier(0.32,0.72,0,1)] data-swiping:select-none data-swiping:duration-0",
           POPUP_SIDE_CLASS[side],
           className
         )}
