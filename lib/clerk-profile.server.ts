@@ -33,9 +33,16 @@ export interface ProfileDetailsRecord {
   image_url: string;
   year_of_graduation: number;
   job_preference: number;
+  signup_username?: string | null;
+  enrollment_number?: string | null;
+  institution_name?: string | null;
+  academic_program?: string | null;
+  year_of_study?: number | null;
+  gender?: "male" | "female" | null;
+  mobile_number?: string | null;
 }
 
-const PROFILE_DETAIL_FIELDS = "first_name,second_name,bio,country,college,degree,branch,image_url,year_of_graduation,job_preference";
+const PROFILE_DETAIL_FIELDS = "first_name,second_name,bio,country,college,degree,branch,image_url,year_of_graduation,job_preference,signup_username,enrollment_number,institution_name,academic_program,year_of_study,gender,mobile_number";
 
 function makeProfileId(identity: ClerkProfileIdentity): string {
   const legacyId = identity.externalId?.trim();

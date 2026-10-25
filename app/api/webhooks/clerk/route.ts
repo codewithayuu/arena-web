@@ -1,7 +1,10 @@
+import { clerkClient } from "@clerk/nextjs/server";
 import { verifyWebhook } from "@clerk/nextjs/webhooks";
 import { createHash } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { deleteMemberWebData } from "@/lib/topic-comments-db";
+import { parseSignupProfileMetadata } from "@/lib/signup-profile";
+import { syncSignupProfileDetails } from "@/lib/signup-profile-sync.server";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -203,6 +206,24 @@ export async function POST(request: NextRequest) {
     });
     if (!updateResponse.ok) {
       return new NextResponse("Profile synchronization failed", { status: 503 });
+    }
+
+    const rawUnsafeMetadata = (userData as typeof userData & { unsafe_metadata?: unknown }).unsafe_metadata;
+    const unsafeMetadata = rawUnsafeMetadata && typeof rawUnsafeMetadata === "object" && !Array.isArray(rawUnsafeMetadata)
+      ? rawUnsafeMetadata as Record<string, unknown>
+      : null;
+    const hasSignupProfilePayload = Boolean(
+      unsafeMetadata &&
+      Object.prototype.hasOwnProperty.call(unsafeMetadata, "mindflareSignupProfile") &&
+      unsafeMetadata.mindflareSignupProfile !== null,
+    );
+    const signupProfile = parseSignupProfileMetadata(unsafeMetadata?.mindflareSignupProfile);
+    if (signupProfile) await syncSignupProfileDetails(profile.id, signupProfile);
+    if (hasSignupProfilePayload) {
+      const clerk = await clerkClient();
+      await clerk.users.updateUserMetadata(clerkId, {
+        unsafeMetadata: { mindflareSignupProfile: null },
+      });
     }
   } catch {
     return new NextResponse("Profile synchronization unavailable", { status: 503 });
