@@ -24,7 +24,7 @@ export function DevelopmentPanel({ profile }: DevelopmentPanelProps) {
 
   if (!github.githubProfile) {
     return (
-      <section className="rounded-2xl border border-white/10 bg-black p-6 text-white">
+      <section className="rounded-xl border border-white/10 bg-black p-6 text-white font-poppins shadow-sm">
         <h2 className="text-sm font-bold uppercase tracking-wider">GitHub development profile</h2>
         <p className="mt-2 text-sm text-zinc-400">Connect and verify GitHub to load public repositories, stars, followers, and language data.</p>
       </section>
@@ -51,7 +51,7 @@ export function DevelopmentPanel({ profile }: DevelopmentPanelProps) {
     <div className="space-y-6">
       {/* 1. Top Metrics Banner */}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
-        <div className="rounded-2xl border border-white/10 bg-black p-4 shadow-xl hover:border-white/20 transition-all">
+        <div className="rounded-xl border border-white/10 bg-black p-4 shadow-sm hover:border-white/20 transition-all">
           <div className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-zinc-400 mb-1">
             <Activity className="w-4 h-4 text-[#ff1018]" />
             <span>Public Repositories</span>
@@ -62,7 +62,7 @@ export function DevelopmentPanel({ profile }: DevelopmentPanelProps) {
           <span className="text-[10px] font-mono text-zinc-400 mt-0.5 block">Owned public repositories</span>
         </div>
 
-        <div className="rounded-2xl border border-white/10 bg-black p-4 shadow-xl hover:border-white/20 transition-all">
+        <div className="rounded-xl border border-white/10 bg-black p-4 shadow-sm hover:border-white/20 transition-all">
           <div className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-zinc-400 mb-1">
             <GitCommit className="w-4 h-4 text-emerald-400" />
             <span>Repository Stars</span>
@@ -73,7 +73,7 @@ export function DevelopmentPanel({ profile }: DevelopmentPanelProps) {
           <span className="text-[10px] font-mono text-zinc-400 mt-0.5 block">Within {github.sampledRepositories ?? 0} fetched repositories</span>
         </div>
 
-        <div className="rounded-2xl border border-white/10 bg-black p-4 shadow-xl hover:border-white/20 transition-all">
+        <div className="rounded-xl border border-white/10 bg-black p-4 shadow-sm hover:border-white/20 transition-all">
           <div className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-zinc-400 mb-1">
             <GitPullRequest className="w-4 h-4 text-purple-400" />
             <span>Followers</span>
@@ -84,7 +84,7 @@ export function DevelopmentPanel({ profile }: DevelopmentPanelProps) {
           <span className="text-[10px] font-mono text-zinc-400 mt-0.5 block">Public GitHub account</span>
         </div>
 
-        <div className="rounded-2xl border border-white/10 bg-black p-4 shadow-xl hover:border-white/20 transition-all">
+        <div className="rounded-xl border border-white/10 bg-black p-4 shadow-sm hover:border-white/20 transition-all">
           <div className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-zinc-400 mb-1">
             <Calendar className="w-4 h-4 text-amber-400" />
             <span>Following</span>
@@ -95,7 +95,7 @@ export function DevelopmentPanel({ profile }: DevelopmentPanelProps) {
           <span className="text-[10px] font-mono text-zinc-400 mt-0.5 block">Public GitHub account</span>
         </div>
 
-        <div className="rounded-2xl border border-white/10 bg-black p-4 shadow-xl hover:border-white/20 transition-all">
+        <div className="rounded-xl border border-white/10 bg-black p-4 shadow-sm hover:border-white/20 transition-all">
           <div className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-zinc-400 mb-1">
             <Activity className="w-4 h-4 text-cyan-400" />
             <span>Public Events · 30d</span>
@@ -107,7 +107,7 @@ export function DevelopmentPanel({ profile }: DevelopmentPanelProps) {
         </div>
       </div>
 
-      <section className="rounded-2xl border border-white/10 bg-black p-5 shadow-2xl">
+      <section className="rounded-xl border border-white/10 bg-black p-5 shadow-sm">
         <div className="flex items-center justify-between gap-3 mb-4 pb-2 border-b border-white/10">
           <div>
             <h2 className="text-sm font-bold text-white uppercase tracking-wider">Recent public activity</h2>
@@ -133,7 +133,7 @@ export function DevelopmentPanel({ profile }: DevelopmentPanelProps) {
       </section>
 
       {/* 2. Language Distribution */}
-      <div className="rounded-2xl border border-white/10 bg-black p-5 shadow-2xl">
+      <div className="rounded-xl border border-white/10 bg-black p-5 shadow-sm">
         <div className="flex items-center justify-between mb-4 pb-2 border-b border-white/10">
           <div>
             <h2 className="text-sm font-bold text-white uppercase tracking-wider">
@@ -176,7 +176,7 @@ export function DevelopmentPanel({ profile }: DevelopmentPanelProps) {
       </div>
 
       {/* 3. Featured Repositories */}
-      <div className="rounded-2xl border border-white/10 bg-black p-5 shadow-2xl">
+      <div className="rounded-xl border border-white/10 bg-black p-5 shadow-sm">
         <div className="flex items-center justify-between mb-4 pb-2 border-b border-white/10">
           <h2 className="text-sm font-bold text-white uppercase tracking-wider">
             Featured Repositories

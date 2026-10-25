@@ -11,9 +11,9 @@ interface JourneyAboutPanelProps {
 
 export function JourneyAboutPanel({ profile }: JourneyAboutPanelProps) {
   return (
-    <div className="space-y-6">
+    <div className="space-y-4 font-poppins">
       {/* 1. Education Section */}
-      <div className="rounded-2xl border border-white/10 bg-black p-5 shadow-2xl">
+      <div className="rounded-xl border border-white/10 bg-black p-5 shadow-sm">
         <div className="flex items-center gap-2 mb-4 pb-2 border-b border-white/10">
           <GraduationCap className="w-4 h-4 text-[#ff1018]" />
           <h2 className="text-sm font-bold text-white uppercase tracking-wider">
@@ -43,7 +43,7 @@ export function JourneyAboutPanel({ profile }: JourneyAboutPanelProps) {
       </div>
 
       {/* 2. Projects Showcase */}
-      <div className="rounded-2xl border border-white/10 bg-black p-5 shadow-2xl">
+      <div className="rounded-xl border border-white/10 bg-black p-5 shadow-sm">
         <div className="flex items-center gap-2 mb-4 pb-2 border-b border-white/10">
           <FolderGit2 className="w-4 h-4 text-[#ff1018]" />
           <h2 className="text-sm font-bold text-white uppercase tracking-wider">

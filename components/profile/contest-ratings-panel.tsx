@@ -32,7 +32,7 @@ export function ContestRatingsPanel({ profile }: ContestRatingsPanelProps) {
     <div className="space-y-6">
       {/* 1. Header Overview Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-        <div className="rounded-2xl border border-white/10 bg-black p-4 shadow-xl hover:border-white/20 transition-all">
+        <div className="rounded-xl border border-white/10 bg-black p-4 shadow-xl hover:border-white/20 transition-all">
           <div className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-zinc-400 mb-1">
             <Trophy className="w-4 h-4 text-[#ff1018]" />
             <span>Contest Records</span>
@@ -44,7 +44,7 @@ export function ContestRatingsPanel({ profile }: ContestRatingsPanelProps) {
           <div className="text-[11px] font-mono text-zinc-400 mt-0.5">Published Mindflare results plus connected-provider history</div>
         </div>
 
-        <div className="rounded-2xl border border-white/10 bg-black p-4 shadow-xl hover:border-white/20 transition-all">
+        <div className="rounded-xl border border-white/10 bg-black p-4 shadow-xl hover:border-white/20 transition-all">
           <div className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-zinc-400 mb-1">
             <TrendingUp className="w-4 h-4 text-emerald-400" />
             <span>Peak Ratings</span>
@@ -55,7 +55,7 @@ export function ContestRatingsPanel({ profile }: ContestRatingsPanelProps) {
           <div className="text-[11px] font-mono text-zinc-400 mt-0.5">Provider rating scales are listed separately</div>
         </div>
 
-        <div className="rounded-2xl border border-white/10 bg-black p-4 shadow-xl hover:border-white/20 transition-all">
+        <div className="rounded-xl border border-white/10 bg-black p-4 shadow-xl hover:border-white/20 transition-all">
           <div className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-zinc-400 mb-1">
             <Award className="w-4 h-4 text-amber-400" />
             <span>Best Recorded Rank</span>
@@ -67,7 +67,7 @@ export function ContestRatingsPanel({ profile }: ContestRatingsPanelProps) {
         </div>
       </div>
 
-      <section aria-labelledby="arena-contest-history-heading" className="rounded-2xl border border-white/10 bg-black p-5 shadow-2xl">
+      <section aria-labelledby="arena-contest-history-heading" className="rounded-xl border border-white/10 bg-black p-5 shadow-sm">
         <div className="mb-4 flex flex-col gap-1 border-b border-white/10 pb-3 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <h2 id="arena-contest-history-heading" className="text-sm font-bold uppercase tracking-wider text-white">Mindflare Arena results</h2>
@@ -121,7 +121,7 @@ export function ContestRatingsPanel({ profile }: ContestRatingsPanelProps) {
       </section>
 
       {/* 2. Interactive ApexCharts Rating Progression Timeline */}
-      <div className="rounded-2xl border border-white/10 bg-black p-5 shadow-2xl">
+      <div className="rounded-xl border border-white/10 bg-black p-5 shadow-sm">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4 pb-3 border-b border-white/10">
           <div>
             <h2 className="text-sm font-bold text-white uppercase tracking-wider">
@@ -177,7 +177,7 @@ export function ContestRatingsPanel({ profile }: ContestRatingsPanelProps) {
       </div>
 
       {/* 3. Rating Delta Gains & Drops Analytics (ApexCharts Bar) */}
-      <div className="rounded-2xl border border-white/10 bg-black p-5 shadow-2xl">
+      <div className="rounded-xl border border-white/10 bg-black p-5 shadow-sm">
         <div className="flex items-center justify-between mb-4 pb-2 border-b border-white/10">
           <div>
             <h2 className="text-sm font-bold text-white uppercase tracking-wider">
@@ -199,7 +199,7 @@ export function ContestRatingsPanel({ profile }: ContestRatingsPanelProps) {
       </div>
 
       {/* 3. Recent Contests List */}
-      <div className="rounded-2xl border border-white/10 bg-black p-5 shadow-2xl">
+      <div className="rounded-xl border border-white/10 bg-black p-5 shadow-sm">
         <h2 className="text-sm font-bold text-white uppercase tracking-wider mb-4 pb-2 border-b border-white/10">
           Connected Platform History ({sortedContests.length} Events)
         </h2>

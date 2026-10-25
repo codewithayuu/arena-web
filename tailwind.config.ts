@@ -19,9 +19,10 @@ const config: Config = {
     },
     extend: {
       screens: {
-        // Desktop shells must survive split-screen windows on mouse/trackpad PCs.
+        // Keep the desktop shell at the 640px split-screen fallback, but never
+        // force it onto phone-width viewports just because a mouse is present.
         desktop: {
-          raw: '(min-width: 768px), (hover: hover) and (pointer: fine)',
+          raw: '(min-width: 640px)',
         },
       },
       colors: {
@@ -79,6 +80,7 @@ const config: Config = {
       fontFamily: {
         sans: ['var(--font-sans)', 'Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'],
         mono: ['var(--font-mono)', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'Monaco', 'Consolas', 'monospace'],
+        poppins: ['var(--font-poppins)', 'Arial', 'sans-serif'],
       },
       keyframes: {
         'accordion-down': {

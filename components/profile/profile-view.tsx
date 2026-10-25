@@ -33,6 +33,7 @@ export function ProfileView({ initialUsername, initialTab = "problemSolving" }: 
   const [profileLoadError, setProfileLoadError] = useState<string | null>(null);
   const [reloadVersion, setReloadVersion] = useState(0);
   const [activeTab, setActiveTab] = useState<ProfileTabKey>(initialTab);
+  const [selectedPlatformFilter, setSelectedPlatformFilter] = useState<string>("all");
 
   // Modals state
   const [isConnectOpen, setIsConnectOpen] = useState(false);
@@ -349,8 +350,8 @@ export function ProfileView({ initialUsername, initialTab = "problemSolving" }: 
   return (
     <div className="w-full bg-transparent text-foreground selection:bg-[#ff1018]/30 selection:text-white">
       {/* Main Container sitting above the ambient frosted glass atmosphere */}
-      <div className="max-w-[1640px] mx-auto px-3 sm:px-6">
-        <div className="flex flex-col lg:flex-row gap-5 items-start">
+      <div className="max-w-7xl mx-auto px-2 sm:px-4 md:px-6 font-poppins">
+        <div className="flex flex-col md:flex-row gap-4 items-start">
           {/* Left Column: Hero Card & Platform Scorecards Sidebar */}
           <ProfileHeroCard
             profile={profile}

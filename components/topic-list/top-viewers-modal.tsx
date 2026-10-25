@@ -3,6 +3,7 @@
 import React, { useEffect, useState } from "react";
 import { X } from "lucide-react";
 import { FaFire } from "react-icons/fa";
+import { ModalPortal } from "./modal-portal";
 
 interface TopViewersModalProps {
   isOpen: boolean;
@@ -43,18 +44,22 @@ export function TopViewersModal({
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-in fade-in duration-200">
+    <ModalPortal isOpen={isOpen}>
+    <div className="fixed inset-0 z-[120] grid place-items-center overflow-y-auto overscroll-contain p-3 sm:p-6 bg-black/80 backdrop-blur-md animate-in fade-in duration-200">
       <div
-        className="relative w-full max-w-md rounded-2xl border border-white/10 bg-[#0e0e13] p-5 sm:p-6 shadow-2xl text-white overflow-hidden"
+        aria-labelledby="top-viewers-title"
+        aria-modal="true"
+        className="relative max-h-[calc(100dvh-1.5rem)] w-full max-w-md overflow-y-auto overscroll-contain rounded-2xl border border-white/10 bg-[#0e0e13] px-5 pb-5 sm:px-6 sm:pb-6 shadow-2xl text-white"
         onClick={(e) => e.stopPropagation()}
+        role="dialog"
       >
-        <div className="flex items-center justify-between pb-3 border-b border-white/10 mb-4">
+        <div className="sticky top-0 z-10 -mx-5 mb-4 flex items-center justify-between border-b border-white/10 bg-[#0e0e13] px-5 pt-5 pb-3 sm:-mx-6 sm:px-6 sm:pt-6">
           <div className="flex items-center gap-2">
             <div className="p-1.5 rounded-lg bg-orange-500/15 border border-orange-500/30 text-orange-400">
               <FaFire className="w-4 h-4" />
             </div>
             <div>
-              <h3 className="text-base font-bold text-white tracking-tight">Most Active Learners</h3>
+              <h3 className="text-base font-bold text-white tracking-tight" id="top-viewers-title">Most Active Learners</h3>
               <p className="text-[11px] text-zinc-400">Each measure is normalized to its current top value, then weighted equally.</p>
             </div>
           </div>
@@ -107,5 +112,6 @@ export function TopViewersModal({
         </div>
       </div>
     </div>
+    </ModalPortal>
   );
 }

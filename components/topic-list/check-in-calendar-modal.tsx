@@ -4,6 +4,7 @@ import React, { useState, useMemo } from "react";
 import { X, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight } from "lucide-react";
 import { MdCalendarToday } from "react-icons/md";
 import { FaFire, FaTrophy, FaEye } from "react-icons/fa";
+import { ModalPortal } from "./modal-portal";
 
 interface CheckInCalendarModalProps {
   isOpen: boolean;
@@ -156,16 +157,20 @@ export function CheckInCalendarModal({
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-in fade-in duration-200">
+    <ModalPortal isOpen={isOpen}>
+    <div className="fixed inset-0 z-[120] grid place-items-center overflow-y-auto overscroll-contain p-3 sm:p-6 bg-black/80 backdrop-blur-md animate-in fade-in duration-200">
       <div
-        className="relative w-full max-w-[560px] rounded-3xl border border-white/10 bg-[#0e0e13] p-5 sm:p-7 shadow-2xl overflow-hidden text-white"
+        aria-labelledby="check-in-calendar-title"
+        aria-modal="true"
+        className="relative max-h-[calc(100dvh-1.5rem)] w-full max-w-[560px] overflow-y-auto overscroll-contain rounded-3xl border border-white/10 bg-[#0e0e13] px-5 pb-5 sm:px-7 sm:pb-7 shadow-2xl text-white"
         onClick={(e) => e.stopPropagation()}
+        role="dialog"
       >
         {/* Header Bar */}
-        <div className="flex items-center justify-between pb-2">
+        <div className="sticky top-0 z-10 -mx-5 mb-2 flex items-center justify-between bg-[#0e0e13] px-5 pt-5 pb-2 sm:-mx-7 sm:px-7 sm:pt-7">
           <div className="flex items-center gap-2">
             <MdCalendarToday className="w-5 h-5 text-zinc-300" />
-            <h3 className="text-lg font-bold text-white tracking-tight">Check-in Calendar</h3>
+            <h3 className="text-lg font-bold text-white tracking-tight" id="check-in-calendar-title">Check-in Calendar</h3>
           </div>
           <button
             type="button"
@@ -192,12 +197,12 @@ export function CheckInCalendarModal({
         </div>
 
         {/* 4 Summary Stat Cards */}
-        <div className="grid grid-cols-4 gap-2 sm:gap-2.5 mt-4 mb-5">
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 sm:gap-2.5 mt-4 mb-5">
           {/* 1. Current Streak */}
           <div className="rounded-xl border border-amber-500/25 bg-[#1b1510] p-2.5 sm:p-3 text-center flex flex-col justify-between">
-            <div className="flex items-center justify-center gap-1 text-[11px] font-semibold text-amber-500">
+            <div className="flex min-h-6 items-center justify-center gap-1 text-[10px] leading-tight font-semibold text-amber-500">
               <FaFire className="w-3 h-3 text-amber-500 shrink-0" />
-              <span className="truncate">Current Streak</span>
+              <span className="min-w-0 text-center">Current Streak</span>
             </div>
             <div className="text-2xl sm:text-3xl font-extrabold font-mono text-amber-500 my-1">
               {currentStreak}
@@ -207,9 +212,9 @@ export function CheckInCalendarModal({
 
           {/* 2. Longest Streak */}
           <div className="rounded-xl border border-yellow-500/25 bg-[#1c1910] p-2.5 sm:p-3 text-center flex flex-col justify-between">
-            <div className="flex items-center justify-center gap-1 text-[11px] font-semibold text-yellow-500">
+            <div className="flex min-h-6 items-center justify-center gap-1 text-[10px] leading-tight font-semibold text-yellow-500">
               <FaTrophy className="w-3 h-3 text-yellow-500 shrink-0" />
-              <span className="truncate">Longest Streak</span>
+              <span className="min-w-0 text-center">Longest Streak</span>
             </div>
             <div className="text-2xl sm:text-3xl font-extrabold font-mono text-yellow-500 my-1">
               {longestStreak}
@@ -219,9 +224,9 @@ export function CheckInCalendarModal({
 
           {/* 3. Total Views */}
           <div className="rounded-xl border border-sky-500/25 bg-[#0e1822] p-2.5 sm:p-3 text-center flex flex-col justify-between">
-            <div className="flex items-center justify-center gap-1 text-[11px] font-semibold text-sky-400">
+            <div className="flex min-h-6 items-center justify-center gap-1 text-[10px] leading-tight font-semibold text-sky-400">
               <FaEye className="w-3 h-3 text-sky-400 shrink-0" />
-              <span className="truncate">Total Views</span>
+              <span className="min-w-0 text-center">Total Views</span>
             </div>
             <div className="text-2xl sm:text-3xl font-extrabold font-mono text-sky-400 my-1">
               {totalViews}
@@ -231,9 +236,9 @@ export function CheckInCalendarModal({
 
           {/* 4. Total Days */}
           <div className="rounded-xl border border-purple-500/25 bg-[#171224] p-2.5 sm:p-3 text-center flex flex-col justify-between">
-            <div className="flex items-center justify-center gap-1 text-[11px] font-semibold text-purple-400">
+            <div className="flex min-h-6 items-center justify-center gap-1 text-[10px] leading-tight font-semibold text-purple-400">
               <MdCalendarToday className="w-3 h-3 text-purple-400 shrink-0" />
-              <span className="truncate">Total Days</span>
+              <span className="min-w-0 text-center">Total Days</span>
             </div>
             <div className="text-2xl sm:text-3xl font-extrabold font-mono text-purple-400 my-1">
               {totalDays}
@@ -348,5 +353,6 @@ export function CheckInCalendarModal({
         </div>
       </div>
     </div>
+    </ModalPortal>
   );
 }

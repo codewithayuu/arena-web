@@ -1,7 +1,7 @@
 import { ClerkProvider } from "@clerk/nextjs";
 import { dark } from "@clerk/themes";
 import { Suspense, type ReactNode } from "react";
-import { Plus_Jakarta_Sans, JetBrains_Mono } from "next/font/google";
+import { Plus_Jakarta_Sans, JetBrains_Mono, Poppins } from "next/font/google";
 import "./styles.css";
 import { TooltipProvider } from "@/components/animate-ui/tooltip";
 import { AccountSyncStatus } from "@/components/topic-list/account-sync-status";
@@ -17,6 +17,13 @@ const fontSans = Plus_Jakarta_Sans({
 const fontMono = JetBrains_Mono({
   subsets: ["latin"],
   variable: "--font-mono",
+  display: "swap",
+});
+
+const fontPoppins = Poppins({
+  subsets: ["latin"],
+  weight: ["400", "500", "600", "700", "800"],
+  variable: "--font-poppins",
   display: "swap",
 });
 
@@ -44,7 +51,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
           <link rel="preconnect" href="https://safe-sculpin-2713.clerk.accounts.dev" crossOrigin="anonymous" />
           <link rel="dns-prefetch" href="https://safe-sculpin-2713.clerk.accounts.dev" />
         </head>
-        <body className={`${fontSans.variable} ${fontMono.variable} font-sans relative min-h-screen bg-[#08080a] text-foreground antialiased selection:bg-[#e83040]/30 selection:text-red-300`}>
+        <body className={`${fontSans.variable} ${fontMono.variable} ${fontPoppins.variable} font-sans relative min-h-screen bg-[#08080a] text-foreground antialiased selection:bg-[#e83040]/30 selection:text-red-300`}>
           {/* Dynamic Frosted Glass Atmosphere strictly in BG across the app */}
           <div
             aria-hidden="true"

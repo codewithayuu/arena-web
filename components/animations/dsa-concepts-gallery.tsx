@@ -234,15 +234,15 @@ export function DsaConceptsGallery() {
               </div>
 
               {/* Grid of Cards */}
-              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
                 {section.cards.map((card) => (
                   <Link
                     key={card.slug}
                     href={card.href}
-                    className="group block outline-none focus-visible:ring-2 focus-visible:ring-[#FF1018] rounded-xl"
+                    className="group block w-full min-w-0 rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-[#FF1018]"
                   >
                     <div
-                      className="flex items-center justify-between gap-3 rounded-xl border border-white/10 bg-black px-4 py-3.5 transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md hover:border-white/20 hover:bg-white/[0.02]"
+                      className="flex min-w-0 items-center justify-between gap-3 rounded-xl border border-white/10 bg-black px-4 py-3.5 transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md hover:border-white/20 hover:bg-white/[0.02]"
                       style={{ ["--accent" as any]: section.accent || "#67E8F9" }}
                     >
                       {/* Left: Dot & Title */}

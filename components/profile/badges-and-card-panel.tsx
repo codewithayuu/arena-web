@@ -24,9 +24,9 @@ export function BadgesAndCardPanel({ profile }: BadgesAndCardPanelProps) {
   };
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4 font-poppins">
       {/* 1. Holographic Developer Card Section */}
-      <div className="rounded-2xl border border-white/10 bg-black p-6 shadow-2xl flex flex-col lg:flex-row items-center justify-between gap-6">
+      <div className="rounded-xl border border-white/10 bg-black p-6 shadow-sm flex flex-col lg:flex-row items-center justify-between gap-6">
         {/* Left Information */}
         <div className="space-y-3 max-w-md">
           <div className="flex items-center gap-2 text-xs font-bold text-[#ff4452] uppercase tracking-wider">
@@ -71,14 +71,14 @@ export function BadgesAndCardPanel({ profile }: BadgesAndCardPanelProps) {
         <div className="w-full max-w-[340px] perspective-[1000px]">
           <div
             onClick={() => setIsFlipped(!isFlipped)}
-            className={`w-full h-[200px] rounded-2xl relative transition-transform duration-700 transform-gpu cursor-pointer select-none ${
+            className={`w-full h-[200px] rounded-xl relative transition-transform duration-700 transform-gpu cursor-pointer select-none ${
               isFlipped ? "rotate-y-180" : ""
             }`}
             style={{ transformStyle: "preserve-3d" }}
           >
             {/* Front of Card */}
             <div
-              className={`absolute inset-0 rounded-2xl p-5 border border-zinc-700/80 bg-gradient-to-br from-[#1c1c24] via-[#121218] to-[#0a0a0d] shadow-2xl flex flex-col justify-between overflow-hidden ${
+              className={`absolute inset-0 rounded-xl p-5 border border-zinc-700/80 bg-gradient-to-br from-[#1c1c24] via-[#121218] to-[#0a0a0d] shadow-sm flex flex-col justify-between overflow-hidden ${
                 isFlipped ? "pointer-events-none opacity-0" : "opacity-100"
               }`}
             >
@@ -138,7 +138,7 @@ export function BadgesAndCardPanel({ profile }: BadgesAndCardPanelProps) {
 
             {/* Back of Card */}
             <div
-              className={`absolute inset-0 rounded-2xl p-5 border border-zinc-700/80 bg-gradient-to-br from-[#15151c] to-[#09090c] shadow-2xl flex flex-col justify-between overflow-hidden ${
+              className={`absolute inset-0 rounded-xl p-5 border border-zinc-700/80 bg-gradient-to-br from-[#15151c] to-[#09090c] shadow-sm flex flex-col justify-between overflow-hidden ${
                 !isFlipped ? "pointer-events-none opacity-0" : "opacity-100"
               }`}
               style={{ transform: "rotateY(180deg)" }}
@@ -176,7 +176,7 @@ export function BadgesAndCardPanel({ profile }: BadgesAndCardPanelProps) {
       </div>
 
       {/* 2. Earned Badges Grid */}
-      <div className="rounded-2xl border border-white/10 bg-black p-5 shadow-2xl">
+      <div className="rounded-xl border border-white/10 bg-black p-5 shadow-sm">
         <div className="flex items-center justify-between mb-4 pb-2 border-b border-white/10">
           <div>
             <h2 className="text-sm font-bold text-white uppercase tracking-wider">
