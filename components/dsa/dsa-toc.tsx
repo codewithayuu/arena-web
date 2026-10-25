@@ -68,7 +68,7 @@ const DEFAULT_TOCS: Record<string, TocItem[]> = {
   ],
 };
 
-export function DsaToc() {
+export function DsaToc({ compact = false }: { compact?: boolean }) {
   const pathname = usePathname();
   const slug = pathname?.split("/").pop() || "";
   const [tocItems, setTocItems] = useState<TocItem[]>(DEFAULT_TOCS[slug] || []);
@@ -118,7 +118,7 @@ export function DsaToc() {
     const handleScroll = () => {
       const totalScroll =
         document.documentElement.scrollHeight - window.innerHeight;
-      if (totalScroll > 0) {
+      if (totalScroll > 0 && !compact) {
         const currentProgress = Math.min(
           100,
           Math.max(0, Math.round((window.scrollY / totalScroll) * 100)),
@@ -140,7 +140,7 @@ export function DsaToc() {
     window.addEventListener("scroll", handleScroll, { passive: true });
     handleScroll();
     return () => window.removeEventListener("scroll", handleScroll);
-  }, [tocItems]);
+  }, [tocItems, compact]);
 
   const scrollToSection = (
     e: React.MouseEvent<HTMLAnchorElement>,
@@ -157,45 +157,50 @@ export function DsaToc() {
         top: offsetPosition,
         behavior: "smooth",
       });
+      if (compact) e.currentTarget.closest("details")?.removeAttribute("open");
       setActiveId(id);
     }
   };
 
   return (
     <div
-      className="w-full h-full"
-      data-focus-hideable="true"
-      data-right-sidebar="true"
+      className={compact ? "w-full" : "w-full h-full"}
+      data-focus-hideable={compact ? undefined : "true"}
+      data-right-sidebar={compact ? undefined : "true"}
     >
-      <div className="h-full max-h-[calc(100vh-8.5rem)] custom-scrollbar overflow-y-auto py-2">
+      <div className={compact ? "max-h-60 overflow-y-auto custom-scrollbar" : "h-full max-h-[calc(100vh-8.5rem)] custom-scrollbar overflow-y-auto py-2"}>
         {/* TOC Navigation */}
         <div className="w-full">
-          <nav className="pl-2 2xl:pl-4 py-2">
+          <nav aria-label="Page sections" className={compact ? "py-2 pl-3" : "pl-2 2xl:pl-4 py-2"}>
             {/* Reading Progress */}
-            <div className="mb-4 pr-4">
-              <Progress value={readingProgress} className="w-full">
-                <div className="flex items-center justify-between text-xs text-muted-foreground mb-1.5 font-medium">
-                  <ProgressLabel className="text-xs font-medium text-muted-foreground">
-                    Reading Progress
-                  </ProgressLabel>
-                  <div className="flex items-center tabular-nums font-mono text-xs">
-                    <ProgressValue transition={{ stiffness: 80, damping: 20 }} />
-                    <span>%</span>
+            {!compact && (
+              <div className="mb-4 pr-4">
+                <Progress value={readingProgress} className="w-full">
+                  <div className="flex items-center justify-between text-xs text-muted-foreground mb-1.5 font-medium">
+                    <ProgressLabel className="text-xs font-medium text-muted-foreground">
+                      Reading Progress
+                    </ProgressLabel>
+                    <div className="flex items-center tabular-nums font-mono text-xs">
+                      <ProgressValue transition={{ stiffness: 80, damping: 20 }} />
+                      <span>%</span>
+                    </div>
                   </div>
-                </div>
-                <ProgressTrack className="h-1.5 bg-muted rounded-full overflow-hidden">
-                  <ProgressIndicator className="bg-gradient-to-r from-black via-red-500 to-black h-full rounded-full shadow-[0_0_12px_rgba(239,68,68,0.35)]" />
-                </ProgressTrack>
-              </Progress>
-            </div>
+                  <ProgressTrack className="h-1.5 bg-muted rounded-full overflow-hidden">
+                    <ProgressIndicator className="bg-gradient-to-r from-black via-red-500 to-black h-full rounded-full shadow-[0_0_12px_rgba(239,68,68,0.35)]" />
+                  </ProgressTrack>
+                </Progress>
+              </div>
+            )}
 
             {tocItems.length > 0 && (
               <>
-                <h2 className="text-xs font-bold text-muted-foreground mb-2.5">
-                  On this page
-                </h2>
+                {!compact && (
+                  <h2 className="text-xs font-bold text-muted-foreground mb-2.5">
+                    On this page
+                  </h2>
+                )}
 
-                <ul className="space-y-1 text-xs">
+                <ul className={compact ? "space-y-1 text-sm" : "space-y-1 text-xs"}>
                   {tocItems.map((item) => {
                     const isActive = activeId === item.id;
                     return (
@@ -215,7 +220,7 @@ export function DsaToc() {
                         <a
                           href={`#${item.id}`}
                           onClick={(e) => scrollToSection(e, item.id)}
-                          className="block py-1 leading-snug transition-colors"
+                          className={compact ? "block min-h-11 py-2 leading-snug transition-colors" : "block py-1 leading-snug transition-colors"}
                         >
                           {item.title}
                         </a>
@@ -224,6 +229,9 @@ export function DsaToc() {
                   })}
                 </ul>
               </>
+            )}
+            {compact && tocItems.length === 0 && (
+              <p className="px-1 py-2 text-sm text-muted-foreground">No section headings on this page.</p>
             )}
           </nav>
         </div>

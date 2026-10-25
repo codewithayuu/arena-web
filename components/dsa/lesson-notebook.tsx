@@ -1,8 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useUser } from "@clerk/nextjs";
-import { BookOpenText, ChevronLeft, ChevronRight, FilePenLine, Plus, Trash2, X } from "lucide-react";
+import { BookOpenText, ChevronLeft, ChevronRight, ChevronUp, FilePenLine, Plus, Trash2, X } from "lucide-react";
 import Link from "next/link";
 import SmoothButton from "@/components/smoothui/smooth-button";
 import Dialog from "@/components/smoothui/dialog";
@@ -22,6 +22,8 @@ interface LessonNotebookProps {
   currentSlug: string;
   bookMode: boolean;
   onBookModeChange: (enabled: boolean) => void;
+  responsiveMoreMenu?: boolean;
+  mobileMoreAction?: ReactNode;
 }
 
 const GUEST_NOTES_KEY = "mindflare_guest_lesson_notes_v1";
@@ -39,7 +41,8 @@ function readGuestNotes(): LearningNote[] {
   }
 }
 
-export function LessonNotebook({ currentSlug, bookMode, onBookModeChange }: LessonNotebookProps) {
+export function LessonNotebook({ currentSlug, bookMode, onBookModeChange, responsiveMoreMenu = false, mobileMoreAction }: LessonNotebookProps) {
+  const moreMenuRef = useRef<HTMLDetailsElement>(null);
   const { isLoaded, isSignedIn, user } = useUser();
   const [mode, setMode] = useState<PanelMode | null>(null);
   const [notes, setNotes] = useState<LearningNote[]>([]);
@@ -279,18 +282,62 @@ export function LessonNotebook({ currentSlug, bookMode, onBookModeChange }: Less
     if (target) selectNote(target);
   };
 
+  const closeMobileMoreMenu = () => {
+    if (!moreMenuRef.current) return;
+    moreMenuRef.current.open = false;
+    moreMenuRef.current.querySelector("summary")?.focus();
+  };
+
+  const renderNoteButtons = (mobile = false) => (
+    <div className={mobile ? "flex w-full flex-col items-stretch gap-1" : "flex items-center gap-1 sm:gap-2"}>
+      <SmoothButton type="button" size="xs" variant="ghost" onClick={() => openPanel("note")} className={`min-h-10 gap-1.5 text-muted-foreground hover:text-foreground ${mobile ? "w-full justify-start px-3" : "px-2"}`} aria-label="Open lesson notes">
+        <FilePenLine className="h-4 w-4" />
+        <span className={!mobile && !responsiveMoreMenu ? "hidden sm:inline" : undefined}>Notes</span>
+      </SmoothButton>
+      <SmoothButton type="button" size="xs" variant="ghost" onClick={() => openPanel("notebook")} className={`min-h-10 gap-1.5 text-muted-foreground hover:text-foreground ${mobile ? "w-full justify-start px-3" : "px-2"}`} aria-label="Open all notebooks">
+        <BookOpenText className="h-4 w-4" />
+        <span className={!mobile && !responsiveMoreMenu ? "hidden md:inline" : undefined}>Notebook</span>
+      </SmoothButton>
+    </div>
+  );
+
+  const renderBookModeButton = (mobile = false) => (
+    <SmoothButton
+      type="button"
+      size="xs"
+      variant={bookMode ? "solid" : "ghost"}
+      color={bookMode ? "accent" : "neutral"}
+      onClick={() => onBookModeChange(!bookMode)}
+      aria-label={bookMode ? "Exit book reading mode" : "Read as book"}
+      className={`min-h-10 gap-1.5 text-muted-foreground hover:text-foreground ${mobile ? "w-full justify-start px-3" : "min-w-10 px-2"}`}
+    >
+      <BookOpenText className="h-4 w-4" />
+      {mobile && <span>{bookMode ? "Exit book mode" : "Read as book"}</span>}
+    </SmoothButton>
+  );
+
   return (
     <>
-      <div className="flex items-center gap-1 sm:gap-2">
-        <SmoothButton type="button" size="xs" variant="ghost" onClick={() => openPanel("note")} className="gap-1 sm:gap-1.5 text-muted-foreground hover:text-foreground" aria-label="Open lesson notes">
-          <FilePenLine className="h-3.5 w-3.5" />
-          <span className="hidden sm:inline">Notes</span>
-        </SmoothButton>
-        <SmoothButton type="button" size="xs" variant="ghost" onClick={() => openPanel("notebook")} className="gap-1 sm:gap-1.5 text-muted-foreground hover:text-foreground" aria-label="Open all notebooks">
-          <BookOpenText className="h-3.5 w-3.5" />
-          <span className="hidden md:inline">Notebook</span>
-        </SmoothButton>
+      <div className={responsiveMoreMenu ? "hidden items-center gap-1 md:flex" : "flex items-center gap-1 sm:gap-2"}>
+        {renderNoteButtons()}
+        {responsiveMoreMenu && renderBookModeButton()}
       </div>
+      {responsiveMoreMenu && (
+        <details ref={moreMenuRef} className="relative md:hidden">
+          <summary className="flex min-h-10 cursor-pointer list-none items-center justify-center gap-1.5 rounded-lg border border-border bg-background px-3 text-sm font-medium text-foreground [&::-webkit-details-marker]:hidden">
+            <span>More</span>
+            <ChevronUp className="h-4 w-4" aria-hidden="true" />
+          </summary>
+          <div
+            onClick={closeMobileMoreMenu}
+            className="absolute bottom-[calc(100%+0.5rem)] right-0 z-[70] flex min-w-48 flex-col gap-1 rounded-xl border border-border bg-background p-2 shadow-xl"
+          >
+            {renderNoteButtons(true)}
+            {renderBookModeButton(true)}
+            {mobileMoreAction}
+          </div>
+        </details>
+      )}
 
       <Dialog
         open={mode !== null}
@@ -438,17 +485,7 @@ export function LessonNotebook({ currentSlug, bookMode, onBookModeChange }: Less
           @media (prefers-reduced-motion: reduce) { .notebook-page-turn { animation-duration: 1ms; } }
         `}</style>
       </Dialog>
-      <SmoothButton
-        type="button"
-        size="icon-sm"
-        variant={bookMode ? "solid" : "ghost"}
-        color={bookMode ? "accent" : "neutral"}
-        onClick={() => onBookModeChange(!bookMode)}
-        aria-label={bookMode ? "Exit book reading mode" : "Read as book"}
-        className="text-muted-foreground hover:text-foreground"
-      >
-        <BookOpenText className="h-4 w-4" />
-      </SmoothButton>
+      {!responsiveMoreMenu && renderBookModeButton()}
     </>
   );
 }

@@ -265,7 +265,7 @@ export function CourseIntroContent() {
               </p>
 
               {/* The Interactive Move Zeroes Animation Player */}
-              <InteractiveAnimation />
+              <InteractiveAnimation variant="move-zeroes" />
             </div>
           </div>
 

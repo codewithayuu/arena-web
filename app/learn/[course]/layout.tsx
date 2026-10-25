@@ -5,6 +5,7 @@ import { useParams } from "next/navigation";
 import { Navbar } from "@/components/navbar";
 import { DsaSidebar } from "@/components/dsa/dsa-sidebar";
 import { DsaToc } from "@/components/dsa/dsa-toc";
+import { DsaMobileLearnNav } from "@/components/dsa/mobile-learn-nav";
 import {
   DsaSidebarProvider,
   useDsaSidebar,
@@ -43,6 +44,7 @@ function CourseLayoutContent({
               data-focus-expand="true"
               data-content-area="true"
             >
+              <DsaMobileLearnNav />
               {children}
             </div>
           </div>

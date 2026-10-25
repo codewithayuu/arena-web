@@ -1,4 +1,5 @@
 import React from "react";
+import remarkGfm from "remark-gfm";
 import { Metadata } from "next";
 import { notFound } from "next/navigation";
 import fs from "fs";
@@ -14,6 +15,7 @@ import { LessonHeader } from "@/components/dsa/lesson-header";
 import { dsaMdxComponents } from "@/components/dsa/mdx-components";
 import { compileMDX } from "next-mdx-remote/rsc";
 import { parseMdxFrontmatter, cleanMdxSource } from "@/lib/mdx-sanitizer";
+import { MdxRenderError } from "@/components/dsa/mdx-render-error";
 
 interface PageProps {
   params: Promise<{
@@ -127,6 +129,7 @@ export default async function DsaLessonPage({ params, searchParams }: PageProps)
   if (mdxPath) {
     const rawSource = fs.readFileSync(mdxPath, "utf8");
     const { data: frontmatter, content } = parseMdxFrontmatter(rawSource);
+    const sanitized = cleanMdxSource(content);
 
     let ContentComponent: React.ReactNode = null;
     let loaded = false;
@@ -155,10 +158,13 @@ export default async function DsaLessonPage({ params, searchParams }: PageProps)
     if (!loaded) {
       try {
         const { content: compiledContent } = await compileMDX({
-          source: content,
+          source: sanitized,
           components: dsaMdxComponents,
           options: {
             parseFrontmatter: false,
+            mdxOptions: {
+              remarkPlugins: [remarkGfm],
+            },
           },
         });
         ContentComponent = compiledContent;
@@ -170,9 +176,11 @@ export default async function DsaLessonPage({ params, searchParams }: PageProps)
 
     if (!loaded) {
       ContentComponent = (
-        <div className="prose dark:prose-invert max-w-none whitespace-pre-wrap font-sans text-sm text-foreground/90">
-          {content}
-        </div>
+        <MdxRenderError
+          courseTitle="DSA"
+          backHref="/learn/dsa"
+          backLabel="Back to DSA lessons"
+        />
       );
     }
 

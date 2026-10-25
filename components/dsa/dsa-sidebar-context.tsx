@@ -6,12 +6,16 @@ interface DsaSidebarContextType {
   isCollapsed: boolean;
   setIsCollapsed: React.Dispatch<React.SetStateAction<boolean>>;
   toggleCollapsed: () => void;
+  mobileOpen: boolean;
+  setMobileOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  toggleMobileOpen: () => void;
 }
 
 const DsaSidebarContext = createContext<DsaSidebarContextType | undefined>(undefined);
 
 export function DsaSidebarProvider({ children }: { children: React.ReactNode }) {
   const [isCollapsed, setIsCollapsed] = useState(false);
+  const [mobileOpen, setMobileOpen] = useState(false);
 
   // Restore collapse state from localStorage on client mount
   useEffect(() => {
@@ -48,6 +52,9 @@ export function DsaSidebarProvider({ children }: { children: React.ReactNode }) 
   const toggleCollapsed = useCallback(() => {
     setCollapsedState((prev) => !prev);
   }, [setCollapsedState]);
+  const toggleMobileOpen = useCallback(() => {
+    setMobileOpen((prev) => !prev);
+  }, []);
 
   return (
     <DsaSidebarContext.Provider
@@ -55,6 +62,9 @@ export function DsaSidebarProvider({ children }: { children: React.ReactNode }) 
         isCollapsed,
         setIsCollapsed: setCollapsedState,
         toggleCollapsed,
+        mobileOpen,
+        setMobileOpen,
+        toggleMobileOpen,
       }}
     >
       {children}

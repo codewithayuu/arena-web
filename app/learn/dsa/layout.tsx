@@ -4,6 +4,7 @@ import React from "react";
 import { Navbar } from "@/components/navbar";
 import { DsaSidebar } from "@/components/dsa/dsa-sidebar";
 import { DsaToc } from "@/components/dsa/dsa-toc";
+import { DsaMobileLearnNav } from "@/components/dsa/mobile-learn-nav";
 import {
   DsaSidebarProvider,
   useDsaSidebar,
@@ -36,6 +37,7 @@ function DsaLayoutContent({ children }: { children: React.ReactNode }) {
               data-focus-expand="true"
               data-content-area="true"
             >
+              <DsaMobileLearnNav />
               {children}
             </div>
           </div>

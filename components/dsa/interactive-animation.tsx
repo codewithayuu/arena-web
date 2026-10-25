@@ -26,8 +26,6 @@ interface StepState {
   codeLine: number;
 }
 
-const DEFAULT_ARRAY = [0, 1, 0, 3, 12];
-
 const ANIMATION_STEPS: StepState[] = [
   {
     step: 0,
@@ -232,8 +230,12 @@ const CODE_SNIPPETS: Record<string, string[]> = {
   ],
 };
 
-export function InteractiveAnimation() {
-  const [activeTab, setActiveTab] = useState<'extra_array' | 'swap' | 'one_pass'>('one_pass');
+export function InteractiveAnimation({ variant }: { variant?: "move-zeroes" }) {
+  if (variant !== "move-zeroes") return null;
+  return <MoveZeroesAnimation />;
+}
+
+function MoveZeroesAnimation() {
   const [currentStepIndex, setCurrentStepIndex] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [playbackSpeed, setPlaybackSpeed] = useState<number>(1);
@@ -262,6 +264,14 @@ export function InteractiveAnimation() {
     return () => clearInterval(timer);
   }, [isPlaying, playbackSpeed]);
 
+  useEffect(() => {
+    const syncFullscreen = () => {
+      setIsFullscreen(document.fullscreenElement === containerRef.current);
+    };
+    document.addEventListener("fullscreenchange", syncFullscreen);
+    return () => document.removeEventListener("fullscreenchange", syncFullscreen);
+  }, []);
+
   const togglePlay = () => setIsPlaying((prev) => !prev);
   const stepPrev = () => {
     setIsPlaying(false);
@@ -276,84 +286,32 @@ export function InteractiveAnimation() {
     setCurrentStepIndex(0);
   };
 
-  const toggleFullscreen = () => {
+  const toggleFullscreen = async () => {
     if (!containerRef.current) return;
-    if (!isFullscreen) {
-      if (containerRef.current.requestFullscreen) {
-        containerRef.current.requestFullscreen();
+    try {
+      if (document.fullscreenElement === containerRef.current) {
+        await document.exitFullscreen();
+      } else {
+        await containerRef.current.requestFullscreen();
       }
-      setIsFullscreen(true);
-    } else {
-      if (document.exitFullscreen) {
-        document.exitFullscreen();
-      }
-      setIsFullscreen(false);
+    } catch {
+      // Keep the control usable if the browser declines the request.
     }
   };
-
-  const progressPercent = (currentStepIndex / (ANIMATION_STEPS.length - 1)) * 100;
 
   return (
     <div
       ref={containerRef}
-      className={`not-prose w-full my-6 bg-card text-card-foreground rounded-xl border border-border overflow-hidden shadow-lg transition-all ${
-        isFullscreen ? 'fixed inset-0 z-[100] rounded-none overflow-y-auto bg-background p-6' : ''
+      className={`not-prose w-full shadow-lg transition-all ${
+        isFullscreen
+          ? 'fixed inset-0 z-[100] overflow-y-auto rounded-none bg-background p-6'
+          : 'my-6 overflow-hidden rounded-xl border border-border bg-card text-card-foreground'
       }`}
     >
       <div className="flex flex-col gap-3 sm:gap-4 p-4 sm:p-5">
-        {/* Strategy Tabs */}
-        <div className="overflow-x-auto pb-1">
-          <div className="flex w-max min-w-full justify-center">
-            <div className="w-[520px] max-w-full">
-              <div
-                role="tablist"
-                className="items-center justify-center rounded-lg bg-muted p-1 text-muted-foreground grid grid-cols-3 text-xs sm:text-sm font-medium"
-              >
-                <button
-                  type="button"
-                  onClick={() => {
-                    setActiveTab('extra_array');
-                    reset();
-                  }}
-                  className={`inline-flex items-center justify-center rounded-md px-3 py-1.5 transition-all ${
-                    activeTab === 'extra_array'
-                      ? 'bg-background text-foreground shadow-sm font-semibold'
-                      : 'hover:text-foreground'
-                  }`}
-                >
-                  Extra Array
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setActiveTab('swap');
-                    reset();
-                  }}
-                  className={`inline-flex items-center justify-center rounded-md px-3 py-1.5 transition-all ${
-                    activeTab === 'swap'
-                      ? 'bg-background text-foreground shadow-sm font-semibold'
-                      : 'hover:text-foreground'
-                  }`}
-                >
-                  Two Pointers (Swap)
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setActiveTab('one_pass');
-                    reset();
-                  }}
-                  className={`inline-flex items-center justify-center rounded-md px-3 py-1.5 transition-all ${
-                    activeTab === 'one_pass'
-                      ? 'bg-background text-foreground shadow-sm font-semibold'
-                      : 'hover:text-foreground'
-                  }`}
-                >
-                  Minimal Operations
-                </button>
-              </div>
-            </div>
-          </div>
+        <div className="flex flex-col gap-1 border-b border-border/60 pb-3">
+          <h3 className="text-sm font-semibold text-foreground sm:text-base">Move Zeroes · Two-pointer walkthrough</h3>
+          <p className="text-xs leading-relaxed text-muted-foreground">Follow the read and write pointers through one in-place pass.</p>
         </div>
 
         {/* Collapsible Input Panel */}
@@ -399,7 +357,8 @@ export function InteractiveAnimation() {
           <div className="absolute inset-0 bg-[radial-gradient(#333_1px,transparent_1px)] [background-size:16px_16px] opacity-20 pointer-events-none" />
 
           {/* Visualization SVG */}
-          <div className="relative w-full max-w-2xl h-[170px] flex items-center justify-center z-10">
+          <div role="region" aria-label="Move Zeroes array visualization; swipe horizontally on small screens" tabIndex={0} className="relative z-10 w-full overflow-x-auto focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
+          <div className="relative mx-auto h-[170px] w-full min-w-[600px] max-w-2xl flex items-center justify-center">
             <svg
               viewBox="0 0 600 170"
               className="w-full h-full max-h-[170px]"
@@ -545,6 +504,7 @@ export function InteractiveAnimation() {
               })}
             </svg>
           </div>
+          </div>
         </div>
 
         {/* Step Explanation Text Banner */}
@@ -557,14 +517,14 @@ export function InteractiveAnimation() {
 
         {/* Playback Controls Bar */}
         <div className="bg-background rounded-lg border border-border shadow-sm p-2 sm:p-3">
-          <div className="flex items-center gap-2 sm:gap-3">
+          <div className="flex flex-wrap items-center gap-2 sm:gap-3">
             {/* Play/Pause & Step Buttons */}
             <div className="flex items-center gap-1 sm:gap-1.5 flex-shrink-0">
               <SimpleTooltip content={isPlaying ? 'Pause' : 'Play'}>
                 <button
                   type="button"
                   onClick={togglePlay}
-                  className="inline-flex items-center justify-center rounded-md border border-input bg-primary text-primary-foreground hover:bg-primary/90 h-8 w-8 sm:h-9 sm:w-9 p-0 transition-colors shadow-sm"
+                  className="inline-flex h-11 w-11 items-center justify-center rounded-md border border-input bg-primary p-0 text-primary-foreground shadow-sm transition-colors hover:bg-primary/90 sm:h-9 sm:w-9"
                   aria-label={isPlaying ? 'Pause' : 'Play'}
                 >
                   {isPlaying ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4 ml-0.5" />}
@@ -575,7 +535,7 @@ export function InteractiveAnimation() {
                   type="button"
                   onClick={stepPrev}
                   disabled={currentStepIndex === 0}
-                  className="inline-flex items-center justify-center rounded-md border border-input bg-background hover:bg-accent hover:text-accent-foreground disabled:opacity-40 disabled:pointer-events-none h-8 w-8 sm:h-9 sm:w-9 p-0 transition-colors"
+                  className="inline-flex h-11 w-11 items-center justify-center rounded-md border border-input bg-background p-0 transition-colors hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-40 sm:h-9 sm:w-9"
                   aria-label="Step backward"
                 >
                   <ChevronLeft className="h-4 w-4" />
@@ -586,7 +546,7 @@ export function InteractiveAnimation() {
                   type="button"
                   onClick={stepNext}
                   disabled={currentStepIndex === ANIMATION_STEPS.length - 1}
-                  className="inline-flex items-center justify-center rounded-md border border-input bg-background hover:bg-accent hover:text-accent-foreground disabled:opacity-40 disabled:pointer-events-none h-8 w-8 sm:h-9 sm:w-9 p-0 transition-colors"
+                  className="inline-flex h-11 w-11 items-center justify-center rounded-md border border-input bg-background p-0 transition-colors hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-40 sm:h-9 sm:w-9"
                   aria-label="Step forward"
                 >
                   <ChevronRight className="h-4 w-4" />
@@ -595,38 +555,27 @@ export function InteractiveAnimation() {
             </div>
 
             {/* Clickable Progress Slider / Scrubber */}
-            <div
-              className="relative flex-1 min-w-0 cursor-pointer py-2"
-              onClick={(e) => {
-                const rect = e.currentTarget.getBoundingClientRect();
-                const clickX = e.clientX - rect.left;
-                const ratio = Math.max(0, Math.min(1, clickX / rect.width));
-                const targetStep = Math.round(ratio * (ANIMATION_STEPS.length - 1));
+            <input
+              type="range"
+              min={0}
+              max={ANIMATION_STEPS.length - 1}
+              value={currentStepIndex}
+              aria-label="Animation step"
+              aria-valuetext={`Step ${currentStepIndex} of ${ANIMATION_STEPS.length - 1}`}
+              onChange={(event) => {
                 setIsPlaying(false);
-                setCurrentStepIndex(targetStep);
+                setCurrentStepIndex(Number(event.target.value));
               }}
-            >
-              <div className="relative h-2 bg-muted rounded-full overflow-hidden">
-                <div
-                  className="absolute top-0 left-0 h-full bg-primary transition-all duration-150 ease-out rounded-full"
-                  style={{ width: `${progressPercent}%` }}
-                />
-              </div>
-              <div
-                className="absolute top-1/2 -translate-y-1/2 -translate-x-1/2 pointer-events-none transition-all duration-150"
-                style={{ left: `${progressPercent}%` }}
-              >
-                <div className="h-3.5 w-3.5 rounded-full bg-primary border-2 border-background shadow-md" />
-              </div>
-            </div>
+              className="order-3 h-11 basis-full cursor-pointer accent-primary sm:order-none sm:h-8 sm:min-w-[120px] sm:flex-1 sm:basis-auto"
+            />
 
             {/* Step Counter */}
-            <span className="text-xs text-muted-foreground whitespace-nowrap tabular-nums font-mono">
+            <span className="order-2 ml-auto whitespace-nowrap font-mono text-xs tabular-nums text-muted-foreground sm:order-none sm:ml-0">
               {currentStepIndex} / {ANIMATION_STEPS.length - 1}
             </span>
 
             {/* Speed Selector */}
-            <div className="w-[85px] shrink-0">
+            <div className="order-4 ml-auto flex shrink-0 items-center gap-2 sm:order-none sm:ml-0">
               <Select
                 value={String(playbackSpeed)}
                 onValueChange={(val) => setPlaybackSpeed(parseFloat(val))}
@@ -637,7 +586,7 @@ export function InteractiveAnimation() {
                   { value: "2", label: "2.0x" },
                 ]}
                 size="sm"
-                className="h-8 text-xs font-medium"
+                className="h-10 w-[85px] text-xs font-medium sm:h-8"
               />
             </div>
 
@@ -646,7 +595,9 @@ export function InteractiveAnimation() {
               <button
                 type="button"
                 onClick={toggleFullscreen}
-                className="p-2 rounded-md bg-background hover:bg-accent border border-border text-muted-foreground hover:text-foreground transition-colors flex-shrink-0"
+                aria-label={isFullscreen ? 'Exit animation fullscreen' : 'Enter animation fullscreen'}
+                aria-pressed={isFullscreen}
+                className="inline-flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-md border border-border bg-background p-2 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground sm:h-9 sm:w-9"
               >
                 {isFullscreen ? <Minimize className="h-4 w-4" /> : <Maximize className="h-4 w-4" />}
               </button>

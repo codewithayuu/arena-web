@@ -2,7 +2,7 @@ import matter from 'gray-matter';
 
 // Recognized JSX and HTML elements supported in MDX
 const VALID_TAG_PATTERN =
-  /^(LessonCard|QuizCard|MultiSelectQuiz|DragDropQuiz|LLDProblemsBlock|Callout|Accordion|Tabs|Tab|Badge|InteractiveAnimation|AuthorCard|CommentsSection|h[1-6]|p|div|span|table|thead|tbody|tr|th|td|ul|ol|li|a|strong|b|em|i|code|pre|br|hr|img|blockquote|details|summary|sub|sup|kbd|mark)(\s|\/|>|$)/i;
+  /^(LessonHeader|LessonCard|DsaMindmap|PatternsSheetCard|CompanyProblemsCard|FeatureGrid|FeatureCard|InteractiveAnimation|CodeCompiler|QuizCard|VideoPreviewCard|LearningSteps|AuthorCard|CommentsSection|CourseRoadmapView|CommunityView|DsaCodeBlock|CodeBlock|IntroCard|ComplexityCard|BigOSimulation|h[1-6]|p|div|span|table|thead|tbody|tr|th|td|ul|ol|li|a|strong|b|em|i|code|pre|br|hr|img|blockquote|details|summary|sub|sup|kbd|mark)(\s|\/|>|$)/i;
 
 export interface FrontmatterData {
   title?: string;

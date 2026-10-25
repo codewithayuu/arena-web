@@ -1,12 +1,13 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Play,
   Send,
   Tag,
   Building2,
   Expand,
+  Minimize,
   Copy,
   Check,
   ChevronDown,
@@ -124,6 +125,7 @@ const TEST_CASES = [
 ];
 
 export function CodeCompiler() {
+  const problemRef = useRef<HTMLDivElement>(null);
   const [selectedLanguage, setSelectedLanguage] = useState<'Java' | 'Python' | 'C++' | 'JavaScript'>('Java');
   const [code, setCode] = useState<string>(STARTER_CODES.Java);
   const [activeTab, setActiveTab] = useState<'testcases' | 'output' | 'feedback'>('testcases');
@@ -140,6 +142,30 @@ export function CodeCompiler() {
 
   // Hints state
   const [openHints, setOpenHints] = useState<Record<number, boolean>>({});
+
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
+  useEffect(() => {
+    const syncFullscreen = () => {
+      setIsFullscreen(document.fullscreenElement === problemRef.current);
+    };
+    document.addEventListener('fullscreenchange', syncFullscreen);
+    return () => document.removeEventListener('fullscreenchange', syncFullscreen);
+  }, []);
+
+  const toggleFullscreen = async () => {
+    const problem = problemRef.current;
+    if (!problem) return;
+    try {
+      if (document.fullscreenElement === problem) {
+        await document.exitFullscreen();
+      } else {
+        await problem.requestFullscreen();
+      }
+    } catch {
+      // Browser policy can decline fullscreen; the rest of the compiler remains usable.
+    }
+  };
 
   const handleLanguageChange = (lang: 'Java' | 'Python' | 'C++' | 'JavaScript') => {
     setSelectedLanguage(lang);
@@ -174,7 +200,14 @@ export function CodeCompiler() {
   const selectedCase = TEST_CASES.find((c) => c.id === selectedCaseId) || TEST_CASES[0];
 
   return (
-    <div className="not-prose my-6 rounded-xl border border-border bg-card overflow-hidden shadow-lg">
+    <div
+      ref={problemRef}
+      className={`not-prose border border-border bg-card shadow-lg ${
+        isFullscreen
+          ? 'fixed inset-0 z-[100] flex flex-col overflow-y-auto rounded-none'
+          : 'my-6 overflow-hidden rounded-xl'
+      }`}
+    >
       {/* Problem Header */}
       <div className="p-4 sm:p-5 border-b border-border space-y-3">
         <div className="flex flex-wrap items-start justify-between gap-2">
@@ -188,13 +221,17 @@ export function CodeCompiler() {
           </div>
 
           <div className="flex items-center gap-2">
-            <SimpleTooltip content="Fullscreen">
+            <SimpleTooltip content={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}>
               <SmoothButton
+                type="button"
                 size="icon-sm"
                 variant="ghost"
-                className="text-muted-foreground hover:text-foreground"
+                onClick={() => void toggleFullscreen()}
+                aria-label={isFullscreen ? 'Exit compiler fullscreen' : 'Expand compiler'}
+                aria-pressed={isFullscreen}
+                className="min-h-10 min-w-10 text-muted-foreground hover:text-foreground"
               >
-                <Expand className="w-4 h-4" />
+                {isFullscreen ? <Minimize className="w-4 h-4" /> : <Expand className="w-4 h-4" />}
               </SmoothButton>
             </SimpleTooltip>
           </div>
@@ -273,8 +310,9 @@ export function CodeCompiler() {
           value={code}
           onChange={(e) => setCode(e.target.value)}
           rows={14}
+          wrap="off"
           spellCheck={false}
-          className="w-full bg-transparent p-4 font-mono text-xs leading-relaxed outline-none resize-none border-none text-zinc-200 selection:bg-primary/30"
+          className="w-full overflow-x-auto whitespace-pre bg-transparent p-4 font-mono text-[13px] leading-relaxed outline-none resize-none border-none text-zinc-200 selection:bg-primary/30 sm:text-xs"
         />
       </div>
 

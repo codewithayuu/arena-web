@@ -130,7 +130,7 @@ export function DsaBottomBar({ currentSlug, bookMode = false }: DsaBottomBarProp
         </div>
 
         {/* Center: Prev/Next Links & Action Buttons */}
-        <div className="w-full max-w-4xl mx-auto flex items-center justify-center gap-2 sm:gap-3">
+        <div className="mx-auto flex w-full max-w-4xl items-center justify-between gap-1 sm:justify-center sm:gap-3">
           {/* Previous Lesson Link */}
           {prev ? (
             <SimpleTooltip content={`Previous: ${prev.title}`}>
@@ -138,11 +138,12 @@ export function DsaBottomBar({ currentSlug, bookMode = false }: DsaBottomBarProp
                 asChild
                 size="xs"
                 variant="outline"
-                className="gap-1 font-medium"
+                className="min-h-10 shrink-0 gap-1 px-2 font-medium sm:px-3"
               >
-                <Link href={prev.href}>
+                <Link href={prev.href} aria-label={`Previous lesson: ${prev.title}`}>
                   <ChevronLeft className="h-3.5 w-3.5 flex-shrink-0" />
-                  <span className="hidden sm:inline truncate max-w-[130px]">
+                  <span className="sm:hidden">Prev</span>
+                  <span className="hidden max-w-[130px] truncate sm:inline">
                     {prev.title}
                   </span>
                 </Link>
@@ -153,7 +154,7 @@ export function DsaBottomBar({ currentSlug, bookMode = false }: DsaBottomBarProp
           )}
 
           {/* Action Tools in Center */}
-          <div className="flex items-center gap-1 sm:gap-2">
+          <div className="flex shrink-0 items-center gap-0.5 sm:gap-2">
             <SmoothButton
               type="button"
               size="xs"
@@ -162,7 +163,7 @@ export function DsaBottomBar({ currentSlug, bookMode = false }: DsaBottomBarProp
               onClick={toggleStarred}
               aria-label={isStarred ? "Remove lesson bookmark" : "Bookmark lesson"}
               aria-pressed={isStarred}
-              className="gap-1 sm:gap-1.5"
+              className="min-h-10 min-w-10 gap-1 sm:gap-1.5"
             >
               <Star
                 className={`h-3.5 w-3.5 ${isStarred ? "fill-current text-amber-500" : ""}`}
@@ -178,7 +179,7 @@ export function DsaBottomBar({ currentSlug, bookMode = false }: DsaBottomBarProp
               onClick={toggleCompleted}
               aria-label={isCompleted ? "Mark lesson incomplete" : "Mark lesson complete"}
               aria-pressed={isCompleted}
-              className="gap-1 sm:gap-1.5"
+              className="min-h-10 min-w-10 gap-1 sm:gap-1.5"
             >
               <CircleCheck
                 className={`h-3.5 w-3.5 ${isCompleted ? "fill-current text-cyan-400" : ""}`}
@@ -189,6 +190,19 @@ export function DsaBottomBar({ currentSlug, bookMode = false }: DsaBottomBarProp
             <LessonNotebook
               currentSlug={currentSlug}
               bookMode={bookMode}
+              responsiveMoreMenu
+              mobileMoreAction={(
+                <button
+                  type="button"
+                  onClick={() => void toggleFullscreen()}
+                  aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+                  aria-pressed={isFullscreen}
+                  className="flex min-h-10 w-full items-center gap-1.5 rounded-md px-3 text-left text-sm text-foreground hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+                >
+                  {isFullscreen ? <Minimize className="h-4 w-4" /> : <Expand className="h-4 w-4" />}
+                  <span>{isFullscreen ? "Exit fullscreen" : "Fullscreen"}</span>
+                </button>
+              )}
               onBookModeChange={(enabled) => {
                 const path = `/learn/dsa/${currentSlug}`;
                 window.location.href = enabled ? `${path}?book=1` : path;
@@ -203,7 +217,7 @@ export function DsaBottomBar({ currentSlug, bookMode = false }: DsaBottomBarProp
                 onClick={() => void toggleFullscreen()}
                 aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
                 aria-pressed={isFullscreen}
-                className="text-muted-foreground hover:text-foreground"
+                className="hidden min-h-10 min-w-10 text-muted-foreground hover:text-foreground md:inline-flex"
               >
                 {isFullscreen ? <Minimize className="h-4 w-4" /> : <Expand className="h-4 w-4" />}
               </SmoothButton>
@@ -217,10 +231,11 @@ export function DsaBottomBar({ currentSlug, bookMode = false }: DsaBottomBarProp
                 asChild
                 size="xs"
                 variant="outline"
-                className="gap-1 font-medium"
+                className="min-h-10 shrink-0 gap-1 px-2 font-medium sm:px-3"
               >
-                <Link href={next.href}>
-                  <span className="hidden sm:inline truncate max-w-[130px]">
+                <Link href={next.href} aria-label={`Next lesson: ${next.title}`}>
+                  <span className="sm:hidden">Next</span>
+                  <span className="hidden max-w-[130px] truncate sm:inline">
                     {next.title}
                   </span>
                   <ChevronRight className="h-3.5 w-3.5 flex-shrink-0" />

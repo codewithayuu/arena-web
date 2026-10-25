@@ -22,13 +22,14 @@ import { BigOSimulation } from "@/components/animations/dsa/big-o-simulation";
 
 // Helper to create valid HTML id from heading children
 function slugifyHeading(children: React.ReactNode): string {
-  if (typeof children === "string") {
-    return children
-      .toLowerCase()
-      .replace(/[^\w\s-]/g, "")
-      .replace(/\s+/g, "-");
-  }
-  return "";
+  return extractTextNode(children)
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim()
+    .replace(/[^\w\s-]/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-");
 }
 
 // Helper to extract raw text content from React node tree
@@ -53,7 +54,7 @@ export const dsaMdxComponents = {
     const headingId = id || slugifyHeading(children);
     return (
       <h1
-        id={headingId}
+        id={headingId || undefined}
         className="text-2xl sm:text-3xl font-bold tracking-tight text-foreground mb-4 mt-8 pt-4 border-t border-border first:mt-0 first:pt-0 first:border-0 scroll-mt-28"
         {...props}
       >
@@ -69,7 +70,7 @@ export const dsaMdxComponents = {
     const headingId = id || slugifyHeading(children);
     return (
       <h2
-        id={headingId}
+        id={headingId || undefined}
         className="text-xl sm:text-2xl font-bold tracking-tight text-foreground mb-3 mt-6 scroll-mt-28"
         {...props}
       >
@@ -85,7 +86,7 @@ export const dsaMdxComponents = {
     const headingId = id || slugifyHeading(children);
     return (
       <h3
-        id={headingId}
+        id={headingId || undefined}
         className="text-lg font-bold text-foreground mb-2 mt-4 scroll-mt-28"
         {...props}
       >
@@ -111,7 +112,7 @@ export const dsaMdxComponents = {
     ...props
   }: React.HTMLAttributes<HTMLUListElement>) => (
     <ul
-      className={`list-disc list-inside space-y-2 mb-4 text-foreground/90 text-xs sm:text-sm pl-2 ${className}`}
+      className={`list-disc list-outside space-y-2 mb-4 text-foreground/90 text-sm sm:text-base pl-5 ${className}`}
       {...props}
     >
       {children}
@@ -123,7 +124,7 @@ export const dsaMdxComponents = {
     ...props
   }: React.HTMLAttributes<HTMLOListElement>) => (
     <ol
-      className={`list-decimal list-inside space-y-2 mb-4 text-foreground/90 text-xs sm:text-sm pl-2 ${className}`}
+      className={`list-decimal list-outside space-y-2 mb-4 text-foreground/90 text-sm sm:text-base pl-5 ${className}`}
       {...props}
     >
       {children}
@@ -228,13 +229,23 @@ export const dsaMdxComponents = {
     className = "",
     ...props
   }: React.TableHTMLAttributes<HTMLTableElement>) => (
-    <div className="my-6 overflow-x-auto rounded-xl border border-border/80 shadow-md">
-      <table
-        className={`min-w-full border-collapse text-left text-sm ${className}`}
-        {...props}
+    <div className="my-6">
+      <div
+        role="region"
+        aria-label="Scrollable table. Swipe horizontally to view all columns."
+        tabIndex={0}
+        className="overflow-x-auto rounded-xl border border-border/80 shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
       >
-        {children}
-      </table>
+        <table
+          className={`min-w-full border-collapse text-left text-sm ${className}`}
+          {...props}
+        >
+          {children}
+        </table>
+      </div>
+      <p aria-hidden="true" className="mt-2 text-xs text-muted-foreground sm:hidden">
+        Swipe horizontally to view more columns.
+      </p>
     </div>
   ),
   thead: ({
@@ -279,7 +290,7 @@ export const dsaMdxComponents = {
     ...props
   }: React.ThHTMLAttributes<HTMLTableCellElement>) => (
     <th
-      className={`px-3 sm:px-4 py-2.5 text-xs sm:text-sm font-bold text-foreground border-r last:border-r-0 border-border/50 ${className}`}
+      className={`px-3 sm:px-4 py-2.5 text-sm font-bold text-foreground border-r last:border-r-0 border-border/50 ${className}`}
       {...props}
     >
       {children}
@@ -291,7 +302,7 @@ export const dsaMdxComponents = {
     ...props
   }: React.TdHTMLAttributes<HTMLTableCellElement>) => (
     <td
-      className={`px-3 sm:px-4 py-2.5 text-xs sm:text-sm text-foreground/90 align-top border-r last:border-r-0 border-border/30 ${className}`}
+      className={`px-3 sm:px-4 py-2.5 text-sm text-foreground/90 align-top border-r last:border-r-0 border-border/30 ${className}`}
       {...props}
     >
       {children}

@@ -12,9 +12,7 @@ import {
   Award,
   FileText,
   FilePlay,
-  PlayCircle,
   CodeXml,
-  Menu,
   X,
   Layers,
 } from "lucide-react";
@@ -117,7 +115,9 @@ export function DsaSidebar({ course, activeSlug }: DsaSidebarProps) {
   const setIsCollapsed = sidebarContext
     ? sidebarContext.setIsCollapsed
     : setLocalCollapsed;
-  const [mobileOpen, setMobileOpen] = useState(false);
+  const [localMobileOpen, setLocalMobileOpen] = useState(false);
+  const mobileOpen = sidebarContext ? sidebarContext.mobileOpen : localMobileOpen;
+  const setMobileOpen = sidebarContext ? sidebarContext.setMobileOpen : setLocalMobileOpen;
   const [searchQuery, setSearchQuery] = useState("");
 
   // Find which module contains currentSlug
@@ -148,6 +148,28 @@ export function DsaSidebar({ course, activeSlug }: DsaSidebarProps) {
       }
     });
   }, [curriculum, currentSlug]);
+
+  useEffect(() => {
+    if (!mobileOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setMobileOpen(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [mobileOpen, setMobileOpen]);
+
+  useEffect(() => {
+    setMobileOpen(false);
+  }, [pathname, setMobileOpen]);
+
+  useEffect(() => {
+    const desktopBreakpoint = window.matchMedia("(min-width: 768px)");
+    const closeDrawerOnDesktop = () => {
+      if (desktopBreakpoint.matches) setMobileOpen(false);
+    };
+    desktopBreakpoint.addEventListener("change", closeDrawerOnDesktop);
+    return () => desktopBreakpoint.removeEventListener("change", closeDrawerOnDesktop);
+  }, [setMobileOpen]);
 
   const toggleModule = (title: string) => {
     setExpandedModules((prev) => ({
@@ -183,26 +205,11 @@ export function DsaSidebar({ course, activeSlug }: DsaSidebarProps) {
 
   return (
     <>
-      {/* Mobile Drawer Trigger (Floating on small screens) */}
-      <div className="md:hidden desktop:hidden fixed bottom-16 left-3 z-50">
-        <button
-          onClick={() => setMobileOpen(!mobileOpen)}
-          className="flex items-center gap-2 px-3.5 py-2.5 rounded-full bg-background border border-border shadow-xl text-sm font-medium text-foreground hover:bg-muted transition-colors"
-          aria-label="Toggle curriculum menu"
-        >
-          {mobileOpen ? (
-            <X className="h-4 w-4" />
-          ) : (
-            <Menu className="h-4 w-4" />
-          )}
-          <span>Course Menu</span>
-        </button>
-      </div>
-
       {/* Mobile Backdrop */}
       {mobileOpen && (
         <div
           className="md:hidden desktop:hidden fixed inset-0 z-40 bg-black/60 backdrop-blur-sm"
+          aria-hidden="true"
           onClick={() => setMobileOpen(false)}
         />
       )}
@@ -264,15 +271,19 @@ export function DsaSidebar({ course, activeSlug }: DsaSidebarProps) {
       <div
         className={`fixed top-20 bottom-14 z-50 transition-all duration-300 ease-in-out ${
           isCollapsed
-            ? "-translate-x-full opacity-0 pointer-events-none xl:w-0"
+            ? "md:-translate-x-full md:opacity-0 md:pointer-events-none xl:w-0"
             : "translate-x-0 opacity-100"
         } ${
           mobileOpen
-            ? "left-0 right-0 max-w-sm sm:max-w-md w-full px-2"
+            ? "left-0 right-0 max-w-sm sm:max-w-md w-full px-2 md:left-2 md:right-auto md:max-w-none md:w-[min(290px,38vw)] md:px-0"
             : "left-2 w-[min(290px,38vw)] hidden md:block desktop:block"
         }`}
       >
-        <nav className="relative h-full z-40 transition-all duration-300 ease-in-out overflow-visible">
+        <nav
+          id="dsa-course-sidebar"
+          aria-label="Course curriculum"
+          className="relative h-full z-40 transition-all duration-300 ease-in-out overflow-visible"
+        >
           {/* Desktop Collapse Button on right rail */}
           <SimpleTooltip content="Collapse menu" side="left">
             <SmoothButton

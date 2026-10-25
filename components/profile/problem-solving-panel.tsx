@@ -18,9 +18,19 @@ import {
   X,
 } from "lucide-react";
 import { SimpleTooltip } from "@/components/animate-ui/tooltip";
+import HeatMap from "@uiw/react-heat-map";
 import { getPlatformIconPath, VerifiedSealBadge } from "./verified-badge";
 import { ContestRatingApexChart } from "./contest-rating-apex-chart";
 import { ProblemSolvingVelocityApexChart } from "./problem-solving-velocity-apex-chart";
+
+const ACTIVITY_PANEL_COLORS: Record<number, string> = {
+  0: "#2a3038",
+  1: "#a1aa6d",
+  2: "#8cc665",
+  3: "#44a340",
+  4: "#1e6823",
+};
+const ACTIVITY_PANEL_COLOR_LEVELS = Object.values(ACTIVITY_PANEL_COLORS);
 
 interface ProblemSolvingPanelProps {
   profile: UserProfileData;
@@ -59,15 +69,60 @@ export function ProblemSolvingPanel({
   const medPct = Math.round((totalMedium / totalCalculated) * 100);
   const hardPct = Math.round((totalHard / totalCalculated) * 100);
 
-  // A calendar year view built from the synced per-platform activity records
-  const heatmapDays = useMemo(() => {
-    const firstDay = Date.UTC(selectedYear, 0, 1);
-    const start = firstDay - new Date(firstDay).getUTCDay() * 86_400_000;
-    return Array.from({ length: 371 }, (_, index) => {
-      const date = new Date(start + index * 86_400_000).toISOString().slice(0, 10);
-      return [date, date.startsWith(`${selectedYear}-`) ? profile.submissionHeatmap[date] ?? 0 : 0] as const;
-    });
-  }, [profile.submissionHeatmap, selectedYear]);
+  // Use the same calendar heatmap library and palette as the topic-list activity view.
+  const heatmapValues = useMemo(
+    () =>
+      Object.entries(profile.submissionHeatmap)
+        .filter(([date, count]) => date.startsWith(String(selectedYear) + "-") && count > 0)
+        .map(([date, count]) => ({ date: date.split("-").join("/"), count })),
+    [profile.submissionHeatmap, selectedYear]
+  );
+  const heatmapRange = useMemo(
+    () => ({
+      startDate: new Date(selectedYear, 0, 1),
+      endDate: new Date(selectedYear, 11, 31),
+    }),
+    [selectedYear]
+  );
+  const activityStreaks = useMemo(() => {
+    const activityDays = Object.entries(profile.submissionHeatmap)
+      .filter(
+        ([date, count]) =>
+          /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(date) &&
+          Number.isFinite(count) &&
+          count > 0
+      )
+      .map(([date]) => Math.floor(Date.parse(date + "T00:00:00Z") / 86_400_000))
+      .filter(Number.isFinite)
+      .sort((left, right) => left - right);
+
+    if (activityDays.length === 0) {
+      return {
+        currentStreak: profile.currentStreak,
+        maxStreak: profile.maxStreak,
+      };
+    }
+
+    let maxStreak = 0;
+    let currentRun = 0;
+    let previousDay: number | null = null;
+    for (const day of activityDays) {
+      currentRun = previousDay !== null && day === previousDay + 1 ? currentRun + 1 : 1;
+      maxStreak = Math.max(maxStreak, currentRun);
+      previousDay = day;
+    }
+
+    const now = new Date();
+    const today = Math.floor(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) / 86_400_000
+    );
+    const lastActiveDay = activityDays[activityDays.length - 1];
+
+    return {
+      currentStreak: lastActiveDay === today || lastActiveDay === today - 1 ? currentRun : 0,
+      maxStreak,
+    };
+  }, [profile.currentStreak, profile.maxStreak, profile.submissionHeatmap]);
 
   const totalActivityEvents = useMemo(() => {
     return Object.entries(profile.submissionHeatmap)
@@ -156,12 +211,17 @@ export function ProblemSolvingPanel({
           </div>
           <div className="my-auto py-2">
             <span className="text-5xl font-extrabold font-sans text-white tracking-tight tabular-nums">
-              {profile.totalActiveDays || "—"}
+              {profile.totalActiveDays ?? "—"}
             </span>
           </div>
           <div className="text-[11px] font-medium text-zinc-400 flex items-center justify-center gap-1">
             <Flame className="w-3 h-3 text-[#ff1018]" />
-            <span>Current streak: <strong className="text-white">{profile.currentStreak ?? 0}d</strong></span>
+            <span>
+              Current streak:{" "}
+              <strong className="text-white">
+                {activityStreaks.currentStreak == null ? "—" : activityStreaks.currentStreak + "d"}
+              </strong>
+            </span>
           </div>
         </div>
 
@@ -169,15 +229,21 @@ export function ProblemSolvingPanel({
         <div className="col-span-1 md:col-span-2 lg:col-span-3 rounded-xl border border-white/10 bg-black p-4 flex flex-col justify-between relative shadow-sm overflow-hidden min-h-[170px]">
           {/* Heatmap Header */}
           <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-white/10">
-            <div className="flex items-center gap-3">
+            <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
               <span className="text-xs font-semibold text-white">
                 {totalActivityEvents.toLocaleString()} <span className="text-zinc-400 font-normal">Submissions in {selectedYear}</span>
               </span>
               <span className="text-xs text-zinc-400">
-                Max Streak: <strong className="text-white font-bold">{profile.maxStreak ?? 0}</strong>
+                Max Streak:{" "}
+                <strong className="text-white font-bold">
+                  {activityStreaks.maxStreak == null ? "—" : activityStreaks.maxStreak + "d"}
+                </strong>
               </span>
               <span className="text-xs text-zinc-400">
-                Current: <strong className="text-white font-bold">{profile.currentStreak ?? 0}</strong>
+                Current:{" "}
+                <strong className="text-white font-bold">
+                  {activityStreaks.currentStreak == null ? "—" : activityStreaks.currentStreak + "d"}
+                </strong>
               </span>
             </div>
 
@@ -200,50 +266,61 @@ export function ProblemSolvingPanel({
             </div>
           </div>
 
-          {/* 53 x 7 Calendar Grid */}
-          <div className="w-full py-2.5 overflow-x-auto no-scrollbar">
-            <div
-              role="grid"
-              aria-label={`${selectedYear} activity heatmap`}
-              className="grid w-full grid-cols-[repeat(53,minmax(0,1fr))] gap-x-0.5"
-            >
-              {Array.from({ length: 53 }).map((_, colIdx) => (
-                <div key={colIdx} role="row" className="grid min-w-0 grid-rows-7 gap-y-0.5">
-                  {Array.from({ length: 7 }).map((_, rowIdx) => {
-                    const dayIdx = colIdx * 7 + rowIdx;
-                    const dayData = heatmapDays[dayIdx];
-                    const count = dayData ? dayData[1] : 0;
-                    const dateStr = dayData ? dayData[0] : "";
-
-                    let bgClass = "bg-[#141418]";
-                    if (count > 0 && count <= 2) bgClass = "bg-emerald-950 border border-emerald-800";
-                    else if (count > 2 && count <= 5) bgClass = "bg-emerald-700";
-                    else if (count > 5) bgClass = "bg-emerald-400";
-
-                    return (
-                      <SimpleTooltip key={rowIdx} content={`${count} submissions on ${dateStr || "N/A"}`}>
-                        <div
-                          role="gridcell"
-                          aria-label={`${count} submissions on ${dateStr}`}
-                          className={`aspect-square w-full max-w-[0.75rem] justify-self-center rounded-[2px] transition-transform hover:scale-125 ${bgClass}`}
-                        />
-                      </SimpleTooltip>
-                    );
-                  })}
-                </div>
-              ))}
+          {/* Year Activity Heatmap */}
+          <p className="mb-1 text-[10px] text-zinc-500 sm:hidden">
+            Swipe or scroll horizontally to view the full year.
+          </p>
+          <div
+            role="region"
+            aria-label={selectedYear + " activity heatmap. Scroll horizontally to explore all months."}
+            tabIndex={0}
+            className="w-full overflow-x-auto overscroll-x-contain py-2.5 focus-visible:outline focus-visible:outline-1 focus-visible:outline-emerald-400"
+          >
+            <div className="min-w-[600px]">
+              <HeatMap
+                value={heatmapValues}
+                startDate={heatmapRange.startDate}
+                endDate={heatmapRange.endDate}
+                rectSize={9}
+                space={2}
+                rectProps={{ rx: 2 }}
+                weekLabels={false}
+                monthPlacement="top"
+                legendCellSize={0}
+                panelColors={ACTIVITY_PANEL_COLORS}
+                className="block w-full select-none text-zinc-400"
+                aria-label={selectedYear + " coding activity heatmap with " + totalActivityEvents + " submissions"}
+                role="img"
+                rectRender={(props, data) => {
+                  const count = data.count ?? 0;
+                  const level = count === 0 ? 0 : Math.min(Math.ceil(count / 2), 4);
+                  const date = data.date.split("/").join("-");
+                  const label =
+                    count + (count === 1 ? " submission on " : " submissions on ") + date;
+                  return (
+                    <rect
+                      {...props}
+                      fill={ACTIVITY_PANEL_COLOR_LEVELS[level] ?? ACTIVITY_PANEL_COLORS[0]}
+                      rx={2}
+                      title={label}
+                      aria-label={label}
+                    />
+                  );
+                }}
+              />
             </div>
           </div>
 
           {/* Legend Footer */}
-          <div className="flex items-center justify-between pt-1 text-[10px] text-zinc-400">
-            <span className="text-[10px] text-zinc-500">Synced across LeetCode, Codeforces, CodeChef, and GeeksforGeeks</span>
+          <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 pt-1 text-[10px] text-zinc-400">
+            <span className="text-[10px] text-zinc-500">Activity from connected platforms</span>
             <div className="flex items-center gap-1">
               <span>Less</span>
-              <div className="w-2.5 h-2.5 rounded-[2px] bg-[#141418]" />
-              <div className="w-2.5 h-2.5 rounded-[2px] bg-emerald-950 border border-emerald-800" />
-              <div className="w-2.5 h-2.5 rounded-[2px] bg-emerald-700" />
-              <div className="w-2.5 h-2.5 rounded-[2px] bg-emerald-400" />
+              <div className="w-2.5 h-2.5 rounded-[2px] bg-[#2a3038] border border-white/10" />
+              <div className="w-2.5 h-2.5 rounded-[2px] bg-[#a1aa6d] border border-white/10" />
+              <div className="w-2.5 h-2.5 rounded-[2px] bg-[#8cc665] border border-white/10" />
+              <div className="w-2.5 h-2.5 rounded-[2px] bg-[#44a340] border border-white/10" />
+              <div className="w-2.5 h-2.5 rounded-[2px] bg-[#1e6823] border border-white/10" />
               <span>More</span>
             </div>
           </div>

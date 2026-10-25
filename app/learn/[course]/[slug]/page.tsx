@@ -1,4 +1,5 @@
 import React from 'react';
+import remarkGfm from 'remark-gfm';
 import { Metadata } from 'next';
 import { notFound } from 'next/navigation';
 import fs from 'fs';
@@ -8,6 +9,7 @@ import { dsaMdxComponents } from '@/components/dsa/mdx-components';
 import { compileMDX } from 'next-mdx-remote/rsc';
 import { getCourseTitle } from '@/lib/curriculum-data';
 import { parseMdxFrontmatter, cleanMdxSource } from '@/lib/mdx-sanitizer';
+import { MdxRenderError } from '@/components/dsa/mdx-render-error';
 
 interface PageProps {
   params: Promise<{
@@ -91,6 +93,9 @@ export default async function GenericCourseLessonPage({ params }: PageProps) {
         components: dsaMdxComponents,
         options: {
           parseFrontmatter: false,
+          mdxOptions: {
+            remarkPlugins: [remarkGfm],
+          },
         },
       });
       ContentComponent = compiledContent;
@@ -102,9 +107,11 @@ export default async function GenericCourseLessonPage({ params }: PageProps) {
 
   if (!loaded) {
     ContentComponent = (
-      <div className="prose dark:prose-invert max-w-none whitespace-pre-wrap font-sans text-sm text-foreground/90">
-        {content}
-      </div>
+      <MdxRenderError
+        courseTitle={courseTitle}
+        backHref={`/learn/${course}`}
+        backLabel={`Back to ${courseTitle} lessons`}
+      />
     );
   }
 
