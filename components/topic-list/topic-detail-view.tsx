@@ -1035,7 +1035,7 @@ export function TopicDetailView({ topic, initialProblems }: TopicDetailViewProps
                               </div>
                             </td>
 
-                            {/* Column 5: DIFFICULTY (Exact typography from /practice/company/google) */}
+                            {/* Column 5: DIFFICULTY */}
                             <td className="py-3 px-3 text-center align-middle shrink-0">
                               <span
                                 className={`font-semibold text-xs sm:text-sm ${

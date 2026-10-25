@@ -18,7 +18,7 @@ export function CompanyProblemsCard() {
       </p>
       <div className="pt-2">
         <Link
-          href="/practice/company"
+          href="/practice/dsa-patterns"
           className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-border bg-background hover:bg-muted font-medium text-xs sm:text-sm transition-colors text-foreground"
         >
           <span>Explore Company-Wise Problems</span>

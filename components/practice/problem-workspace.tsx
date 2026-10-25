@@ -838,17 +838,7 @@ function ProblemWorkspaceInner({
             {/* Close back to practice list */}
             <SimpleTooltip content="Exit to Problems List">
               <Link
-                href={
-                  listParam === "system-design"
-                    ? "/practice/system-design"
-                    : listParam === "concurrency"
-                      ? "/practice/concurrency"
-                      : listParam === "low-level-design"
-                        ? "/practice/low-level-design"
-                        : listParam?.startsWith("company-")
-                          ? `/practice/company/${listParam.replace("company-", "")}`
-                          : "/practice/dsa-patterns"
-                }
+                href="/practice/dsa-patterns"
                 className="p-1.5 rounded-lg text-zinc-400 hover:text-rose-400 hover:bg-rose-500/10 border border-transparent hover:border-rose-500/20 transition-colors"
               >
                 <X className="w-4 h-4" />

@@ -52,14 +52,6 @@ const PRACTICE_ITEMS: MegaItem[] = [
     href: "/practice/dsa-patterns",
     icon: Sparkles,
   },
-  {
-    title: "Company Tracks",
-    category: "INTERVIEWS",
-    badge: "New",
-    description: "Targeted problem banks for Google, Amazon, Meta, Microsoft & top engineering firms.",
-    href: "/practice/company/google",
-    icon: Workflow,
-  },
 ];
 
 const LEARN_ITEMS: MegaItem[] = [
@@ -264,7 +256,7 @@ export function Navbar() {
 
               {/* Hover Tab 1: Practice */}
               <Link
-                href="/practice"
+                href="/practice/dsa-patterns"
                 onMouseEnter={() => openTab("practice")}
                 className={`h-8 flex items-center px-2.5 lg:px-3.5 text-xs lg:text-sm font-medium rounded-full transition-all duration-200 ${activeTab === "practice" || (pathname.startsWith("/practice") && !activeTab)
                     ? "bg-white/[0.14] text-white shadow-inner"
@@ -296,18 +288,6 @@ export function Navbar() {
                   }`}
               >
                 Contests
-              </Link>
-              <Link
-                href="/deadlock"
-                aria-label="Enter the Deadlock Arena"
-                aria-current={pathname.startsWith("/deadlock") ? "page" : undefined}
-                onMouseEnter={() => openTab(null)}
-                className={`h-8 flex items-center px-2.5 lg:px-3.5 text-xs lg:text-sm font-medium rounded-full transition-all duration-200 ${pathname.startsWith("/deadlock") && !activeTab
-                    ? "bg-white/[0.14] text-white shadow-inner"
-                    : "text-zinc-300 hover:text-white hover:bg-white/[0.08]"
-                  }`}
-              >
-                Deadlock
               </Link>
             </nav>
 
@@ -385,7 +365,7 @@ export function Navbar() {
                 {/* TAB 1: PRACTICE MEGA MENU */}
                 {activeTab === "practice" && (
                   <div>
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3.5">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
                       {PRACTICE_ITEMS.map((card) => {
                         const IconComponent = card.icon;
                         return (
@@ -424,10 +404,10 @@ export function Navbar() {
 
                     <div className="mt-4 pt-3.5 border-t border-white/[0.08] flex items-center justify-between text-xs">
                       <span className="text-zinc-400">
-                        Plus 500+ problems across all tiers. Updated weekly.
+                        Curated algorithmic interview patterns & topic problem sets.
                       </span>
                       <Link
-                        href="/practice"
+                        href="/practice/dsa-patterns"
                         className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-white/[0.08] hover:bg-white/[0.15] border border-white/[0.1] text-white font-medium transition-colors"
                       >
                         <span>Explore all practice</span>
@@ -644,18 +624,6 @@ export function Navbar() {
 
                       <li>
                         <Link
-                          href="/deadlock"
-                          aria-current={pathname.startsWith("/deadlock") ? "page" : undefined}
-                          onClick={() => setMobileMenuOpen(false)}
-                          className={`flex h-9 items-center justify-between rounded-xl px-3 text-xs sm:text-[13px] font-medium transition-all ${pathname.startsWith("/deadlock") ? "bg-white/[0.12] text-white" : "text-zinc-200 hover:bg-white/[0.06] hover:text-white"
-                            }`}
-                        >
-                          <span>Deadlock Arena</span>
-                        </Link>
-                      </li>
-
-                      <li>
-                        <Link
                           href="/courses"
                           onClick={() => setMobileMenuOpen(false)}
                           className="flex h-9 items-center justify-between rounded-xl px-3 text-xs sm:text-[13px] font-medium text-zinc-200 hover:bg-white/[0.06] hover:text-white transition-all"
@@ -739,7 +707,7 @@ export function Navbar() {
 
                     <div className="mt-2 pt-2 border-t border-white/[0.08]">
                       <Link
-                        href="/practice"
+                        href="/practice/dsa-patterns"
                         onClick={() => setMobileMenuOpen(false)}
                         className="w-full flex items-center justify-center gap-1.5 py-2 rounded-xl bg-white/[0.08] text-white text-[11px] font-semibold hover:bg-white/[0.15] transition-colors"
                       >

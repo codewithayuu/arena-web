@@ -420,7 +420,7 @@ export default function RoadmapsPage() {
           <div className="relative z-10">
             <AnimateIcon animateOnHover asChild>
               <Link
-                href="/practice"
+                href="/practice/dsa-patterns"
                 className="inline-flex items-center gap-2 px-6 py-3 rounded-xl bg-[#e83040] hover:bg-[#d02535] text-white text-sm font-semibold transition-all shadow-lg shadow-red-500/30 active:scale-95 cursor-pointer"
               >
                 <span>Explore Practice Hub</span>

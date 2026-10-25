@@ -132,7 +132,7 @@ const OUTCOME_TRACKS: Record<string, RecommendedTrack> = {
     description:
       "Solve quantitative distributed architecture problems with an in-browser Monaco editor: Little's Law, Amdahl's Law, Consistent Hashing, Availability 9s, and Rate Limiting algorithms.",
     firstProblemTitle: "Consistent Hashing & Token Bucket Limits",
-    firstProblemUrl: "/practice/system-design",
+    firstProblemUrl: "/practice/dsa-patterns",
     roadmapTitle: "System Design Career Roadmap",
     roadmapUrl: "/roadmaps",
     estimatedTime: "8–10 Weeks",
@@ -146,7 +146,7 @@ const OUTCOME_TRACKS: Record<string, RecommendedTrack> = {
     description:
       "Master synchronization primitives, mutexes, semaphores, barriers, and deadlock prevention. Write and test real multi-threaded code under simulated race conditions.",
     firstProblemTitle: "Producer-Consumer Mutex Synchronization",
-    firstProblemUrl: "/practice/concurrency",
+    firstProblemUrl: "/practice/dsa-patterns",
     roadmapTitle: "Concurrency Engineering Guide",
     roadmapUrl: "/roadmaps",
     estimatedTime: "6–8 Weeks",
@@ -160,7 +160,7 @@ const OUTCOME_TRACKS: Record<string, RecommendedTrack> = {
     description:
       "Implement extensible object-oriented systems and GoF design patterns (Strategy, Factory, Observer, Decorator) validated against real automated test suites.",
     firstProblemTitle: "Design LRU Cache with Clean OOD",
-    firstProblemUrl: "/practice/low-level-design",
+    firstProblemUrl: "/practice/dsa-patterns",
     roadmapTitle: "Low-Level Design Roadmaps",
     roadmapUrl: "/roadmaps",
     estimatedTime: "6–8 Weeks",

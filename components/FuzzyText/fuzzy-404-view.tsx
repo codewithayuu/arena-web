@@ -62,7 +62,7 @@ export function Fuzzy404View() {
         </Link>
 
         <Link
-          href="/practice"
+          href="/practice/dsa-patterns"
           className="flex-1 min-w-[160px] inline-flex items-center justify-center gap-2 px-6 py-3.5 rounded-full border border-white/10 hover:border-white/25 bg-white/[0.04] hover:bg-white/[0.08] text-zinc-200 hover:text-white font-medium text-sm backdrop-blur-md transition-all duration-200 active:scale-[0.98]"
         >
           <Code2 className="w-4 h-4 text-zinc-400" />

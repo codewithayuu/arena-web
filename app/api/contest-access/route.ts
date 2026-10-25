@@ -15,13 +15,13 @@ export async function POST(request:NextRequest) {
   const keyDigest=createHash("sha256").update(input.key.trim()).digest("hex");
   const response=await supabaseRequest(supabaseRpcUrl("resolve_contest_temporary_key"),{method:"POST",headers:{"Content-Type":"application/json"},
    body:JSON.stringify({p_key_sha256:keyDigest})});
-  if(!response.ok)return NextResponse.json({code:"INVALID_EXPIRED_OR_USED_KEY"},{status:403});
+  if(!response.ok)return NextResponse.json({code:response.status>=500?"TEMPORARY_SIGN_IN_UNAVAILABLE":"INVALID_EXPIRED_OR_USED_KEY"},{status:response.status>=500?503:403,headers:{"Cache-Control":"no-store"}});
   const value=await response.json();
   const client=await clerkClient();
   const signIn=await client.signInTokens.createSignInToken({userId:value.clerk_user_id,expiresInSeconds:60});
   const consumed=await supabaseRequest(supabaseRpcUrl("consume_contest_temporary_key"),{method:"POST",headers:{"Content-Type":"application/json"},
    body:JSON.stringify({p_key_sha256:keyDigest})});
-  if(!consumed.ok)return NextResponse.json({code:"INVALID_EXPIRED_OR_USED_KEY"},{status:403,headers:{"Cache-Control":"no-store"}});
+  if(!consumed.ok)return NextResponse.json({code:consumed.status>=500?"TEMPORARY_SIGN_IN_UNAVAILABLE":"INVALID_EXPIRED_OR_USED_KEY"},{status:consumed.status>=500?503:403,headers:{"Cache-Control":"no-store"}});
   const url=new URL(signIn.url);
   if(url.protocol!=="https:")throw new Error();
   url.searchParams.set("redirect_url",new URL(`/contests/${value.contest_id}`,request.url).toString());

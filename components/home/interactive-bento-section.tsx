@@ -64,7 +64,7 @@ export function InteractiveBentoSection() {
           </div>
 
           <Link
-            href="/practice"
+            href="/practice/dsa-patterns"
             className="group inline-flex items-center gap-2 text-sm font-medium text-zinc-300 hover:text-white transition-colors"
           >
             <span>Explore All 350+ Live Simulators</span>

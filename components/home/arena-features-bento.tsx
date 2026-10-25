@@ -97,7 +97,7 @@ export function ArenaFeaturesBento() {
           </div>
 
           <Link
-            href="/practice"
+            href="/practice/dsa-patterns"
             className="group shrink-0 inline-flex items-center gap-2 px-8 py-4 rounded-full bg-[#FF1018] hover:bg-[#E00C14] text-white font-medium text-base shadow-xl shadow-[#FF1018]/25 transition-all duration-200 active:scale-[0.98]"
           >
             <span>Start Practicing Now</span>

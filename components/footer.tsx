@@ -139,22 +139,6 @@ export function Footer() {
                     title: "DSA Patterns",
                     href: "/practice/dsa-patterns",
                   },
-                  {
-                    title: "System Design",
-                    href: "/practice/system-design",
-                  },
-                  {
-                    title: "Concurrency",
-                    href: "/practice/concurrency",
-                  },
-                  {
-                    title: "Low Level Design",
-                    href: "/practice/low-level-design",
-                  },
-                  {
-                    title: "Companies",
-                    href: "/practice/company/google",
-                  },
                 ].map((item) => (
                   <li key={item.title}>
                     <Link

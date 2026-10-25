@@ -54,7 +54,7 @@ function parseProvisionInput(
   };
 }
 
-async function readGatewayObject(response: Response, status: number): Promise<Record<string, unknown>> {
+async function readGatewayObject(response: Response): Promise<Record<string, unknown>> {
   if (!response.ok) throw new RequestFailure(response.status);
   return readBoundedJson(response, 1024 * 1024);
 }
@@ -103,7 +103,7 @@ export async function POST(
           `/v1/admin/contests/${targetContestId}/runtime-controls`, bearer,
           { method: "GET", headers: { "Cache-Control": "no-store" } },
         );
-        const value = await readGatewayObject(response, response.status);
+        const value = await readGatewayObject(response);
         if (typeof value.state !== "string" || (value.ends_at !== null && typeof value.ends_at !== "string")) {
           throw new RequestFailure(503);
         }
@@ -166,7 +166,7 @@ export async function POST(
             body: JSON.stringify(command),
           },
         );
-        const value = await readGatewayObject(response, response.status);
+        const value = await readGatewayObject(response);
         if (typeof value.user_id !== "string" || typeof value.expires_at !== "string" || typeof value.key_count !== "number") {
           throw new RequestFailure(503);
         }

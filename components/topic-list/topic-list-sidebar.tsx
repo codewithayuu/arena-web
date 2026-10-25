@@ -192,10 +192,10 @@ export function TopicListSidebar({
         sectionTitle: 'Practice',
         items: [
           {
-            id: 'mixed-practice',
-            label: 'Mixed Practice',
+            id: 'dsa-patterns',
+            label: 'DSA Patterns',
             icon: FaMix,
-            href: '/practice',
+            href: '/practice/dsa-patterns',
             badge: <span className="text-xs font-semibold text-emerald-400 font-mono">Arena</span>,
           },
         ],
