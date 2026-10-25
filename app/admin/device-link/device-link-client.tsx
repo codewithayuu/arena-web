@@ -3,6 +3,7 @@
 import { SignIn, useAuth, useReverification } from "@clerk/nextjs";
 import { useEffect, useRef, useState } from "react";
 import SmoothButton from "@/components/smoothui/smooth-button";
+import { PageLoading } from "@/components/ui/page-loading";
 
 function validHandoff(state: string, callback: string): boolean {
   if (!/^[A-Za-z0-9_-]{32,128}$/.test(state)) return false;
@@ -90,7 +91,7 @@ export function DeviceLinkClient({ state, callback }: { state: string; callback:
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connected, isLoaded, isSignedIn, state, callback]);
 
-  if (!isLoaded) return <main className="min-h-screen bg-[#08090c] p-8 text-white">Loading Mindflare sign-in…</main>;
+  if (!isLoaded) return <PageLoading variant="device-link" label="secure desktop sign-in" />;
   if (!isSignedIn) {
     return <main className="flex min-h-screen flex-col items-center justify-center gap-5 bg-[#08090c] p-6 text-white">
       <p className="max-w-md text-center text-sm text-zinc-300">Sign in to Mindflare to connect the desktop Admin Companion. Administrative tools stay in the desktop app.</p>

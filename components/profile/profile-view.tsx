@@ -13,6 +13,7 @@ import { JourneyAboutPanel } from "./journey-about-panel";
 import { ConnectAccountsModal } from "./connect-accounts-modal";
 import { EditProfileModal } from "./edit-profile-modal";
 import { ShareProfileModal } from "./share-profile-modal";
+import { PageLoading } from "@/components/ui/page-loading";
 
 interface ProfileViewProps {
   initialUsername: string;
@@ -327,7 +328,7 @@ export function ProfileView({ initialUsername, initialTab = "problemSolving" }: 
   };
 
   if (isProfileLoading) {
-    return <div role="status" className="mx-auto max-w-4xl px-6 py-24 text-center text-sm text-zinc-400">Loading profile…</div>;
+    return <PageLoading variant="profile" label="member profile" embedded />;
   }
 
   if (profileLoadError) {

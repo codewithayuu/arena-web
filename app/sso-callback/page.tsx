@@ -32,7 +32,7 @@ function SSOCallbackHandler() {
 export default function SSOCallbackPage() {
   return (
     <div className="flex min-h-screen items-center justify-center bg-black text-white">
-      <Suspense fallback={<p>Completing sign-in…</p>}>
+      <Suspense fallback={<p role="status" aria-live="polite" className="text-sm text-zinc-400">Completing sign-in…</p>}>
         <SSOCallbackHandler />
       </Suspense>
     </div>

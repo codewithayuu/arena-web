@@ -3,14 +3,11 @@
 import React, { useMemo } from "react";
 import dynamic from "next/dynamic";
 import type { ApexOptions } from "apexcharts";
+import { ChartLoading } from "@/components/ui/visual-loading";
 
 const ReactApexChart = dynamic(() => import("react-apexcharts"), {
   ssr: false,
-  loading: () => (
-    <div className="w-full h-[260px] rounded-xl bg-[#0d0d12] border border-white/5 animate-pulse flex items-center justify-center text-xs font-mono text-zinc-500">
-      Loading activity analytics...
-    </div>
-  ),
+  loading: () => <ChartLoading label="activity chart" kind="activity" height={260} />,
 });
 
 interface ProblemSolvingVelocityApexChartProps {

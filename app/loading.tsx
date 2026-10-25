@@ -1,5 +1,5 @@
-import { PhantomPageSkeleton } from "@/components/ui/phantom";
+import { RootLoadingFallback } from "@/components/ui/page-loading";
 
 export default function Loading() {
-  return <PhantomPageSkeleton />;
+  return <RootLoadingFallback />;
 }

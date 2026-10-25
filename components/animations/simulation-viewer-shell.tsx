@@ -23,14 +23,9 @@ import {
 import dynamic from "next/dynamic";
 import { Navbar } from "@/components/navbar";
 import { Footer } from "@/components/footer";
+import { SimulationLoading } from "@/components/ui/visual-loading";
 
-const SimulationLoadingState = () => (
-  <div
-    aria-busy="true"
-    aria-label="Loading interactive simulation"
-    className="min-h-[420px] rounded-2xl border border-white/10 bg-black animate-pulse"
-  />
-);
+const SimulationLoadingState = () => <SimulationLoading label="interactive algorithm simulation" />;
 
 const SIMULATION_COMPONENTS = {
   "big-o": dynamic(() => import("./dsa/big-o-simulation").then((module) => module.BigOSimulation), { ssr: false, loading: SimulationLoadingState }),

@@ -23,9 +23,21 @@ const BinarySearchTreeSimulation = dynamic(
 
 function SimulationLoadingCard({ title }: { title: string }) {
   return (
-    <div className="w-full h-72 rounded-2xl bg-zinc-950/40 border border-white/5 animate-pulse flex flex-col items-center justify-center p-6 text-zinc-600">
-      <div className="h-6 w-32 bg-white/5 rounded-md mb-2" />
-      <span className="text-xs font-mono">Loading {title}...</span>
+    <div role="status" aria-busy="true" aria-live="polite" className="relative flex h-72 w-full flex-col justify-between overflow-hidden rounded-2xl border border-white/5 bg-zinc-950/40 p-5">
+      <span className="sr-only">Loading {title} visualization</span>
+      <div aria-hidden="true" className="space-y-3">
+        <div className="h-4 w-36 rounded-md bg-white/[0.07] animate-pulse motion-reduce:animate-none" />
+        <div className="h-3 w-52 max-w-full rounded-md bg-white/[0.04] animate-pulse motion-reduce:animate-none" />
+      </div>
+      <div aria-hidden="true" className="flex items-center justify-around gap-3">
+        <div className="h-10 w-10 rounded-lg bg-white/[0.06] animate-pulse motion-reduce:animate-none" />
+        <div className="h-16 w-16 rounded-full bg-white/[0.07] animate-pulse motion-reduce:animate-none" />
+        <div className="h-12 w-12 rounded-lg bg-white/[0.05] animate-pulse motion-reduce:animate-none" />
+      </div>
+      <div aria-hidden="true" className="flex items-center gap-2 border-t border-white/[0.05] pt-3">
+        <div className="h-2 flex-1 rounded-full bg-white/[0.05] animate-pulse motion-reduce:animate-none" />
+        <div className="h-7 w-20 rounded-md bg-white/[0.06] animate-pulse motion-reduce:animate-none" />
+      </div>
     </div>
   );
 }

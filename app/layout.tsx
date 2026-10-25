@@ -3,11 +3,10 @@ import { dark } from "@clerk/themes";
 import { Suspense, type ReactNode } from "react";
 import { Plus_Jakarta_Sans, JetBrains_Mono } from "next/font/google";
 import "./styles.css";
-import "@aejkatappaja/phantom-ui/ssr.css";
 import { TooltipProvider } from "@/components/animate-ui/tooltip";
 import { AccountSyncStatus } from "@/components/topic-list/account-sync-status";
 import { UserPresenceAvatar } from "@/components/animate-ui/components/community/user-presence-avatar";
-import { PhantomNavigationIndicator } from "@/components/ui/phantom-navigation";
+import { NavigationProgressIndicator } from "@/components/ui/navigation-progress-indicator";
 
 const fontSans = Plus_Jakarta_Sans({
   subsets: ["latin"],
@@ -97,7 +96,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
           {/* Page Content above BG */}
           <div className="relative z-10 flex min-h-screen flex-col">
             <Suspense fallback={null}>
-              <PhantomNavigationIndicator />
+              <NavigationProgressIndicator />
             </Suspense>
             <AccountSyncStatus />
             <UserPresenceAvatar />

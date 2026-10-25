@@ -1,5 +1,6 @@
 import { Suspense } from "react";
 import { DeviceLinkClient } from "./device-link-client";
+import { PageLoading } from "@/components/ui/page-loading";
 
 export default async function AdminDeviceLinkPage({
   searchParams,
@@ -8,7 +9,7 @@ export default async function AdminDeviceLinkPage({
 }) {
   const params = await searchParams;
   return (
-    <Suspense fallback={<main className="min-h-screen bg-[#08090c] p-8 text-white">Loading secure desktop sign-in…</main>}>
+    <Suspense fallback={<PageLoading variant="device-link" label="secure desktop sign-in" />}>
       <DeviceLinkClient state={params.state ?? ""} callback={params.callback ?? ""} />
     </Suspense>
   );

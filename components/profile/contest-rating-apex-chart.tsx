@@ -4,14 +4,11 @@ import React, { useMemo } from "react";
 import dynamic from "next/dynamic";
 import type { ApexOptions } from "apexcharts";
 import { ContestHistoryItem } from "@/lib/profile-data";
+import { ChartLoading } from "@/components/ui/visual-loading";
 
 const ReactApexChart = dynamic(() => import("react-apexcharts"), {
   ssr: false,
-  loading: () => (
-    <div className="w-full h-[280px] rounded-xl bg-[#0d0d12] border border-white/5 animate-pulse flex items-center justify-center text-xs font-mono text-zinc-500">
-      Loading contest chart...
-    </div>
-  ),
+  loading: () => <ChartLoading label="connected platform rating chart" kind="rating" height={280} />,
 });
 
 interface ContestRatingApexChartProps {

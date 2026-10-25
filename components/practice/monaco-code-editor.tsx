@@ -5,6 +5,7 @@ import dynamic from "next/dynamic";
 import { loader } from "@monaco-editor/react";
 import { configureMonacoLoader } from "@/lib/monaco-loader";
 import { monacoLanguageId } from "@/lib/monaco-language";
+import { EditorLoading } from "@/components/ui/visual-loading";
 
 // SEB permits only the pinned exam origin and launcher loopback. Serve Monaco
 // from this app's origin instead of the loader's default public CDN.
@@ -12,14 +13,7 @@ configureMonacoLoader(loader);
 
 const Editor = dynamic(() => import("@monaco-editor/react"), {
   ssr: false,
-  loading: () => (
-    <div className="w-full h-full min-h-[300px] flex items-center justify-center bg-black text-muted-foreground font-mono text-xs">
-      <div className="flex items-center gap-2">
-        <div className="w-4 h-4 border-2 border-[#FF1018] border-t-transparent rounded-full animate-spin" />
-        <span className="text-zinc-400">Loading Editor...</span>
-      </div>
-    </div>
-  ),
+  loading: () => <EditorLoading label="Monaco code editor" />,
 });
 
 interface MonacoCodeEditorProps {

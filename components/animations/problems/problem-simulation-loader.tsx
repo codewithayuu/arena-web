@@ -3,16 +3,9 @@
 import dynamic from "next/dynamic";
 import Link from "next/link";
 import { ArrowLeft, Sparkles } from "lucide-react";
+import { SimulationLoading } from "@/components/ui/visual-loading";
 
-const SimulationLoadingState = () => (
-  <div className="min-h-screen bg-transparent p-8 flex items-center justify-center relative z-10">
-    <div
-      aria-busy="true"
-      aria-label="Loading problem simulation"
-      className="h-[28rem] w-full max-w-6xl animate-pulse rounded-2xl border border-white/10 bg-black"
-    />
-  </div>
-);
+const SimulationLoadingState = () => <SimulationLoading label="problem visualization" />;
 
 const SIMULATION_COMPONENTS = {
   "two-sum": dynamic(() => import("@/components/animations/problems/implementations/two-sum-problem").then((module) => module.TwoSumProblemSimulation), { loading: SimulationLoadingState }),

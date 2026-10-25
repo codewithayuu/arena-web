@@ -5,10 +5,11 @@ import dynamic from "next/dynamic";
 import Link from "next/link";
 import { Play, Terminal, ArrowRight, CheckCircle2, RotateCcw, Copy, Check } from "lucide-react";
 import { SpecularButton } from "@/components/reactbits/specular-button";
+import { EditorLoading } from "@/components/ui/visual-loading";
 
 const MonacoCodeEditor = dynamic(
   () => import("@/components/practice/monaco-code-editor").then((module) => module.MonacoCodeEditor),
-  { ssr: false, loading: () => <div className="h-full bg-[#1E1E1E]" aria-label="Loading code editor" /> },
+  { ssr: false, loading: () => <EditorLoading label="interactive code editor" /> },
 );
 
 const CODE_SAMPLES: Record<string, { filename: string; code: string }> = {

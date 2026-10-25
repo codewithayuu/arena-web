@@ -3,6 +3,7 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import dynamic from "next/dynamic";
 import { useUser } from "@clerk/nextjs";
+import { TopicOverlayLoading } from "@/components/ui/visual-loading";
 import {
   CATEGORIES,
   ALL_TOPICS,
@@ -66,15 +67,19 @@ function updateLocalCompletionActivity(localKey: (key: string) => string, topicI
 
 const ModulesModal = dynamic(() =>
   import("./modules-modal").then((module) => module.ModulesModal),
+  { loading: () => <TopicOverlayLoading label="topic modules" kind="modules" /> },
 );
 const SearchModal = dynamic(() =>
   import("./search-modal").then((module) => module.SearchModal),
+  { loading: () => <TopicOverlayLoading label="topic search" kind="search" /> },
 );
 const TopicHeatmapModal = dynamic(() =>
   import("./heatmap-modal").then((module) => module.TopicHeatmapModal),
+  { loading: () => <TopicOverlayLoading label="activity heatmap" kind="heatmap" /> },
 );
 const AuraModal = dynamic(() =>
   import("./aura-modal").then((module) => module.AuraModal),
+  { loading: () => <TopicOverlayLoading label="Aura progress" kind="aura" /> },
 );
 
 export function TopicListView() {
