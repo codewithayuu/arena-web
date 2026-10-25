@@ -16,7 +16,7 @@ export function AnnouncementBanner() {
         className="block hover:bg-primary/90 transition-all duration-300"
       >
         <div className="container flex items-center justify-center py-1 text-sm font-medium text-primary-foreground pr-8">
-          <Clock2 className="h-4 w-4 mr-2 animate-pulse" />
+          <Clock2 className="h-4 w-4 mr-2 motion-safe:animate-pulse" />
           <span>
             <strong>Limited Time Offer:</strong> Get upto 40% off on Mindflare
             Premium.

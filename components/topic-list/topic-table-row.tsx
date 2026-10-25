@@ -46,9 +46,10 @@ function TopicTableRowComponent({
   const diffTitle = getTopicDifficultyTitle(topic.difficulty);
   const impLabel = getTopicImportanceLabel(topic.importance);
   return (
-    <tr
+    <div
       id={topic.topic_id}
-      className={`group transition-colors hover:bg-white/[0.035] ${
+      role="listitem"
+      className={`group grid grid-cols-[1.75rem_1.75rem_1.75rem_minmax(0,1fr)] items-center gap-x-1 px-2 py-2 transition-colors hover:bg-white/[0.035] sm:grid-cols-[3rem_3rem_3rem_minmax(0,1fr)_5rem_4rem_7rem] sm:gap-x-0 sm:px-0 sm:py-0 ${
         isCompleted
           ? "bg-white/[0.01]"
           : isSkipped
@@ -59,7 +60,7 @@ function TopicTableRowComponent({
       }`}
     >
       {/* 1. Practice Flag Button */}
-      <td className="w-10 sm:w-12 min-w-[40px] sm:min-w-[48px] px-2 sm:px-3 py-3 text-center align-middle shrink-0">
+      <div className="flex justify-center sm:px-3 sm:py-3">
         <SimpleTooltip
           content={
             isCompleted
@@ -72,6 +73,8 @@ function TopicTableRowComponent({
           <button
             type="button"
             onClick={() => onTogglePractice(topic.topic_id)}
+            aria-label={isPracticing ? `Stop practicing ${topic.topic_title}` : `Practice ${topic.topic_title}`}
+            aria-pressed={isPracticing}
             disabled={isCompleted}
             className={`w-7 h-7 mx-auto rounded-md border flex items-center justify-center transition-all cursor-pointer ${
               isPracticing
@@ -84,10 +87,10 @@ function TopicTableRowComponent({
             <Flag className="w-3.5 h-3.5" animateOnHover />
           </button>
         </SimpleTooltip>
-      </td>
+      </div>
 
       {/* Explicit skipped state */}
-      <td className="w-10 min-w-[40px] px-1 py-3 text-center align-middle shrink-0">
+      <div className="flex justify-center sm:px-1 sm:py-3">
         <SimpleTooltip content={isSkipped ? "Remove from skipped topics" : "Skip this topic for now"}>
           <button
             type="button"
@@ -99,10 +102,10 @@ function TopicTableRowComponent({
             <SkipForward className="h-3.5 w-3.5" />
           </button>
         </SimpleTooltip>
-      </td>
+      </div>
 
       {/* 2. Completion Checkbox Button */}
-      <td className="w-10 sm:w-12 min-w-[40px] sm:min-w-[48px] px-2 sm:px-3 py-3 text-center align-middle shrink-0">
+      <div className="flex justify-center sm:px-3 sm:py-3">
         <SimpleTooltip
           content={isCompleted ? "Completed! Click to unmark" : "Mark as completed"}
         >
@@ -112,7 +115,7 @@ function TopicTableRowComponent({
               e.stopPropagation();
               onToggleComplete(topic.topic_id);
             }}
-            aria-label={isCompleted ? "Completed! Click to unmark" : "Mark as completed"}
+            aria-label={isCompleted ? `Mark ${topic.topic_title} incomplete` : `Mark ${topic.topic_title} as completed`}
             className={`w-5 h-5 rounded-[4px] flex items-center justify-center shrink-0 transition-all duration-75 border mx-auto cursor-pointer active:scale-90 ${
               isCompleted
                 ? "border-[#10b981] bg-[#10b981] text-black shadow-[0_0_8px_rgba(16,185,129,0.35)]"
@@ -126,10 +129,10 @@ function TopicTableRowComponent({
             />
           </button>
         </SimpleTooltip>
-      </td>
+      </div>
 
       {/* 3. Number, Topic Title, and Bookmark PulseHeart */}
-      <td className="px-3 sm:px-4 py-3 align-middle min-w-[180px]">
+      <div className="min-w-0 py-1 sm:px-3 sm:py-3">
         <div className="flex items-center justify-between gap-3 min-w-0 pr-1">
           <Link
             href={`/topic-list/${topic.topic_id}`}
@@ -170,22 +173,22 @@ function TopicTableRowComponent({
             </div>
           </SimpleTooltip>
         </div>
-      </td>
+      </div>
 
       {/* 4. Importance Stars Capsule */}
-      <td className="w-16 sm:w-20 min-w-[64px] sm:min-w-[80px] px-2 py-3 text-center align-middle shrink-0">
-        <div className="flex justify-center">
+      <div className="col-span-4 flex items-center justify-end gap-3 border-t border-white/[0.04] pt-1.5 text-[10px] text-zinc-500 sm:col-span-3 sm:col-start-5 sm:grid sm:grid-cols-[5rem_4rem_7rem] sm:gap-0 sm:border-t-0 sm:pt-0">
+        <div className="flex min-w-0 flex-col items-center justify-center gap-0.5 sm:px-2 sm:py-3">
+          <span className="sm:hidden">Importance</span>
           <SimpleTooltip content={impLabel}>
             <div className="inline-flex items-center justify-center gap-0.5 px-2 py-1 rounded border border-white/10 bg-white/[0.04] cursor-pointer">
               <ImportanceStars importance={topic.importance} />
             </div>
           </SimpleTooltip>
         </div>
-      </td>
 
       {/* 5. Difficulty Circle Column */}
-      <td className="w-12 sm:w-16 min-w-[48px] sm:min-w-[64px] px-2 py-3 text-center align-middle shrink-0">
-        <div className="flex justify-center">
+        <div className="flex min-w-0 flex-col items-center justify-center gap-0.5 sm:px-2 sm:py-3">
+          <span className="sm:hidden">Difficulty</span>
           <SimpleTooltip content={`Difficulty: Level ${topic.difficulty} (${diffTitle})`}>
             <div className="cursor-pointer">
               <DifficultyCircle
@@ -196,10 +199,10 @@ function TopicTableRowComponent({
             </div>
           </SimpleTooltip>
         </div>
-      </td>
 
       {/* Community completion count */}
-      <td className="w-24 sm:w-28 min-w-[96px] sm:min-w-[112px] px-3 py-3 text-right align-middle shrink-0">
+        <div className="flex min-w-0 flex-col items-center justify-center gap-0.5 sm:px-3 sm:py-3">
+          <span className="sm:hidden">Community</span>
         <SimpleTooltip content={completionCount === undefined ? "Community completion count unavailable." : `${completionCount.toLocaleString()} users completed this topic.`}>
           <div className="flex justify-end">
             <div className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md border border-white/10 bg-white/[0.04] hover:bg-white/[0.08] hover:border-blue-500/30 hover:scale-105 hover:shadow-[0_0_0_3px_rgba(59,130,246,0.15)] transition-all duration-200 cursor-pointer active:scale-95">
@@ -212,8 +215,9 @@ function TopicTableRowComponent({
             </div>
           </div>
         </SimpleTooltip>
-      </td>
-    </tr>
+        </div>
+      </div>
+    </div>
   );
 }
 

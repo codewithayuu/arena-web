@@ -51,6 +51,11 @@ export async function GET(req: NextRequest) {
     const rank = user.rank || "unrated";
     const maxRank = user.maxRank || rank;
 
+    let avatar = user.avatar || user.titlePhoto || "";
+    if (avatar && avatar.startsWith("//")) {
+      avatar = `https:${avatar}`;
+    }
+
     return NextResponse.json({
       success: true,
       data: {
@@ -59,7 +64,7 @@ export async function GET(req: NextRequest) {
         maxRating,
         rank,
         maxRank,
-        avatar: user.avatar || user.titlePhoto || "",
+        avatar,
         lastOnlineTimeSeconds: user.lastOnlineTimeSeconds,
       },
     });

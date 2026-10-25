@@ -250,7 +250,7 @@ export function InteractiveAnimationSection() {
                       <div key={idx} className="flex flex-col items-center gap-1.5">
                         <div className="h-5 flex items-center justify-center">
                           {isScanner && (
-                            <div className="flex flex-col items-center animate-bounce">
+                            <div className="flex flex-col items-center motion-safe:animate-bounce">
                               <span className="text-[10px] font-mono font-bold text-[#38BDF8]">i</span>
                               <span className="text-[#38BDF8] text-[10px]">▼</span>
                             </div>

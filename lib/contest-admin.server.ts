@@ -11,8 +11,8 @@ export async function adminGatewayRequest(path:string,init:RequestInit={}):Promi
   return adminGatewayRequestWithToken(path,token,init);
 }
 
-/** The native Admin Companion supplies its short-lived Clerk session token in memory.
- * The gateway still verifies the token, AAL2 freshness, and server-owned admin role. */
+/** Forward a short-lived Clerk session token from an authenticated server route.
+ * The gateway verifies the token, AAL2 freshness, and server-owned admin role. */
 export async function adminGatewayRequestWithToken(path:string,token:string,init:RequestInit={}):Promise<Response> {
   if(typeof token!=="string"||token.length<32||token.length>16384||/\s/.test(token))
     return NextResponse.json({code:"UNAUTHORIZED"},{status:401});

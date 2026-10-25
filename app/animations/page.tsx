@@ -163,11 +163,11 @@ export default function AnimationsPage() {
                         <div className="pointer-events-none absolute inset-x-0 bottom-0 h-32 bg-gradient-to-t from-black/95 via-black/45 to-transparent z-10" />
 
                         {/* Ambient Red Hover Aura */}
-                        <div className="pointer-events-none absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity duration-500 bg-radial from-[#e83040]/15 via-transparent to-transparent z-10" />
+                        <div className="pointer-events-none absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity duration-500 z-10" style={{ background: 'radial-gradient(ellipse at center, rgba(232, 48, 64, 0.15), transparent 70%)' }} />
 
                         {/* Large Cyber Icon Chip touching top edge above heading */}
                         <div className="pointer-events-auto absolute left-[9.8%] top-[3.5%] sm:top-[4%] md:top-[4.5%] flex size-16 sm:size-20 md:size-24 lg:size-[104px] items-center justify-center rounded-2xl sm:rounded-3xl bg-black/80 backdrop-blur-md border border-[#e83040]/50 text-[#e83040] shadow-2xl shadow-black/90 group-hover:bg-[#e83040] group-hover:text-black group-hover:border-[#e83040] group-hover:shadow-[0_0_35px_rgba(232,48,64,0.65)] group-hover:scale-105 transition-all duration-300 z-30">
-                          <Icon className="size-9 sm:size-11 md:size-13 lg:size-16 transition-transform duration-200 group-hover:scale-110" />
+                          <Icon className="size-9 sm:size-11 md:w-[3.25rem] md:h-[3.25rem] lg:size-16 transition-transform duration-200 group-hover:scale-110" />
                         </div>
 
                         {/* Interactive HUD Bottom Row */}

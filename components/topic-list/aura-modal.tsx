@@ -120,6 +120,31 @@ function CategoryMilestoneMedal({
   );
 }
 
+function CodeforcesAvatar({ src, handle }: { src?: string | null; handle?: string | null }) {
+  const [hasError, setHasError] = useState(false);
+  const normalizedSrc = src ? (src.startsWith("//") ? `https:${src}` : src) : null;
+
+  if (!normalizedSrc || hasError) {
+    return (
+      <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl border border-white/10 bg-black text-zinc-400">
+        <User className="w-5 h-5" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="relative h-12 w-12 shrink-0 overflow-hidden rounded-xl border border-white/10 bg-black">
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={normalizedSrc}
+        alt={handle || "Codeforces Avatar"}
+        className="h-full w-full object-cover"
+        onError={() => setHasError(true)}
+      />
+    </div>
+  );
+}
+
 export function AuraModal({ isOpen, onClose }: AuraModalProps) {
   const { isSignedIn } = useUser();
   const [claimPending, setClaimPending] = useState(false);
@@ -244,7 +269,7 @@ export function AuraModal({ isOpen, onClose }: AuraModalProps) {
                   <span className="text-xl sm:text-2xl font-black tracking-tight text-white font-mono">
                     {currentTier.name.toUpperCase()}
                   </span>
-                  <span className="text-xs font-semibold px-2 py-0.5 rounded bg-black border border-white/15 text-zinc-300">
+                  <span className="text-xs font-mono uppercase tracking-wider text-zinc-500">
                     Tier Rank
                   </span>
                 </div>
@@ -566,74 +591,59 @@ export function AuraModal({ isOpen, onClose }: AuraModalProps) {
 
               {/* Connected Status Card */}
               {codeforces.isConnected ? (
-                <div className="p-5 rounded-xl border border-white/10 bg-[#0a0a0c] space-y-4">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-3">
-                      {codeforces.avatar ? (
-                        <div className="relative w-12 h-12 rounded-lg overflow-hidden border border-white/10 bg-black">
-                          <Image
-                            src={codeforces.avatar}
-                            alt={codeforces.handle || ""}
-                            fill
-                            className="object-cover"
-                          />
-                        </div>
-                      ) : (
-                        <div className="flex h-12 w-12 items-center justify-center rounded-lg border border-white/10 bg-black text-zinc-400">
-                          <User className="w-5 h-5" />
-                        </div>
-                      )}
-                      <div>
-                        <div className="flex items-center gap-2">
-                          <span className="text-base font-bold text-white font-mono">
+                <div className="p-4 sm:p-5 rounded-2xl border border-white/10 bg-black space-y-4">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <CodeforcesAvatar src={codeforces.avatar} handle={codeforces.handle} />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+                          <span className="text-base font-bold text-white font-mono truncate">
                             {codeforces.handle}
                           </span>
-                          <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-black border border-white/15 text-emerald-400">
-                            Public · unverified
+                          <span className="text-xs font-mono text-zinc-400">
+                            (Public lookup · unverified)
                           </span>
                         </div>
-                        <div className="text-xs text-zinc-400 capitalize">
-                          Rank: <span className="text-white font-semibold">{codeforces.rank}</span> &bull; Max:{" "}
-                          <span className="text-white font-semibold">{codeforces.maxRank}</span>
+                        <div className="text-xs text-zinc-400 mt-0.5">
+                          Rank: <span className="text-white font-medium capitalize">{codeforces.rank}</span> &bull; Max:{" "}
+                          <span className="text-white font-medium capitalize">{codeforces.maxRank}</span>
                         </div>
                       </div>
                     </div>
 
-                    <div className="text-right">
-                      <div className="text-[10px] font-bold uppercase tracking-wider text-zinc-400">
+                    <div className="flex sm:flex-col items-center sm:items-end justify-between pt-2 sm:pt-0 border-t sm:border-t-0 border-white/10">
+                      <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-500 font-mono">
                         Aura status
-                      </div>
-                      <div className="text-xl font-black font-mono text-emerald-400">
+                      </span>
+                      <span className="text-xs sm:text-sm font-bold font-mono text-zinc-300">
                         Not counted
-                      </div>
+                      </span>
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-3 gap-2 pt-3 border-t border-white/10 text-center">
-                    <div className="p-2.5 rounded-lg bg-black border border-white/10">
-                      <div className="text-[10px] text-zinc-400 font-semibold uppercase">Current Rating</div>
-                      <div className="text-sm font-bold font-mono text-white mt-0.5">{codeforces.rating}</div>
+                  <div className="grid grid-cols-3 gap-2.5 pt-3 border-t border-white/10 text-center">
+                    <div className="p-3 rounded-xl bg-[#0a0a0c] border border-white/10">
+                      <div className="text-[10px] text-zinc-400 font-bold uppercase tracking-wider font-mono">Current</div>
+                      <div className="text-base sm:text-lg font-bold font-mono text-white mt-0.5">{codeforces.rating}</div>
                     </div>
-                    <div className="p-2.5 rounded-lg bg-black border border-white/10">
-                      <div className="text-[10px] text-zinc-400 font-semibold uppercase">Max Rating</div>
-                      <div className="text-sm font-bold font-mono text-white mt-0.5">{codeforces.maxRating}</div>
+                    <div className="p-3 rounded-xl bg-[#0a0a0c] border border-white/10">
+                      <div className="text-[10px] text-zinc-400 font-bold uppercase tracking-wider font-mono">Max Rating</div>
+                      <div className="text-base sm:text-lg font-bold font-mono text-white mt-0.5">{codeforces.maxRating}</div>
                     </div>
-                    <div className="p-2.5 rounded-lg bg-black border border-white/10">
-                      <div className="text-[10px] text-zinc-400 font-semibold uppercase flex items-center justify-center gap-1">
-                        <TablerNumbersIcon className="w-3 h-3 text-[#ff1018]" />
-                        <span>Multiplier</span>
-                      </div>
-                      <div className="text-sm font-bold font-mono text-white mt-0.5">&times; 2 Aura</div>
+                    <div className="p-3 rounded-xl bg-[#0a0a0c] border border-white/10">
+                      <div className="text-[10px] text-zinc-400 font-bold uppercase tracking-wider font-mono">Multiplier</div>
+                      <div className="text-base sm:text-lg font-bold font-mono text-zinc-300 mt-0.5">&times; 2 Aura</div>
                     </div>
                   </div>
 
-                  <div className="flex items-center justify-between pt-2">
-                    <span className="text-[11px] text-zinc-400">
-                      Last looked up: {codeforces.lastSyncedAt ? new Date(codeforces.lastSyncedAt).toLocaleDateString() : "—"}
+                  <div className="flex items-center justify-between pt-1 text-xs">
+                    <span className="text-[11px] text-zinc-500 font-mono">
+                      Last synced: {codeforces.lastSyncedAt ? new Date(codeforces.lastSyncedAt).toLocaleDateString() : "—"}
                     </span>
                     <button
+                      type="button"
                       onClick={disconnectCodeforces}
-                      className="text-xs font-semibold text-red-400 hover:text-red-300 underline"
+                      className="text-xs font-semibold text-rose-400 hover:text-rose-300 transition-colors cursor-pointer"
                     >
                       Unlink Handle
                     </button>

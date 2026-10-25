@@ -256,11 +256,11 @@ export function ConnectAccountsModal({
   return (
     <>
       <div className="fixed inset-0 z-40 flex items-center justify-center p-4 bg-black/85 backdrop-blur-md animate-in fade-in duration-200">
-        <div className="w-full max-w-4xl h-[680px] max-h-[92vh] rounded-2xl border border-white/10 bg-[#0c0c0f] shadow-2xl flex overflow-hidden text-white">
+        <div className="flex h-[680px] max-h-[92vh] w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-white/10 bg-[#0c0c0f] text-white shadow-2xl md:flex-row">
           {/* ========================================================
               LEFT SIDEBAR (Matching Screenshot 1)
               ======================================================== */}
-          <aside className="w-56 shrink-0 bg-[#09090c] border-r border-white/10 p-4 flex flex-col justify-between">
+          <aside className="flex w-full shrink-0 flex-col justify-between border-b border-white/10 bg-[#09090c] p-3 md:w-56 md:border-b-0 md:border-r md:p-4">
             <div className="space-y-4">
               {/* Back to Profile Button */}
               <button
@@ -273,7 +273,7 @@ export function ConnectAccountsModal({
               </button>
 
               {/* Navigation Items */}
-              <nav className="space-y-1 pt-2">
+              <nav className="grid grid-cols-2 gap-1 pt-2 md:block md:space-y-1">
                 <button
                   type="button"
                   onClick={() => setActiveSidebarTab("basic")}
@@ -341,7 +341,7 @@ export function ConnectAccountsModal({
               </nav>
             </div>
 
-            <div className="pt-4 border-t border-white/10 text-[10px] font-mono text-zinc-500">
+            <div className="hidden border-t border-white/10 pt-4 text-[10px] font-mono text-zinc-500 md:block">
               Mindflare Profile Sync v1.4
             </div>
           </aside>
@@ -349,7 +349,7 @@ export function ConnectAccountsModal({
           {/* ========================================================
               RIGHT CONTENT PANEL (Matching Screenshot 1)
               ======================================================== */}
-          <main className="flex-1 p-6 overflow-y-auto no-scrollbar flex flex-col justify-between">
+          <main className="flex min-h-0 min-w-0 flex-1 flex-col justify-between overflow-y-auto p-3 no-scrollbar md:p-6">
             <div className="space-y-6">
               {/* Header */}
               <div className="pb-4 border-b border-white/10">
@@ -444,13 +444,13 @@ export function ConnectAccountsModal({
                         </div>
 
                         {/* Input Box for URL / Handle */}
-                        <div className="flex-1 flex items-center gap-2">
+                        <div className="flex min-w-0 flex-1 flex-col items-stretch gap-2 sm:flex-row sm:items-center">
                           <input
                             type="text"
                             value={rawVal}
                             onChange={(e) => handleInputChange(item.key, e.target.value)}
                             placeholder={item.placeholder}
-                            className="flex-1 bg-black border border-white/10 rounded-lg px-3 py-1.5 text-xs font-mono text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-[#ff1018]"
+                            className="w-full min-w-0 flex-1 bg-black border border-white/10 rounded-lg px-3 py-1.5 text-xs font-mono text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-[#ff1018]"
                           />
 
                           {/* Action Button: Verify or Submit */}
@@ -476,7 +476,7 @@ export function ConnectAccountsModal({
                               size="xs"
                               disabled={!rawVal.trim()}
                               onClick={() => handleStartVerify(item.key)}
-                              className="rounded-lg bg-zinc-800 hover:bg-[#ff1018] text-zinc-200 hover:text-white font-bold text-xs px-3.5 py-1.5 border border-white/10 hover:border-[#ff1018] transition-all cursor-pointer disabled:opacity-40"
+                              className="shrink-0 self-end rounded-lg bg-zinc-800 hover:bg-[#ff1018] text-zinc-200 hover:text-white font-bold text-xs px-3.5 py-1.5 border border-white/10 hover:border-[#ff1018] transition-all cursor-pointer disabled:opacity-40 sm:self-auto"
                             >
                               Verify
                             </SmoothButton>

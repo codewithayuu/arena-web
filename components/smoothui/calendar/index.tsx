@@ -30,7 +30,7 @@ const CalendarDayButton = ({
     <button
       {...props}
       className={cn(
-        "flex aspect-square size-auto w-full min-w-(--cell-size) flex-col items-center justify-center gap-1 rounded-md p-0 font-normal text-sm leading-none",
+        "flex aspect-square size-auto w-full min-w-[var(--cell-size)] flex-col items-center justify-center gap-1 rounded-md p-0 font-normal text-sm leading-none",
         "hover:bg-foreground/10",
         "group-data-[focused=true]/day:relative group-data-[focused=true]/day:z-10",
         "group-data-[focused=true]/day:ring-[3px] group-data-[focused=true]/day:ring-ring/50",
@@ -89,11 +89,11 @@ export default function Calendar({
       className={cn("group/calendar w-fit p-3 [--cell-size:2rem]", className)}
       classNames={{
         button_next: cn(
-          "inline-flex size-(--cell-size) select-none items-center justify-center rounded-md p-0 text-muted-foreground hover:bg-foreground/10 hover:text-foreground disabled:opacity-50",
+          "inline-flex h-[var(--cell-size)] w-[var(--cell-size)] select-none items-center justify-center rounded-md p-0 text-muted-foreground hover:bg-foreground/10 hover:text-foreground disabled:opacity-50",
           defaultClassNames.button_next
         ),
         button_previous: cn(
-          "inline-flex size-(--cell-size) select-none items-center justify-center rounded-md p-0 text-muted-foreground hover:bg-foreground/10 hover:text-foreground disabled:opacity-50",
+          "inline-flex h-[var(--cell-size)] w-[var(--cell-size)] select-none items-center justify-center rounded-md p-0 text-muted-foreground hover:bg-foreground/10 hover:text-foreground disabled:opacity-50",
           defaultClassNames.button_previous
         ),
         caption_label: cn(
@@ -113,7 +113,7 @@ export default function Calendar({
         hidden: cn("invisible", defaultClassNames.hidden),
         month: cn("flex w-full flex-col gap-4", defaultClassNames.month),
         month_caption: cn(
-          "flex h-(--cell-size) w-full items-center justify-center px-(--cell-size)",
+          "flex h-[var(--cell-size)] w-full items-center justify-center px-[var(--cell-size)]",
           defaultClassNames.month_caption
         ),
         months: cn(

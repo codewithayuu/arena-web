@@ -17,7 +17,7 @@ export function HeroElite() {
       <div className="relative z-10 max-w-6xl mx-auto px-6 sm:px-10 lg:px-12 flex flex-col items-center text-center">
         {/* Subtle Category Lead */}
         <div className="flex items-center gap-2 mb-6 text-xs font-mono tracking-widest text-[#FF3B41] uppercase">
-          <span className="w-1.5 h-1.5 rounded-full bg-[#FF1018] animate-pulse" />
+          <span className="w-1.5 h-1.5 rounded-full bg-[#FF1018] motion-safe:animate-pulse" />
           <span>The Algorithmic Society of MAIT</span>
         </div>
 

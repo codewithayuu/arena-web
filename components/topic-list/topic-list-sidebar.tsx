@@ -3,11 +3,13 @@
 import React, { useState, useMemo } from 'react';
 import Link from 'next/link';
 import {
+  Search,
   X,
-  Check,
   ChevronDown,
   ChevronRight,
   Copy,
+  Check,
+  Star,
 } from 'lucide-react';
 import {
   FaGraduationCap,
@@ -29,6 +31,7 @@ import { MdSkipNext } from 'react-icons/md';
 import { TbCompass } from 'react-icons/tb';
 import { Category, ALL_TOPICS, PROBLEMS } from '@/lib/topic-list-data';
 import { TablerNumbersIcon } from './tabler-numbers';
+import { cn } from '@/lib/utils';
 
 interface TopicListSidebarProps {
   completedTopics: string[];
@@ -43,6 +46,8 @@ interface TopicListSidebarProps {
   onOpenAuraModal?: () => void;
   onToggleSkip?: (topicId: string) => void;
   showCategories?: boolean;
+  inDrawer?: boolean;
+  onItemClick?: () => void;
 }
 
 export function TopicListSidebar({
@@ -58,6 +63,8 @@ export function TopicListSidebar({
   onOpenAuraModal,
   onToggleSkip,
   showCategories = false,
+  inDrawer = false,
+  onItemClick,
 }: TopicListSidebarProps) {
   const [searchQuery, setSearchQuery] = useState('');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -303,29 +310,13 @@ export function TopicListSidebar({
 
   return (
     <>
-      <aside className="w-full md:w-60 desktop:w-60 shrink-0">
-        <button
-          type="button"
-          aria-expanded={mobileMenuOpen}
-          aria-controls="topic-list-navigation-content"
-          onClick={() => setMobileMenuOpen((open) => !open)}
-          className="mb-2 flex min-h-12 w-full items-center justify-between gap-3 rounded-2xl border border-white/10 bg-black px-4 text-left shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 md:hidden desktop:hidden"
-        >
-          <span className="flex min-w-0 items-center gap-2 text-sm font-semibold text-foreground">
-            <TbCompass className="h-4 w-4 shrink-0 text-sky-400" />
-            <span>Topic list tools</span>
-          </span>
-          <span className="flex shrink-0 items-center gap-2 text-xs font-mono text-zinc-300">
-            {totalVisibleItems} tools
-            <ChevronDown className={`h-4 w-4 transition-transform ${mobileMenuOpen ? 'rotate-180' : ''}`} />
-          </span>
-        </button>
+      <div className={cn("w-full shrink-0", !inDrawer && "w-full")}>
         <div
           id="topic-list-navigation-content"
-          className={`${mobileMenuOpen ? 'block' : 'hidden'} md:block desktop:block rounded-2xl border border-white/10 bg-black shadow-xl overflow-hidden`}
+          className="rounded-2xl border border-white/10 bg-black shadow-xl overflow-hidden block"
         >
           {/* Header Bar */}
-          <div className="hidden md:flex desktop:flex px-4 py-3 border-b border-white/10 bg-black items-center justify-between">
+          <div className="flex px-4 py-3 border-b border-white/10 bg-black items-center justify-between">
             <div className="flex items-center gap-2">
               <TbCompass className="w-4 h-4 text-sky-400" />
               <span className="text-sm font-semibold text-foreground">Navigation</span>
@@ -338,7 +329,7 @@ export function TopicListSidebar({
           {/* Search Input Bar */}
           <div className="p-2.5 border-b border-white/10 bg-black">
             <div className="relative">
-              <FaSearch className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground pointer-events-none" />
+              <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground pointer-events-none" />
               <input
                 type="text"
                 placeholder="Search..."
@@ -371,6 +362,7 @@ export function TopicListSidebar({
                         <Link
                           key={item.id}
                           href={item.href}
+                          onClick={() => onItemClick?.()}
                           className="group flex items-center justify-between px-3.5 py-2 text-xs text-foreground/85 hover:bg-white/[0.06] hover:text-white border-l-2 border-transparent transition-all"
                         >
                           {content}
@@ -383,7 +375,10 @@ export function TopicListSidebar({
                       <button
                         key={item.id}
                         type="button"
-                        onClick={item.onClick}
+                        onClick={() => {
+                          item.onClick?.();
+                          onItemClick?.();
+                        }}
                         className="w-full group flex items-center justify-between px-3.5 py-2 text-xs text-foreground/85 hover:bg-white/[0.06] hover:text-white border-l-2 border-transparent transition-all cursor-pointer text-left"
                       >
                         {content}
@@ -396,11 +391,11 @@ export function TopicListSidebar({
             ))}
           </div>
         </div>
-      </aside>
+      </div>
 
       {/* Tour Modal */}
       {activeModal === 'tour' && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200">
+        <div className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200">
           <div className="relative w-full max-w-lg rounded-2xl border border-white/10 bg-[#0B0B0F] p-6 shadow-2xl overflow-hidden">
             <button
               onClick={() => setActiveModal(null)}
@@ -497,7 +492,7 @@ export function TopicListSidebar({
 
       {/* Features & Info Modal */}
       {activeModal === 'info' && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200">
+        <div className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200">
           <div className="relative w-full max-w-xl rounded-2xl border border-white/10 bg-[#0B0B0F] p-6 shadow-2xl overflow-hidden">
             <button
               onClick={() => setActiveModal(null)}
@@ -542,13 +537,13 @@ export function TopicListSidebar({
                 <h4 className="font-semibold text-white mb-1">Importance Tiers</h4>
                 <ul className="space-y-1.5 mt-2">
                   <li className="flex items-center gap-2">
-                    <span className="text-amber-400 font-bold">★★★ Must Know:</span> Highest priority topics for contest preparation.
+                    <span className="text-amber-400 font-bold inline-flex items-center gap-0.5"><Star className="w-2.5 h-2.5 fill-current" /><Star className="w-2.5 h-2.5 fill-current" /><Star className="w-2.5 h-2.5 fill-current" /> Must Know:</span> Highest priority topics for contest preparation.
                   </li>
                   <li className="flex items-center gap-2">
-                    <span className="text-zinc-300 font-bold">★★☆ Should Know:</span> Recommended topics for broader contest practice.
+                    <span className="text-zinc-300 font-bold inline-flex items-center gap-0.5"><Star className="w-2.5 h-2.5 fill-current" /><Star className="w-2.5 h-2.5 fill-current" /> Should Know:</span> Recommended topics for broader contest practice.
                   </li>
                   <li className="flex items-center gap-2">
-                    <span className="text-zinc-500 font-bold">★☆☆ Nice to Know:</span> Advanced niche algorithms for specialized problems.
+                    <span className="text-zinc-500 font-bold inline-flex items-center gap-0.5"><Star className="w-2.5 h-2.5 fill-current" /> Nice to Know:</span> Advanced niche algorithms for specialized problems.
                   </li>
                 </ul>
               </div>
@@ -559,7 +554,7 @@ export function TopicListSidebar({
 
       {/* Wrapped Progress Modal */}
       {activeModal === 'wrapped' && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200">
+        <div className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200">
           <div className="relative w-full max-w-md rounded-2xl border border-white/10 bg-gradient-to-b from-[#160B1E] via-[#0B0B0F] to-[#0B0B0F] p-6 shadow-2xl overflow-hidden">
             <button
               onClick={() => setActiveModal(null)}
@@ -614,7 +609,7 @@ export function TopicListSidebar({
 
       {/* Favourites Modal */}
       {(activeModal === 'favourites-topics' || activeModal === 'favourites-problems') && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200">
+        <div className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200">
           <div className="relative w-full max-w-lg rounded-2xl border border-white/10 bg-[#0B0B0F] p-6 shadow-2xl overflow-hidden max-h-[80vh] flex flex-col">
             <button
               onClick={() => setActiveModal(null)}
@@ -654,7 +649,7 @@ export function TopicListSidebar({
 
       {/* Skipped Items Modal */}
       {activeModal === 'skipped' && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200">
+        <div className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200">
           <div className="relative w-full max-w-lg rounded-2xl border border-white/10 bg-[#0B0B0F] p-6 shadow-2xl overflow-hidden max-h-[80vh] flex flex-col">
             <button
               onClick={() => setActiveModal(null)}
@@ -701,7 +696,7 @@ export function TopicListSidebar({
 
       {/* Code Library Modal */}
       {activeModal === 'code-library' && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200">
+        <div className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200">
           <div className="relative w-full max-w-2xl rounded-2xl border border-white/10 bg-[#0B0B0F] p-6 shadow-2xl overflow-hidden max-h-[85vh] flex flex-col">
             <button
               onClick={() => setActiveModal(null)}

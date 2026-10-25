@@ -110,6 +110,7 @@ function ProblemWorkspaceInner({
 }: ProblemWorkspaceProps) {
   const router = useRouter();
   const { open, toggleSidebar, setOpen } = useSidebar();
+  const [isCompactWorkspace, setIsCompactWorkspace] = useState(false);
   const currentList = getProblemsByList(listParam);
   const allProblems = currentList.problems;
   const listTitle = currentList.title;
@@ -117,6 +118,14 @@ function ProblemWorkspaceInner({
     problem.slug,
     listParam,
   );
+
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 1023px)");
+    const updateLayout = () => setIsCompactWorkspace(media.matches);
+    updateLayout();
+    media.addEventListener("change", updateLayout);
+    return () => media.removeEventListener("change", updateLayout);
+  }, []);
 
   // Left Panel Tabs
   const [leftTab, setLeftTab] = usePersistedState<
@@ -698,9 +707,9 @@ function ProblemWorkspaceInner({
 
   return (
     <TooltipProvider delayDuration={400} disableHoverableContent>
-      <div className="flex flex-col h-screen w-screen overflow-hidden bg-black text-white select-none">
+      <div className="flex h-[100dvh] w-screen flex-col overflow-hidden bg-black text-white select-none">
         {/* Top Navigation Bar: AMOLED Pure Black */}
-        <header className="h-12 border-b border-white/10 bg-[#08080a] px-3 flex items-center justify-between flex-shrink-0 z-30">
+        <header className="z-30 flex min-h-12 flex-shrink-0 flex-wrap items-center justify-between gap-x-2 gap-y-1 border-b border-white/10 bg-[#08080a] px-2 py-2 sm:px-3 lg:h-12 lg:flex-nowrap lg:py-0">
           {/* Left Side: Brand Logo, Sidebar Trigger & List dropdown */}
           <div className="flex items-center gap-2 sm:gap-3">
             <SimpleTooltip content="Mindflare Home">
@@ -721,7 +730,7 @@ function ProblemWorkspaceInner({
                 type="button"
                 onClick={toggleSidebar}
                 className={cn(
-                  "p-1.5 rounded-lg border transition-all",
+                  "hidden rounded-lg border p-1.5 transition-all lg:flex",
                   open
                     ? "bg-white/10 text-white border-white/20"
                     : "text-zinc-400 hover:text-white hover:bg-white/10 border-transparent hover:border-white/10"
@@ -735,7 +744,7 @@ function ProblemWorkspaceInner({
               <button
                 type="button"
                 onClick={toggleSidebar}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-white/5 border border-white/10 text-zinc-200 hover:text-white hover:bg-white/10 hover:border-white/20 transition-all"
+                className="hidden items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1.5 text-xs font-semibold text-zinc-200 transition-all hover:border-white/20 hover:bg-white/10 hover:text-white lg:flex"
               >
                 <span>{cleanListTitle}</span>
                 <ChevronDown
@@ -749,18 +758,18 @@ function ProblemWorkspaceInner({
           </div>
 
           {/* Center: Prev, Shuffle, Problem Title with Status Dot, Next */}
-          <div className="flex items-center gap-1 sm:gap-2">
+          <div className="order-3 flex w-full items-center justify-center gap-1 lg:order-none lg:w-auto lg:gap-2">
             {prev ? (
               <SimpleTooltip content={`Previous: ${prev.title}`}>
                 <Link
                   href={`/practice/dsa/${prev.slug}?list=${listParam}`}
-                  className="p-1.5 rounded-lg text-zinc-400 hover:text-white hover:bg-white/10 border border-transparent hover:border-white/10 transition-colors"
+                  className="shrink-0 rounded-lg border border-transparent p-1.5 text-zinc-400 transition-colors hover:border-white/10 hover:bg-white/10 hover:text-white"
                 >
                   <ChevronLeft className="w-4 h-4" />
                 </Link>
               </SimpleTooltip>
             ) : (
-              <span className="p-1.5 text-zinc-700 cursor-not-allowed">
+              <span className="shrink-0 p-1.5 text-zinc-700 cursor-not-allowed">
                 <ChevronLeft className="w-4 h-4" />
               </span>
             )}
@@ -769,13 +778,13 @@ function ProblemWorkspaceInner({
               <button
                 type="button"
                 onClick={handleRandomProblem}
-                className="p-1.5 rounded-lg text-zinc-400 hover:text-white hover:bg-white/10 border border-transparent hover:border-white/10 transition-colors"
+                className="hidden rounded-lg border border-transparent p-1.5 text-zinc-400 transition-colors hover:border-white/10 hover:bg-white/10 hover:text-white lg:flex"
               >
                 <Shuffle className="w-4 h-4" />
               </button>
             </SimpleTooltip>
 
-            <div className="flex items-center gap-2 px-3 py-1 rounded-lg bg-white/[0.04] border border-white/10 shadow-inner">
+            <div className="flex min-w-0 items-center gap-2 rounded-lg border border-white/10 bg-white/[0.04] px-2 py-1 shadow-inner sm:px-3">
               <span
                 className={`w-2 h-2 rounded-full shrink-0 ${
                   problem.difficulty === "Easy"
@@ -785,7 +794,7 @@ function ProblemWorkspaceInner({
                       : "bg-rose-400 shadow-[0_0_8px_rgba(244,63,94,0.5)]"
                 }`}
               />
-              <span className="text-xs sm:text-sm font-semibold text-white tracking-tight truncate max-w-[130px] sm:max-w-[220px]">
+              <span className="max-w-[180px] truncate text-xs font-semibold tracking-tight text-white sm:text-sm lg:max-w-[220px]">
                 {problem.title}
               </span>
             </div>
@@ -794,26 +803,26 @@ function ProblemWorkspaceInner({
               <SimpleTooltip content={`Next: ${next.title}`}>
                 <Link
                   href={`/practice/dsa/${next.slug}?list=${listParam}`}
-                  className="p-1.5 rounded-lg text-zinc-400 hover:text-white hover:bg-white/10 border border-transparent hover:border-white/10 transition-colors"
+                  className="shrink-0 rounded-lg border border-transparent p-1.5 text-zinc-400 transition-colors hover:border-white/10 hover:bg-white/10 hover:text-white"
                 >
                   <ChevronRight className="w-4 h-4" />
                 </Link>
               </SimpleTooltip>
             ) : (
-              <span className="p-1.5 text-zinc-700 cursor-not-allowed">
+              <span className="shrink-0 p-1.5 text-zinc-700 cursor-not-allowed">
                 <ChevronRight className="w-4 h-4" />
               </span>
             )}
           </div>
 
           {/* Right Side: Timer, Fullscreen, Close */}
-          <div className="flex items-center gap-1.5 sm:gap-2">
+          <div className="ml-auto flex items-center gap-1.5 lg:ml-0 lg:gap-2">
             {/* Stopwatch Timer */}
             <SimpleTooltip content={timerRunning ? "Pause timer" : "Resume timer"}>
               <button
                 type="button"
                 onClick={() => setTimerRunning(!timerRunning)}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-mono text-zinc-300 hover:text-white bg-white/5 hover:bg-white/10 border border-white/10 transition-colors"
+                className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-2 py-1.5 text-xs font-mono text-zinc-300 transition-colors hover:bg-white/10 hover:text-white sm:gap-1.5 sm:px-2.5"
               >
                 <Clock className="w-3.5 h-3.5 text-zinc-400" />
                 <span>{formatTimer(timerSeconds)}</span>
@@ -825,7 +834,7 @@ function ProblemWorkspaceInner({
               <button
                 type="button"
                 onClick={toggleFullscreen}
-                className="p-1.5 rounded-lg text-zinc-400 hover:text-white hover:bg-white/10 border border-transparent hover:border-white/10 transition-colors"
+                className="hidden rounded-lg border border-transparent p-1.5 text-zinc-400 transition-colors hover:border-white/10 hover:bg-white/10 hover:text-white lg:flex"
               >
                 {isFullscreen ? (
                   <Minimize2 className="w-4 h-4" />
@@ -839,7 +848,7 @@ function ProblemWorkspaceInner({
             <SimpleTooltip content="Exit to Problems List">
               <Link
                 href="/practice/dsa-patterns"
-                className="p-1.5 rounded-lg text-zinc-400 hover:text-rose-400 hover:bg-rose-500/10 border border-transparent hover:border-rose-500/20 transition-colors"
+                className="shrink-0 rounded-lg border border-transparent p-1.5 text-zinc-400 transition-colors hover:border-rose-500/20 hover:bg-rose-500/10 hover:text-rose-400"
               >
                 <X className="w-4 h-4" />
               </Link>
@@ -848,12 +857,12 @@ function ProblemWorkspaceInner({
         </header>
 
         {/* Workspace Body: SmoothUI Sidebar on Left + Resizable Workspace */}
-        <div className="flex-1 w-full overflow-hidden flex relative bg-black">
+        <div className="relative flex min-h-0 w-full flex-1 overflow-hidden bg-black">
           {/* SmoothUI Problem Sidebar (Collapsible Rail 56px <-> 280px) */}
           <Sidebar
             collapsibleWidth={56}
             expandedWidth={280}
-            className="border-r border-white/10 bg-[#08080a] select-none shrink-0 z-20 transition-colors"
+            className="hidden shrink-0 select-none border-r border-white/10 bg-[#08080a] transition-colors lg:flex lg:z-20"
           >
             {/* Sidebar Header */}
             <SidebarHeader className="flex items-center justify-between p-3 border-b border-white/5">
@@ -1001,20 +1010,20 @@ function ProblemWorkspaceInner({
           </Sidebar>
 
           {/* Main Resizable Workspace Area */}
-          <div className="flex-1 h-full overflow-hidden relative bg-black">
-            <Group orientation="horizontal" className="h-full w-full">
+          <div className="relative h-full min-w-0 flex-1 overflow-hidden bg-black">
+            <Group orientation={isCompactWorkspace ? "vertical" : "horizontal"} className="h-full w-full">
               {/* LEFT PANEL: Problem Details & Tabs */}
               <Panel
                 defaultSize={48}
                 minSize={25}
-                className="flex flex-col bg-black border-r border-white/10"
+                className="flex min-h-0 flex-col border-r border-white/10 bg-black"
               >
                 {/* Left Header Tabs */}
-                <div className="flex items-center border-b border-white/10 bg-[#08080a] px-2 text-xs font-medium">
+                <div className="flex items-center overflow-x-auto whitespace-nowrap border-b border-white/10 bg-[#08080a] px-2 text-xs font-medium no-scrollbar">
                   <button
                     type="button"
                     onClick={() => setLeftTab("problem")}
-                    className={`flex items-center gap-1.5 px-3 py-2.5 border-b-2 transition-all ${
+                      className={`flex shrink-0 items-center gap-1.5 border-b-2 px-3 py-2.5 transition-all ${
                       leftTab === "problem"
                         ? "border-[#FF1018] text-white font-semibold bg-white/[0.02]"
                         : "border-transparent text-zinc-400 hover:text-zinc-200"
@@ -1029,7 +1038,7 @@ function ProblemWorkspaceInner({
                   <button
                     type="button"
                     onClick={() => setLeftTab("solution")}
-                    className={`flex items-center gap-1.5 px-3 py-2.5 border-b-2 transition-all ${
+                      className={`flex shrink-0 items-center gap-1.5 border-b-2 px-3 py-2.5 transition-all ${
                       leftTab === "solution"
                         ? "border-[#FF1018] text-white font-semibold bg-white/[0.02]"
                         : "border-transparent text-zinc-400 hover:text-zinc-200"
@@ -1042,7 +1051,7 @@ function ProblemWorkspaceInner({
                   <button
                     type="button"
                     onClick={() => setLeftTab("submissions")}
-                    className={`flex items-center gap-1.5 px-3 py-2.5 border-b-2 transition-all ${
+                      className={`flex shrink-0 items-center gap-1.5 border-b-2 px-3 py-2.5 transition-all ${
                       leftTab === "submissions"
                         ? "border-[#FF1018] text-white font-semibold bg-white/[0.02]"
                         : "border-transparent text-zinc-400 hover:text-zinc-200"
@@ -1055,7 +1064,7 @@ function ProblemWorkspaceInner({
                   <button
                     type="button"
                     onClick={() => setLeftTab("notes")}
-                    className={`flex items-center gap-1.5 px-3 py-2.5 border-b-2 transition-all ${
+                      className={`flex shrink-0 items-center gap-1.5 border-b-2 px-3 py-2.5 transition-all ${
                       leftTab === "notes"
                         ? "border-[#FF1018] text-white font-semibold bg-white/[0.02]"
                         : "border-transparent text-zinc-400 hover:text-zinc-200"
@@ -1068,7 +1077,7 @@ function ProblemWorkspaceInner({
                   <button
                     type="button"
                     onClick={() => setLeftTab("discussion")}
-                    className={`flex items-center gap-1.5 px-3 py-2.5 border-b-2 transition-all ${
+                      className={`flex shrink-0 items-center gap-1.5 border-b-2 px-3 py-2.5 transition-all ${
                       leftTab === "discussion"
                         ? "border-[#FF1018] text-white font-semibold bg-white/[0.02]"
                         : "border-transparent text-zinc-400 hover:text-zinc-200"
@@ -1461,28 +1470,38 @@ function ProblemWorkspaceInner({
               </Panel>
 
               {/* VERTICAL RESIZE HANDLE */}
-              <Separator className="w-1.5 bg-black hover:bg-white/10 cursor-col-resize flex items-center justify-center transition-colors group">
-                <div className="h-6 w-1 rounded-full bg-zinc-700 group-hover:bg-[#FF1018] transition-colors" />
+              <Separator
+                className={cn(
+                  "flex items-center justify-center bg-black transition-colors group hover:bg-white/10",
+                  isCompactWorkspace
+                    ? "h-1.5 w-full cursor-row-resize"
+                    : "w-1.5 cursor-col-resize",
+                )}
+              >
+                <div className={cn(
+                  "rounded-full bg-zinc-700 transition-colors group-hover:bg-[#FF1018]",
+                  isCompactWorkspace ? "h-1 w-6" : "h-6 w-1",
+                )} />
               </Separator>
 
               {/* RIGHT PANEL: Editor (Top) & Test Cases (Bottom) */}
               <Panel
                 defaultSize={52}
                 minSize={30}
-                className="flex flex-col bg-black"
+                className="flex min-h-0 min-w-0 flex-col bg-black"
               >
                 <Group orientation="vertical" className="h-full w-full">
                   {/* TOP: Monaco Code Editor */}
                   <Panel
                     defaultSize={62}
                     minSize={25}
-                    className="flex flex-col border-b border-white/10 bg-black"
+                    className="flex min-h-0 flex-col border-b border-white/10 bg-black"
                   >
                     {/* Editor Toolbar */}
-                    <div className="h-10 border-b border-white/10 bg-[#08080a] px-3 flex items-center justify-between flex-shrink-0 text-xs select-none">
-                      <div className="flex items-center gap-2">
+                    <div className="flex min-h-10 flex-shrink-0 flex-wrap items-center justify-between gap-2 border-b border-white/10 bg-[#08080a] px-2 py-1 text-xs select-none sm:px-3">
+                      <div className="flex min-w-0 flex-wrap items-center gap-2">
                         {/* Language Selector */}
-                        <div className="w-[148px] shrink-0">
+                        <div className="w-[120px] shrink-0 sm:w-[148px]">
                           <Select
                             value={selectedLanguage}
                             onValueChange={setSelectedLanguage}
@@ -1598,7 +1617,7 @@ function ProblemWorkspaceInner({
                     className="flex flex-col bg-black"
                   >
                     {/* Bottom Header Bar: Tabs left, Action buttons right */}
-                    <div className="h-11 border-b border-white/10 bg-[#08080a] px-3 flex items-center justify-between flex-shrink-0 text-xs">
+                    <div className="flex min-h-11 flex-shrink-0 flex-wrap items-center justify-between gap-2 border-b border-white/10 bg-[#08080a] px-2 py-1 text-xs sm:px-3">
                       {/* Left Tabs */}
                       <div className="flex items-center gap-1">
                         <button
@@ -1630,7 +1649,7 @@ function ProblemWorkspaceInner({
                       </div>
 
                       {/* Right Buttons: Evaluate, Run, Submit */}
-                      <div className="flex items-center gap-2">
+                      <div className="flex flex-wrap items-center justify-end gap-2">
                         <span className="hidden lg:inline text-[10px] text-zinc-500" role="status" aria-live="polite">
                           {runtimeSessionActive && runtimeConnectionState === "connected"
                             ? "Runtime connected to this tab"

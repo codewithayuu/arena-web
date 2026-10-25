@@ -177,9 +177,9 @@ export function CodeCompiler() {
     <div className="not-prose my-6 rounded-xl border border-border bg-card overflow-hidden shadow-lg">
       {/* Problem Header */}
       <div className="p-4 sm:p-5 border-b border-border space-y-3">
-        <div className="flex items-center justify-between gap-3">
-          <div className="flex items-center gap-2.5">
-            <h3 className="text-xl font-bold tracking-tight text-foreground">
+        <div className="flex flex-wrap items-start justify-between gap-2">
+          <div className="flex min-w-0 flex-wrap items-center gap-2.5">
+            <h3 className="text-lg font-bold tracking-tight text-foreground sm:text-xl">
               Trapping Rain Water
             </h3>
             <Badge variant="destructive" size="sm">
@@ -244,14 +244,14 @@ export function CodeCompiler() {
       </div>
 
       {/* Code Editor Header */}
-      <div className="px-4 py-2 bg-muted/40 border-b border-border flex items-center justify-between gap-3">
+      <div className="flex flex-col items-stretch justify-between gap-2 border-b border-border bg-muted/40 px-3 py-2 sm:flex-row sm:items-center sm:gap-3 sm:px-4">
         <div className="flex items-center gap-2">
           <Terminal className="h-4 w-4 text-primary" />
           <span className="text-xs font-bold text-foreground">Code Editor</span>
         </div>
 
         {/* Language selector */}
-        <div className="w-[180px] shrink-0">
+        <div className="w-full min-w-0 sm:w-[180px] sm:shrink-0">
           <Select
             value={selectedLanguage}
             onValueChange={(val) => handleLanguageChange(val as any)}

@@ -46,7 +46,7 @@ const POPUP_CLASS =
   "z-50 min-w-40 origin-[var(--transform-origin)] rounded-md border bg-popover p-1 text-popover-foreground shadow-md outline-none transition-[scale,opacity] duration-150 ease-out data-ending-style:scale-[0.98] data-ending-style:opacity-0 data-starting-style:scale-[0.98] data-starting-style:opacity-0 motion-reduce:transition-none";
 
 const ITEM_CLASS =
-  "relative flex cursor-default select-none items-center gap-2 rounded-sm px-2 py-1.5 text-sm outline-hidden data-disabled:pointer-events-none data-disabled:opacity-50 data-highlighted:bg-accent data-highlighted:text-accent-foreground";
+  "relative flex cursor-default select-none items-center gap-2 rounded-sm px-2 py-1.5 text-sm outline-none data-disabled:pointer-events-none data-disabled:opacity-50 data-highlighted:bg-accent data-highlighted:text-accent-foreground";
 
 export const MenubarRoot = ({ className, ...props }: MenubarRootProps) => (
   <MenubarPrimitive

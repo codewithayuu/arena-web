@@ -8,7 +8,7 @@ type Participant={user_id:string;display_name:string;membership_kind:"permanent"
  blocked:boolean;session_state:string|null;last_heartbeat_at:string|null;submission_count:number;camera_event_count?:number;latest_camera_event?:string|null};
 type Controls={contest_id:string;execution_mode:"server_judged"|"participant_local";lifecycle_version:number;mode_locked:boolean;settings_locked:boolean;
  starts_at:string|null;ends_at:string|null;server_time:string;participants:Participant[];state:string;late_join_grace_seconds:number;
- configuration:{signed_policy_settings?:{browser_camera?:{enabled:boolean;required:boolean;face_indicators:boolean}}}};
+ configuration:{directory_visibility?:"public"|"registered_only";signed_policy_settings?:{browser_camera?:{enabled:boolean;required:boolean;face_indicators:boolean}}}};
 type IssuedKeys={user_id:string;login_key:string;exam_browser_key:string;expires_at:string};
 const field="rounded-lg border border-white/20 bg-zinc-950 px-3 py-2 text-sm";
 
@@ -19,7 +19,7 @@ export function ContestControlDashboard() {
  const [controls,setControls]=useState<Controls|null>(null),[message,setMessage]=useState("Loading contest administration…");
  const [reason,setReason]=useState(""),[busy,setBusy]=useState(false),[name,setName]=useState(""),[email,setEmail]=useState("");
  const [keys,setKeys]=useState<IssuedKeys|null>(null);
- const [archive,setArchive]=useState<File|null>(null),[start,setStart]=useState(""),[end,setEnd]=useState(""),[lateGrace,setLateGrace]=useState(5);
+ const [archives,setArchives]=useState<File[]>([]),[contestName,setContestName]=useState(""),[start,setStart]=useState(""),[end,setEnd]=useState(""),[lateGrace,setLateGrace]=useState(5);
  const importKey=useRef("");const publicationKey=useRef("");const selectedRef=useRef(selected);selectedRef.current=selected;
  const [pending,setPending]=useState<{key:string;command:Record<string,unknown>}|null>(null);
  useEffect(()=>{let active=true;void fetch("/api/admin/contests",{cache:"no-store"}).then(async response=>{
@@ -47,14 +47,15 @@ export function ContestControlDashboard() {
   setLateGrace(controls.late_join_grace_seconds/60);publicationKey.current=crypto.randomUUID();
  },[controls?.contest_id]);
  async function importArchive() {
-  if(!archive||busy)return;setBusy(true);if(!importKey.current)importKey.current=crypto.randomUUID();
+  if(!archives.length||busy||contestName.trim().length<3)return;setBusy(true);if(!importKey.current)importKey.current=crypto.randomUUID();
   try {
-   const response=await fetch("/api/admin/contests/import",{method:"POST",headers:{"Content-Type":"application/zip","Idempotency-Key":importKey.current},body:archive});
+   const form=new FormData();form.set("contest_name",contestName.trim());for(const archive of archives)form.append("problem_zip",archive,archive.name);
+   const response=await fetch("/api/admin/contests/import",{method:"POST",headers:{"Idempotency-Key":importKey.current},body:form});
    const value=await response.json();if(!response.ok){setMessage(value.error||`Import failed: ${value.code}.`);return;}
    const list=await fetch("/api/admin/contests",{cache:"no-store"});if(list.ok)setContests((await list.json()).items);
-   setSelected(value.contest_id);setMessage("The contest draft, problems and evaluation data were saved to the contest database.");
-   setArchive(null);importKey.current="";
-  }catch{setMessage("Import is unconfirmed. Keep the same file selected and retry to recover its receipt.");}
+   setSelected(value.contest_id);setMessage("The contest draft and individually uploaded problems were saved. Set visibility and schedule before publishing.");
+   setArchives([]);setContestName("");importKey.current="";
+  }catch{setMessage("Import is unconfirmed. Keep the same problem ZIPs and contest name selected, then retry to recover its receipt.");}
   finally{setBusy(false);}
  }
  async function publishLocal() {
@@ -94,27 +95,34 @@ export function ContestControlDashboard() {
  return <main className="mx-auto max-w-6xl space-y-6 px-6 py-12 text-zinc-100">
   <header><h1 className="text-3xl font-bold">Contest operations</h1><p className="mt-2 text-zinc-400">Manage evaluation, participant access, and live progress.</p></header>
   <p role="status" aria-live="polite" className="text-sm text-amber-100">{message}</p>
-  {isLoaded&&!isSignedIn&&<SignIn fallbackRedirectUrl="/admin/contests" />}
+  {isLoaded&&!isSignedIn&&<SignIn fallbackRedirectUrl="/operations/contest-management" />}
   {isSignedIn&&<button className={field} disabled={busy} onClick={async()=>{const response=await verifyAdmin();if(response instanceof Response&&response.ok)window.location.reload();}}>Verify administrator session</button>}
-  <section className="space-y-3 rounded-xl border border-white/15 p-5"><h2 className="font-semibold">Import a local-evaluation contest</h2>
-   <p className="text-sm text-zinc-400">Upload a ZIP with statements, visible samples, and complete static input/output pairs. This importer uses whitespace-separated token comparison. Custom checkers and interactive problems use the existing server import pipeline.</p>
-   <input type="file" aria-label="Contest ZIP archive" accept=".zip" disabled={busy} onChange={event=>{setArchive(event.target.files?.[0]||null);importKey.current=crypto.randomUUID();}} />
-   <button className={field} disabled={!archive||busy} onClick={()=>void importArchive()}>Import ZIP</button>
+  <section className="space-y-3 rounded-xl border border-white/15 p-5"><h2 className="font-semibold">Create a contest from problem ZIPs</h2>
+   <p className="text-sm text-zinc-400">Add one ZIP per problem. Each package must contain one static problem with complete input/output pairs, up to 64 cases, 64 KiB per input, 32 KiB per expected output, and 2 MiB total input. Inputs are inspectable on participant devices; expected outputs stay in the contest database.</p>
+   <label className="block text-sm">Contest name<input className={`${field} mt-1 block w-full`} maxLength={160} value={contestName} onChange={event=>{setContestName(event.target.value);importKey.current=crypto.randomUUID();}} /></label>
+   <input type="file" aria-label="Problem ZIP archive" accept=".zip" disabled={busy} onChange={event=>{
+    const file=event.target.files?.[0];if(file){setArchives(current=>[...current,file]);importKey.current=crypto.randomUUID();}event.currentTarget.value="";
+   }} />
+   <ul className="space-y-1 text-sm">{archives.map((file,index)=><li key={`${file.name}-${index}`} className="flex items-center justify-between gap-3">
+    <span>{index+1}. {file.name} · {(file.size/1024/1024).toFixed(1)} MiB</span>
+    <button type="button" className={field} disabled={busy} onClick={()=>{setArchives(current=>current.filter((_,item)=>item!==index));importKey.current=crypto.randomUUID();}}>Remove</button>
+   </li>)}</ul>
+   <button className={field} disabled={archives.length===0||contestName.trim().length<3||busy} onClick={()=>void importArchive()}>Generate contest draft</button>
   </section>
   <div className="flex flex-wrap items-center gap-3"><label>Contest <select className={field} value={selected} onChange={e=>setSelected(e.target.value)} disabled={busy||!!pending}>
    <option value="">Select a contest</option>{contests.map(contest=><option key={contest.id} value={contest.id}>{contest.name} · {contest.state}</option>)}</select></label>
    <Link href="/contests" className="text-sm underline">Participant view</Link></div>
   {controls&&<>
-   <section className="space-y-3 rounded-xl border border-white/15 p-5"><h2 className="font-semibold">Evaluation mode</h2>
-    <p className="text-sm">{controls.mode_locked?"The published execution mode is locked."
-     :controls.settings_locked?"A signed policy revision exists, so the execution mode and camera settings are locked."
-     :"Choose the final evaluation location before publishing a signed policy."}</p>
-    <select aria-label="Contest execution mode" className={field} disabled={busy||controls.mode_locked||controls.settings_locked||!!pending} value={controls.execution_mode}
-     onChange={e=>void command({action:"set_execution_mode",execution_mode:e.target.value,expected_version:controls.lifecycle_version})}>
-     <option value="server_judged">Isolated server judge</option><option value="participant_local">Participant device · client-reported result</option>
+   {!controls.mode_locked&&<section className="space-y-3 rounded-xl border border-white/15 p-5"><h2 className="font-semibold">Contest visibility</h2>
+    <p className="text-sm text-zinc-400">Public contests appear in the public and registered-user schedules. Registered-only contests appear only to participants registered for that contest.</p>
+    <select aria-label="Contest visibility" className={field} disabled={busy||!!pending} value={controls.configuration.directory_visibility||"public"}
+     onChange={e=>void command({action:"set_visibility",visibility:e.target.value,expected_version:controls.lifecycle_version})}>
+     <option value="public">Public</option><option value="registered_only">Registered users only</option>
     </select>
-    <p className="text-xs text-zinc-400">On-device evaluation releases test data to the participant device. Results carry client-reported provenance.</p>
-    {controls.execution_mode==="server_judged"&&<p className="text-xs text-zinc-400">Server mode keeps the existing isolated judge pipeline. Configure its package revisions, toolchain pins, and judge bindings through the server contest authoring workflow; there is no automatic fallback between modes.</p>}
+   </section>}
+   <section className="space-y-3 rounded-xl border border-white/15 p-5"><h2 className="font-semibold">Evaluation flow</h2>
+    <p className="text-sm">{controls.execution_mode==="participant_local"?"Dry runs and submissions execute on the participant device. Submission stdout is compared with expected outputs held by the contest service.":"This draft uses a legacy server-judged policy. Create a new Arena2 contest to use the current local output-comparison flow."}</p>
+    <p className="text-xs text-zinc-400">The participant can inspect or forge outputs on an owned machine. The result records a server-side comparison but does not verify that source code produced those outputs.</p>
     <label className="flex gap-2 text-sm"><input type="checkbox" disabled={busy||controls.mode_locked||controls.settings_locked||!!pending}
       checked={controls.configuration.signed_policy_settings?.browser_camera?.enabled===true} onChange={event=>void command({action:"set_browser_camera",
         enabled:event.target.checked,face_indicators:event.target.checked,required:event.target.checked,expected_version:controls.lifecycle_version})}/>

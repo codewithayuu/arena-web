@@ -277,7 +277,7 @@ export function TopicDetailView({ topic, initialProblems }: TopicDetailViewProps
     try {
       localStorage.setItem(localKey(`youknowwho_completed_${topic.topic_id}`), String(next));
       if (next) {
-        setSuggestionToast("🎉 Topic marked as completed! Aura boosted.");
+        setSuggestionToast("Topic marked as completed! Aura boosted.");
         setTimeout(() => setSuggestionToast(null), 3000);
       }
       emitAuraSync();
@@ -653,7 +653,7 @@ export function TopicDetailView({ topic, initialProblems }: TopicDetailViewProps
           {/* Guest Sign-in Alert Banner */}
           {!isSignedIn && <div className="rounded-2xl border border-white/10 bg-black p-3.5 sm:p-4 mb-6 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
             <div className="flex items-center gap-2 text-zinc-300">
-              <span className="text-base">👀</span>
+              
               <span>You are not signed in. Please sign in to save your progress across devices.</span>
             </div>
             <Link
@@ -833,7 +833,7 @@ export function TopicDetailView({ topic, initialProblems }: TopicDetailViewProps
                     onChange={(e) => setSourceFilter(e.target.value)}
                     className="h-8 px-3 rounded-xl border border-white/10 bg-black text-xs text-[#F4F3FC] hover:border-white/20 hover:bg-white/[0.04] transition-colors cursor-pointer appearance-none pr-7 focus:outline-none"
                   >
-                    <option value="all">🔍 All Sources</option>
+                    <option value="all">All Sources</option>
                     <option value="codeforces">Codeforces</option>
                     <option value="cses">CSES</option>
                     <option value="atcoder">AtCoder</option>
@@ -847,7 +847,7 @@ export function TopicDetailView({ topic, initialProblems }: TopicDetailViewProps
                   href="/settings?tab=handles"
                   className="inline-flex items-center gap-1.5 h-8 px-3 rounded-xl border border-white/10 bg-black hover:border-white/20 hover:bg-white/[0.04] text-xs text-[#F4F3FC] transition-colors"
                 >
-                  <span>📊 Connect Codeforces</span>
+                  <span>Connect Codeforces</span>
                 </Link>
               </div>
             </div>

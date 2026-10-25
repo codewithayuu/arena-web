@@ -24,8 +24,12 @@ import {
   Search,
   ChevronDown,
   ExternalLink,
+  X,
 } from "@/components/animate-ui/icons";
 import { FaChartLine } from "react-icons/fa";
+import { TbCompass } from "react-icons/tb";
+import { HamburgerIcon } from "@chakra-ui/icons";
+import { motion, AnimatePresence } from "motion/react";
 import SmoothButton from "@/components/smoothui/smooth-button";
 import Kbd from "@/components/smoothui/kbd";
 import { TooltipProvider, SimpleTooltip } from "@/components/animate-ui/tooltip";
@@ -123,7 +127,32 @@ export function TopicListView() {
   const [hasOpenedSearch, setHasOpenedSearch] = useState(false);
   const [hasOpenedHeatmap, setHasOpenedHeatmap] = useState(false);
   const [hasOpenedAuraModal, setHasOpenedAuraModal] = useState(false);
-  const [isStatsDockOpen, setIsStatsDockOpen] = useState(false);
+  const [isNavDrawerOpen, setIsNavDrawerOpen] = useState(false);
+  const [isStatsDrawerOpen, setIsStatsDrawerOpen] = useState(false);
+
+  // Lock body scroll when either mobile drawer is open
+  useEffect(() => {
+    if (isNavDrawerOpen || isStatsDrawerOpen) {
+      document.body.style.overflow = "hidden";
+    } else {
+      document.body.style.overflow = "";
+    }
+    return () => {
+      document.body.style.overflow = "";
+    };
+  }, [isNavDrawerOpen, isStatsDrawerOpen]);
+
+  // Close drawers on Escape key
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setIsNavDrawerOpen(false);
+        setIsStatsDrawerOpen(false);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
   const [isUsefulLinksOpen, setIsUsefulLinksOpen] = usePersistedState<boolean>(
     "topic_list_useful_links_open",
     false
@@ -607,44 +636,51 @@ export function TopicListView() {
           </div>
         )}
         {/* Main Container */}
-        <div className="mx-auto max-w-[1680px] px-3 sm:px-6 py-6">
-          <div className="flex flex-col md:flex-row desktop:flex-row gap-6 lg:gap-8 justify-center items-start">
-            {/* Sidebar tools and topic navigation */}
-            <div className="w-full md:w-60 shrink-0 md:sticky md:top-24 self-start">
-              <button
-                type="button"
-                aria-expanded={isStatsDockOpen}
-                aria-controls="topic-list-stats-dock"
-                aria-label={isStatsDockOpen ? "Close stats" : "Open stats"}
-                onClick={() => setIsStatsDockOpen((open) => !open)}
-                className="fixed right-3 top-[4.25rem] z-[45] grid h-10 w-10 place-items-center rounded-full glass-pill text-white transition-all hover:border-white/20 active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#e83040] md:static md:mb-3 md:flex md:h-12 md:w-full md:items-center md:justify-between md:rounded-2xl md:border md:border-white/10 md:bg-black md:px-4 md:shadow-lg"
-              >
-                <span className="flex min-w-0 items-center gap-2">
-                  <FaChartLine className="h-4 w-4 shrink-0 text-emerald-400" />
-                  <span className="hidden text-sm font-semibold text-foreground md:inline">Your Stats</span>
-                </span>
-                <ChevronDown
-                  className={cn(
-                    "hidden h-4 w-4 text-zinc-400 transition-transform md:block",
-                    isStatsDockOpen && "rotate-180"
-                  )}
-                />
-              </button>
-              <div
-                id="topic-list-stats-dock"
-                className={cn(
-                  isStatsDockOpen
-                    ? "fixed right-3 top-[7.25rem] z-[45] max-h-[calc(100dvh-8rem)] overflow-y-auto md:static md:mb-3 md:max-h-none md:overflow-visible"
-                    : "hidden"
-                )}
-              >
-                <StatsDock
-                  completedTopics={completedTopics}
-                  totalProblemsCount={3888}
-                  onOpenHeatmap={() => { setHasOpenedHeatmap(true); setIsHeatmapOpen(true); }}
-                  onOpenAuraModal={() => { setHasOpenedAuraModal(true); setIsAuraModalOpen(true); }}
-                />
-              </div>
+        <div className="mx-auto max-w-[1720px] px-3 sm:px-6 py-6">
+          {/* Mobile Dual-Hamburger Sticky Command Bar (xl:hidden) */}
+          <div className="xl:hidden sticky top-[4.25rem] z-30 mb-5 flex items-center justify-between gap-2 rounded-2xl border border-white/10 bg-[#0a0a0c]/90 px-3 py-2.5 backdrop-blur-xl shadow-xl">
+            {/* Left Hamburger: Navigation */}
+            <button
+              type="button"
+              onClick={() => {
+                setIsStatsDrawerOpen(false);
+                setIsNavDrawerOpen(true);
+              }}
+              className="flex items-center gap-2 rounded-xl border border-white/10 bg-black px-3.5 py-2 text-xs font-semibold text-white transition-all hover:bg-white/[0.06] hover:border-white/20 active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20 cursor-pointer shadow-sm"
+              aria-label="Open Navigation menu"
+            >
+              <HamburgerIcon className="w-4 h-4 text-zinc-300" />
+              <span>Navigation</span>
+              <span className="font-mono text-[11px] text-zinc-400">
+                (15)
+              </span>
+            </button>
+
+            {/* Middle Indicator */}
+            <div className="hidden xs:flex sm:flex items-center gap-2 text-xs font-medium text-zinc-400">
+              <span className="w-1.5 h-1.5 rounded-full bg-[#ff1018]" />
+              <span className="text-zinc-300 font-semibold">The God List</span>
+            </div>
+
+            {/* Right Hamburger: Your Stats */}
+            <button
+              type="button"
+              onClick={() => {
+                setIsNavDrawerOpen(false);
+                setIsStatsDrawerOpen(true);
+              }}
+              className="flex items-center gap-2 rounded-xl border border-white/10 bg-black px-3.5 py-2 text-xs font-semibold text-white transition-all hover:bg-white/[0.06] hover:border-white/20 active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20 cursor-pointer shadow-sm"
+              aria-label="Open Your Stats menu"
+            >
+              <HamburgerIcon className="w-4 h-4 text-zinc-300" />
+              <span>Your Stats</span>
+            </button>
+          </div>
+
+          {/* 3-Column Layout: Left Navigation + Center God List + Right Your Stats */}
+          <div className="flex flex-col xl:flex-row gap-6 xl:gap-6 2xl:gap-8 justify-center items-start">
+            {/* Left Sidebar: Navigation (Desktop xl+) */}
+            <aside className="hidden xl:block w-60 2xl:w-64 shrink-0 xl:sticky xl:top-24 self-start">
               <TopicListSidebar
                 completedTopics={completedTopics}
                 favouriteTopics={favouriteTopics}
@@ -655,16 +691,17 @@ export function TopicListView() {
                 onSelectCategory={handleSelectCategory}
                 onOpenModules={() => { setHasOpenedModules(true); setIsModulesOpen(true); }}
                 onOpenHeatmap={() => { setHasOpenedHeatmap(true); setIsHeatmapOpen(true); }}
+                onOpenAuraModal={() => { setHasOpenedAuraModal(true); setIsAuraModalOpen(true); }}
                 onToggleSkip={handleToggleSkip}
               />
-            </div>
+            </aside>
 
             {/* Main Content Area */}
             <main className="flex-1 min-w-0 max-w-[880px] w-full">
               {/* Header Hero - Centered Centric UI */}
               <div className="mb-4 text-center flex flex-col items-center">
-                <div className="inline-flex items-center gap-2 px-3.5 py-1 rounded-full text-xs font-semibold bg-[#0E7490]/15 text-[#38BDF8] border border-[#0E7490]/35 mb-2.5 shadow-sm">
-                  <span className="w-1.5 h-1.5 rounded-full bg-[#38BDF8] animate-pulse" />
+                <div className="inline-flex items-center gap-2 text-xs font-semibold text-zinc-400 mb-2.5">
+                  <span className="w-1.5 h-1.5 rounded-full bg-[#ff1018]" />
                   Curated Competitive Programming Track
                 </div>
 
@@ -835,8 +872,167 @@ export function TopicListView() {
               </div>
             </main>
 
+            {/* Right Sidebar: Your Stats (Desktop xl+) */}
+            <aside className="hidden xl:block w-72 2xl:w-80 shrink-0 xl:sticky xl:top-24 self-start">
+              <StatsDock
+                completedTopics={completedTopics}
+                totalProblemsCount={3888}
+                onOpenHeatmap={() => { setHasOpenedHeatmap(true); setIsHeatmapOpen(true); }}
+                onOpenAuraModal={() => { setHasOpenedAuraModal(true); setIsAuraModalOpen(true); }}
+              />
+            </aside>
           </div>
         </div>
+
+        {/* Mobile Navigation Drawer (Left Slide-in) */}
+        <AnimatePresence>
+          {isNavDrawerOpen && (
+            <div className="xl:hidden">
+              {/* Backdrop */}
+              <motion.div
+                key="nav-backdrop"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.25, ease: "easeInOut" }}
+                onClick={() => setIsNavDrawerOpen(false)}
+                className="fixed inset-0 z-[55] bg-black/80 backdrop-blur-sm"
+                aria-hidden="true"
+              />
+
+              {/* Left Drawer Panel */}
+              <motion.aside
+                key="nav-drawer"
+                role="dialog"
+                aria-modal="true"
+                aria-label="Navigation Menu"
+                initial={{ x: "-100%" }}
+                animate={{ x: 0 }}
+                exit={{ x: "-100%" }}
+                transition={{ type: "spring", damping: 28, stiffness: 280 }}
+                className="fixed inset-y-0 left-0 z-[60] w-[min(340px,calc(100vw-2.5rem))] bg-[#0a0a0c] border-r border-white/10 shadow-2xl flex flex-col overflow-hidden"
+              >
+                {/* Header with Title + Close button */}
+                <div className="flex items-center justify-between p-4 border-b border-white/10 bg-black/70">
+                  <div className="flex items-center gap-2">
+                    <TbCompass className="w-5 h-5 text-sky-400" />
+                    <h2 className="text-sm font-bold text-white tracking-tight">Navigation</h2>
+                    <span className="text-xs font-mono text-zinc-400">(15)</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setIsNavDrawerOpen(false)}
+                    className="p-1.5 rounded-xl border border-white/10 bg-white/[0.04] text-zinc-400 hover:text-white hover:bg-white/10 active:scale-95 transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 cursor-pointer"
+                    aria-label="Close navigation"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+
+                {/* Navigation Items */}
+                <div className="flex-1 overflow-y-auto p-3 scrollbar-thin">
+                  <TopicListSidebar
+                    completedTopics={completedTopics}
+                    favouriteTopics={favouriteTopics}
+                    favouriteProblems={favouriteProblems}
+                    skippedTopics={skippedTopics}
+                    categories={CATEGORIES}
+                    activeCategoryId={activeCategory}
+                    onSelectCategory={(catId) => {
+                      handleSelectCategory(catId);
+                      setIsNavDrawerOpen(false);
+                    }}
+                    onOpenModules={() => {
+                      setHasOpenedModules(true);
+                      setIsModulesOpen(true);
+                      setIsNavDrawerOpen(false);
+                    }}
+                    onOpenHeatmap={() => {
+                      setHasOpenedHeatmap(true);
+                      setIsHeatmapOpen(true);
+                      setIsNavDrawerOpen(false);
+                    }}
+                    onOpenAuraModal={() => {
+                      setHasOpenedAuraModal(true);
+                      setIsAuraModalOpen(true);
+                      setIsNavDrawerOpen(false);
+                    }}
+                    onToggleSkip={handleToggleSkip}
+                    inDrawer
+                    onItemClick={() => setIsNavDrawerOpen(false)}
+                  />
+                </div>
+              </motion.aside>
+            </div>
+          )}
+        </AnimatePresence>
+
+        {/* Mobile Stats Drawer (Right Slide-in) */}
+        <AnimatePresence>
+          {isStatsDrawerOpen && (
+            <div className="xl:hidden">
+              {/* Backdrop */}
+              <motion.div
+                key="stats-backdrop"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.25, ease: "easeInOut" }}
+                onClick={() => setIsStatsDrawerOpen(false)}
+                className="fixed inset-0 z-[55] bg-black/80 backdrop-blur-sm"
+                aria-hidden="true"
+              />
+
+              {/* Right Drawer Panel */}
+              <motion.aside
+                key="stats-drawer"
+                role="dialog"
+                aria-modal="true"
+                aria-label="Your Stats Menu"
+                initial={{ x: "100%" }}
+                animate={{ x: 0 }}
+                exit={{ x: "100%" }}
+                transition={{ type: "spring", damping: 28, stiffness: 280 }}
+                className="fixed inset-y-0 right-0 z-[60] w-[min(380px,calc(100vw-1.5rem))] bg-[#0a0a0c] border-l border-white/10 shadow-2xl flex flex-col overflow-hidden"
+              >
+                {/* Header with Title + Close button */}
+                <div className="flex items-center justify-between p-4 border-b border-white/10 bg-black/70">
+                  <div className="flex items-center gap-2">
+                    <FaChartLine className="w-5 h-5 text-emerald-400" />
+                    <h2 className="text-sm font-bold text-white tracking-tight">Your Stats</h2>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setIsStatsDrawerOpen(false)}
+                    className="p-1.5 rounded-xl border border-white/10 bg-white/[0.04] text-zinc-400 hover:text-white hover:bg-white/10 active:scale-95 transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 cursor-pointer"
+                    aria-label="Close stats"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+
+                {/* Stats Content */}
+                <div className="flex-1 overflow-y-auto p-3.5 scrollbar-thin">
+                  <StatsDock
+                    completedTopics={completedTopics}
+                    totalProblemsCount={3888}
+                    onOpenHeatmap={() => {
+                      setHasOpenedHeatmap(true);
+                      setIsHeatmapOpen(true);
+                      setIsStatsDrawerOpen(false);
+                    }}
+                    onOpenAuraModal={() => {
+                      setHasOpenedAuraModal(true);
+                      setIsAuraModalOpen(true);
+                      setIsStatsDrawerOpen(false);
+                    }}
+                    onActionClick={() => setIsStatsDrawerOpen(false)}
+                  />
+                </div>
+              </motion.aside>
+            </div>
+          )}
+        </AnimatePresence>
 
         {/* Modules Modal */}
         {hasOpenedModules && (

@@ -177,7 +177,7 @@ export function ProblemSolvingPanel({ profile, onOpenConnect }: ProblemSolvingPa
       <div className="rounded-2xl border border-white/10 bg-black p-5 shadow-2xl">
         <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
           {/* Left Stats Cards (2 Columns) */}
-          <div className="lg:col-span-2 grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:col-span-2">
             {/* Box 1: Questions Solved */}
             <div className="rounded-xl border border-white/10 bg-[#0a0a0c] p-4 flex flex-col justify-between hover:border-white/20 transition-all">
               <div className="flex items-center justify-between">
@@ -262,10 +262,14 @@ export function ProblemSolvingPanel({ profile, onOpenConnect }: ProblemSolvingPa
             </div>
 
             {/* Calendar year contribution grid */}
-            <div className="overflow-x-auto no-scrollbar py-3">
-              <div className="flex gap-1 min-w-[560px]">
+            <div className="w-full py-3">
+              <div
+                role="grid"
+                aria-label={`${selectedYear} activity by day`}
+                className="grid w-full grid-cols-[repeat(53,minmax(0,1fr))] gap-x-0.5"
+              >
                 {Array.from({ length: 53 }).map((_, colIdx) => (
-                  <div key={colIdx} className="flex flex-col gap-1">
+                  <div key={colIdx} role="row" className="grid min-w-0 grid-rows-7 gap-y-0.5">
                     {Array.from({ length: 7 }).map((_, rowIdx) => {
                       const dayIdx = colIdx * 7 + rowIdx;
                       const dayData = heatmapDays[dayIdx];
@@ -280,7 +284,9 @@ export function ProblemSolvingPanel({ profile, onOpenConnect }: ProblemSolvingPa
                       return (
                         <SimpleTooltip key={rowIdx} content={`${count} activity events on ${dateStr || "N/A"}`}>
                           <div
-                            className={`w-2.5 h-2.5 sm:w-3 sm:h-3 rounded-[2px] transition-transform hover:scale-125 cursor-pointer ${bgClass}`}
+                            role="gridcell"
+                            aria-label={`${count} activity events on ${dateStr || "N/A"}`}
+                            className={`aspect-square w-full max-w-[0.75rem] justify-self-center rounded-[2px] transition-transform hover:scale-125 ${bgClass}`}
                           />
                         </SimpleTooltip>
                       );
@@ -422,21 +428,21 @@ export function ProblemSolvingPanel({ profile, onOpenConnect }: ProblemSolvingPa
             </div>
 
             {/* Rating Highlights Footer */}
-            <div className="grid grid-cols-2 gap-2 pt-3 border-t border-white/10 text-xs text-zinc-400 font-mono mt-2">
-              <div className="p-2 rounded-xl bg-[#0d0d12] border border-white/10 flex items-center justify-between">
+            <div className="mt-2 grid grid-cols-1 gap-2 border-t border-white/10 pt-3 text-xs font-mono text-zinc-400 sm:grid-cols-2">
+              <div className="flex min-w-0 flex-wrap items-center justify-between gap-x-2 gap-y-1 rounded-xl border border-white/10 bg-[#0d0d12] p-2">
                 <span>Provider peak ratings:</span>
-                <span className="font-bold text-emerald-400 text-sm">{profile.platforms.filter((p) => typeof p.maxRating === "number").map((p) => `${p.name} ${p.maxRating}`).join(" · ") || "Unavailable"}</span>
+                <span className="min-w-0 break-words text-sm font-bold text-emerald-400">{profile.platforms.filter((p) => typeof p.maxRating === "number").map((p) => `${p.name} ${p.maxRating}`).join(" · ") || "Unavailable"}</span>
               </div>
-              <div className="p-2 rounded-xl bg-[#0d0d12] border border-white/10 flex items-center justify-between">
+              <div className="flex min-w-0 flex-wrap items-center justify-between gap-x-2 gap-y-1 rounded-xl border border-white/10 bg-[#0d0d12] p-2">
                 <span>Provider ranks:</span>
-                <span className="font-bold text-amber-400 text-sm">{profile.platforms.filter((p) => p.rank !== undefined).map((p) => `${p.name} ${p.rank}`).join(" · ") || "Unavailable"}</span>
+                <span className="min-w-0 break-words text-sm font-bold text-amber-400">{profile.platforms.filter((p) => p.rank !== undefined).map((p) => `${p.name} ${p.rank}`).join(" · ") || "Unavailable"}</span>
               </div>
             </div>
           </div>
 
           {/* Card 2: Earned Badges Showcase */}
           <div className="rounded-2xl border border-white/10 bg-black p-5 shadow-2xl">
-            <div className="flex items-center justify-between mb-4 pb-3 border-b border-white/10">
+            <div className="mb-4 flex flex-col gap-3 border-b border-white/10 pb-3 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <h2 className="text-sm font-black text-white uppercase tracking-wider flex items-center gap-2">
                   <Award className="w-4 h-4 text-amber-400" />
@@ -446,7 +452,7 @@ export function ProblemSolvingPanel({ profile, onOpenConnect }: ProblemSolvingPa
               </div>
 
               {/* Platform Filters */}
-              <div className="flex items-center gap-1">
+              <div className="flex flex-wrap items-center gap-1">
                 {["all", "LeetCode", "CodeChef", "CodeStudio"].map((pKey) => (
                   <button
                     key={pKey}

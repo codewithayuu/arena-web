@@ -18,9 +18,9 @@ const DIFFICULTY_OPTIONS = [
 
 const IMPORTANCE_OPTIONS = [
   { value: "", label: "All Importance Levels" },
-  { value: "1", label: "★☆☆ Nice to know" },
-  { value: "2", label: "★★☆ Should know" },
-  { value: "3", label: "★★★ Must know" },
+  { value: "1", label: "Priority 1 (Nice to know)" },
+  { value: "2", label: "Priority 2 (Should know)" },
+  { value: "3", label: "Priority 3 (Must know)" },
 ];
 
 const COMPLETION_OPTIONS = [

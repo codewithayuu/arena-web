@@ -100,7 +100,7 @@ export function AuthenticStatsGrid({
                   <div className="pt-1 border-t border-white/10 text-[10px] text-zinc-400 space-y-0.5">
                     {AURA_TIERS.map((t) => (
                       <div key={t.id} className="flex justify-between">
-                        <span>{t.symbol} {t.name}</span>
+                        <span className="flex items-center gap-1.5"><span className="font-mono text-[10px] text-sky-400 font-bold">[{t.symbol}]</span><span>{t.name}</span></span>
                         <span className="font-mono text-zinc-300">{t.minAura.toLocaleString()}+</span>
                       </div>
                     ))}
@@ -125,7 +125,7 @@ export function AuthenticStatsGrid({
 
           <div className="mt-0.5">
             <div className="flex items-center gap-1.5">
-              <span className="text-base leading-none">{currentTier.symbol}</span>
+              <span className="text-xs font-mono font-bold text-sky-400">Tier {currentTier.symbol}</span>
               <span className="text-sm font-bold text-sky-400 font-sans tracking-tight">
                 {currentTier.name}
               </span>
@@ -333,7 +333,7 @@ export function AuthenticStatsGrid({
           <div className="mt-1">
             {categoryBadges.totalBadges > 0 ? (
               <div className="flex items-center gap-1 text-sm font-bold font-sans text-white">
-                <span>🎖️ {categoryBadges.totalBadges}</span>
+                <span className="inline-flex items-center gap-1.5"><FaMedal className="w-3.5 h-3.5 text-amber-400" /><span>{categoryBadges.totalBadges} Badges</span></span>
               </div>
             ) : (
               <div className="text-xl font-bold font-sans text-zinc-500 leading-tight">

@@ -35,7 +35,7 @@ export type ContestSubmissionReceipt = {
 };
 
 export type ContestSubmissionStatus = ContestSubmissionReceipt & {
-  result_origin?: "CLIENT_REPORTED";
+  result_origin?: "CLIENT_REPORTED" | "CLIENT_EXECUTION_SERVER_OUTPUT_CHECKED";
   status: "queued" | "judging" | "judged" | "internal_error";
   verdict: "AC" | "WA" | "CE" | "RE" | "TLE" | "MLE" | "OLE" | "CANCELED" | null;
   score: number | null;
@@ -713,7 +713,7 @@ function isContestSampleRunResult(value: unknown): value is ContestSampleRunResu
 function isStatus(value: unknown, submissionId: string): value is ContestSubmissionStatus {
   const status = asRecord(value);
   return !!status && onlyKeys(status, ["submission_id", "status", "accepted_at", "source_sha256", "idempotency_key", "verdict", "score", "reason", "result_origin"]) &&
-    (status.result_origin === undefined || status.result_origin === "CLIENT_REPORTED") &&
+    (status.result_origin === undefined || status.result_origin === "CLIENT_REPORTED" || status.result_origin === "CLIENT_EXECUTION_SERVER_OUTPUT_CHECKED") &&
     typeof status.submission_id === "string" && status.submission_id.toLowerCase() === submissionId.toLowerCase() &&
     ["queued", "judging", "judged", "internal_error"].includes(String(status.status)) && isDateTime(status.accepted_at) &&
     typeof status.source_sha256 === "string" && SHA256.test(status.source_sha256) && isUuid(status.idempotency_key) &&

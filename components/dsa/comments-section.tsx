@@ -135,7 +135,7 @@ export function CommentsSection() {
   return (
     <div className="not-prose mt-12 pt-8 border-t border-border">
       {/* Comments Heading */}
-      <div className="mb-6 flex items-center justify-between">
+      <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <h2 className="text-2xl font-bold text-foreground flex items-center gap-2">
           <MessageCircle className="h-6 w-6 text-primary" />
           <span>Comments ({comments.length})</span>

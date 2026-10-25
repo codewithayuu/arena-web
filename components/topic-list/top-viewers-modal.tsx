@@ -43,7 +43,7 @@ export function TopViewersModal({
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-in fade-in duration-200">
+    <div className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-in fade-in duration-200">
       <div
         className="relative w-full max-w-md rounded-2xl border border-white/10 bg-[#0e0e13] p-5 sm:p-6 shadow-2xl text-white overflow-hidden"
         onClick={(e) => e.stopPropagation()}

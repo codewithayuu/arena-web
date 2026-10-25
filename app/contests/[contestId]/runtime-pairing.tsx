@@ -598,7 +598,7 @@ function ContestRuntimePairingInner({ contestId, policy, launchRequestId }: {
   return (
     <section id="runtime-pairing" aria-labelledby="runtime-pairing-heading" className="mt-6 scroll-mt-6 rounded-lg border border-white/10 bg-black/20 p-5">
       <h3 id="runtime-pairing-heading" className="font-semibold">Mindflare runtime and exam readiness</h3>
-      <p className="mt-2 text-sm font-semibold">{participantLocal ? "On-device evaluation · client-reported results" : "Server judging"}</p>
+      <p className="mt-2 text-sm font-semibold">{participantLocal ? "Local execution · server output comparison" : "Server judging"}</p>
       {isMockMode && <p className="mt-3 rounded-lg border border-amber-400/30 bg-amber-950/30 p-3 text-sm text-amber-100" role="status">
         Development mock only. Admission, camera checks, judging, and completion are simulated here; no official contest result is created.
       </p>}
@@ -744,7 +744,7 @@ function ContestRuntimePairingInner({ contestId, policy, launchRequestId }: {
           <p className="mt-2 text-sm text-zinc-200">{isMockMode
             ? "Development mock: completion was simulated; the contest server was not contacted."
             : "Completion was confirmed by the contest server."} Local Run and contest access are disabled. {participantLocal
-            ? "The contest service retains client-reported results and scores; it does not independently verify local verdicts."
+            ? "The service compares outputs sent by this device with its expected outputs. It cannot confirm that the submitted source produced them."
             : isMockMode ? "This preview contains no contest verdicts or official standings."
               : "Official verdicts and standings remain server-owned."}</p>
           <p className="mt-2 text-sm text-zinc-300" role="status" aria-live="polite">
@@ -826,19 +826,19 @@ function browserSessionStorage(): ContestHandoffStorage | null {
 }
 
 function submissionStatusMessage(status: ContestSubmissionStatus, participantLocal: boolean): string {
-  const clientReported = participantLocal || status.result_origin === "CLIENT_REPORTED";
+  const localOutputCheck = participantLocal || status.result_origin === "CLIENT_REPORTED" || status.result_origin === "CLIENT_EXECUTION_SERVER_OUTPUT_CHECKED";
   if (status.status === "judged") {
-    return clientReported
-      ? `Client-reported local result: ${status.verdict ?? "pending"}${status.score === null ? "" : ` · score ${status.score}`}. The contest service recorded it without rerunning the code.`
+    return localOutputCheck
+      ? `Server output comparison: ${status.verdict ?? "pending"}${status.score === null ? "" : ` · score ${status.score}`}. The source-to-output relationship is not verified.`
       : `Server verdict: ${status.verdict ?? "pending"}${status.score === null ? "" : ` · judge score ${status.score}`}.`;
   }
   if (status.status === "internal_error") {
-    return clientReported
-      ? "The contest service could not finalize the client-reported result. Its submission record remains in history; contact the organizer if it does not recover."
+    return localOutputCheck
+      ? "The contest service could not finalize the output comparison. Its submission record remains in history; contact the organizer if it does not recover."
       : "The server judge reported an internal error. The submission remains in server history; contact the organizer if it does not recover.";
   }
-  return clientReported
-    ? `The contest service has recorded the local result as ${status.status}.`
+  return localOutputCheck
+    ? `The contest service recorded the local output check as ${status.status}.`
     : `Submission ${status.submission_id} is ${status.status} in the server judge queue.`;
 }
 
@@ -1339,7 +1339,7 @@ function ContestWorkspace({
       return;
     }
     setSubmitting(true);
-    setSubmissionMessage(participantLocal ? "Requesting local evaluation authorization…" : "Sending source to the contest authority for server judging…");
+    setSubmissionMessage(participantLocal ? "Preparing the local output check…" : "Sending source to the contest authority for server judging…");
     let acceptedId: string | null = null;
     let attempt: PendingContestSubmission | null = null;
     try {
@@ -1375,7 +1375,7 @@ function ContestWorkspace({
         setSubmissionHistory(current=>[{submission_id:status.submission_id,problem_id:selected.problem_id,language,
           accepted_at:status.accepted_at,source_sha256:status.source_sha256,idempotency_key:status.idempotency_key},
           ...current.filter(item=>item.submission_id!==status.submission_id)].slice(0,50));
-        setSubmissionMessage(`Client-reported local result: ${status.verdict ?? "pending"}. The contest service recorded this result; it did not independently rerun the code.`);
+        setSubmissionMessage(`Server output comparison: ${status.verdict ?? "pending"}. The source-to-output relationship is not verified.`);
         return;
       }
       const receipt = await submitContestSource({
@@ -1433,7 +1433,7 @@ function ContestWorkspace({
       setSubmissionMessage(acceptedId
         ? `Submission ${acceptedId} was accepted. Its latest server status could not be read; use Check status to retry the source-free status request.`
         : participantLocal
-          ? "The client report is unconfirmed. Retry this exact source, problem and language; the saved evaluation report will be reused when available."
+            ? "The output comparison is unconfirmed. Retry this exact source, problem and language; the launcher will rerun locally and the same submission key will be reused."
           : "The server submission response was not confirmed. Retry this exact problem, language and source to reuse the same idempotency key.");
     } finally {
       setActiveExecutionId(null);
@@ -1677,7 +1677,7 @@ function ContestWorkspace({
               className="mt-3 rounded border border-white/20 px-4 py-2 text-sm disabled:opacity-50">Exit secure browser for recovery (not contest completion)</button>}
           </div>
           <p className="text-xs text-amber-300">{participantLocal
-            ? "Run previews do not change your score. Submit evaluates on this device and records a client-reported result with the contest service."
+            ? "Run previews do not change your score. Submit runs locally, sends bounded stdout to the contest service, and records its comparison. The service cannot prove the source produced those outputs."
             : "Local output is unverified and never changes contest score. Submit sends source to the server judge; only its verdict updates official results."}</p>
           {runResults.map((result, index) => {
             const diagnostic = result.compile_exit_code !== null && result.compile_exit_code !== 0
@@ -1705,13 +1705,13 @@ function ContestWorkspace({
           })}
           {submissionMessage && <p role="status" aria-live="polite" className="text-sm text-zinc-300">{submissionMessage}</p>}
           <section className="mt-2 border-t border-white/10 pt-4" aria-labelledby="submission-history-heading">
-            <h5 id="submission-history-heading" className="font-semibold">{participantLocal ? "Recent client-reported submissions" : "Recent server submissions"}</h5>
+            <h5 id="submission-history-heading" className="font-semibold">{participantLocal ? "Recent server output comparisons" : "Recent server submissions"}</h5>
             <button type="button" onClick={() => { setHistoryLoading(true); setHistoryRefresh((value) => value + 1); }} disabled={historyLoading || submitting || completing}
               className="mt-2 rounded border border-white/20 px-3 py-2 text-xs disabled:opacity-50">Refresh contest history and recover receipts</button>
             {historyLoading && <p className="mt-2 text-sm text-zinc-400">Loading contest history…</p>}
             {historyUnavailable && <p className="mt-2 text-sm text-zinc-400">Contest history is temporarily unavailable. Accepted submission records remain stored by the contest authority.</p>}
             {historyPageError && <p className="mt-2 text-sm text-zinc-400">Older history could not be loaded. Retry to continue.</p>}
-            {!historyLoading && !historyUnavailable && submissionHistory.length === 0 && <p className="mt-2 text-sm text-zinc-400">{participantLocal ? "No client-reported submissions are recorded for this contest yet." : "No server submissions are recorded for this contest yet."}</p>}
+            {!historyLoading && !historyUnavailable && submissionHistory.length === 0 && <p className="mt-2 text-sm text-zinc-400">{participantLocal ? "No server output comparisons are recorded for this contest yet." : "No server submissions are recorded for this contest yet."}</p>}
             <ol className="mt-2 grid gap-2">
               {submissionHistory.map((item) => {
                 const status = historyStatuses[item.submission_id];

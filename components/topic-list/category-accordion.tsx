@@ -6,6 +6,7 @@ import {
   Link as LinkIcon,
   ArrowUpDown,
   Check,
+  Info,
 } from "@/components/animate-ui/icons";
 import { Category, EnrichedTopic } from "@/lib/topic-list-data";
 import { TopicTableRow } from "./topic-table-row";
@@ -151,7 +152,7 @@ export function CategoryAccordion({
 
             {category.category_desc && (
               <p className="text-xs text-gray-400 max-w-3xl leading-relaxed">
-                💡 {category.category_desc}
+                <Info className="w-3 h-3 inline mr-1.5 text-sky-400" />{category.category_desc}
               </p>
             )}
           </div>
@@ -254,31 +255,30 @@ export function CategoryAccordion({
                 {/* Subcategory Description (e.g., 💡 Learning C++ is recommended.) */}
                 {sub.sub_category_desc && (
                   <p className="text-xs text-gray-400 pl-0.5">
-                    💡 {sub.sub_category_desc}
+                    <Info className="w-3 h-3 inline mr-1.5 text-sky-400" />{sub.sub_category_desc}
                   </p>
                 )}
 
                 {/* Subcategory Table (NO THEAD ROW - pure AMOLED topics list matching company/google) */}
-                <div className="overflow-x-auto rounded-xl border border-white/10 bg-black shadow-md">
-                  <table className="w-full text-left border-collapse min-w-[500px]">
-                    <tbody className="divide-y divide-white/[0.06] bg-black">
-                      {subTopics.map((topic) => (
-                        <TopicTableRow
-                          key={topic.topic_id}
-                          topic={topic}
-                          isCompleted={completedTopics.includes(topic.topic_id)}
-                          isPracticing={practicingTopics.includes(topic.topic_id)}
-                          isFavourite={favouriteTopics.includes(topic.topic_id)}
-                          isSkipped={skippedTopics.includes(topic.topic_id)}
-                          completionCount={communityTopicStats[topic.topic_id]?.completed_count}
-                          onToggleComplete={onToggleComplete}
-                          onTogglePractice={onTogglePractice}
-                          onToggleFavourite={onToggleFavourite}
-                          onToggleSkip={onToggleSkip}
-                        />
-                      ))}
-                    </tbody>
-                  </table>
+                <div
+                  role="list"
+                  className="divide-y divide-white/[0.06] overflow-hidden rounded-xl border border-white/10 bg-black shadow-md"
+                >
+                  {subTopics.map((topic) => (
+                    <TopicTableRow
+                      key={topic.topic_id}
+                      topic={topic}
+                      isCompleted={completedTopics.includes(topic.topic_id)}
+                      isPracticing={practicingTopics.includes(topic.topic_id)}
+                      isFavourite={favouriteTopics.includes(topic.topic_id)}
+                      isSkipped={skippedTopics.includes(topic.topic_id)}
+                      completionCount={communityTopicStats[topic.topic_id]?.completed_count}
+                      onToggleComplete={onToggleComplete}
+                      onTogglePractice={onTogglePractice}
+                      onToggleFavourite={onToggleFavourite}
+                      onToggleSkip={onToggleSkip}
+                    />
+                  ))}
                 </div>
               </div>
             );

@@ -3,6 +3,7 @@
 import React, { useState, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { SimpleTooltip } from '@/components/animate-ui/tooltip';
+import { Sparkles } from '@/components/animate-ui/icons';
 import { cn } from '@/lib/utils';
 
 export interface ClapButtonProps {
@@ -91,7 +92,7 @@ export function ClapButton({ count, onClap, disabled = false, className }: ClapB
               className="pointer-events-none absolute -top-1 left-1/2 -translate-x-1/2 z-30 select-none"
             >
               <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-[#1c1408] border border-amber-500/40 text-amber-300 font-mono font-bold text-[10px] shadow-[0_4px_14px_rgba(245,158,11,0.3)] backdrop-blur-md">
-                <span>👏</span>
+                <Sparkles className="w-2.5 h-2.5 text-amber-400" />
                 <span>{b.label}</span>
               </span>
             </motion.div>
@@ -125,7 +126,7 @@ export function ClapButton({ count, onClap, disabled = false, className }: ClapB
             transition={{ duration: 0.35, ease: 'easeInOut' }}
             className="inline-flex items-center justify-center text-sm leading-none select-none"
           >
-            👏
+            <Sparkles className="w-3.5 h-3.5 text-amber-400" />
           </motion.span>
 
           {/* Clap Counter */}

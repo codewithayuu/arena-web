@@ -384,7 +384,7 @@ export default function Select({
         <button
           aria-selected={isSelected}
           className={cn(
-            "relative flex w-full cursor-default select-none items-center gap-2 rounded-lg py-2 pr-8 pl-3 text-left text-xs outline-hidden",
+            "relative flex w-full cursor-default select-none items-center gap-2 rounded-lg py-2 pr-8 pl-3 text-left text-xs outline-none",
             "transition-colors cursor-pointer",
             opt.disabled
               ? "pointer-events-none opacity-50"

@@ -34,27 +34,27 @@ export function ProfileNavTabs({
     {
       value: "problemSolving",
       icon: <Code className="w-4 h-4 shrink-0" />,
-      label: <span>Problem Solving</span>,
+      label: <span className="sr-only md:not-sr-only">Problem Solving</span>,
     },
     {
       value: "contests",
       icon: <Trophy className="w-4 h-4 shrink-0" />,
-      label: <span>Contest Ratings</span>,
+      label: <span className="sr-only md:not-sr-only">Contest Ratings</span>,
     },
     {
       value: "development",
       icon: <CircuitBoard className="w-4 h-4 shrink-0" />,
-      label: <span>Development</span>,
+      label: <span className="sr-only md:not-sr-only">Development</span>,
     },
     {
       value: "badgesCard",
       icon: <Award className="w-4 h-4 shrink-0" />,
-      label: <span>Badges &amp; Card</span>,
+      label: <span className="sr-only md:not-sr-only">Badges &amp; Card</span>,
     },
     {
       value: "about",
       icon: <BookOpen className="w-4 h-4 shrink-0" />,
-      label: <span>Journey &amp; Projects</span>,
+      label: <span className="sr-only md:not-sr-only">Journey &amp; Projects</span>,
     },
   ];
 
@@ -72,7 +72,7 @@ export function ProfileNavTabs({
         radius={9999}
         inset={3}
         equalSlots={false}
-        className="profile-rubber-nav min-w-[700px] w-full"
+        className="profile-rubber-nav min-w-0 w-full"
         aria-label="Profile navigation sections"
       />
     </div>
