@@ -7,11 +7,17 @@ import {
   type ParticipantContestProblem,
   type PublicContestStandings,
 } from "@/lib/contest-submissions";
+import {
+  generateMockStandings,
+  generateDynamicMockStandings,
+  getMockSolvedProblemIds,
+  isMockContestModeEnabled,
+} from "@/lib/mock-contest-store";
 
 const STANDINGS_PAGE_SIZE = 50;
 const STANDINGS_REFRESH_INTERVAL_MS = 30_000;
 
-export function ContestStandings({ contestId }: { contestId: string }) {
+export function ContestStandings({ contestId, participantLocal = false }: { contestId: string; participantLocal?: boolean }) {
   const [standings, setStandings] = useState<PublicContestStandings | null>(null);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState<string | null>(null);
@@ -23,13 +29,22 @@ export function ContestStandings({ contestId }: { contestId: string }) {
     requestInFlight.current = true;
     setLoading(true);
     setMessage(null);
+
+    // If local mock mode is enabled, load simulated live standings immediately
+    if (isMockContestModeEnabled()) {
+      const mockStandings = generateMockStandings(contestId, getMockSolvedProblemIds(contestId));
+      setStandings(mockStandings);
+      setLastConfirmedAt(new Date().toISOString());
+      setLoading(false);
+      requestInFlight.current = false;
+      return;
+    }
+
     try {
       setStandings(await getPublicContestStandings(contestId));
       setLastConfirmedAt(new Date().toISOString());
     } catch (error) {
-      setMessage(error instanceof ContestSubmissionError && error.status === 404
-        ? "Official standings are not published yet. Any previously confirmed snapshot remains visible."
-        : "Standings could not be refreshed from the contest server. Any previously confirmed snapshot remains visible; retry when the connection is available.");
+      setMessage("Standings could not be refreshed. The last confirmed snapshot is shown; retry when the connection returns.");
     } finally {
       requestInFlight.current = false;
       setLoading(false);
@@ -44,13 +59,16 @@ export function ContestStandings({ contestId }: { contestId: string }) {
     const timer = window.setInterval(refreshWhenVisible, STANDINGS_REFRESH_INTERVAL_MS);
     document.addEventListener("visibilitychange", refreshWhenVisible);
     window.addEventListener("online", refreshWhenVisible);
+    window.addEventListener("mindflare_mock_submissions_changed", refresh);
     return () => {
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", refreshWhenVisible);
       window.removeEventListener("online", refreshWhenVisible);
+      window.removeEventListener("mindflare_mock_submissions_changed", refresh);
     };
   }, [refresh]);
 
+  const mockMode = isMockContestModeEnabled();
   const scoringLabel = standings?.scoring.preset === "codeforces_dynamic"
     ? "Codeforces Dynamic"
     : standings?.scoring.preset === "icpc" ? "ICPC" : "Points";
@@ -60,8 +78,8 @@ export function ContestStandings({ contestId }: { contestId: string }) {
     <section aria-labelledby="contest-standings-heading" className="mt-7 rounded-xl border border-white/10 bg-black/20 p-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h2 id="contest-standings-heading" className="text-xl font-semibold">Official standings</h2>
-          {standings && <p className="mt-1 text-sm text-zinc-400">{scoringLabel} · {standings.state}{lastConfirmedAt ? ` · snapshot received ${new Date(lastConfirmedAt).toLocaleTimeString()}` : ""}</p>}
+          <h2 id="contest-standings-heading" className="text-xl font-semibold">{mockMode ? "Development sample standings" : participantLocal ? "Client-reported standings" : "Official standings"}</h2>
+          {standings && <p className="mt-1 text-sm text-zinc-400">{scoringLabel} · {standings.state}{lastConfirmedAt ? ` · updated ${new Date(lastConfirmedAt).toLocaleTimeString()}` : ""}</p>}
         </div>
         <button
           type="button"
@@ -73,20 +91,21 @@ export function ContestStandings({ contestId }: { contestId: string }) {
         </button>
       </div>
 
+      {participantLocal && !mockMode && <p className="mt-3 text-sm text-amber-200">The contest service stores and scores verdicts reported by participant devices. It does not independently verify local verdicts.</p>}
       {standings?.scoring.preset === "codeforces_dynamic" && (
         <p className="mt-3 text-sm text-zinc-400">
-          Points are recalculated from the server’s current solve counts, contest time, and wrong attempts.
+          Points are recalculated from the contest service’s current solve counts, contest time, and wrong attempts{participantLocal ? ", using participant-reported verdicts." : "."}
         </p>
       )}
       {message && <p className="mt-4 text-sm text-amber-200" role="status">{message}</p>}
-      {!message && loading && <p className="mt-4 text-sm text-zinc-400" role="status">Loading server standings…</p>}
+      {!message && loading && <p className="mt-4 text-sm text-zinc-400" role="status">Loading contest standings…</p>}
       {standings && standings.rows.length === 0 && (
-        <p className="mt-4 text-sm text-zinc-400" role="status">No official submissions are on the standings yet.</p>
+        <p className="mt-4 text-sm text-zinc-400" role="status">{participantLocal ? "No participant-reported submissions are on the standings yet." : "No official submissions are on the standings yet."}</p>
       )}
       {standings && standings.rows.length > 0 && (
         <div className="mt-4 overflow-x-auto">
           <table className="w-full min-w-[36rem] border-collapse text-left text-sm">
-            <caption className="sr-only">Contest ranks and official scoring</caption>
+            <caption className="sr-only">Contest ranks and scores</caption>
             <thead>
               <tr className="border-b border-white/15 text-zinc-400">
                 <th scope="col" className="px-3 py-2">Rank</th>
@@ -122,9 +141,11 @@ export function ContestStandings({ contestId }: { contestId: string }) {
 export function ContestProblemStandings({
   contestId,
   problems,
+  participantLocal = false,
 }: {
   contestId: string;
   problems: ParticipantContestProblem[];
+  participantLocal?: boolean;
 }) {
   const [standings, setStandings] = useState<PublicContestStandings | null>(null);
   const [loading, setLoading] = useState(true);
@@ -138,14 +159,23 @@ export function ContestProblemStandings({
     requestInFlight.current = true;
     setLoading(true);
     setMessage(null);
+    // If mock mode is enabled, supply dynamic mock problem standings
+    if (isMockContestModeEnabled()) {
+      const mockStandings = generateDynamicMockStandings(contestId, problems, getMockSolvedProblemIds(contestId));
+      setStandings(mockStandings);
+      setLastConfirmedAt(new Date().toISOString());
+      setPage(0);
+      setLoading(false);
+      requestInFlight.current = false;
+      return;
+    }
+
     try {
       setStandings(await getPublicContestStandings(contestId));
       setLastConfirmedAt(new Date().toISOString());
       setPage(0);
-    } catch (error) {
-      setMessage(error instanceof ContestSubmissionError && error.status === 404
-        ? "Official problem scores are not published yet. Any previously confirmed snapshot remains visible."
-        : "Problem scores could not be refreshed from the contest server. Any previously confirmed snapshot remains visible; retry when the connection is available.");
+    } catch {
+      setMessage("Per-problem standings could not be refreshed. The last confirmed snapshot is shown; retry when the connection returns.");
     } finally {
       requestInFlight.current = false;
       setLoading(false);
@@ -179,7 +209,7 @@ export function ContestProblemStandings({
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h4 id="contest-problem-standings-heading" className="text-lg font-semibold">Per-problem standings</h4>
-          {standings && <p className="mt-1 text-sm text-zinc-400">{standings.scoring.preset === "icpc" ? "ICPC" : standings.scoring.preset === "codeforces_dynamic" ? "Codeforces Dynamic" : "Points"} · server projection{lastConfirmedAt ? ` · snapshot received ${new Date(lastConfirmedAt).toLocaleTimeString()}` : ""}</p>}
+          {standings && <p className="mt-1 text-sm text-zinc-400">{standings.scoring.preset === "icpc" ? "ICPC" : standings.scoring.preset === "codeforces_dynamic" ? "Codeforces Dynamic" : "Points"} · {participantLocal ? "projection from client-reported verdicts" : "server projection"}{lastConfirmedAt ? ` · updated ${new Date(lastConfirmedAt).toLocaleTimeString()}` : ""}</p>}
         </div>
         <button
           type="button"
@@ -196,13 +226,13 @@ export function ContestProblemStandings({
       {message && <p className="mt-4 text-sm text-amber-200" role="status">{message}</p>}
       {!message && loading && <p className="mt-4 text-sm text-zinc-400" role="status">Loading problem scores…</p>}
       {standings && rows.length === 0 && (
-        <p className="mt-4 text-sm text-zinc-400" role="status">No official submissions are on the standings yet.</p>
+        <p className="mt-4 text-sm text-zinc-400" role="status">{participantLocal ? "No participant-reported submissions are on the standings yet." : "No official submissions are on the standings yet."}</p>
       )}
       {standings && rows.length > 0 && (
         <>
           <div className="mt-4 overflow-x-auto">
             <table className="w-full min-w-max border-collapse text-left text-sm">
-              <caption className="sr-only">Freeze-masked official scores for each verified contest problem</caption>
+              <caption className="sr-only">Freeze-masked contest scores for each verified contest problem</caption>
               <thead>
                 <tr className="border-b border-white/15 text-zinc-400">
                   <th scope="col" className="sticky left-0 bg-zinc-950 px-3 py-2">Rank</th>

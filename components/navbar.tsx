@@ -297,6 +297,18 @@ export function Navbar() {
               >
                 Contests
               </Link>
+              <Link
+                href="/deadlock"
+                aria-label="Enter the Deadlock Arena"
+                aria-current={pathname.startsWith("/deadlock") ? "page" : undefined}
+                onMouseEnter={() => openTab(null)}
+                className={`h-8 flex items-center px-2.5 lg:px-3.5 text-xs lg:text-sm font-medium rounded-full transition-all duration-200 ${pathname.startsWith("/deadlock") && !activeTab
+                    ? "bg-white/[0.14] text-white shadow-inner"
+                    : "text-zinc-300 hover:text-white hover:bg-white/[0.08]"
+                  }`}
+              >
+                Deadlock
+              </Link>
             </nav>
 
             {/* Island 3: Secondary Ecosystem Pill */}
@@ -628,6 +640,18 @@ export function Navbar() {
                           <span>Contests</span>
                           <ChevronRight className="h-3.5 w-3.5 text-zinc-500" />
                         </button>
+                      </li>
+
+                      <li>
+                        <Link
+                          href="/deadlock"
+                          aria-current={pathname.startsWith("/deadlock") ? "page" : undefined}
+                          onClick={() => setMobileMenuOpen(false)}
+                          className={`flex h-9 items-center justify-between rounded-xl px-3 text-xs sm:text-[13px] font-medium transition-all ${pathname.startsWith("/deadlock") ? "bg-white/[0.12] text-white" : "text-zinc-200 hover:bg-white/[0.06] hover:text-white"
+                            }`}
+                        >
+                          <span>Deadlock Arena</span>
+                        </Link>
                       </li>
 
                       <li>

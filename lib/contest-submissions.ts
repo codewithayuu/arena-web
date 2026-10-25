@@ -35,11 +35,12 @@ export type ContestSubmissionReceipt = {
 };
 
 export type ContestSubmissionStatus = ContestSubmissionReceipt & {
+  result_origin?: "CLIENT_REPORTED";
   status: "queued" | "judging" | "judged" | "internal_error";
   verdict: "AC" | "WA" | "CE" | "RE" | "TLE" | "MLE" | "OLE" | "CANCELED" | null;
   score: number | null;
   reason: "ACCEPTED_OUTPUT_MATCH" | "WRONG_ANSWER" | "COMPILE_FAILED" | "RUNTIME_ERROR" |
-    "TIME_LIMIT" | "MEMORY_LIMIT" | "OUTPUT_LIMIT" | "CANCELED" | null;
+    "TIME_LIMIT" | "MEMORY_LIMIT" | "OUTPUT_LIMIT" | "CANCELED" | "CLIENT_REPORTED_LOCAL_EVALUATION" | null;
 };
 
 export type ContestSubmissionHistoryItem = {
@@ -201,7 +202,7 @@ const SHA256 = /^[a-f0-9]{64}$/;
 const VERDICTS = new Set(["AC", "WA", "CE", "RE", "TLE", "MLE", "OLE", "CANCELED"]);
 const REASONS = new Set([
   "ACCEPTED_OUTPUT_MATCH", "WRONG_ANSWER", "COMPILE_FAILED", "RUNTIME_ERROR",
-  "TIME_LIMIT", "MEMORY_LIMIT", "OUTPUT_LIMIT", "CANCELED",
+  "TIME_LIMIT", "MEMORY_LIMIT", "OUTPUT_LIMIT", "CANCELED", "CLIENT_REPORTED_LOCAL_EVALUATION",
 ]);
 const MAX_RESPONSE_BYTES = 64 * 1024;
 
@@ -651,6 +652,9 @@ function isParticipantProblem(value: unknown): value is ParticipantContestProble
     });
 }
 
+export const isParticipantContestProblem = isParticipantProblem;
+export const contestGatewayUrl = gatewayUrl;
+
 function gatewayUrl(): URL | null {
   try {
     const url = new URL(process.env.NEXT_PUBLIC_MINDFLARE_GATEWAY_ORIGIN || "");
@@ -699,7 +703,8 @@ function isContestSampleRunResult(value: unknown): value is ContestSampleRunResu
 
 function isStatus(value: unknown, submissionId: string): value is ContestSubmissionStatus {
   const status = asRecord(value);
-  return !!status && onlyKeys(status, ["submission_id", "status", "accepted_at", "source_sha256", "idempotency_key", "verdict", "score", "reason"]) &&
+  return !!status && onlyKeys(status, ["submission_id", "status", "accepted_at", "source_sha256", "idempotency_key", "verdict", "score", "reason", "result_origin"]) &&
+    (status.result_origin === undefined || status.result_origin === "CLIENT_REPORTED") &&
     typeof status.submission_id === "string" && status.submission_id.toLowerCase() === submissionId.toLowerCase() &&
     ["queued", "judging", "judged", "internal_error"].includes(String(status.status)) && isDateTime(status.accepted_at) &&
     typeof status.source_sha256 === "string" && SHA256.test(status.source_sha256) && isUuid(status.idempotency_key) &&

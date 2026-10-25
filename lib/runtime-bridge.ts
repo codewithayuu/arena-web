@@ -81,6 +81,7 @@ export type LocalExecutionResult = {
 
 export type ContestLocalRunContext = {
   problemId: string;
+  evaluationPackageJson?: string;
   contestPolicy: {
     policy: Record<string, unknown>;
     sha256: string;
@@ -672,30 +673,23 @@ export async function runLocalInput(
     );
   }
   const mode = session.purpose === "practice" ? "PRACTICE_LOCAL" : "CONTEST_SAMPLE_LOCAL";
+  const executionBody = {
+    protocol_version: 1, execution_id: executionId, mode, language, source,
+    toolchain_version: capability.toolchain_version, stdin,
+    ...(contestContext ? { problem_id: contestContext.problemId, contest_policy: contestContext.contestPolicy } : {}),
+    ...(practiceManifest ? { practice_manifest: practiceManifest } : {}), test_bundle_id: null,
+  };
   let response: Response;
   try {
-    response = await fetch(`${RUNTIME}${practiceManifest ? "/v1/execution/practice" : "/v1/execution/run"}`, {
+    response = await fetch(`${RUNTIME}${contestContext?.evaluationPackageJson ? "/v1/execution/local-preview" : practiceManifest ? "/v1/execution/practice" : "/v1/execution/run"}`, {
       method: "POST", mode: "cors", credentials: "omit", cache: "no-store", redirect: "error",
       headers: {
         "Authorization": `Bearer ${session.sessionToken}`,
         "Content-Type": "application/json",
         Accept: "application/json",
       },
-      body: JSON.stringify({
-        protocol_version: 1,
-        execution_id: executionId,
-        mode,
-        language,
-        source,
-        toolchain_version: capability.toolchain_version,
-        stdin,
-        ...(contestContext ? {
-          problem_id: contestContext.problemId,
-          contest_policy: contestContext.contestPolicy,
-        } : {}),
-        ...(practiceManifest ? { practice_manifest: practiceManifest } : {}),
-        test_bundle_id: null,
-      }),
+      body: JSON.stringify(contestContext?.evaluationPackageJson
+        ? { execution: executionBody, payload_json: contestContext.evaluationPackageJson } : executionBody),
       signal: AbortSignal.timeout(practiceManifest ? 120_000 : 300_000),
     });
   } catch {
@@ -744,7 +738,7 @@ export async function runLocalInput(
   return value as LocalExecutionResult;
 }
 
-async function ensureLocalToolchain(session: RuntimeSession, language: string, version: string): Promise<void> {
+export async function ensureLocalToolchain(session: RuntimeSession, language: string, version: string): Promise<void> {
   if (Date.parse(session.expiresAt) <= Date.now() || !/^[a-z0-9_-]{1,32}$/.test(language) ||
       !/^[A-Za-z0-9._-]{1,64}$/.test(version)) {
     throw new RuntimeBridgeError("PAIRING_EXPIRED", "Reconnect before installing a toolchain.");

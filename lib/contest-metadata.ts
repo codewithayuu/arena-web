@@ -39,6 +39,7 @@ export type ParticipantContestMetadata = {
   phase: ContestSchedulePhase;
   starts_at: string;
   ends_at: string;
+  preflight_minutes: number;
   preflight_opens_at: string;
   first_admission_closes_at: string;
   late_join_grace_seconds: number;
@@ -66,6 +67,8 @@ export type ParticipantContestSummary = {
   phase: ContestSchedulePhase;
   starts_at: string;
   ends_at: string;
+  preflight_minutes: number;
+  preflight_opens_at: string;
   registration: {
     mode: "individual" | "team" | null;
     enabled: boolean;
@@ -77,6 +80,27 @@ export type ParticipantContestSummary = {
 
 export type ParticipantContestDirectory = {
   items: ParticipantContestSummary[];
+  limit: number;
+  offset: number;
+  next_offset: number | null;
+  server_time: string;
+};
+
+export type PublicContestSummary = {
+  contest_id: string;
+  name: string;
+  lifecycle_state: ContestLifecycleState;
+  phase: ContestSchedulePhase;
+  starts_at: string;
+  ends_at: string;
+  preflight_minutes: number;
+  preflight_opens_at: string;
+  problem_count: number;
+  registration_enabled: boolean;
+};
+
+export type PublicContestDirectory = {
+  items: PublicContestSummary[];
   limit: number;
   offset: number;
   next_offset: number | null;
@@ -130,8 +154,9 @@ export function parseParticipantContestMetadata(
       typeof metadata.phase !== "string" || !SCHEDULE_PHASES.has(metadata.phase as ContestSchedulePhase) ||
       !dateTime(metadata.starts_at) || !dateTime(metadata.ends_at) || !dateTime(metadata.preflight_opens_at) ||
       !dateTime(metadata.first_admission_closes_at) || !dateTime(metadata.server_time) ||
+      !boundedInteger(metadata.preflight_minutes, 0, 120) ||
       Date.parse(metadata.ends_at) <= Date.parse(metadata.starts_at) ||
-      Date.parse(metadata.preflight_opens_at) !== Date.parse(metadata.starts_at) - 15 * 60_000 ||
+      Date.parse(metadata.preflight_opens_at) !== Date.parse(metadata.starts_at) - metadata.preflight_minutes * 60_000 ||
       Date.parse(metadata.first_admission_closes_at) !== Math.min(
         Date.parse(metadata.starts_at) + (boundedInteger(metadata.late_join_grace_seconds, 0, 1800) ? metadata.late_join_grace_seconds : -1) * 1000,
         Date.parse(metadata.ends_at),
@@ -158,6 +183,7 @@ export function parseParticipantContestMetadata(
     phase: metadata.phase as ContestSchedulePhase,
     starts_at: metadata.starts_at,
     ends_at: metadata.ends_at,
+    preflight_minutes: metadata.preflight_minutes as number,
     preflight_opens_at: metadata.preflight_opens_at,
     first_admission_closes_at: metadata.first_admission_closes_at,
     late_join_grace_seconds: metadata.late_join_grace_seconds as number,
@@ -201,7 +227,10 @@ export function parseParticipantContestDirectory(value: unknown): ParticipantCon
         typeof item.lifecycle_state !== "string" || !LIFECYCLE_STATES.has(item.lifecycle_state as ContestLifecycleState) ||
         !boundedInteger(item.lifecycle_version, 0, Number.MAX_SAFE_INTEGER) ||
         typeof item.phase !== "string" || !SCHEDULE_PHASES.has(item.phase as ContestSchedulePhase) ||
-        !dateTime(item.starts_at) || !dateTime(item.ends_at) || Date.parse(item.ends_at) <= Date.parse(item.starts_at) ||
+        !dateTime(item.starts_at) || !dateTime(item.ends_at) || !dateTime(item.preflight_opens_at) ||
+        !boundedInteger(item.preflight_minutes, 0, 120) ||
+        Date.parse(item.preflight_opens_at) !== Date.parse(item.starts_at) - item.preflight_minutes * 60_000 ||
+        Date.parse(item.ends_at) <= Date.parse(item.starts_at) ||
         Date.parse(item.starts_at) < priorStartMs ||
         !nullableKind(registration.mode) || typeof registration.enabled !== "boolean" ||
         typeof registration.open !== "boolean" ||
@@ -220,6 +249,8 @@ export function parseParticipantContestDirectory(value: unknown): ParticipantCon
       phase: item.phase as ContestSchedulePhase,
       starts_at: item.starts_at,
       ends_at: item.ends_at,
+      preflight_minutes: item.preflight_minutes,
+      preflight_opens_at: item.preflight_opens_at,
       registration: {
         mode: registration.mode,
         enabled: registration.enabled,
@@ -237,4 +268,39 @@ export function parseParticipantContestDirectory(value: unknown): ParticipantCon
     next_offset: directory.next_offset as number | null,
     server_time: directory.server_time,
   };
+}
+
+/** Parse the unauthenticated public schedule projection; it contains no registration or contest content. */
+export function parsePublicContestDirectory(value: unknown): PublicContestDirectory | null {
+  const directory = record(value);
+  if (!directory || !boundedInteger(directory.limit, 1, 50) || !boundedInteger(directory.offset, 0, 10_000) ||
+      !dateTime(directory.server_time) || !Array.isArray(directory.items) || directory.items.length > directory.limit ||
+      !(directory.next_offset === null || directory.next_offset === directory.offset + directory.limit &&
+        boundedInteger(directory.next_offset, 1, 10_050)) ||
+      (directory.next_offset !== null && directory.items.length !== directory.limit)) return null;
+  const items: PublicContestSummary[] = [];
+  const ids = new Set<string>();
+  let priorStartMs = Number.NEGATIVE_INFINITY;
+  for (const candidate of directory.items) {
+    const item = record(candidate);
+    if (!item || typeof item.contest_id !== "string" || !UUID.test(item.contest_id) || ids.has(item.contest_id.toLowerCase()) ||
+        typeof item.name !== "string" || !item.name.trim() || item.name.length > 160 ||
+        typeof item.lifecycle_state !== "string" || !LIFECYCLE_STATES.has(item.lifecycle_state as ContestLifecycleState) ||
+        typeof item.phase !== "string" || !SCHEDULE_PHASES.has(item.phase as ContestSchedulePhase) ||
+        !dateTime(item.starts_at) || !dateTime(item.ends_at) || !dateTime(item.preflight_opens_at) ||
+        !boundedInteger(item.preflight_minutes, 0, 120) ||
+        Date.parse(item.ends_at) <= Date.parse(item.starts_at) ||
+        Date.parse(item.preflight_opens_at) !== Date.parse(item.starts_at) - item.preflight_minutes * 60_000 ||
+        Date.parse(item.starts_at) < priorStartMs || !boundedInteger(item.problem_count, 1, 256) ||
+        typeof item.registration_enabled !== "boolean") return null;
+    ids.add(item.contest_id.toLowerCase());
+    priorStartMs = Date.parse(item.starts_at);
+    items.push({ contest_id: item.contest_id.toLowerCase(), name: item.name,
+      lifecycle_state: item.lifecycle_state as ContestLifecycleState, phase: item.phase as ContestSchedulePhase,
+      starts_at: item.starts_at, ends_at: item.ends_at, preflight_minutes: item.preflight_minutes,
+      preflight_opens_at: item.preflight_opens_at, problem_count: item.problem_count,
+      registration_enabled: item.registration_enabled });
+  }
+  return { items, limit: directory.limit, offset: directory.offset, next_offset: directory.next_offset as number | null,
+    server_time: directory.server_time };
 }

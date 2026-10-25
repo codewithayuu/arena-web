@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseParticipantContestDirectory, parseParticipantContestMetadata } from "@/lib/contest-metadata";
+import { parseParticipantContestDirectory, parseParticipantContestMetadata, parsePublicContestDirectory } from "@/lib/contest-metadata";
 
 const contestId = "71000000-0000-4000-8000-000000000001";
 
@@ -13,7 +13,8 @@ function fixture() {
     phase: "upcoming",
     starts_at: "2030-01-02T03:04:05Z",
     ends_at: "2030-01-02T04:04:05Z",
-    preflight_opens_at: "2030-01-02T02:49:05Z",
+    preflight_minutes: 5,
+    preflight_opens_at: "2030-01-02T02:59:05Z",
     first_admission_closes_at: "2030-01-02T03:09:05Z",
     late_join_grace_seconds: 300,
     server_time: "2030-01-02T02:00:00Z",
@@ -72,6 +73,8 @@ function directoryFixture(): {
     phase: string;
     starts_at: string;
     ends_at: string;
+      preflight_minutes: number;
+      preflight_opens_at: string;
     registration: {
       mode: "individual" | "team" | null;
       enabled: boolean;
@@ -95,6 +98,8 @@ function directoryFixture(): {
       phase: "upcoming",
       starts_at: "2030-01-02T03:04:05Z",
       ends_at: "2030-01-02T04:04:05Z",
+      preflight_minutes: 5,
+      preflight_opens_at: "2030-01-02T02:59:05Z",
       registration: { mode: "individual", enabled: true, open: true, status: null, kind: null },
       private_bundle: "must be discarded",
     }],
@@ -132,4 +137,20 @@ test("participant directory rejects malformed pagination, duplicate rows, and un
   const safeShape = parseParticipantContestDirectory(privateShape);
   assert.ok(safeShape);
   assert.equal("invite_code" in safeShape.items[0], false);
+});
+
+test("public contest directory exposes bounded timing without private contest fields", () => {
+  const value = {
+    items: [{ contest_id: contestId, name: "Spring Open", lifecycle_state: "scheduled", phase: "upcoming",
+      starts_at: "2030-01-02T03:04:05Z", ends_at: "2030-01-02T04:04:05Z", preflight_minutes: 5,
+      preflight_opens_at: "2030-01-02T02:59:05Z", problem_count: 4, registration_enabled: true,
+      private_policy: { test_cases: ["secret"] } }],
+    limit: 20, offset: 0, next_offset: null, server_time: "2030-01-02T02:00:00Z",
+  };
+  const parsed = parsePublicContestDirectory(value);
+  assert.ok(parsed);
+  assert.equal(parsed.items[0].preflight_minutes, 5);
+  assert.equal("private_policy" in parsed.items[0], false);
+  value.items[0].preflight_opens_at = "2030-01-02T02:49:05Z";
+  assert.equal(parsePublicContestDirectory(value), null);
 });

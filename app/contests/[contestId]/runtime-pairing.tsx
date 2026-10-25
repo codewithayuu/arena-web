@@ -1,6 +1,7 @@
 "use client";
 
 import { useAuth } from "@clerk/nextjs";
+import { acceptLocalEvaluationNotice, contestExecutionMode, getLocalEvaluationProblems, getLocalEvaluationPackage, LOCAL_EVALUATION_NOTICE, submitLocalEvaluation } from "@/lib/local-evaluation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { watchContestHeartbeat } from "@/lib/contest-heartbeat";
 import {
@@ -64,6 +65,40 @@ import {
   type ContestSubmissionStatus,
   type ParticipantContestProblem,
 } from "@/lib/contest-submissions";
+import { ProctoringProvider, useProctoring } from "@/lib/proctoring/proctoring-context";
+import { ProctoringScreeningModal } from "@/components/proctoring/ProctoringScreeningModal";
+import { ContestProctoringHUD } from "@/components/proctoring/ContestProctoringHUD";
+import {
+  isMockContestModeEnabled,
+  saveMockSubmission,
+  getMockSolvedProblemIds,
+  type MockSubmissionRecord,
+} from "@/lib/mock-contest-store";
+import { Camera, ShieldCheck, Sparkles, CheckCircle2, Cpu } from "lucide-react";
+import { ContestCamera } from "@/components/proctoring/ContestCamera";
+import { DEFAULT_PROCTORING_CONFIG } from "@/lib/proctoring/types";
+
+const DEFAULT_DEMO_PROBLEMS: ParticipantContestProblem[] = [
+  {
+    problem_id: "dead10c2-prob-0001-8000-000000000001",
+    ordinal: 1,
+    title: "A. Containment Grid Allocation",
+    statement_markdown: "# A. Containment Grid Allocation\n\n### Problem Description\nThe research installation containment grid consists of N sectors arranged linearly from 1 to N. Each sector has an initial containment integrity A_i.\n\nIn each operation, you can deploy a stabilization pulse to any sector i, which increases A_i by K, and decreases adjacent sectors A_{i-1} and A_{i+1} (if they exist) by floor(K / 2).\n\nDetermine whether you can make all sector integrities strictly greater than zero.\n\n### Input\nThe first line contains two integers N and K.\nThe second line contains N space-separated integers A_1, A_2, ..., A_N.\n\n### Output\nPrint YES if all sectors can achieve positive integrity, or NO otherwise.\n",
+    public_samples: [
+      { input: "3 4\n-1 5 -1\n", output: "YES\n" },
+      { input: "2 2\n-5 -5\n", output: "NO\n" },
+    ],
+  },
+  {
+    problem_id: "dead10c2-prob-0002-8000-000000000002",
+    ordinal: 2,
+    title: "B. Flux Relay Synchronization",
+    statement_markdown: "# B. Flux Relay Synchronization\n\n### Problem Description\nThree primary relays control energy flow in the Deadlock facility. Each relay requires a synchronized frequency match.\n\nGiven the frequencies of M incoming flux packets, find the maximum number of relays that can be simultaneously activated.\n\n### Input\nThe first line contains an integer M.\nThe second line contains M integers denoting packet frequencies.\n\n### Output\nPrint the maximum active relay count.\n",
+    public_samples: [
+      { input: "4\n10 20 30 40\n", output: "3\n" },
+    ],
+  },
+];
 
 type PairingState = "checking" | "disconnected" | "pairing" | "waiting" | "launch_ready" | "preflight" | "admitted" | "completed" | "recovery_exit" | "blocked" | "error";
 type ExamPolicy = {
@@ -81,12 +116,33 @@ type ExamPolicy = {
   languages: string[];
 };
 
-export function ContestRuntimePairing({ contestId, policy, launchRequestId }: {
+export function ContestRuntimePairing(props: {
   contestId: string;
   policy: ExamPolicy;
   launchRequestId: string | null;
 }) {
+  return (
+    <ProctoringProvider config={{...DEFAULT_PROCTORING_CONFIG,enabled:process.env.NODE_ENV === "development" && process.env.NEXT_PUBLIC_LOCAL_CONTEST_MODE === "true"}}>
+      <ContestRuntimePairingInner {...props} />
+    </ProctoringProvider>
+  );
+}
+
+function ContestRuntimePairingInner({ contestId, policy, launchRequestId }: {
+  contestId: string;
+  policy: ExamPolicy;
+  launchRequestId: string | null;
+}) {
+  const [showScreeningModal, setShowScreeningModal] = useState(false);
+  const [proctoringVerified, setProctoringVerified] = useState(false);
+  const [simulatedAdmitted, setSimulatedAdmitted] = useState(false);
   const { isLoaded, isSignedIn, getToken, userId } = useAuth();
+  const participantLocal = contestExecutionMode(policy.policyEnvelope.policy) === "participant_local";
+  const [localNoticeAccepted, setLocalNoticeAccepted] = useState(false);
+  const [localNoticePending, setLocalNoticePending] = useState(false);
+  const cameraPolicy = policy.policyEnvelope.policy.browser_camera as {enabled:true;required:boolean;face_indicators:boolean;notice_version:1;notice_body:string;notice_sha256:string}|undefined;
+  const [cameraReady,setCameraReady] = useState(false);
+  useEffect(()=>{setLocalNoticeAccepted(false);setCameraReady(false);},[userId,policy.digest]);
   const [state, setState] = useState<PairingState>("checking");
   const preparedPreflight = useRef<{ challenge: ContestPreflightChallenge; appVersion: string; evidence?: Record<string, unknown> } | null>(null);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
@@ -106,6 +162,39 @@ export function ContestRuntimePairing({ contestId, policy, launchRequestId }: {
   const [problems, setProblems] = useState<ParticipantContestProblem[]>([]);
   const [message, setMessage] = useState("Checking the local Mindflare runtime…");
   const currentClerkUserId = useRef<string | null>(userId ?? null);
+  const [isMockMode, setIsMockMode] = useState(false);
+
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const search = new URLSearchParams(window.location.search);
+      const q = search.get("mock") ?? search.get("local");
+      if (q !== null && process.env.NODE_ENV === "development" && process.env.NEXT_PUBLIC_LOCAL_CONTEST_MODE === "true") {
+        setIsMockMode(q === "1" || q === "true");
+      } else {
+        setIsMockMode(isMockContestModeEnabled());
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isMockMode) return;
+    let active = true;
+    void fetch(`/api/contests/${encodeURIComponent(contestId)}/problems`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (!active) return;
+        if (data.success && Array.isArray(data.problems) && data.problems.length > 0) {
+          setProblems(data.problems);
+        } else if (problems.length === 0) {
+          setProblems(DEFAULT_DEMO_PROBLEMS);
+        }
+      })
+      .catch(() => {
+        if (!active) return;
+        if (problems.length === 0) setProblems(DEFAULT_DEMO_PROBLEMS);
+      });
+    return () => { active = false; };
+  }, [contestId, isMockMode]);
 
   useEffect(() => {
     currentClerkUserId.current = userId ?? null;
@@ -141,6 +230,10 @@ export function ContestRuntimePairing({ contestId, policy, launchRequestId }: {
 
   useEffect(() => {
     if (!admission || completedAt || completionPending || leaseState === "blocked") return;
+    if (isMockMode) {
+      // In mock mode, don't run server heartbeat requiring Clerk tokens
+      return;
+    }
     return watchContestHeartbeat({
       renew: async () => {
         const accessToken = await getToken({ skipCache: true });
@@ -221,6 +314,7 @@ export function ContestRuntimePairing({ contestId, policy, launchRequestId }: {
 
   useEffect(() => {
     if (!session || !admission || state !== "admitted" || completedAt || completionPending || exitNavigating) return;
+    if (isMockMode) return;
     let active = true;
     let navigating = false;
     const checkLauncherShutdown = async () => {
@@ -328,7 +422,9 @@ export function ContestRuntimePairing({ contestId, policy, launchRequestId }: {
     setPairingRecoveryRequired(false);
 
     await recoverCleanupAfterPairing(paired);
-    const publicProblems = await getLocalContestProblems(paired, contestId);
+    const publicProblems = participantLocal
+      ? await getLocalEvaluationProblems(contestId, (await getToken({ skipCache: true })) ?? "", lease)
+      : await getLocalContestProblems(paired, contestId);
     if (currentClerkUserId.current !== expectedUserId) {
       throw new RuntimeBridgeError("PAIRING_ACCOUNT_MISMATCH", "The signed-in account changed during pairing. Restart pairing from this contest page.");
     }
@@ -362,6 +458,8 @@ export function ContestRuntimePairing({ contestId, policy, launchRequestId }: {
   }
 
   async function connect() {
+    if (participantLocal && !localNoticeAccepted) {setMessage("Accept the local-evaluation notice before preparing admission.");return;}
+    if (cameraPolicy?.required && !cameraReady) {setMessage("Complete camera consent and enable the preview before preparing admission.");return;}
     if (!isLoaded || !isSignedIn || state === "pairing" || state === "waiting" || state === "preflight" || state === "admitted") return;
     if (!launchRequestId) {
       setState("blocked");
@@ -395,11 +493,13 @@ export function ContestRuntimePairing({ contestId, policy, launchRequestId }: {
           throw new RuntimeBridgeError("PAIRING_ACCOUNT_MISMATCH", "The signed-in account no longer matches the account that paired this launcher. Restart pairing from this contest page.");
         }
         await recoverCleanupAfterPairing(session);
-        setProblems(await getLocalContestProblems(session, contestId));
+        setProblems(participantLocal
+          ? await getLocalEvaluationProblems(contestId, (await getToken({ skipCache: true })) ?? "", admission)
+          : await getLocalContestProblems(session, contestId));
         setLeaseState("healthy");
         setPairingRecoveryRequired(false);
         setState("admitted");
-        setMessage("The server admission lease is active. Public problem data is loaded; contest submissions go directly to the server judge.");
+        setMessage("Admission is active. Problems are loaded and submissions follow the published evaluation mode.");
         return;
       }
       const pending = loadPendingHandoff(contestId, policy);
@@ -498,17 +598,121 @@ export function ContestRuntimePairing({ contestId, policy, launchRequestId }: {
   return (
     <section id="runtime-pairing" aria-labelledby="runtime-pairing-heading" className="mt-6 scroll-mt-6 rounded-lg border border-white/10 bg-black/20 p-5">
       <h3 id="runtime-pairing-heading" className="font-semibold">Mindflare runtime and exam readiness</h3>
+      <p className="mt-2 text-sm font-semibold">{participantLocal ? "On-device evaluation · client-reported results" : "Server judging"}</p>
+      {isMockMode && <p className="mt-3 rounded-lg border border-amber-400/30 bg-amber-950/30 p-3 text-sm text-amber-100" role="status">
+        Development mock only. Admission, camera checks, judging, and completion are simulated here; no official contest result is created.
+      </p>}
+      {participantLocal && <div className="mt-3 rounded-lg border border-amber-500/30 p-4">
+        <p className="text-sm text-amber-100">{LOCAL_EVALUATION_NOTICE}</p>
+        <label className="mt-3 flex items-start gap-2 text-sm">
+          <input type="checkbox" checked={localNoticeAccepted} disabled={localNoticePending || localNoticeAccepted || !isSignedIn}
+            onChange={async event => {
+              if (!event.target.checked) return;
+              setLocalNoticePending(true);
+              try {
+                const token=await getToken({skipCache:true});
+                if(!token) throw new Error("AUTH_SESSION_UNAVAILABLE");
+                await acceptLocalEvaluationNotice(contestId,token,policy.revision,policy.digest);
+                setLocalNoticeAccepted(true);
+              } catch {setMessage("The local-evaluation notice could not be recorded. Sign in and retry before admission.");}
+              finally {setLocalNoticePending(false);}
+            }} />
+          {localNoticePending ? "Recording acceptance…" : "I understand and accept this contest's on-device evaluation rules."}
+        </label>
+      </div>}
+      {cameraPolicy?.enabled && !isMockMode && <ContestCamera key={`${userId}:${contestId}:${policy.digest}`} contestId={contestId} policy={cameraPolicy}
+        revision={policy.revision} digest={policy.digest} admission={admission} endsAt={String(policy.policyEnvelope.policy.ends_at)}
+        active={!exitReason && state!=="completed" && state!=="recovery_exit" && leaseState!=="blocked"} onReady={setCameraReady} />}
       <p className="mt-2 text-sm text-zinc-300" role="status" aria-live="polite">{message}</p>
       {runtime && <p className="mt-2 text-xs text-zinc-500">Runtime {runtime.version} · protocol {runtime.protocol_version}</p>}
       {admission && <p className={`mt-2 text-xs ${leaseState === "healthy" ? "text-emerald-300" : "text-amber-300"}`}>Last server lease expiry {new Date(admission.expires_at).toLocaleTimeString()} · {leaseState === "healthy" ? "checked every 20 seconds" : leaseState === "retrying" ? "rechecking connection; execution paused" : "server recovery required"}</p>}
       {completedAt && <p className="mt-3 text-sm text-emerald-300">The server confirmed this contest session ended at {new Date(completedAt).toLocaleTimeString()}.</p>}
+      {isMockMode && state !== "admitted" && (
+        <div className="mt-4 rounded-xl border border-emerald-500/30 bg-emerald-950/20 p-5 shadow-lg">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2">
+                <span className="flex h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
+                <h4 className="text-sm font-bold text-white">Mock Contest Mode Active</h4>
+                <span className="rounded-full bg-purple-500/10 border border-purple-500/30 px-2 py-0.5 text-[10px] font-semibold text-purple-400">
+                  Zero Azure Judge & Local SEB Launcher Dependency
+                </span>
+              </div>
+              <p className="text-xs text-zinc-300 max-w-xl">
+                Client-side AI proctoring screening is required before starting. Camera frames, face tracking, and BlazeGaze iris estimation will run locally in your browser.
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                onClick={() => setShowScreeningModal(true)}
+                className="flex items-center gap-2 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 px-5 py-2.5 text-xs font-bold text-white shadow-lg hover:from-emerald-500 hover:to-teal-500 transition-all cursor-pointer"
+              >
+                <Camera className="h-4 w-4" />
+                Verify AI Proctoring & Enter Contest
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setProctoringVerified(true);
+                  setSimulatedAdmitted(true);
+                  setAdmission({
+                    contest_id: contestId,
+                    session_id: `mock-session-${Date.now()}`,
+                    lease_token: "mock-lease-token",
+                    device_id: "mock-device",
+                    device_epoch: 1,
+                    expires_at: new Date(Date.now() + 86400000).toISOString(),
+                    policy_digest: policy.digest,
+                    policy_revision: policy.revision,
+                    replayed: false,
+                  });
+                  setState("admitted");
+                  setMessage("Client-side proctoring ready. Admitted to contest workspace.");
+                }}
+                className="flex items-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2.5 text-xs font-semibold text-zinc-300 hover:bg-white/10 transition-all cursor-pointer"
+              >
+                <Sparkles className="h-4 w-4 text-emerald-400" />
+                Direct Enter (Skip Camera Check)
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <ProctoringScreeningModal
+        isOpen={showScreeningModal}
+        contestId={contestId}
+        onScreeningPassed={() => {
+          setShowScreeningModal(false);
+          setProctoringVerified(true);
+          setSimulatedAdmitted(true);
+          setAdmission({
+            contest_id: contestId,
+            session_id: `mock-session-${Date.now()}`,
+            lease_token: "mock-lease-token",
+            device_id: "mock-device",
+            device_epoch: 1,
+            expires_at: new Date(Date.now() + 86400000).toISOString(),
+            policy_digest: policy.digest,
+            policy_revision: policy.revision,
+            replayed: false,
+          });
+          setState("admitted");
+          setMessage("Development mock: admission was simulated. No contest authority or camera verification was contacted.");
+        }}
+        onCancel={() => setShowScreeningModal(false)}
+      />
+
       {state === "admitted" && admission && (
         <>
+          {isMockMode && <ContestProctoringHUD />}
           <a href="#contest-workspace" className="mt-4 inline-flex rounded-lg bg-emerald-700 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-600">
-            Admission confirmed — continue to contest workspace
+            {isMockMode ? "Mock admission — continue to preview" : "Admission confirmed — continue to contest workspace"}
           </a>
           <ContestWorkspace contestId={contestId} languages={policy.languages} policyEnvelope={policy.policyEnvelope} session={session} admission={admission} problems={problems}
-          accessPaused={leaseState !== "healthy"}
+          accessPaused={leaseState !== "healthy" || (cameraPolicy?.required === true && !cameraReady)}
+          isMockMode={isMockMode}
           onCompletionPending={setCompletionPending}
           onRecoveryExit={() => {
             setExitReason("recovery");
@@ -526,18 +730,26 @@ export function ContestRuntimePairing({ contestId, policy, launchRequestId }: {
             setAdmittedClerkUserId(null);
             clearPendingHandoff(contestId);
             setState("completed");
-            setMessage(launcherConfirmed
-              ? "The server confirmed completion, and the launcher confirmed terminal cache cleanup."
-              : "The server confirmed completion. The launcher did not confirm cleanup in this request; its supervised exit or startup recovery remains responsible, and cleanup is not reported as successful.");
+            setMessage(isMockMode
+              ? "Development mock: completion was simulated. No server or launcher confirmation was requested."
+              : launcherConfirmed
+                ? "The server confirmed completion, and the launcher confirmed terminal cache cleanup."
+                : "The server confirmed completion. The launcher did not confirm cleanup in this request; its supervised exit or startup recovery remains responsible, and cleanup is not reported as successful.");
           }} />
         </>
       )}
       {state === "completed" && exitReason === "completed" && (
         <section className="mt-5 rounded-lg border border-emerald-300/25 bg-emerald-300/5 p-4" aria-labelledby="contest-completed-heading">
           <h4 id="contest-completed-heading" className="text-lg font-semibold text-emerald-200">Contest session completed</h4>
-          <p className="mt-2 text-sm text-zinc-200">Completion was confirmed by the contest server. Local Run and contest access are disabled. Official verdicts and standings remain server-owned.</p>
+          <p className="mt-2 text-sm text-zinc-200">{isMockMode
+            ? "Development mock: completion was simulated; the contest server was not contacted."
+            : "Completion was confirmed by the contest server."} Local Run and contest access are disabled. {participantLocal
+            ? "The contest service retains client-reported results and scores; it does not independently verify local verdicts."
+            : isMockMode ? "This preview contains no contest verdicts or official standings."
+              : "Official verdicts and standings remain server-owned."}</p>
           <p className="mt-2 text-sm text-zinc-300" role="status" aria-live="polite">
-            {completionPending ? "The launcher is revoking local content access and cleaning the encrypted cache…"
+            {isMockMode ? "The mock preview did not request launcher cache cleanup."
+              : completionPending ? "The launcher is revoking local content access and cleaning the encrypted cache…"
               : cleanupConfirmed === true ? "Launcher cleanup was confirmed. The cleanup audit is queued independently of this page."
                 : "Launcher cleanup was not confirmed here. The cache remains inaccessible; supervised exit or startup recovery will retry. Cleanup is not reported as successful."}
           </p>
@@ -552,7 +764,9 @@ export function ContestRuntimePairing({ contestId, policy, launchRequestId }: {
           <h4 id="contest-recovery-exit-heading" className="text-lg font-semibold text-amber-200">{launchIntentExpired ? "Launcher authorization expired" : "Exit for recovery"}</h4>
           <p className="mt-2 text-sm text-zinc-200">{launchIntentExpired
             ? "This is not contest completion and no admission was granted. Exit orderly to the normal browser, then request a fresh one-use launcher authorization from contest details."
-            : "This is not contest completion and does not create an official verdict. The launcher will disable the session, clean its cache and queue the metadata-only audit as SEB exits. Unconfirmed submissions remain recoverable from server history."}</p>
+            : participantLocal
+              ? "This is not contest completion and does not create a result. The launcher will disable the session, clean its cache and queue the metadata-only audit as SEB exits. Unconfirmed records remain recoverable from contest-service history."
+              : "This is not contest completion and does not create an official verdict. The launcher will disable the session, clean its cache and queue the metadata-only audit as SEB exits. Unconfirmed submissions remain recoverable from server history."}</p>
           <button type="button" onClick={exitToSeb} disabled={exitNavigating}
             className="mt-4 rounded-lg border border-amber-200/30 px-4 py-2 text-sm font-semibold text-amber-100 disabled:opacity-50">
             {exitNavigating ? "Opening SEB recovery exit…" : launchIntentExpired ? "Exit SEB to request a fresh launch" : "Exit Secure Exam Browser for recovery"}
@@ -611,6 +825,23 @@ function browserSessionStorage(): ContestHandoffStorage | null {
   try { return window.sessionStorage; } catch { return null; }
 }
 
+function submissionStatusMessage(status: ContestSubmissionStatus, participantLocal: boolean): string {
+  const clientReported = participantLocal || status.result_origin === "CLIENT_REPORTED";
+  if (status.status === "judged") {
+    return clientReported
+      ? `Client-reported local result: ${status.verdict ?? "pending"}${status.score === null ? "" : ` · score ${status.score}`}. The contest service recorded it without rerunning the code.`
+      : `Server verdict: ${status.verdict ?? "pending"}${status.score === null ? "" : ` · judge score ${status.score}`}.`;
+  }
+  if (status.status === "internal_error") {
+    return clientReported
+      ? "The contest service could not finalize the client-reported result. Its submission record remains in history; contact the organizer if it does not recover."
+      : "The server judge reported an internal error. The submission remains in server history; contact the organizer if it does not recover.";
+  }
+  return clientReported
+    ? `The contest service has recorded the local result as ${status.status}.`
+    : `Submission ${status.submission_id} is ${status.status} in the server judge queue.`;
+}
+
 function isSemver(value: string): boolean {
   return /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/.test(value);
 }
@@ -660,6 +891,7 @@ function ContestWorkspace({
   admission,
   problems,
   accessPaused,
+  isMockMode = false,
   onCompletionPending,
   onRecoveryExit,
   onCompleted,
@@ -671,11 +903,23 @@ function ContestWorkspace({
   admission: ContestAdmission;
   problems: ParticipantContestProblem[];
   accessPaused: boolean;
+  isMockMode?: boolean;
   onCompletionPending: (pending: boolean) => void;
   onRecoveryExit: () => void;
   onCompleted: (completedAt: string, launcherConfirmed: boolean) => void;
 }) {
   const { getToken, userId } = useAuth();
+  const participantLocal = contestExecutionMode(policyEnvelope.policy) === "participant_local";
+  async function previewPackage(problemId: string): Promise<string | undefined> {
+    if (!participantLocal) return undefined;
+    const token=await getToken({skipCache:true});
+    if(!token) throw new Error("AUTH_SESSION_UNAVAILABLE");
+    const pins=policyEnvelope.policy.local_evaluation_packages;
+    const expectedSha=pins&&typeof pins==="object"&&!Array.isArray(pins)?(pins as Record<string,unknown>)[problemId]:undefined;
+    const revision=policyEnvelope.policy.policy_revision;
+    if(typeof expectedSha!=="string"||!Number.isInteger(revision))throw new Error("INVALID_SIGNED_LOCAL_POLICY");
+    return getLocalEvaluationPackage(contestId,token,admission,problemId,Number(revision),expectedSha);
+  }
   const allowedLanguages = useMemo(() => languages.filter(isContestLanguage), [languages]);
   const [selectedProblemId, setSelectedProblemId] = useState(problems[0]?.problem_id ?? "");
   const [language, setLanguage] = useState<ContestLanguage>(allowedLanguages[0] ?? "cpp17");
@@ -688,6 +932,10 @@ function ContestWorkspace({
   const [pendingSubmission, setPendingSubmission] = useState<PendingContestSubmission | null>(null);
   const [lastSubmissionId, setLastSubmissionId] = useState<string | null>(null);
   const [submissionHistory, setSubmissionHistory] = useState<ContestSubmissionHistoryItem[]>([]);
+
+  const solvedProblemIds = useMemo(() => {
+    return isMockMode ? getMockSolvedProblemIds(contestId) : new Set<string>();
+  }, [contestId, isMockMode, submissionHistory]);
   const [historyCursor, setHistoryCursor] = useState<ContestSubmissionHistoryCursor | null>(null);
   const [historyHasMore, setHistoryHasMore] = useState(false);
   const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
@@ -702,10 +950,9 @@ function ContestWorkspace({
   const [assetUrls, setAssetUrls] = useState<Record<string, string>>({});
   const [submitting, setSubmitting] = useState(false);
   const [completing, setCompleting] = useState(false);
-  const storageKey = useMemo(() => userId
-    ? `mindflare:contest-drafts:v1:${encodeURIComponent(userId)}:${contestId}`
-    : null, [contestId, userId]);
-  const recoveryKey = storageKey ? `${storageKey}:pending-submission:v1` : null;
+  const effectiveUserId = userId || "guest_contestant";
+  const storageKey = useMemo(() => `mindflare:contest-drafts:v1:${encodeURIComponent(effectiveUserId)}:${contestId}`, [contestId, effectiveUserId]);
+  const recoveryKey = `${storageKey}:pending-submission:v1`;
   const recoveryKeyRef = useRef(recoveryKey);
   recoveryKeyRef.current = recoveryKey;
   const [loadedRecoveryKey, setLoadedRecoveryKey] = useState<string | null>(null);
@@ -784,6 +1031,11 @@ function ContestWorkspace({
   }, [contestId, selected?.assets, selected?.problem_id, session]);
 
   useEffect(() => {
+    if (isMockMode) {
+      setHistoryUnavailable(false);
+      setHistoryLoading(false);
+      return;
+    }
     let active = true;
     void (async () => {
       try {
@@ -857,6 +1109,32 @@ function ContestWorkspace({
 
   async function runPublicSamples() {
     if (!selected || !selectedDraftReady || accessPaused || running || submitting || completing || selected.public_samples.length === 0) return;
+
+    if (isMockMode) {
+      setRunning(true);
+      setRunKind("sample");
+      setSubmissionMessage("");
+      setRunResults([]);
+      await new Promise((resolve) => setTimeout(resolve, 350));
+
+      const isSolution = source.trim().length > 15;
+      const results: WorkspaceRunResult[] = selected.public_samples.map((sample) => ({
+        stdout: sample.output,
+        stderr: "",
+        exit_code: 0,
+        compile_exit_code: 0,
+        sample_matches: isSolution,
+        duration_ms: Math.floor(Math.random() * 20) + 18,
+        peak_memory_bytes: 14 * 1024 * 1024,
+        origin: "local" as const,
+        inputKind: "sample" as const,
+      }));
+      setRunResults(results);
+      setRunning(false);
+      setSubmissionMessage(isSolution ? "All visible samples passed!" : "Sample output differed from expected.");
+      return;
+    }
+
     if (!session || !admission) {
       setSubmissionMessage("An admitted paired launcher session is required before running public samples.");
       return;
@@ -875,6 +1153,7 @@ function ContestWorkspace({
           const result = await runLocalInput(session, source, language, sample.input, executionId, undefined, {
             problemId: selected.problem_id,
             contestPolicy: policyEnvelope,
+            evaluationPackageJson: await previewPackage(selected.problem_id),
           });
           results.push({
             stdout: result.stdout,
@@ -889,7 +1168,7 @@ function ContestWorkspace({
           });
         }
       } catch (error) {
-        if (!isContestSampleFallbackEligible(error)) throw error;
+        if (participantLocal || !isContestSampleFallbackEligible(error)) throw error;
         const accessToken = await getToken({ skipCache: true });
         if (!accessToken) throw new Error("AUTH_SESSION_UNAVAILABLE");
         const serverResults = await runContestPublicSamplesOnServer({
@@ -921,6 +1200,28 @@ function ContestWorkspace({
   async function runCustomInput() {
     if (!selected || !selectedDraftReady || accessPaused || running || submitting || completing || !source ||
         customInputTooLarge || !allowedLanguages.includes(language)) return;
+
+    if (isMockMode) {
+      setRunning(true);
+      setRunKind("custom");
+      setRunResults([]);
+      setSubmissionMessage("");
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      setRunResults([{
+        stdout: `Simulated custom run output:\nReceived input:\n${customInput.slice(0, 100)}\nProcess exited with status 0`,
+        stderr: "",
+        exit_code: 0,
+        compile_exit_code: 0,
+        duration_ms: 24,
+        peak_memory_bytes: 14 * 1024 * 1024,
+        sample_matches: null,
+        origin: "local",
+        inputKind: "custom",
+      }]);
+      setRunning(false);
+      return;
+    }
+
     if (!session || session.purpose !== "contest" || session.contestId !== contestId ||
         admission.contest_id !== contestId) {
       setSubmissionMessage("An admitted paired contest launcher is required for custom input.");
@@ -936,6 +1237,7 @@ function ContestWorkspace({
       const result = await runLocalInput(session, source, language, customInput, executionId, undefined, {
         problemId: selected.problem_id,
         contestPolicy: policyEnvelope,
+        evaluationPackageJson: await previewPackage(selected.problem_id),
       });
       setRunResults([{
         stdout: result.stdout,
@@ -971,7 +1273,61 @@ function ContestWorkspace({
   }
 
   async function submitToServer() {
-    if (!selected || !selectedDraftReady || !recoveryReady || !recoveryKey || accessPaused || submitting || running || completing || !allowedLanguages.includes(language)) return;
+    if (!selected || !selectedDraftReady || accessPaused || submitting || running || completing || !allowedLanguages.includes(language)) return;
+
+    if (isMockMode) {
+      setSubmitting(true);
+      setSubmissionMessage("Development mock: simulating a submission. The source is not sent to a contest judge.");
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      setSubmissionMessage("Development mock: creating a sample result. No test cases are being judged.");
+      await new Promise((resolve) => setTimeout(resolve, 750));
+
+      const subId = `mock-sub-${Date.now().toString(36)}`;
+      const record: MockSubmissionRecord = {
+        submission_id: subId,
+        problem_id: selected.problem_id,
+        problem_title: selected.title,
+        language,
+        accepted_at: new Date().toISOString(),
+        verdict: "ACCEPTED",
+        runtime_ms: 38,
+        memory_mb: 14,
+        score: 100,
+        source,
+      };
+
+      saveMockSubmission(contestId, record);
+      setLastSubmissionId(subId);
+      setHistoryStatuses((current) => ({
+        ...current,
+        [subId]: {
+          submission_id: subId,
+          status: "judged",
+          accepted_at: record.accepted_at,
+          source_sha256: "mock-sha256",
+          idempotency_key: "mock-key",
+          verdict: "AC",
+          score: 100,
+          reason: "ACCEPTED_OUTPUT_MATCH",
+        },
+      }));
+      setSubmissionHistory((current) => [
+        {
+          submission_id: subId,
+          problem_id: selected.problem_id,
+          language,
+          accepted_at: record.accepted_at,
+          source_sha256: "mock-sha256",
+          idempotency_key: "mock-key",
+        },
+        ...current.filter((item) => item.submission_id !== subId),
+      ]);
+      setSubmissionMessage("Development mock result: simulated AC · score 100. No code was judged and no official score was updated.");
+      setSubmitting(false);
+      return;
+    }
+
+    if (!recoveryReady || !recoveryKey) return;
     const attemptKey = recoveryKey;
     if (pendingSubmission && pendingSubmission.sessionId !== admission.session_id) {
       setSubmissionMessage("This unresolved attempt belongs to an earlier admission. It cannot be resent under a new session. Recover its authenticated server history or contact the organizer.");
@@ -983,7 +1339,7 @@ function ContestWorkspace({
       return;
     }
     setSubmitting(true);
-    setSubmissionMessage("Sending source to the contest authority for server judging…");
+    setSubmissionMessage(participantLocal ? "Requesting local evaluation authorization…" : "Sending source to the contest authority for server judging…");
     let acceptedId: string | null = null;
     let attempt: PendingContestSubmission | null = null;
     try {
@@ -1003,6 +1359,25 @@ function ContestWorkspace({
         return;
       }
       setPendingSubmission(attempt);
+      if (participantLocal) {
+        if(!session) throw new Error("RUNTIME_UNAVAILABLE");
+        acceptedId=await submitLocalEvaluation({contestId,accessToken,admission,session,problemId:selected.problem_id,
+          language,source,idempotencyKey:attempt.idempotencyKey,context:{problemId:selected.problem_id,contestPolicy:policyEnvelope},
+          onProgress:(text,id)=>{setSubmissionMessage(text);if(id)setActiveExecutionId(id);}});
+        if(recoveryKeyRef.current!==attemptKey) return;
+        if(clearConfirmedSubmission(browserContestDraftStorage(),attemptKey,attempt)) setPendingSubmission(null);
+        setLastSubmissionId(acceptedId);
+        const token=await getToken({skipCache:true});
+        if(!token) throw new Error("AUTH_SESSION_UNAVAILABLE");
+        const status=await getContestSubmissionStatus({submissionId:acceptedId,accessToken:token});
+        if(recoveryKeyRef.current!==attemptKey) return;
+        setHistoryStatuses(current=>({...current,[status.submission_id]:status}));
+        setSubmissionHistory(current=>[{submission_id:status.submission_id,problem_id:selected.problem_id,language,
+          accepted_at:status.accepted_at,source_sha256:status.source_sha256,idempotency_key:status.idempotency_key},
+          ...current.filter(item=>item.submission_id!==status.submission_id)].slice(0,50));
+        setSubmissionMessage(`Client-reported local result: ${status.verdict ?? "pending"}. The contest service recorded this result; it did not independently rerun the code.`);
+        return;
+      }
       const receipt = await submitContestSource({
         contestId,
         idempotencyKey: attempt.idempotencyKey,
@@ -1057,8 +1432,11 @@ function ContestWorkspace({
       }
       setSubmissionMessage(acceptedId
         ? `Submission ${acceptedId} was accepted. Its latest server status could not be read; use Check status to retry the source-free status request.`
-        : "The server submission response was not confirmed. Retry this exact problem, language and source to reuse the same idempotency key; local execution never creates an official verdict.");
+        : participantLocal
+          ? "The client report is unconfirmed. Retry this exact source, problem and language; the saved evaluation report will be reused when available."
+          : "The server submission response was not confirmed. Retry this exact problem, language and source to reuse the same idempotency key.");
     } finally {
+      setActiveExecutionId(null);
       setSubmitting(false);
     }
   }
@@ -1099,11 +1477,7 @@ function ContestWorkspace({
       if (!accessToken) throw new Error("AUTH_SESSION_UNAVAILABLE");
       const status = await getContestSubmissionStatus({ submissionId: lastSubmissionId, accessToken });
       setHistoryStatuses((current) => ({ ...current, [status.submission_id]: status }));
-      setSubmissionMessage(status.status === "judged"
-        ? `Server verdict: ${status.verdict ?? "pending"}${status.score === null ? "" : ` · judge score ${status.score}`}.`
-        : status.status === "internal_error"
-          ? "The server judge reported an internal error. The submission remains in server history; contact the organizer if it does not recover."
-          : `Submission ${status.submission_id} is ${status.status} in the server judge queue.`);
+      setSubmissionMessage(submissionStatusMessage(status, participantLocal));
     } catch {
       setSubmissionMessage("The source-free server status could not be retrieved. Retry the status check; the contest score is unchanged here.");
     } finally {
@@ -1112,6 +1486,14 @@ function ContestWorkspace({
   }
 
   async function finishContest() {
+    if (isMockMode) {
+      setCompleting(true);
+      onCompletionPending(true);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      setCompleting(false);
+      onCompleted(new Date().toISOString(), true);
+      return;
+    }
     if (!recoveryReady || accessPaused || running || submitting || completing || pendingSubmission) {
       setSubmissionMessage("Finish is unavailable while a run or submission response is pending. Resolve that attempt first so no accepted submission is lost from view.");
       return;
@@ -1183,14 +1565,24 @@ function ContestWorkspace({
     <div id="contest-workspace" className="mt-6 scroll-mt-6 border-t border-white/10 pt-5">
       <h4 className="text-lg font-semibold">Contest workspace</h4>
       <div className="mt-3 flex flex-wrap gap-2" role="list" aria-label="Contest problems">
-        {problems.map((problem) => (
-          <button key={problem.problem_id} type="button" disabled={running || submitting || completing}
-            onClick={() => { setSelectedProblemId(problem.problem_id); setRunResults([]); setCustomInput(""); }}
-            aria-pressed={selected?.problem_id === problem.problem_id}
-            className="rounded-lg border border-white/15 px-3 py-2 text-sm text-white aria-pressed:border-red-400">
-            {problem.ordinal}. {problem.title}
-          </button>
-        ))}
+        {problems.map((problem) => {
+          const isSolved = solvedProblemIds.has(problem.problem_id);
+          return (
+            <button
+              key={problem.problem_id}
+              type="button"
+              disabled={running || submitting || completing}
+              onClick={() => { setSelectedProblemId(problem.problem_id); setRunResults([]); setCustomInput(""); }}
+              aria-pressed={selected?.problem_id === problem.problem_id}
+              className={`flex items-center gap-1.5 rounded-lg border px-3 py-2 text-sm text-white aria-pressed:border-red-400 transition-all ${
+                isSolved ? "border-emerald-500/50 bg-emerald-950/40 text-emerald-300 font-semibold" : "border-white/15"
+              }`}
+            >
+              {isSolved && <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />}
+              {problem.ordinal}. {problem.title}
+            </button>
+          );
+        })}
       </div>
       {selected ? (
         <div className="mt-4 grid gap-4">
@@ -1284,7 +1676,9 @@ function ContestWorkspace({
             {(accessPaused || pendingSubmission || recoveryBlocked) && <button type="button" onClick={exitForRecovery} disabled={running || submitting || completing}
               className="mt-3 rounded border border-white/20 px-4 py-2 text-sm disabled:opacity-50">Exit secure browser for recovery (not contest completion)</button>}
           </div>
-          <p className="text-xs text-amber-300">Local output is unverified and never changes contest score. Submit sends source to the server judge; only its verdict updates official results.</p>
+          <p className="text-xs text-amber-300">{participantLocal
+            ? "Run previews do not change your score. Submit evaluates on this device and records a client-reported result with the contest service."
+            : "Local output is unverified and never changes contest score. Submit sends source to the server judge; only its verdict updates official results."}</p>
           {runResults.map((result, index) => {
             const diagnostic = result.compile_exit_code !== null && result.compile_exit_code !== 0
               ? "Compilation failed"
@@ -1311,13 +1705,13 @@ function ContestWorkspace({
           })}
           {submissionMessage && <p role="status" aria-live="polite" className="text-sm text-zinc-300">{submissionMessage}</p>}
           <section className="mt-2 border-t border-white/10 pt-4" aria-labelledby="submission-history-heading">
-            <h5 id="submission-history-heading" className="font-semibold">Recent server submissions</h5>
+            <h5 id="submission-history-heading" className="font-semibold">{participantLocal ? "Recent client-reported submissions" : "Recent server submissions"}</h5>
             <button type="button" onClick={() => { setHistoryLoading(true); setHistoryRefresh((value) => value + 1); }} disabled={historyLoading || submitting || completing}
-              className="mt-2 rounded border border-white/20 px-3 py-2 text-xs disabled:opacity-50">Refresh server history and recover receipts</button>
-            {historyLoading && <p className="mt-2 text-sm text-zinc-400">Loading server history…</p>}
-            {historyUnavailable && <p className="mt-2 text-sm text-zinc-400">Server history is temporarily unavailable. Your accepted submissions remain stored by the contest authority.</p>}
+              className="mt-2 rounded border border-white/20 px-3 py-2 text-xs disabled:opacity-50">Refresh contest history and recover receipts</button>
+            {historyLoading && <p className="mt-2 text-sm text-zinc-400">Loading contest history…</p>}
+            {historyUnavailable && <p className="mt-2 text-sm text-zinc-400">Contest history is temporarily unavailable. Accepted submission records remain stored by the contest authority.</p>}
             {historyPageError && <p className="mt-2 text-sm text-zinc-400">Older history could not be loaded. Retry to continue.</p>}
-            {!historyLoading && !historyUnavailable && submissionHistory.length === 0 && <p className="mt-2 text-sm text-zinc-400">No server submissions are recorded for this contest yet.</p>}
+            {!historyLoading && !historyUnavailable && submissionHistory.length === 0 && <p className="mt-2 text-sm text-zinc-400">{participantLocal ? "No client-reported submissions are recorded for this contest yet." : "No server submissions are recorded for this contest yet."}</p>}
             <ol className="mt-2 grid gap-2">
               {submissionHistory.map((item) => {
                 const status = historyStatuses[item.submission_id];
@@ -1327,7 +1721,7 @@ function ContestWorkspace({
                     <div>
                       <p>{problemTitle} · {item.language}</p>
                       <p className="text-xs text-zinc-400">Accepted {new Date(item.accepted_at).toLocaleString()} · {status
-                        ? status.status === "judged" ? `Server verdict ${status.verdict ?? "pending"}${status.score === null ? "" : ` · judge score ${status.score}`}` : status.status
+                        ? submissionStatusMessage(status, participantLocal)
                         : "status not refreshed"}</p>
                     </div>
                     <button type="button" onClick={() => void refreshHistoryStatus(item.submission_id)} disabled={submitting}
@@ -1346,6 +1740,7 @@ function ContestWorkspace({
           key={`${contestId}:${problems.map((problem) => problem.problem_id).join(",")}`}
           contestId={contestId}
           problems={problems}
+          participantLocal={participantLocal}
         />
       )}
     </div>

@@ -17,6 +17,10 @@ const nextConfig = {
   poweredByHeader: false,
   reactStrictMode: true,
   experimental: {
+    middlewareClientMaxBodySize: '100mb',
+    serverActions: {
+      bodySizeLimit: '100mb',
+    },
     optimizePackageImports: [
       'lucide-react',
       '@tabler/icons-react',

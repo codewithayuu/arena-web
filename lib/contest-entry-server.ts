@@ -5,13 +5,16 @@ import {
   parseParticipantContestMetadata,
   type ParticipantContestDirectory,
   type ParticipantContestMetadata,
+  parsePublicContestDirectory,
+  type PublicContestDirectory,
 } from "@/lib/contest-metadata";
 
 const MAX_POLICY_BYTES = 256 * 1024;
 const MAX_METADATA_BYTES = 16 * 1024;
 const MAX_DIRECTORY_BYTES = 64 * 1024;
+const MAX_PUBLIC_DIRECTORY_BYTES = 64 * 1024;
 const PARTICIPANT_DIRECTORY_LIMIT = 20;
-export const CONTEST_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export const CONTEST_ID = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[a-z0-9_-]{3,64})$/i;
 
 type ContestDetails = {
   startsAt: string;
@@ -41,6 +44,10 @@ export type ParticipantContestDirectoryEntry =
   | { state: "unavailable" }
   | { state: "ready"; directory: ParticipantContestDirectory };
 
+export type PublicContestDirectoryEntry =
+  | { state: "unavailable" }
+  | { state: "ready"; directory: PublicContestDirectory };
+
 function gatewayOrigin(): URL | null {
   try {
     const value = new URL(process.env.MINDFLARE_GATEWAY_ORIGIN || "");
@@ -63,6 +70,8 @@ function object(value: unknown): Record<string, unknown> | null {
 function detailsFromEnvelope(value: unknown, contestId: string): ContestDetails | null {
   const envelope = object(value);
   const policy = object(envelope?.policy);
+  if (policy?.execution_mode !== undefined && !["server_judged", "participant_local"].includes(String(policy.execution_mode))) return null;
+  if (policy?.execution_mode === "participant_local" && !object(policy.local_evaluation_packages)) return null;
   const languages = Array.isArray(policy?.languages) ? policy.languages : null;
   if (!policy || policy.contest_id !== contestId || !Number.isInteger(policy.policy_revision) ||
       typeof envelope?.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(envelope.sha256) ||
@@ -191,6 +200,24 @@ export async function loadParticipantContestDirectory(
   } catch {
     return { state: "unavailable" };
   }
+}
+
+export async function loadPublicContestDirectory(offset: number): Promise<PublicContestDirectoryEntry> {
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > 10_000) return { state: "unavailable" };
+  const origin = gatewayOrigin();
+  if (!origin) return { state: "unavailable" };
+  try {
+    const url = new URL("/v1/public/contests", origin);
+    url.searchParams.set("limit", String(PARTICIPANT_DIRECTORY_LIMIT));
+    url.searchParams.set("offset", String(offset));
+    const response = await fetch(url, { headers: { Accept: "application/json" }, cache: "no-store", redirect: "error",
+      signal: AbortSignal.timeout(5000) });
+    if (!response.ok) { await response.body?.cancel(); return { state: "unavailable" }; }
+    const directory = parsePublicContestDirectory(await boundedJson(response, MAX_PUBLIC_DIRECTORY_BYTES));
+    if (!directory || directory.limit !== PARTICIPANT_DIRECTORY_LIMIT || directory.offset !== offset ||
+        response.headers.get("x-mindflare-server-time") !== directory.server_time) return { state: "unavailable" };
+    return { state: "ready", directory };
+  } catch { return { state: "unavailable" }; }
 }
 
 export async function loadContestEntry(contestId: string): Promise<ContestEntry> {
