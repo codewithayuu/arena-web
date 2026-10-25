@@ -3,7 +3,7 @@
 import React, { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { useClerk } from "@clerk/nextjs";
+import { useClerk, useSignIn, useSignUp } from "@clerk/nextjs";
 import { buildAuthModeHref, safePostAuthUrl } from "@/lib/auth-redirect";
 
 export interface ModernLoginSignupProps {
@@ -21,6 +21,35 @@ function getPostAuthUrl() {
   return safePostAuthUrl(requested, window.location.origin);
 }
 
+function getSsoRedirectOptions() {
+  const redirectUrl = getPostAuthUrl();
+  const callbackUrl = new URL("/sso-callback", window.location.origin);
+  callbackUrl.searchParams.set("redirect_url", redirectUrl);
+
+  return {
+    redirectUrl,
+    redirectCallbackUrl: `${callbackUrl.pathname}${callbackUrl.search}`,
+  };
+}
+
+function getAuthErrorMessage(error: unknown, fallback: string) {
+  if (!error || typeof error !== "object") return fallback;
+
+  const candidate = error as {
+    errors?: Array<{ longMessage?: string; message?: string }>;
+    longMessage?: string;
+    message?: string;
+  };
+
+  return (
+    candidate.errors?.[0]?.longMessage ||
+    candidate.errors?.[0]?.message ||
+    candidate.longMessage ||
+    candidate.message ||
+    fallback
+  );
+}
+
 export default function ModernLoginSignup({
   initialMode = "login",
   onModeChange,
@@ -30,6 +59,8 @@ export default function ModernLoginSignup({
 }: ModernLoginSignupProps = {}) {
   const router = useRouter();
   const clerk = useClerk();
+  const { signIn, fetchStatus: signInFetchStatus } = useSignIn();
+  const { signUp, errors: signUpErrors, fetchStatus: signUpFetchStatus } = useSignUp();
   const [isLogin, setIsLogin] = useState(initialMode === "login");
 
   // Form states
@@ -43,6 +74,13 @@ export default function ModernLoginSignup({
   const [code, setCode] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const isAuthPending =
+    isLoading || signInFetchStatus === "fetching" || signUpFetchStatus === "fetching";
+  const signUpGlobalError = signUpErrors.global
+    ?.map((item) => item.longMessage || item.message)
+    .filter(Boolean)
+    .join(" ");
+  const visibleError = error || (!isLogin ? signUpGlobalError : null);
 
   useEffect(() => {
     setIsLogin(initialMode === "login");
@@ -74,6 +112,22 @@ export default function ModernLoginSignup({
     router.refresh();
   };
 
+  const finishSignUp = async () => {
+    const { error: finalizeError } = await signUp.finalize({
+      navigate: ({ decorateUrl }) => {
+        onSuccess?.();
+        const target = decorateUrl(getPostAuthUrl());
+        if (target.startsWith("http")) {
+          window.location.href = target;
+          return;
+        }
+        router.replace(target);
+        router.refresh();
+      },
+    });
+    if (finalizeError) throw finalizeError;
+  };
+
   const handleGoogleAuth = async () => {
     setError(null);
     if (!isLogin && !isAdult) {
@@ -82,31 +136,26 @@ export default function ModernLoginSignup({
     }
     setIsLoading(true);
     try {
-      if (!clerk.loaded || !clerk.client) {
+      if (!clerk.loaded) {
         throw new Error("Authentication service is loading. Please wait a moment.");
       }
 
+      const redirectOptions = getSsoRedirectOptions();
       if (isLogin) {
-        await clerk.client.signIn.authenticateWithRedirect({
+        const { error: ssoError } = await signIn.sso({
           strategy: "oauth_google",
-          redirectUrl: "/sso-callback",
-          redirectUrlComplete: getPostAuthUrl(),
+          ...redirectOptions,
         });
+        if (ssoError) throw ssoError;
       } else {
-        await clerk.client.signUp.authenticateWithRedirect({
+        const { error: ssoError } = await signUp.sso({
           strategy: "oauth_google",
-          redirectUrl: "/sso-callback",
-          redirectUrlComplete: getPostAuthUrl(),
+          ...redirectOptions,
         });
+        if (ssoError) throw ssoError;
       }
     } catch (err: any) {
-      console.error("Google Auth error:", err);
-      const msg =
-        err?.errors?.[0]?.longMessage ||
-        err?.errors?.[0]?.message ||
-        err?.message ||
-        "Google sign-in failed. Please try again.";
-      setError(msg);
+      setError(getAuthErrorMessage(err, "Google sign-in failed. Please try again."));
       setIsLoading(false);
     }
   };
@@ -194,17 +243,22 @@ export default function ModernLoginSignup({
       } else {
         // Sign Up Flow
         if (pendingVerification) {
-          const completeSignUp = await clerk.client.signUp.attemptEmailAddressVerification({
+          const { error: verificationError } = await signUp.verifications.verifyEmailCode({
             code: code.trim(),
           });
-          if (completeSignUp.status === "complete" && completeSignUp.createdSessionId) {
-            await finishAuthentication(completeSignUp.createdSessionId);
-            return;
-          } else {
-            setError("Verification incomplete. Please check your code.");
-            setIsLoading(false);
+          if (verificationError) throw verificationError;
+
+          if (signUp.status === "complete") {
+            await finishSignUp();
             return;
           }
+
+          if (signUp.missingFields?.includes("protect_check")) {
+            setError("Complete the security check to continue. If it did not appear, refresh and try again.");
+          } else {
+            setError("Verification incomplete. Please check your code.");
+          }
+          return;
         }
 
         if (!showPasswordField) {
@@ -216,29 +270,44 @@ export default function ModernLoginSignup({
         const [firstName, ...rest] = fullName.trim().split(" ");
         const lastName = rest.join(" ");
 
-        const signUpAttempt = await clerk.client.signUp.create({
+        const { error: passwordError } = await signUp.password({
           emailAddress: email.trim(),
+          password,
           firstName: firstName || undefined,
           lastName: lastName || undefined,
-          password,
         });
+        if (passwordError) throw passwordError;
 
-        if (signUpAttempt.status === "complete" && signUpAttempt.createdSessionId) {
-          await finishAuthentication(signUpAttempt.createdSessionId);
+        if (signUp.status === "complete") {
+          await finishSignUp();
           return;
         }
 
-        await clerk.client.signUp.prepareEmailAddressVerification({ strategy: "email_code" });
-        setPendingVerification(true);
+        const { error: emailCodeError } = await signUp.verifications.sendEmailCode();
+        if (emailCodeError) throw emailCodeError;
+
+        if (
+          signUp.status === "missing_requirements" &&
+          signUp.unverifiedFields.includes("email_address") &&
+          signUp.missingFields.length === 0
+        ) {
+          setPendingVerification(true);
+          return;
+        }
+
+        if (signUp.missingFields?.includes("protect_check")) {
+          setError("Complete the security check to continue. If it did not appear, refresh and try again.");
+        } else {
+          setError("Your account needs additional information before it can be created.");
+        }
       }
     } catch (err: any) {
-      console.error("Auth error:", err);
-      const msg =
-        err?.errors?.[0]?.longMessage ||
-        err?.errors?.[0]?.message ||
-        err?.message ||
-        "Authentication failed. Please verify your details or use Google login.";
-      setError(msg);
+      setError(
+        getAuthErrorMessage(
+          err,
+          "Authentication failed. Please verify your details or use Google login.",
+        ),
+      );
     } finally {
       setIsLoading(false);
     }
@@ -310,9 +379,9 @@ export default function ModernLoginSignup({
           {/* Body */}
           <div className="gl-body">
             {/* Error Banner */}
-            {error && (
+            {visibleError && (
               <div className="gl-error-banner" role="alert">
-                {error}
+                {visibleError}
               </div>
             )}
 
@@ -322,9 +391,9 @@ export default function ModernLoginSignup({
                 <button
                   type="button"
                   onClick={handleGoogleAuth}
-                  disabled={isLoading}
+                  disabled={isAuthPending}
                   className="gl-google-btn"
-                  aria-busy={isLoading}
+                  aria-busy={isAuthPending}
                 >
                   <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
                     <path
@@ -376,7 +445,7 @@ export default function ModernLoginSignup({
                     onChange={(e) => setCode(e.target.value)}
                     required
                     autoFocus
-                    disabled={isLoading}
+                    disabled={isAuthPending}
                   />
                 </div>
               ) : (
@@ -397,7 +466,7 @@ export default function ModernLoginSignup({
                         value={fullName}
                         onChange={(e) => setFullName(e.target.value)}
                         required
-                        disabled={isLoading}
+                        disabled={isAuthPending}
                       />
                     </div>
                   )}
@@ -418,7 +487,7 @@ export default function ModernLoginSignup({
                       value={email}
                       onChange={(e) => setEmail(e.target.value)}
                       required
-                      disabled={isLoading}
+                      disabled={isAuthPending}
                     />
                   </div>
 
@@ -445,7 +514,7 @@ export default function ModernLoginSignup({
                           onChange={(e) => setPassword(e.target.value)}
                           required
                           autoFocus
-                          disabled={isLoading}
+                          disabled={isAuthPending}
                         />
                         <button
                           type="button"
@@ -490,7 +559,7 @@ export default function ModernLoginSignup({
                         checked={isAdult}
                         onChange={(e) => setIsAdult(e.target.checked)}
                         required
-                        disabled={isLoading}
+                        disabled={isAuthPending}
                       />
                       <span>I confirm that I am 18 years of age or older.</span>
                     </label>
@@ -501,12 +570,12 @@ export default function ModernLoginSignup({
               {/* Submit Button */}
               <button
                 type="submit"
-                disabled={isLoading}
+                disabled={isAuthPending}
                 className="gl-submit-btn"
-                aria-busy={isLoading}
+                aria-busy={isAuthPending}
               >
                 <span>
-                  {isLoading
+                  {isAuthPending
                     ? "Please wait..."
                     : pendingVerification
                     ? "Verify & Continue"
