@@ -7,14 +7,12 @@ import {
   ExternalLink,
   CircleCheck,
   Clock,
-  Sparkles,
   ArrowRight,
   AnimateIcon,
 } from "@/components/animate-ui/icons";
-import { BookOpen, FileText, Code2, Layers, Cpu, Compass } from "lucide-react";
+import { FileText } from "lucide-react";
 import { Navbar } from "@/components/navbar";
 import { Footer } from "@/components/footer";
-import { LanguageIcon } from "@/components/dsa/language-icons";
 
 export const metadata: Metadata = {
   title: "Web Development & Competitive Programming Roadmaps | Mindflare",
@@ -101,29 +99,6 @@ const ROADMAPS: Roadmap[] = [
     ],
   },
 ];
-
-function renderTopicIcon(topic: string) {
-  const t = topic.toLowerCase();
-  if (t === "c++" || t === "cpp") {
-    return <LanguageIcon language="cpp" className="w-3.5 h-3.5 shrink-0" />;
-  }
-  if (t === "javascript" || t === "js") {
-    return <LanguageIcon language="javascript" className="w-3.5 h-3.5 shrink-0" />;
-  }
-  if (t === "html") {
-    return <Code2 className="w-3.5 h-3.5 text-orange-400 shrink-0" />;
-  }
-  if (t === "css") {
-    return <Code2 className="w-3.5 h-3.5 text-blue-400 shrink-0" />;
-  }
-  if (t.includes("data") || t.includes("structure")) {
-    return <Layers className="w-3.5 h-3.5 text-zinc-400 shrink-0" />;
-  }
-  if (t.includes("algorithm")) {
-    return <Cpu className="w-3.5 h-3.5 text-red-400 shrink-0" />;
-  }
-  return <Compass className="w-3.5 h-3.5 text-zinc-400 shrink-0" />;
-}
 
 export default function RoadmapsPage() {
   return (
@@ -213,34 +188,21 @@ export default function RoadmapsPage() {
       <main className="relative z-10 flex-1 pt-28 sm:pt-32 pb-20 px-4 sm:px-6 lg:px-8 max-w-7xl mx-auto w-full">
         {/* Page Hero Header */}
         <div className="text-center max-w-3xl mx-auto mb-14 sm:mb-16">
-          <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold bg-red-500/10 text-red-400 border border-red-500/20 mb-4 shadow-[0_0_16px_rgba(232,48,64,0.15)]">
-            <span className="w-1.5 h-1.5 rounded-full bg-[#e83040] animate-pulse" />
-            <Sparkles size={14} animateOnHover className="size-3.5 text-[#e83040]" />
-            Structured Learning Paths
-          </div>
+          <p className="mb-3 text-xs font-semibold uppercase tracking-[0.16em] text-[#e83040]">Learning paths</p>
           <h1 className="text-3xl sm:text-4xl lg:text-5xl font-extrabold tracking-tight text-white mb-4">
-            Web Development &amp; Competitive Programming
+            Choose your next path
           </h1>
           <p className="text-sm sm:text-base lg:text-lg text-zinc-400 leading-relaxed max-w-2xl mx-auto">
-            Follow a proven visual path with milestone checklists, key topics, and high-resolution downloadable PDF curriculum guides.
+            Explore a curated path or build one around your goals.
           </p>
 
-          {/* Quick Stats Strip */}
-          <div className="mt-6 flex flex-wrap items-center justify-center gap-5 text-xs sm:text-sm text-zinc-400">
-            <span className="flex items-center gap-1.5 font-medium">
-              <BookOpen className="w-4 h-4 text-[#e83040]" />
-              <span className="text-zinc-300">2 Complete Roadmaps</span>
-            </span>
-            <span className="text-white/20">•</span>
-            <span className="flex items-center gap-1.5 font-medium">
-              <Download size={16} animateOnHover className="size-4 text-[#e83040]" />
-              <span className="text-zinc-300">Free PDF Downloads</span>
-            </span>
-            <span className="text-white/20">•</span>
-            <span className="flex items-center gap-1.5 font-medium">
-              <Sparkles size={16} animateOnHover className="size-4 text-[#e83040]" />
-              <span className="text-zinc-300">Integrated Interactive Practice</span>
-            </span>
+          <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
+            <Link href="/roadmaps/create" className="inline-flex items-center gap-2 border border-[#e83040] bg-[#e83040] px-5 py-3 text-sm font-semibold text-white transition-colors hover:bg-[#ca2635]">
+              Build your roadmap <ArrowRight size={16} />
+            </Link>
+            <Link href="/roadmaps/my" className="inline-flex items-center border border-white/15 px-5 py-3 text-sm font-medium text-zinc-200 transition-colors hover:border-white/35 hover:text-white">
+              Saved roadmaps
+            </Link>
           </div>
         </div>
 
@@ -252,21 +214,16 @@ export default function RoadmapsPage() {
             return (
               <div
                 key={roadmap.id}
-                className="rounded-3xl border border-white/[0.08] bg-[#0c0c10]/75 backdrop-blur-xl overflow-hidden hover:border-red-500/40 transition-all duration-300 shadow-2xl group hover:shadow-[0_0_30px_rgba(232,48,64,0.12)]"
+                className="overflow-hidden border border-white/10 bg-[#111114] transition-colors duration-300 hover:border-white/25 group"
               >
                 <div
                   className={`flex flex-col ${isReversed ? "md:flex-row-reverse" : "md:flex-row"}`}
                 >
                   {/* Roadmap Visual Image Box */}
-                  <div className="w-full md:w-5/12 bg-white/[0.02] backdrop-blur-md p-6 sm:p-8 flex flex-col justify-between items-center relative overflow-hidden border-b md:border-b-0 md:border-r border-white/[0.08]">
+                  <div className="w-full md:w-5/12 bg-[#0c0c0f] p-6 sm:p-8 flex flex-col justify-between items-center relative overflow-hidden border-b md:border-b-0 md:border-r border-white/10">
                     <div className="w-full flex items-center justify-between mb-4 z-10">
-                      <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold bg-white/5 text-zinc-300 border border-white/10">
-                        <Clock size={14} animateOnHover className="size-3.5 text-zinc-400" />
-                        {roadmap.duration}
-                      </span>
-                      <span className="text-xs font-mono text-zinc-400 px-2 py-0.5 rounded bg-white/[0.04] border border-white/5">
-                        PDF Format
-                      </span>
+                      <span className="inline-flex items-center gap-1.5 text-xs text-zinc-400"><Clock size={14} />{roadmap.duration}</span>
+                      <span className="text-xs text-zinc-500">PDF</span>
                     </div>
 
                     {/* Image Preview with Hover Zoom */}
@@ -307,19 +264,15 @@ export default function RoadmapsPage() {
                   {/* Roadmap Details & Milestones Area */}
                   <div className="w-full md:w-7/12 p-6 sm:p-8 flex flex-col justify-between">
                     <div>
-                      {/* Badge & Title */}
-                      <div className="inline-flex items-center gap-2 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-red-500/10 text-red-400 border border-red-500/20 mb-3 shadow-xs">
-                        <span className="w-1.5 h-1.5 rounded-full bg-[#e83040]" />
-                        {roadmap.badge}
-                      </div>
+                      <p className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-[#e83040]">{roadmap.badge}</p>
                       <h2 className="text-xl sm:text-2xl font-bold text-white mb-2 leading-tight">
                         {roadmap.title}
                       </h2>
-                      <p className="text-xs sm:text-sm text-zinc-400 mb-4">
+                      <p className="text-xs sm:text-sm text-zinc-400 mb-3">
                         {roadmap.subtitle}
                       </p>
 
-                      <p className="text-xs sm:text-sm text-zinc-300 leading-relaxed mb-6">
+                      <p className="text-xs sm:text-sm text-zinc-300 leading-relaxed mb-5">
                         {roadmap.description}
                       </p>
 
@@ -344,17 +297,7 @@ export default function RoadmapsPage() {
                       </div>
 
                       {/* Key Topics Badges with Real Language Icons */}
-                      <div className="flex flex-wrap gap-2 mb-8">
-                        {roadmap.keyTopics.map((topic) => (
-                          <span
-                            key={topic}
-                            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium bg-white/5 text-zinc-200 border border-white/10 hover:border-white/20 hover:bg-white/10 transition-all shadow-xs"
-                          >
-                            {renderTopicIcon(topic)}
-                            <span>{topic}</span>
-                          </span>
-                        ))}
-                      </div>
+                      <p className="mb-7 text-xs text-zinc-400">{roadmap.keyTopics.join(" · ")}</p>
                     </div>
 
                     {/* Action Buttons: Red Primary Download, Dark Glass Secondary, Subtle Link */}
@@ -402,32 +345,9 @@ export default function RoadmapsPage() {
           })}
         </div>
 
-        {/* Bottom Banner with Subtle Glow */}
-        <div className="mt-16 rounded-3xl border border-white/[0.08] bg-gradient-to-b from-[#0c0c10]/90 to-[#08080a]/90 backdrop-blur-xl p-8 sm:p-12 text-center max-w-4xl mx-auto shadow-2xl relative overflow-hidden">
-          <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_top,rgba(232,48,64,0.12),transparent_70%)] pointer-events-none" />
-
-          <div className="inline-flex items-center justify-center w-12 h-12 rounded-2xl bg-red-500/10 text-[#e83040] border border-red-500/20 mb-4 shadow-[0_0_16px_rgba(232,48,64,0.25)] relative z-10">
-            <Sparkles size={24} animateOnHover className="size-6 text-[#e83040]" />
-          </div>
-
-          <h2 className="text-xl sm:text-2xl font-bold text-white mb-2 relative z-10">
-            Ready to test your intuition with real code?
-          </h2>
-          <p className="text-sm text-zinc-400 max-w-xl mx-auto mb-6 leading-relaxed relative z-10">
-            Choose a roadmap above, then jump into the Practice Arena to master algorithms, system design, and concurrency with live execution.
-          </p>
-
-          <div className="relative z-10">
-            <AnimateIcon animateOnHover asChild>
-              <Link
-                href="/practice/dsa-patterns"
-                className="inline-flex items-center gap-2 px-6 py-3 rounded-xl bg-[#e83040] hover:bg-[#d02535] text-white text-sm font-semibold transition-all shadow-lg shadow-red-500/30 active:scale-95 cursor-pointer"
-              >
-                <span>Explore Practice Hub</span>
-                <ArrowRight size={16} className="size-4" />
-              </Link>
-            </AnimateIcon>
-          </div>
+        <div className="mt-12 flex flex-col items-start justify-between gap-4 border-y border-white/10 py-6 sm:flex-row sm:items-center">
+          <div><h2 className="text-lg font-semibold text-white">Practice what you learn</h2><p className="mt-1 text-sm text-zinc-400">Build a timed practice set.</p></div>
+          <Link href="/practice/contest-builder" className="inline-flex items-center gap-2 border border-white/20 px-4 py-2.5 text-sm font-medium text-white transition-colors hover:border-white/40">Create practice set <ArrowRight size={15} /></Link>
         </div>
       </main>
 
