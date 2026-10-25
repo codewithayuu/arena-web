@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { LeaderboardView } from "@/components/topic-list/leaderboard-view";
+import { redirect } from "next/navigation";
 
 export const metadata: Metadata = {
   title: "Aura Leaderboard | Mindflare",
@@ -7,5 +7,5 @@ export const metadata: Metadata = {
 };
 
 export default function LeaderboardPage() {
-  return <LeaderboardView />;
+  return redirect('/coming-soon');
 }

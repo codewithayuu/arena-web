@@ -24,6 +24,7 @@ import {
   ChevronDown,
   ExternalLink,
 } from "@/components/animate-ui/icons";
+import { FaChartLine } from "react-icons/fa";
 import SmoothButton from "@/components/smoothui/smooth-button";
 import Kbd from "@/components/smoothui/kbd";
 import { TooltipProvider, SimpleTooltip } from "@/components/animate-ui/tooltip";
@@ -117,6 +118,7 @@ export function TopicListView() {
   const [hasOpenedSearch, setHasOpenedSearch] = useState(false);
   const [hasOpenedHeatmap, setHasOpenedHeatmap] = useState(false);
   const [hasOpenedAuraModal, setHasOpenedAuraModal] = useState(false);
+  const [isStatsDockOpen, setIsStatsDockOpen] = useState(false);
   const [isUsefulLinksOpen, setIsUsefulLinksOpen] = usePersistedState<boolean>(
     "topic_list_useful_links_open",
     false
@@ -602,19 +604,55 @@ export function TopicListView() {
         {/* Main Container */}
         <div className="mx-auto max-w-[1680px] px-3 sm:px-6 py-6">
           <div className="flex flex-col md:flex-row desktop:flex-row gap-6 lg:gap-8 justify-center items-start">
-            {/* Left Column: Navigation Directory Sidebar */}
-            <TopicListSidebar
-              completedTopics={completedTopics}
-              favouriteTopics={favouriteTopics}
-              favouriteProblems={favouriteProblems}
-              skippedTopics={skippedTopics}
-              categories={CATEGORIES}
-              activeCategoryId={activeCategory}
-              onSelectCategory={handleSelectCategory}
-              onOpenModules={() => { setHasOpenedModules(true); setIsModulesOpen(true); }}
-              onOpenHeatmap={() => { setHasOpenedHeatmap(true); setIsHeatmapOpen(true); }}
-              onToggleSkip={handleToggleSkip}
-            />
+            {/* Sidebar tools and topic navigation */}
+            <div className="w-full md:w-60 shrink-0 md:sticky md:top-24 self-start">
+              <button
+                type="button"
+                aria-expanded={isStatsDockOpen}
+                aria-controls="topic-list-stats-dock"
+                aria-label={isStatsDockOpen ? "Close stats" : "Open stats"}
+                onClick={() => setIsStatsDockOpen((open) => !open)}
+                className="fixed right-3 top-[4.25rem] z-[45] grid h-10 w-10 place-items-center rounded-full glass-pill text-white transition-all hover:border-white/20 active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#e83040] md:static md:mb-3 md:flex md:h-12 md:w-full md:items-center md:justify-between md:rounded-2xl md:border md:border-white/10 md:bg-black md:px-4 md:shadow-lg"
+              >
+                <span className="flex min-w-0 items-center gap-2">
+                  <FaChartLine className="h-4 w-4 shrink-0 text-emerald-400" />
+                  <span className="hidden text-sm font-semibold text-foreground md:inline">Your Stats</span>
+                </span>
+                <ChevronDown
+                  className={cn(
+                    "hidden h-4 w-4 text-zinc-400 transition-transform md:block",
+                    isStatsDockOpen && "rotate-180"
+                  )}
+                />
+              </button>
+              <div
+                id="topic-list-stats-dock"
+                className={cn(
+                  isStatsDockOpen
+                    ? "fixed right-3 top-[7.25rem] z-[45] max-h-[calc(100dvh-8rem)] overflow-y-auto md:static md:mb-3 md:max-h-none md:overflow-visible"
+                    : "hidden"
+                )}
+              >
+                <StatsDock
+                  completedTopics={completedTopics}
+                  totalProblemsCount={3888}
+                  onOpenHeatmap={() => { setHasOpenedHeatmap(true); setIsHeatmapOpen(true); }}
+                  onOpenAuraModal={() => { setHasOpenedAuraModal(true); setIsAuraModalOpen(true); }}
+                />
+              </div>
+              <TopicListSidebar
+                completedTopics={completedTopics}
+                favouriteTopics={favouriteTopics}
+                favouriteProblems={favouriteProblems}
+                skippedTopics={skippedTopics}
+                categories={CATEGORIES}
+                activeCategoryId={activeCategory}
+                onSelectCategory={handleSelectCategory}
+                onOpenModules={() => { setHasOpenedModules(true); setIsModulesOpen(true); }}
+                onOpenHeatmap={() => { setHasOpenedHeatmap(true); setIsHeatmapOpen(true); }}
+                onToggleSkip={handleToggleSkip}
+              />
+            </div>
 
             {/* Main Content Area */}
             <main className="flex-1 min-w-0 max-w-[880px] w-full">
@@ -792,15 +830,6 @@ export function TopicListView() {
               </div>
             </main>
 
-            {/* Right Column: Your Stats Sidebar (8 Authentic Cards + Online Judges) */}
-            <div className="hidden xl:block w-[300px] shrink-0 sticky top-24 self-start">
-              <StatsDock
-                completedTopics={completedTopics}
-                totalProblemsCount={3888}
-                onOpenHeatmap={() => { setHasOpenedHeatmap(true); setIsHeatmapOpen(true); }}
-                onOpenAuraModal={() => { setHasOpenedAuraModal(true); setIsAuraModalOpen(true); }}
-              />
-            </div>
           </div>
         </div>
 

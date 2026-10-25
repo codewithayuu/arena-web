@@ -303,8 +303,7 @@ export function TopicListSidebar({
 
   return (
     <>
-      {/* Sticky Navigation Sidebar on the right */}
-      <aside className="w-full md:w-60 desktop:w-60 shrink-0 md:sticky desktop:sticky md:top-24 desktop:top-24">
+      <aside className="w-full md:w-60 desktop:w-60 shrink-0">
         <button
           type="button"
           aria-expanded={mobileMenuOpen}

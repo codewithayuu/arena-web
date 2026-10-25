@@ -104,7 +104,7 @@ export function ContestComingSoon({
       <Navbar />
 
       {/* Main Center Stage: ONLY Coming Soon with Shuffle */}
-      <main className="relative z-10 flex-1 flex flex-col items-center justify-center px-4 sm:px-6 lg:px-8 max-w-5xl mx-auto w-full text-center py-24 sm:py-32">
+      <main className="relative z-10 flex-1 flex flex-col items-center justify-center px-4 sm:px-6 lg:px-8 max-w-5xl mx-auto w-full text-center py-24 sm:py-32 scale-50 md:scale-100">
         <div className="w-full flex items-center justify-center select-none py-10">
           <Shuffle
             text={text}

@@ -1,5 +1,5 @@
 import { Metadata } from "next";
-import { ContestComingSoon } from "@/components/contest/ContestComingSoon";
+import { redirect } from "next/navigation"
 
 export const dynamic = "force-dynamic";
 
@@ -9,5 +9,5 @@ export const metadata: Metadata = {
 };
 
 export default function CoursesPage() {
-  return <ContestComingSoon text="Coming soon" />;
+  return redirect("/coming-soon");
 }

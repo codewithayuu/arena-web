@@ -128,7 +128,7 @@ export function StatsDock({
   }, [isSignedIn]);
 
   return (
-    <aside className="w-[300px] shrink-0 space-y-3.5 text-white">
+    <aside className="w-[min(300px,calc(100vw-1.5rem))] shrink-0 space-y-3.5 text-white md:w-60">
       {/* 1. Authentic Stats Section */}
       <div className="rounded-2xl border border-white/10 bg-black p-3.5 shadow-xl">
         <div className="flex items-center justify-between pb-2.5 border-b border-white/10 mb-3">
