@@ -85,7 +85,10 @@ export async function POST(request: NextRequest) {
         if (message.includes("verification_challenge_invalid_or_used")) {
           return NextResponse.json({ success: false, verified: false, message: "This verification code has expired or was already used. Start a new verification." }, { status: 401 });
         }
-        return topicListError();
+        return NextResponse.json(
+          { success: false, verified: false, message: "Could not finalize verification storage. Please retry." },
+          { status: 503 }
+        );
       }
     } else {
     const platformUrl = supabaseRestUrl("profile_platform_accounts");

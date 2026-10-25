@@ -67,7 +67,7 @@ export function PlatformVerificationModal({
             setSettingsUrl(data.data.settingsUrl);
             setTargetField(data.data.targetField);
           } else {
-            setErrorMessage(data.message || "This platform cannot be verified right now.");
+            setErrorMessage(data.message || data.error || "This platform cannot be verified right now.");
           }
         })
         .catch((error) => {

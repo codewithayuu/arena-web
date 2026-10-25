@@ -65,7 +65,12 @@ export async function POST(request: NextRequest) {
           expires_at: new Date(challenge.expiresAt).toISOString(),
         }),
       });
-      if (!persisted.ok) return topicListError();
+      if (!persisted.ok) {
+        return NextResponse.json(
+          { success: false, message: "Verification storage is temporarily unavailable. Try again shortly." },
+          { status: 503 }
+        );
+      }
     }
     return NextResponse.json({
       success: true,
