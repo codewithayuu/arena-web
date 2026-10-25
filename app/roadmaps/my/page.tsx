@@ -6,5 +6,5 @@ import { MemberRoadmaps } from "@/components/roadmaps/member-roadmaps";
 export const metadata: Metadata = { title: "Saved Roadmaps | Mindflare Arena" };
 
 export default function MyRoadmapsPage() {
-  return <div className="min-h-screen bg-[#08080a] text-white"><Navbar /><MemberRoadmaps /><Footer /></div>;
+  return <div className="min-h-screen bg-background text-foreground"><Navbar /><MemberRoadmaps /><Footer /></div>;
 }

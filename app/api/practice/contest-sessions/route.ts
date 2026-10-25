@@ -1,8 +1,13 @@
 import { auth } from "@clerk/nextjs/server";
 import { NextRequest, NextResponse } from "next/server";
 import { enforceApiRateLimit } from "@/lib/api-rate-limit.server";
+import {
+  filterCodeforcesProblems,
+  getCodeforcesProblems,
+  normalizeCodeforcesFilters,
+  type CodeforcesProblem,
+} from "@/lib/codeforces-problems.server";
 import { getMemberProfileId } from "@/lib/member-profile.server";
-import { PRACTICE_PROBLEMS } from "@/lib/practice-problems";
 import { supabaseRequest, supabaseRestUrl } from "@/lib/supabase-rest.server";
 
 export const runtime = "nodejs";
@@ -10,21 +15,6 @@ export const dynamic = "force-dynamic";
 
 const MAX_PROBLEMS = 30;
 const MAX_TIMER_MINUTES = 240;
-const DIFFICULTIES = new Set(["Easy", "Medium", "Hard"]);
-
-function safeProblem(problemId: string) {
-  const problem = PRACTICE_PROBLEMS.find((item) => item.id === problemId);
-  if (!problem) return null;
-  return {
-    id: problem.id,
-    slug: problem.slug,
-    title: problem.title,
-    difficulty: problem.difficulty,
-    category: problem.category,
-    topics: problem.topics.slice(0, 8),
-    leetcodeUrl: problem.leetcodeUrl,
-  };
-}
 
 function pickRandom<T>(items: T[], count: number): T[] {
   const pool = [...items];
@@ -82,24 +72,33 @@ export async function POST(request: NextRequest) {
   const name = typeof value.name === "string" ? value.name.trim().replace(/\s+/g, " ") : "Practice set";
   const questionCount = value.questionCount;
   const timerMinutes = value.timerMinutes;
-  const difficulties = value.difficulties;
-  const topics = value.topics;
   if (name.length < 1 || name.length > 80) return NextResponse.json({ error: "Name must be 1 to 80 characters" }, { status: 400 });
-  if (!Number.isInteger(questionCount) || Number(questionCount) < 1 || Number(questionCount) > MAX_PROBLEMS) return NextResponse.json({ error: `Choose 1 to ${MAX_PROBLEMS} problems` }, { status: 400 });
-  if (!Number.isInteger(timerMinutes) || Number(timerMinutes) < 0 || Number(timerMinutes) > MAX_TIMER_MINUTES) return NextResponse.json({ error: "Choose a timer from 0 to 240 minutes" }, { status: 400 });
-  if (!Array.isArray(difficulties) || difficulties.length > 3 || !difficulties.every((item) => typeof item === "string" && DIFFICULTIES.has(item))) return NextResponse.json({ error: "Invalid difficulty selection" }, { status: 400 });
-  if (!Array.isArray(topics) || topics.length > 20 || !topics.every((item) => typeof item === "string" && item.trim().length > 0 && item.length <= 80)) return NextResponse.json({ error: "Invalid topic selection" }, { status: 400 });
+  if (!Number.isInteger(questionCount) || Number(questionCount) < 1 || Number(questionCount) > MAX_PROBLEMS) {
+    return NextResponse.json({ error: `Choose 1 to ${MAX_PROBLEMS} problems` }, { status: 400 });
+  }
+  if (!Number.isInteger(timerMinutes) || Number(timerMinutes) < 0 || Number(timerMinutes) > MAX_TIMER_MINUTES) {
+    return NextResponse.json({ error: "Choose a timer from 0 to 240 minutes" }, { status: 400 });
+  }
 
-  const selectedDifficulties = new Set(difficulties as string[]);
-  const selectedTopics = new Set((topics as string[]).map((topic) => topic.trim().toLowerCase()));
-  const pool = PRACTICE_PROBLEMS.filter((problem) => {
-    if (selectedDifficulties.size && !selectedDifficulties.has(problem.difficulty)) return false;
-    if (selectedTopics.size && !problem.topics.some((topic) => selectedTopics.has(topic.toLowerCase()))) return false;
-    return true;
+  const filters = normalizeCodeforcesFilters({
+    search: value.search,
+    minRating: value.minRating,
+    maxRating: value.maxRating,
+    tags: value.tags,
+    sort: value.sort,
   });
-  const chosen = pickRandom(pool, Math.min(Number(questionCount), pool.length));
-  if (chosen.length < Number(questionCount)) {
-    return NextResponse.json({ error: `Only ${pool.length} problems match these filters` }, { status: 422 });
+  if (!filters) return NextResponse.json({ error: "Invalid Codeforces filters" }, { status: 400 });
+
+  let chosen: CodeforcesProblem[];
+  try {
+    const catalog = await getCodeforcesProblems();
+    const pool = filterCodeforcesProblems(catalog, filters);
+    if (pool.length < Number(questionCount)) {
+      return NextResponse.json({ error: `Only ${pool.length} problems match these filters` }, { status: 422 });
+    }
+    chosen = pickRandom(pool, Number(questionCount));
+  } catch {
+    return NextResponse.json({ error: "Codeforces problem catalog is temporarily unavailable" }, { status: 503 });
   }
 
   try {
@@ -114,7 +113,10 @@ export async function POST(request: NextRequest) {
         name,
         question_count: Number(questionCount),
         timer_minutes: Number(timerMinutes),
-        filters: { difficulties: [...selectedDifficulties], topics: [...selectedTopics] },
+        filters: {
+          ...filters,
+          snapshot: chosen,
+        },
         problem_ids: chosen.map((problem) => problem.id),
       }),
     });
@@ -129,7 +131,7 @@ export async function POST(request: NextRequest) {
         questionCount: chosen.length,
         timerMinutes: Number(timerMinutes),
         createdAt: session.created_at,
-        problems: chosen.map((problem) => safeProblem(problem.id)),
+        problems: chosen,
       },
     }, { status: 201 });
   } catch {

@@ -8,5 +8,5 @@ type PageProps = { params: Promise<{ roadmapId: string }> };
 
 export default async function MemberRoadmapPage({ params }: PageProps) {
   const { roadmapId } = await params;
-  return <div className="min-h-screen bg-[#08080a] text-white"><Navbar /><MemberRoadmapDetail roadmapId={roadmapId} /><Footer /></div>;
+  return <div className="min-h-screen bg-background text-foreground"><Navbar /><MemberRoadmapDetail roadmapId={roadmapId} /><Footer /></div>;
 }

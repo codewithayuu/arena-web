@@ -9,5 +9,5 @@ export const metadata: Metadata = {
 };
 
 export default function CreateRoadmapPage() {
-  return <div className="min-h-screen bg-[#08080a] text-white"><Navbar /><PersonalizedRoadmapBuilder /><Footer /></div>;
+  return <div className="min-h-screen bg-background text-foreground"><Navbar /><PersonalizedRoadmapBuilder /><Footer /></div>;
 }

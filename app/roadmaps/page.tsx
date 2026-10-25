@@ -102,7 +102,7 @@ const ROADMAPS: Roadmap[] = [
 
 export default function RoadmapsPage() {
   return (
-    <div className="isolate min-h-screen bg-[#08080a] text-white flex flex-col relative selection:bg-red-500/20 selection:text-white overflow-x-hidden">
+    <div className="isolate min-h-screen bg-background text-foreground flex flex-col relative selection:bg-primary/20 selection:text-primary-foreground overflow-x-hidden">
       {/* Dynamic Mathematical Frosted Glass Atmosphere */}
       <div
         aria-hidden="true"
@@ -167,8 +167,8 @@ export default function RoadmapsPage() {
           className="absolute inset-0"
           style={{
             background: `
-              radial-gradient(ellipse 90% 65% at 50% 25%, transparent 25%, rgba(8, 8, 10, 0.45) 65%, #08080a 100%),
-              linear-gradient(180deg, rgba(255, 255, 255, 0.02) 0%, transparent 35%, rgba(4, 4, 6, 0.75) 100%)
+              radial-gradient(ellipse 90% 65% at 50% 25%, transparent 25%, color-mix(in srgb, var(--background) 45%, transparent) 65%, var(--background) 100%),
+              linear-gradient(180deg, color-mix(in srgb, var(--foreground) 2%, transparent) 0%, transparent 35%, color-mix(in srgb, var(--background) 75%, transparent) 100%)
             `,
           }}
         />
@@ -188,19 +188,19 @@ export default function RoadmapsPage() {
       <main className="relative z-10 flex-1 pt-28 sm:pt-32 pb-20 px-4 sm:px-6 lg:px-8 max-w-7xl mx-auto w-full">
         {/* Page Hero Header */}
         <div className="text-center max-w-3xl mx-auto mb-14 sm:mb-16">
-          <p className="mb-3 text-xs font-semibold uppercase tracking-[0.16em] text-[#e83040]">Learning paths</p>
-          <h1 className="text-3xl sm:text-4xl lg:text-5xl font-extrabold tracking-tight text-white mb-4">
+          <p className="mb-3 text-xs font-semibold uppercase tracking-[0.16em] text-primary">Learning paths</p>
+          <h1 className="text-3xl sm:text-4xl lg:text-5xl font-extrabold tracking-tight text-foreground mb-4">
             Choose your next path
           </h1>
-          <p className="text-sm sm:text-base lg:text-lg text-zinc-400 leading-relaxed max-w-2xl mx-auto">
+          <p className="text-sm sm:text-base lg:text-lg text-muted-foreground leading-relaxed max-w-2xl mx-auto">
             Explore a curated path or build one around your goals.
           </p>
 
           <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
-            <Link href="/roadmaps/create" className="inline-flex items-center gap-2 border border-[#e83040] bg-[#e83040] px-5 py-3 text-sm font-semibold text-white transition-colors hover:bg-[#ca2635]">
+            <Link href="/roadmaps/create" className="inline-flex items-center gap-2 border border-primary bg-primary px-5 py-3 text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90">
               Build your roadmap <ArrowRight size={16} />
             </Link>
-            <Link href="/roadmaps/my" className="inline-flex items-center border border-white/15 px-5 py-3 text-sm font-medium text-zinc-200 transition-colors hover:border-white/35 hover:text-white">
+            <Link href="/roadmaps/my" className="inline-flex items-center border border-input bg-background px-5 py-3 text-sm font-medium text-foreground transition-colors hover:bg-muted">
               Saved roadmaps
             </Link>
           </div>
@@ -214,20 +214,20 @@ export default function RoadmapsPage() {
             return (
               <div
                 key={roadmap.id}
-                className="overflow-hidden border border-white/10 bg-[#111114] transition-colors duration-300 hover:border-white/25 group"
+                className="group overflow-hidden border border-border bg-card text-card-foreground transition-colors duration-300 hover:border-foreground/30"
               >
                 <div
                   className={`flex flex-col ${isReversed ? "md:flex-row-reverse" : "md:flex-row"}`}
                 >
                   {/* Roadmap Visual Image Box */}
-                  <div className="w-full md:w-5/12 bg-[#0c0c0f] p-6 sm:p-8 flex flex-col justify-between items-center relative overflow-hidden border-b md:border-b-0 md:border-r border-white/10">
+                  <div className="relative flex w-full flex-col items-center justify-between overflow-hidden border-b border-border bg-muted p-6 sm:p-8 md:w-5/12 md:border-b-0 md:border-r">
                     <div className="w-full flex items-center justify-between mb-4 z-10">
-                      <span className="inline-flex items-center gap-1.5 text-xs text-zinc-400"><Clock size={14} />{roadmap.duration}</span>
-                      <span className="text-xs text-zinc-500">PDF</span>
+                      <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground"><Clock size={14} />{roadmap.duration}</span>
+                      <span className="text-xs text-muted-foreground">PDF</span>
                     </div>
 
                     {/* Image Preview with Hover Zoom */}
-                    <div className="relative w-full aspect-video sm:aspect-[16/10] rounded-2xl overflow-hidden border border-white/10 shadow-lg bg-black flex items-center justify-center group-hover:border-red-500/40 transition-all duration-500">
+                    <div className="relative flex w-full items-center justify-center overflow-hidden rounded-2xl border border-border bg-background shadow-lg transition-all duration-500 group-hover:border-primary/40 aspect-video sm:aspect-[16/10]">
                       <Image
                         src={roadmap.image}
                         alt={roadmap.imageAlt}
@@ -240,10 +240,10 @@ export default function RoadmapsPage() {
                     </div>
 
                     {/* PDF Quick Download Pill */}
-                    <div className="w-full mt-5 flex items-center justify-between text-xs text-zinc-400 z-10">
+                    <div className="z-10 mt-5 flex w-full items-center justify-between text-xs text-muted-foreground">
                       <span className="flex items-center gap-1.5">
-                        <FileText className="w-3.5 h-3.5 text-[#e83040]" />
-                        <span className="font-mono text-zinc-300 truncate max-w-[180px] sm:max-w-[220px]">
+                        <FileText className="h-3.5 w-3.5 text-primary" />
+                        <span className="max-w-[180px] truncate font-mono text-foreground sm:max-w-[220px]">
                           {roadmap.fileName}
                         </span>
                       </span>
@@ -252,7 +252,7 @@ export default function RoadmapsPage() {
                           href={roadmap.pdfUrl}
                           target="_blank"
                           rel="noopener noreferrer"
-                          className="text-red-400 hover:text-red-300 flex items-center gap-1 font-medium group/preview cursor-pointer transition-colors"
+                          className="group/preview flex cursor-pointer items-center gap-1 font-medium text-primary transition-colors hover:text-primary/80"
                         >
                           <span>Preview PDF</span>
                           <ExternalLink size={12} className="size-3" />
@@ -264,32 +264,32 @@ export default function RoadmapsPage() {
                   {/* Roadmap Details & Milestones Area */}
                   <div className="w-full md:w-7/12 p-6 sm:p-8 flex flex-col justify-between">
                     <div>
-                      <p className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-[#e83040]">{roadmap.badge}</p>
-                      <h2 className="text-xl sm:text-2xl font-bold text-white mb-2 leading-tight">
+                      <p className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-primary">{roadmap.badge}</p>
+                      <h2 className="mb-2 text-xl font-bold leading-tight text-foreground sm:text-2xl">
                         {roadmap.title}
                       </h2>
-                      <p className="text-xs sm:text-sm text-zinc-400 mb-3">
+                      <p className="mb-3 text-xs text-muted-foreground sm:text-sm">
                         {roadmap.subtitle}
                       </p>
 
-                      <p className="text-xs sm:text-sm text-zinc-300 leading-relaxed mb-5">
+                      <p className="mb-5 text-xs leading-relaxed text-foreground sm:text-sm">
                         {roadmap.description}
                       </p>
 
                       {/* Milestones Checklist */}
                       <div className="space-y-2.5 mb-6">
-                        <h3 className="text-xs font-bold uppercase tracking-wider text-zinc-400 mb-2">
+                        <h3 className="mb-2 text-xs font-bold uppercase tracking-wider text-muted-foreground">
                           Key Curriculum Stages
                         </h3>
                         {roadmap.milestones.map((m, mIdx) => (
                           <div
                             key={mIdx}
-                            className="flex items-start gap-2.5 text-xs sm:text-sm text-zinc-300 group/milestone cursor-default"
+                            className="group/milestone flex cursor-default items-start gap-2.5 text-xs text-foreground sm:text-sm"
                           >
                             <CircleCheck
                               size={16}
                               animateOnHover
-                              className="size-4 text-emerald-400 shrink-0 mt-0.5 shadow-[0_0_8px_rgba(52,211,153,0.3)]"
+                              className="mt-0.5 size-4 shrink-0 text-primary"
                             />
                             <span className="leading-relaxed">{m}</span>
                           </div>
@@ -297,17 +297,17 @@ export default function RoadmapsPage() {
                       </div>
 
                       {/* Key Topics Badges with Real Language Icons */}
-                      <p className="mb-7 text-xs text-zinc-400">{roadmap.keyTopics.join(" · ")}</p>
+                      <p className="mb-7 text-xs text-muted-foreground">{roadmap.keyTopics.join(" · ")}</p>
                     </div>
 
                     {/* Action Buttons: Red Primary Download, Dark Glass Secondary, Subtle Link */}
-                    <div className="pt-5 border-t border-white/10 flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
+                    <div className="flex flex-col items-stretch gap-3 border-t border-border pt-5 sm:flex-row sm:items-center">
                       {/* Download PDF (Brand Red Action) */}
                       <AnimateIcon animateOnHover asChild>
                         <a
                           href={roadmap.pdfUrl}
                           download={roadmap.fileName}
-                          className="inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl bg-[#e83040] hover:bg-[#d02535] text-white text-xs sm:text-sm font-semibold transition-all shadow-md shadow-red-500/25 active:scale-95 cursor-pointer"
+                          className="inline-flex cursor-pointer items-center justify-center gap-2 rounded-xl border border-primary bg-primary px-5 py-2.5 text-xs font-semibold text-primary-foreground shadow-md shadow-primary/20 transition-all hover:bg-primary/90 active:scale-95 sm:text-sm"
                         >
                           <Download size={16} className="size-4" />
                           <span>Download PDF Roadmap</span>
@@ -320,7 +320,7 @@ export default function RoadmapsPage() {
                           href={roadmap.pdfUrl}
                           target="_blank"
                           rel="noopener noreferrer"
-                          className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-white/5 hover:bg-white/10 text-zinc-200 text-xs sm:text-sm font-medium border border-white/10 hover:border-white/20 transition-all cursor-pointer"
+                          className="inline-flex cursor-pointer items-center justify-center gap-2 rounded-xl border border-input bg-background px-4 py-2.5 text-xs font-medium text-foreground transition-all hover:bg-muted sm:text-sm"
                         >
                           <ExternalLink size={16} className="size-4" />
                           <span>View in Browser</span>
@@ -331,7 +331,7 @@ export default function RoadmapsPage() {
                       <AnimateIcon animateOnHover asChild>
                         <Link
                           href={roadmap.practiceHref}
-                          className="sm:ml-auto inline-flex items-center justify-center gap-1.5 text-xs sm:text-sm text-zinc-400 hover:text-white font-medium py-2 transition-colors cursor-pointer group/link"
+                          className="group/link inline-flex cursor-pointer items-center justify-center gap-1.5 py-2 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground sm:ml-auto sm:text-sm"
                         >
                           <span>{roadmap.practiceLabel}</span>
                           <ArrowRight size={14} className="size-3.5 group-hover/link:translate-x-0.5 transition-transform" />
@@ -345,9 +345,9 @@ export default function RoadmapsPage() {
           })}
         </div>
 
-        <div className="mt-12 flex flex-col items-start justify-between gap-4 border-y border-white/10 py-6 sm:flex-row sm:items-center">
-          <div><h2 className="text-lg font-semibold text-white">Practice what you learn</h2><p className="mt-1 text-sm text-zinc-400">Build a timed practice set.</p></div>
-          <Link href="/practice/contest-builder" className="inline-flex items-center gap-2 border border-white/20 px-4 py-2.5 text-sm font-medium text-white transition-colors hover:border-white/40">Create practice set <ArrowRight size={15} /></Link>
+        <div className="mt-12 flex flex-col items-start justify-between gap-4 border-y border-border py-6 sm:flex-row sm:items-center">
+          <div><h2 className="text-lg font-semibold text-foreground">Practice what you learn</h2><p className="mt-1 text-sm text-muted-foreground">Build a timed practice set.</p></div>
+          <Link href="/practice/contest-builder" className="inline-flex items-center gap-2 border border-input bg-background px-4 py-2.5 text-sm font-medium text-foreground transition-colors hover:bg-muted">Create practice set <ArrowRight size={15} /></Link>
         </div>
       </main>
 
