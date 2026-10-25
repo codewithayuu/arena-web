@@ -32,8 +32,11 @@ function storageKey(userId: string) {
   return `mindflare_account_sync_queue:${userId}`;
 }
 
-function nextQueuedAt() {
-  lastQueuedAt = Math.max(Date.now(), lastQueuedAt + 1);
+function nextQueuedAt(userId?: string) {
+  const highestPersistedVersion = userId
+    ? readQueue(userId).reduce((highest, job) => Math.max(highest, job.queuedAt ?? 0), 0)
+    : 0;
+  lastQueuedAt = Math.max(Date.now(), lastQueuedAt + 1, highestPersistedVersion + 1);
   return lastQueuedAt;
 }
 
@@ -202,6 +205,7 @@ function splitOversizedProgressJob(job: SyncJob): SyncJob[] | null {
       queuedAt: baseQueuedAt + (offset / PROGRESS_BATCH_SIZE) + 1,
     });
   }
+  lastQueuedAt = Math.max(lastQueuedAt, batches[batches.length - 1]?.queuedAt ?? 0);
   return batches;
 }
 
@@ -219,7 +223,7 @@ function migrateOversizedProgressJobs(userId: string) {
 }
 
 export async function syncAccountMutation(job: SyncJob, userId = activeUserId): Promise<boolean> {
-  const queuedJob: SyncJob = { ...job, queuedAt: nextQueuedAt() };
+  const queuedJob: SyncJob = { ...job, queuedAt: nextQueuedAt(userId ?? undefined) };
   if (userId && activeUserId !== userId) {
     retainForRetry(queuedJob, userId);
     return false;
