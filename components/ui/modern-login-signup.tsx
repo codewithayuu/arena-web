@@ -66,6 +66,7 @@ export default function ModernLoginSignup({
   // Form states
   const [email, setEmail] = useState("");
   const [fullName, setFullName] = useState("");
+  const [username, setUsername] = useState("");
   const [isAdult, setIsAdult] = useState(false);
   const [password, setPassword] = useState("");
   const [showPasswordField, setShowPasswordField] = useState(false);
@@ -81,6 +82,10 @@ export default function ModernLoginSignup({
     .filter(Boolean)
     .join(" ");
   const visibleError = error || (!isLogin ? signUpGlobalError : null);
+  const needsUsername =
+    !isLogin &&
+    signUp.status === "missing_requirements" &&
+    signUp.missingFields.includes("username");
 
   useEffect(() => {
     setIsLogin(initialMode === "login");
@@ -89,6 +94,7 @@ export default function ModernLoginSignup({
     setShowPasswordText(false);
     setPendingVerification(false);
     setIsAdult(false);
+    setUsername("");
   }, [initialMode]);
 
   const handleToggleMode = (mode: "login" | "signup") => {
@@ -97,6 +103,7 @@ export default function ModernLoginSignup({
     setShowPasswordText(false);
     setPendingVerification(false);
     setIsAdult(false);
+    setUsername("");
     setIsLogin(mode === "login");
     if (onModeChange) {
       onModeChange(mode);
@@ -261,6 +268,34 @@ export default function ModernLoginSignup({
           return;
         }
 
+        if (needsUsername) {
+          const normalizedUsername = username.trim();
+          if (!normalizedUsername) {
+            setError("Choose a username to finish creating your account.");
+            return;
+          }
+
+          const { error: updateError } = await signUp.update({
+            username: normalizedUsername,
+          });
+          if (updateError) throw updateError;
+
+          const updatedSignUpStatus: string = signUp.status;
+          if (updatedSignUpStatus === "complete") {
+            await finishSignUp();
+            return;
+          }
+
+          if (signUp.missingFields?.includes("protect_check")) {
+            setError("Complete the security check to continue. If it did not appear, refresh and try again.");
+          } else if (signUp.missingFields?.includes("username")) {
+            setError("That username could not be accepted. Please choose another.");
+          } else {
+            setError("Your account needs additional information before it can be created.");
+          }
+          return;
+        }
+
         if (!showPasswordField) {
           setShowPasswordField(true);
           setIsLoading(false);
@@ -273,6 +308,7 @@ export default function ModernLoginSignup({
         const { error: passwordError } = await signUp.password({
           emailAddress: email.trim(),
           password,
+          username: username.trim(),
           firstName: firstName || undefined,
           lastName: lastName || undefined,
         });
@@ -361,6 +397,8 @@ export default function ModernLoginSignup({
               <span>
                 {pendingVerification
                   ? "Verify your email"
+                  : needsUsername
+                  ? "Finish your account"
                   : isLogin
                   ? "Welcome back"
                   : "Create your account"}
@@ -370,6 +408,8 @@ export default function ModernLoginSignup({
             <p className="gl-sub">
               {pendingVerification
                 ? "Enter the verification code sent to your email."
+                : needsUsername
+                ? "Choose a username to finish creating your account."
                 : isLogin
                 ? "Sign in to your Mindflare account."
                 : "Join the arena and test your competitive edge."}
@@ -385,7 +425,7 @@ export default function ModernLoginSignup({
               </div>
             )}
 
-            {!pendingVerification && (
+            {!pendingVerification && !needsUsername && (
               <>
                 {/* Google OAuth Action Button */}
                 <button
@@ -448,6 +488,39 @@ export default function ModernLoginSignup({
                     disabled={isAuthPending}
                   />
                 </div>
+              ) : needsUsername ? (
+                <>
+                  <div className="gl-field">
+                    <div className="gl-label-row">
+                      <label htmlFor="auth-username" className="gl-label">
+                        Username
+                      </label>
+                    </div>
+                    <input
+                      id="auth-username"
+                      className="gl-input"
+                      type="text"
+                      autoComplete="username"
+                      placeholder="Choose a username"
+                      value={username}
+                      onChange={(e) => setUsername(e.target.value)}
+                      required
+                      autoFocus
+                      disabled={isAuthPending}
+                    />
+                  </div>
+
+                  <label className="gl-checkbox-row">
+                    <input
+                      type="checkbox"
+                      checked={isAdult}
+                      onChange={(e) => setIsAdult(e.target.checked)}
+                      required
+                      disabled={isAuthPending}
+                    />
+                    <span>I confirm that I am 18 years of age or older.</span>
+                  </label>
+                </>
               ) : (
                 /* Standard Credentials Fields */
                 <>
@@ -465,6 +538,27 @@ export default function ModernLoginSignup({
                         placeholder="Ada Lovelace"
                         value={fullName}
                         onChange={(e) => setFullName(e.target.value)}
+                        required
+                        disabled={isAuthPending}
+                      />
+                    </div>
+                  )}
+
+                  {!isLogin && (
+                    <div className="gl-field">
+                      <div className="gl-label-row">
+                        <label htmlFor="auth-username" className="gl-label">
+                          Username
+                        </label>
+                      </div>
+                      <input
+                        id="auth-username"
+                        className="gl-input"
+                        type="text"
+                        autoComplete="username"
+                        placeholder="Choose a username"
+                        value={username}
+                        onChange={(e) => setUsername(e.target.value)}
                         required
                         disabled={isAuthPending}
                       />
@@ -579,6 +673,8 @@ export default function ModernLoginSignup({
                     ? "Please wait..."
                     : pendingVerification
                     ? "Verify & Continue"
+                    : needsUsername
+                    ? "Finish account"
                     : isLogin
                     ? showPasswordField
                       ? "Sign in"
@@ -591,31 +687,33 @@ export default function ModernLoginSignup({
             </form>
 
             {/* Toggle Login / Sign Up */}
-            <p className="gl-foot">
-              {isLogin ? (
-                <>
-                  New to {brandName}?{" "}
-                  <button
-                    type="button"
-                    onClick={() => handleToggleMode("signup")}
-                    className="gl-foot-link"
-                  >
-                    Create one
-                  </button>
-                </>
-              ) : (
-                <>
-                  Already have an account?{" "}
-                  <button
-                    type="button"
-                    onClick={() => handleToggleMode("login")}
-                    className="gl-foot-link"
-                  >
-                    Sign in
-                  </button>
-                </>
-              )}
-            </p>
+            {!needsUsername && (
+              <p className="gl-foot">
+                {isLogin ? (
+                  <>
+                    New to {brandName}?{" "}
+                    <button
+                      type="button"
+                      onClick={() => handleToggleMode("signup")}
+                      className="gl-foot-link"
+                    >
+                      Create one
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    Already have an account?{" "}
+                    <button
+                      type="button"
+                      onClick={() => handleToggleMode("login")}
+                      className="gl-foot-link"
+                    >
+                      Sign in
+                    </button>
+                  </>
+                )}
+              </p>
+            )}
 
             {/* Legal Notice */}
             <div className="gl-legal">
