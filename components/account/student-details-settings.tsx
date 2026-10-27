@@ -126,7 +126,7 @@ export function StudentDetailsSettings() {
             <span>Current year of study</span>
             <select value={details.yearOfStudy} onChange={(event) => setField("yearOfStudy", event.target.value)} required disabled={isSaving}>
               <option value="">Select year</option>
-              {[1, 2, 3, 4, 5, 6].map((year) => <option key={year} value={year}>{year}{year === 1 ? "st" : year === 2 ? "nd" : year === 3 ? "rd" : "th"} year</option>)}
+              {[1, 2, 3, 4].map((year) => <option key={year} value={year}>{year}{year === 1 ? "st" : year === 2 ? "nd" : year === 3 ? "rd" : "th"} year</option>)}
             </select>
           </label>
           <label className="mf-account-details-field">

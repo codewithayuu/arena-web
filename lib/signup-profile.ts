@@ -14,7 +14,7 @@ export const MAIT_PROGRAMS = [
   "MBA",
 ] as const;
 
-export const STUDY_YEARS = [1, 2, 3, 4, 5, 6] as const;
+export const STUDY_YEARS = [1, 2, 3, 4] as const;
 
 export interface SignupProfileDraft {
   firstName: string;

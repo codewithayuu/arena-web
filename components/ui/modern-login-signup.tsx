@@ -4,13 +4,31 @@ import React, { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { useClerk, useSignIn, useSignUp } from "@clerk/nextjs";
+import Select from "@/components/smoothui/select";
 import { buildAuthModeHref, safePostAuthUrl } from "@/lib/auth-redirect";
 import {
   createSignupProfileMetadata,
   MAIT_PROGRAMS,
+  STUDY_YEARS,
   signupProfileValidationError,
   type SignupProfileDraft,
 } from "@/lib/signup-profile";
+
+const STUDY_YEAR_OPTIONS = STUDY_YEARS.map((year) => ({
+  value: String(year),
+  label: `${year}${year === 1 ? "st" : year === 2 ? "nd" : year === 3 ? "rd" : "th"} year`,
+}));
+
+const PROGRAM_OPTIONS = [
+  ...MAIT_PROGRAMS.map((program) => ({ value: program, label: program })),
+  { value: "__other__", label: "Other / not listed" },
+];
+
+const GENDER_OPTIONS = [
+  { value: "", label: "Prefer not to say" },
+  { value: "female", label: "Female" },
+  { value: "male", label: "Male" },
+];
 
 export interface ModernLoginSignupProps {
   initialMode?: "login" | "signup";
@@ -725,19 +743,30 @@ export default function ModernLoginSignup({
                         <input id="auth-institution" className="gl-input" type="text" autoComplete="organization" maxLength={200} placeholder="Maharaja Agrasen Institute of Technology" value={institutionName} onChange={(event) => setInstitutionName(event.target.value)} disabled={isAuthPending} />
                       </div>
                       <div className="gl-field">
-                        <label htmlFor="auth-program" className="gl-label">Branch / program</label>
-                        <select id="auth-program" className="gl-input" value={academicProgram} onChange={(event) => setAcademicProgram(event.target.value)} required disabled={isAuthPending}>
-                          <option value="">Select a branch or program</option>
-                          {MAIT_PROGRAMS.map((program) => <option key={program} value={program}>{program}</option>)}
-                          <option value="__other__">Other / not listed</option>
-                        </select>
+                        <label id="auth-program-label" className="gl-label">Branch / program</label>
+                        <Select
+                          aria-labelledby="auth-program-label"
+                          value={academicProgram}
+                          onValueChange={(val) => setAcademicProgram(val)}
+                          placeholder="Select a branch or program"
+                          disabled={isAuthPending}
+                          options={PROGRAM_OPTIONS}
+                          className="gl-select-trigger"
+                          contentClassName="gl-select-content"
+                        />
                       </div>
                       <div className="gl-field">
-                        <label htmlFor="auth-year" className="gl-label">Current year of study</label>
-                        <select id="auth-year" className="gl-input" value={yearOfStudy} onChange={(event) => setYearOfStudy(event.target.value)} required disabled={isAuthPending}>
-                          <option value="">Select year</option>
-                          {[1, 2, 3, 4, 5, 6].map((year) => <option key={year} value={year}>{year}{year === 1 ? "st" : year === 2 ? "nd" : year === 3 ? "rd" : "th"} year</option>)}
-                        </select>
+                        <label id="auth-year-label" className="gl-label">Current year of study</label>
+                        <Select
+                          aria-labelledby="auth-year-label"
+                          value={yearOfStudy}
+                          onValueChange={(val) => setYearOfStudy(val)}
+                          placeholder="Select year"
+                          disabled={isAuthPending}
+                          options={STUDY_YEAR_OPTIONS}
+                          className="gl-select-trigger"
+                          contentClassName="gl-select-content"
+                        />
                       </div>
                       {academicProgram === "__other__" && (
                         <div className="gl-field">
@@ -746,12 +775,17 @@ export default function ModernLoginSignup({
                         </div>
                       )}
                       <div className="gl-field">
-                        <label htmlFor="auth-gender" className="gl-label">Gender <span className="gl-optional">optional</span></label>
-                        <select id="auth-gender" className="gl-input" value={gender} onChange={(event) => setGender(event.target.value)} disabled={isAuthPending}>
-                          <option value="">Prefer not to say</option>
-                          <option value="female">Female</option>
-                          <option value="male">Male</option>
-                        </select>
+                        <label id="auth-gender-label" className="gl-label">Gender <span className="gl-optional">optional</span></label>
+                        <Select
+                          aria-labelledby="auth-gender-label"
+                          value={gender}
+                          onValueChange={(val) => setGender(val)}
+                          placeholder="Prefer not to say"
+                          disabled={isAuthPending}
+                          options={GENDER_OPTIONS}
+                          className="gl-select-trigger"
+                          contentClassName="gl-select-content"
+                        />
                       </div>
                     </div>
                     <p className="gl-signup-note">Program and contact details are stored on your Mindflare profile. Gender is optional. Enrollment number, institution/program, year of study, mobile number, and gender are not shown on public profiles.</p>
