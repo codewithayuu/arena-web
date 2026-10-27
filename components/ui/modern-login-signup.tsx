@@ -301,7 +301,7 @@ export default function ModernLoginSignup({
         setError("Confirm that you are 18 or older to create an account.");
         return;
       }
-      if (!email.trim()) {
+      if (!needsUsername && !email.trim()) {
         setError("Enter your email address to continue with email, or choose Google below.");
         return;
       }
