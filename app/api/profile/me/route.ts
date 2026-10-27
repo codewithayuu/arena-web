@@ -59,14 +59,19 @@ export async function GET() {
     } catch {
       // Profile views are optional until the profile-view migration is applied.
     }
+    const effectiveDetails = {
+      ...details,
+      college: details.college || details.institution_name || "",
+      branch: details.branch || details.academic_program || "",
+    };
     return NextResponse.json({
       profile: {
         id: profile.id,
         handle: profile.handle,
-        display_name: [details.first_name, details.second_name].filter(Boolean).join(" ") || profile.display_name,
+        display_name: [effectiveDetails.first_name, effectiveDetails.second_name].filter(Boolean).join(" ") || profile.display_name,
         views: profileViews,
       },
-      details,
+      details: effectiveDetails,
       platforms,
       arenaContests: contestHistory.items,
       arenaContestHistoryStatus: contestHistory.status,

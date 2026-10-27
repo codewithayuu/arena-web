@@ -119,8 +119,10 @@ export function ProfileHeroCard({
                   {personalDetails.college}
                 </span>
                 <span className="text-[11px] text-zinc-400">
-                  {personalDetails.degree} in {personalDetails.branch}{" "}
-                  {personalDetails.yearOfGraduation ? `(${personalDetails.yearOfGraduation})` : ""}
+                  {personalDetails.degree && personalDetails.branch
+                    ? `${personalDetails.degree} in ${personalDetails.branch}`
+                    : personalDetails.branch || personalDetails.degree || "Student"}
+                  {personalDetails.yearOfGraduation ? ` (${personalDetails.yearOfGraduation})` : ""}
                 </span>
               </div>
             </div>

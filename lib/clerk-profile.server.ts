@@ -58,8 +58,17 @@ function makeProfileId(identity: ClerkProfileIdentity): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-function makeProfileHandle(clerkUserId: string): string {
-  return `user_${createHash("sha256").update(clerkUserId).digest("hex").slice(0, 24)}`;
+function sanitizeHandle(username: string | null | undefined): string | null {
+  if (typeof username !== "string") return null;
+  const cleaned = username.trim();
+  if (!/^[A-Za-z0-9_.-]{1,80}$/.test(cleaned)) return null;
+  return cleaned;
+}
+
+function makeProfileHandle(identity: ClerkProfileIdentity): string {
+  const custom = sanitizeHandle(identity.username);
+  if (custom) return custom;
+  return `user_${createHash("sha256").update(identity.id).digest("hex").slice(0, 24)}`;
 }
 
 function cleanName(value: string | null | undefined): string {
@@ -178,7 +187,8 @@ export async function ensureClerkProfileData(identity: ClerkProfileIdentity): Pr
     } else {
       const profilesUrl = supabaseRestUrl("profiles");
       profilesUrl.search = "on_conflict=clerk_user_id";
-      const createResponse = await supabaseRequest(profilesUrl, {
+      const initialHandle = makeProfileHandle(identity);
+      let createResponse = await supabaseRequest(profilesUrl, {
         method: "POST",
         headers: {
           "content-type": "application/json",
@@ -187,14 +197,47 @@ export async function ensureClerkProfileData(identity: ClerkProfileIdentity): Pr
         body: JSON.stringify({
           id: makeProfileId(identity),
           clerk_user_id: identity.id,
-          handle: makeProfileHandle(identity.id),
+          handle: initialHandle,
           display_name: profileDisplayName(identity),
         }),
       });
+      if (!createResponse.ok && initialHandle !== `user_${createHash("sha256").update(identity.id).digest("hex").slice(0, 24)}`) {
+        createResponse = await supabaseRequest(profilesUrl, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            prefer: "resolution=ignore-duplicates,return=minimal",
+          },
+          body: JSON.stringify({
+            id: makeProfileId(identity),
+            clerk_user_id: identity.id,
+            handle: `user_${createHash("sha256").update(identity.id).digest("hex").slice(0, 24)}`,
+            display_name: profileDisplayName(identity),
+          }),
+        });
+      }
       if (!createResponse.ok) throw new Error("Profile provisioning failed");
       profile = await readProfile(identity.id);
     }
     if (!profile) throw new Error("Profile provisioning did not create a linked profile");
+  } else {
+    const desiredHandle = sanitizeHandle(identity.username);
+    if (desiredHandle && profile.handle.startsWith("user_") && profile.handle !== desiredHandle) {
+      try {
+        const updateUrl = supabaseRestUrl("profiles");
+        updateUrl.search = new URLSearchParams({ id: `eq.${profile.id}` }).toString();
+        const updateResp = await supabaseRequest(updateUrl, {
+          method: "PATCH",
+          headers: { "content-type": "application/json", prefer: "return=minimal" },
+          body: JSON.stringify({ handle: desiredHandle }),
+        });
+        if (updateResp.ok) {
+          profile = { ...profile, handle: desiredHandle };
+        }
+      } catch {
+        // Retain current handle on error
+      }
+    }
   }
 
   let details = await readProfileDetails(profile.id);
@@ -212,6 +255,15 @@ export async function ensureClerkProfileData(identity: ClerkProfileIdentity): Pr
     if (!createDetailsResponse.ok) throw new Error("Profile details provisioning failed");
     details = await readProfileDetails(profile.id);
     if (!details) throw new Error("Profile details provisioning did not create a details row");
+  }
+
+  if (details) {
+    if (!details.college && details.institution_name) {
+      details.college = details.institution_name;
+    }
+    if (!details.branch && details.academic_program) {
+      details.branch = details.academic_program;
+    }
   }
 
   return { profile, details };

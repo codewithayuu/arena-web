@@ -35,23 +35,33 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
 
     const detailsUrl = supabaseRestUrl("profile_details");
     detailsUrl.search = new URLSearchParams({
-      select: "first_name,second_name,bio,country,college,degree,branch,image_url,year_of_graduation,job_preference",
+      select: "first_name,second_name,bio,country,college,degree,branch,image_url,year_of_graduation,job_preference,institution_name,academic_program,year_of_study",
       profile_id: `eq.${profile.id}`,
       limit: "1",
     }).toString();
     const detailsResponse = await supabaseRequest(detailsUrl, { method: "GET" });
     if (!detailsResponse.ok) throw new Error("Profile details lookup failed");
-    const details = ((await detailsResponse.json()) as Array<Record<string, unknown>>)[0] ?? {
-      first_name: "",
-      second_name: "",
-      bio: "",
-      country: "",
-      college: "",
-      degree: "",
-      branch: "",
-      image_url: "",
-      year_of_graduation: 0,
-      job_preference: 0,
+    const rawDetails = ((await detailsResponse.json()) as Array<Record<string, unknown>>)[0] ?? {};
+    const college = (typeof rawDetails.college === "string" && rawDetails.college.trim())
+      ? rawDetails.college.trim()
+      : (typeof rawDetails.institution_name === "string" ? rawDetails.institution_name.trim() : "");
+    const branch = (typeof rawDetails.branch === "string" && rawDetails.branch.trim())
+      ? rawDetails.branch.trim()
+      : (typeof rawDetails.academic_program === "string" ? rawDetails.academic_program.trim() : "");
+    const details = {
+      first_name: typeof rawDetails.first_name === "string" ? rawDetails.first_name : "",
+      second_name: typeof rawDetails.second_name === "string" ? rawDetails.second_name : "",
+      bio: typeof rawDetails.bio === "string" ? rawDetails.bio : "",
+      country: typeof rawDetails.country === "string" ? rawDetails.country : "",
+      college,
+      degree: typeof rawDetails.degree === "string" ? rawDetails.degree : "",
+      branch,
+      image_url: typeof rawDetails.image_url === "string" ? rawDetails.image_url : "",
+      year_of_graduation: typeof rawDetails.year_of_graduation === "number" ? rawDetails.year_of_graduation : 0,
+      job_preference: typeof rawDetails.job_preference === "number" ? rawDetails.job_preference : 0,
+      institution_name: typeof rawDetails.institution_name === "string" ? rawDetails.institution_name : "",
+      academic_program: typeof rawDetails.academic_program === "string" ? rawDetails.academic_program : "",
+      year_of_study: typeof rawDetails.year_of_study === "number" ? rawDetails.year_of_study : null,
     };
     const platformsUrl = supabaseRestUrl("profile_platform_accounts");
     platformsUrl.search = new URLSearchParams({

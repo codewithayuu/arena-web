@@ -12,6 +12,8 @@ function toDatabaseDetails(profileId: string, signupProfile: SignupProfileDetail
     year_of_study: signupProfile.yearOfStudy,
     gender: signupProfile.gender,
     mobile_number: signupProfile.mobileNumber,
+    college: signupProfile.institutionName || "",
+    branch: signupProfile.academicProgram || "",
     updated_at: timestamp,
   };
 }

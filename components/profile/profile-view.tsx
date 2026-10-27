@@ -215,6 +215,44 @@ export function ProfileView({ initialUsername, initialTab = "problemSolving" }: 
         const arenaContestHistoryStatus = ["available", "partial", "unavailable"].includes(data.arenaContestHistoryStatus)
           ? data.arenaContestHistoryStatus as UserProfileData["arenaContestHistoryStatus"]
           : "unavailable";
+        const detailsData = (data.details ?? {}) as Record<string, unknown>;
+        const college = (typeof detailsData.college === "string" && detailsData.college.trim())
+          || (typeof detailsData.institution_name === "string" && detailsData.institution_name.trim())
+          || stored.personalDetails.college
+          || "";
+        const branch = (typeof detailsData.branch === "string" && detailsData.branch.trim())
+          || (typeof detailsData.academic_program === "string" && detailsData.academic_program.trim())
+          || stored.personalDetails.branch
+          || "";
+        const degree = typeof detailsData.degree === "string" && detailsData.degree.trim()
+          ? detailsData.degree.trim()
+          : (stored.personalDetails.degree || "");
+        const bio = typeof detailsData.bio === "string" ? detailsData.bio : stored.personalDetails.bio;
+        const country = typeof detailsData.country === "string" ? detailsData.country : stored.personalDetails.country;
+        const imageUrl = typeof detailsData.image_url === "string" ? detailsData.image_url : stored.personalDetails.imageUrl;
+        const yearOfGraduation = typeof detailsData.year_of_graduation === "number" ? detailsData.year_of_graduation : stored.personalDetails.yearOfGraduation;
+        const jobPreference = typeof detailsData.job_preference === "number" ? detailsData.job_preference : stored.personalDetails.jobPreference;
+        const yearOfStudy = typeof detailsData.year_of_study === "number" ? detailsData.year_of_study : undefined;
+
+        const currentYear = new Date().getFullYear();
+        const startYear = yearOfStudy ? currentYear - (yearOfStudy - 1) : currentYear - 2;
+        const endYear = yearOfGraduation > 0 ? yearOfGraduation : (yearOfStudy ? currentYear + (4 - yearOfStudy) : currentYear + 2);
+
+        const education: UserProfileData["education"] = (stored.education && stored.education.length > 0)
+          ? stored.education
+          : college
+            ? [
+                {
+                  id: "edu-primary",
+                  institution: college,
+                  degree: degree || (branch.includes("B.Tech") ? "B.Tech" : "Undergraduate Degree"),
+                  fieldOfStudy: branch.replace(/^B\.Tech\s*[-—–]\s*/i, "") || "Engineering",
+                  startYear,
+                  endYear,
+                },
+              ]
+            : [];
+
         const synced: UserProfileData = {
           ...stored,
           id: data.profile.id || stored.id,
@@ -224,15 +262,16 @@ export function ProfileView({ initialUsername, initialTab = "problemSolving" }: 
           secondName: data.details.second_name || fallbackName.slice(1).join(" "),
           personalDetails: {
             ...stored.personalDetails,
-            bio: data.details.bio,
-            country: data.details.country,
-            college: data.details.college,
-            degree: data.details.degree,
-            branch: data.details.branch,
-            imageUrl: data.details.image_url,
-            yearOfGraduation: data.details.year_of_graduation,
-            jobPreference: data.details.job_preference,
+            bio,
+            country,
+            college,
+            degree,
+            branch,
+            imageUrl,
+            yearOfGraduation,
+            jobPreference,
           },
+          education,
           platforms,
           contests,
           arenaContests,
@@ -395,7 +434,12 @@ export function ProfileView({ initialUsername, initialTab = "problemSolving" }: 
             )}
 
             {activeTab === "about" && (
-              <JourneyAboutPanel profile={profile} />
+              <JourneyAboutPanel
+                profile={profile}
+                isOwner={isOwner}
+                onOpenEdit={() => setIsEditOpen(true)}
+                onOpenConnect={() => setIsConnectOpen(true)}
+              />
             )}
           </div>
         </div>

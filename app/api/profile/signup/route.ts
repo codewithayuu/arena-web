@@ -27,6 +27,17 @@ export async function POST() {
 
     if (signupProfile) {
       await syncSignupProfileDetails(profile.id, signupProfile);
+      try {
+        const updateHandleUrl = supabaseRestUrl("profiles");
+        updateHandleUrl.search = new URLSearchParams({ id: `eq.${profile.id}` }).toString();
+        await supabaseRequest(updateHandleUrl, {
+          method: "PATCH",
+          headers: { "content-type": "application/json", prefer: "return=minimal" },
+          body: JSON.stringify({ handle: signupProfile.username }),
+        });
+      } catch {
+        // Preserve profile sync if handle update conflicts
+      }
       const client = await clerkClient();
       await client.users.updateUserMetadata(userId, {
         unsafeMetadata: { mindflareSignupProfile: null },

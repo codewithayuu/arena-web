@@ -25,7 +25,16 @@ function profileUuid(clerkUserId: string, legacyProfileId?: string | null): stri
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-function profileHandle(clerkUserId: string): string {
+function sanitizeHandle(username: string | null | undefined): string | null {
+  if (typeof username !== "string") return null;
+  const cleaned = username.trim();
+  if (!/^[A-Za-z0-9_.-]{1,80}$/.test(cleaned)) return null;
+  return cleaned;
+}
+
+function profileHandle(clerkUserId: string, username?: string | null): string {
+  const custom = sanitizeHandle(username);
+  if (custom) return custom;
   return `user_${createHash("sha256").update(clerkUserId).digest("hex").slice(0, 24)}`;
 }
 
@@ -173,7 +182,7 @@ export async function POST(request: NextRequest) {
     const profile = {
       id: profileUuid(clerkId, userData.external_id),
       clerk_user_id: clerkId,
-      handle: profileHandle(clerkId),
+      handle: profileHandle(clerkId, typeof userData.username === "string" ? userData.username : undefined),
       display_name: displayName(userData),
     };
     const createResponse = await fetch(url, {
@@ -197,10 +206,18 @@ export async function POST(request: NextRequest) {
         ? { id: `eq.${legacyProfileId}` }
         : { clerk_user_id: `eq.${clerkId}` },
     ).toString();
+    const patchBody: Record<string, string> = {
+      clerk_user_id: clerkId,
+      display_name: profile.display_name,
+    };
+    const customHandle = sanitizeHandle(typeof userData.username === "string" ? userData.username : undefined);
+    if (customHandle) {
+      patchBody.handle = customHandle;
+    }
     const updateResponse = await fetch(updateUrl, {
       method: "PATCH",
       headers: { ...headers, prefer: "return=minimal" },
-      body: JSON.stringify({ clerk_user_id: clerkId, display_name: profile.display_name }),
+      body: JSON.stringify(patchBody),
       cache: "no-store",
       signal: AbortSignal.timeout(5000),
     });
@@ -218,7 +235,18 @@ export async function POST(request: NextRequest) {
       unsafeMetadata.mindflareSignupProfile !== null,
     );
     const signupProfile = parseSignupProfileMetadata(unsafeMetadata?.mindflareSignupProfile);
-    if (signupProfile) await syncSignupProfileDetails(profile.id, signupProfile);
+    if (signupProfile) {
+      await syncSignupProfileDetails(profile.id, signupProfile);
+      const updateHandleUrl = new URL(url);
+      updateHandleUrl.search = new URLSearchParams({ id: `eq.${profile.id}` }).toString();
+      await fetch(updateHandleUrl, {
+        method: "PATCH",
+        headers: { ...headers, prefer: "return=minimal" },
+        body: JSON.stringify({ handle: signupProfile.username }),
+        cache: "no-store",
+        signal: AbortSignal.timeout(5000),
+      }).catch(() => {});
+    }
     if (hasSignupProfilePayload) {
       const clerk = await clerkClient();
       await clerk.users.updateUserMetadata(clerkId, {
