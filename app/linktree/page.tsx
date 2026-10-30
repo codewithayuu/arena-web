@@ -65,7 +65,7 @@ export default function LinktreePage() {
         </div>
 
         <h1 className="mt-5 text-2xl font-bold tracking-tight sm:text-3xl">
-          Mindflare <span className="text-[#FF1018]">Arena</span>
+          Mind<span className="text-[#FF1018]">Flare</span>
         </h1>
         <p className="mt-1 text-sm font-medium tracking-wide text-zinc-300">
           Where <span className="text-[#FF1018]">algorithm</span> sparks{" "}

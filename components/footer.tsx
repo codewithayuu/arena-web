@@ -172,6 +172,10 @@ export function Footer() {
               <ul className="mt-4 space-y-3">
                 {[
                   {
+                    title: "Team",
+                    href: "/team",
+                  },
+                  {
                     title: "Terms & Conditions",
                     href: "/terms",
                   },
