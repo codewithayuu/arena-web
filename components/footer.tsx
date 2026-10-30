@@ -35,7 +35,7 @@ export function Footer() {
                 {/* Discord */}
                 <a
                   aria-label="Discord"
-                  href="https://discord.gg/rCtXvbFx9Z"
+                  href="https://discord.gg/tsEC8qjcJ"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="flex h-9 w-9 items-center justify-center rounded-xl border border-white/10 bg-white/[0.04] text-zinc-400 transition-all duration-200 hover:border-white/25 hover:bg-white/[0.08] hover:text-white cursor-pointer"
