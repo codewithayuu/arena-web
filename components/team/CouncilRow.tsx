@@ -38,8 +38,8 @@ export function CouncilRow({ isMediaCreativeOpen }: CouncilRowProps) {
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-6 lg:gap-8 items-stretch w-full max-w-3xl mx-auto">
-        <PersonCard person={president} tier={2} />
-        <PersonCard person={vicePresident} tier={2} />
+        <PersonCard person={president} tier={1} />
+        <PersonCard person={vicePresident} tier={1} />
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-6 lg:gap-8 items-stretch">
@@ -56,26 +56,26 @@ export function CouncilRow({ isMediaCreativeOpen }: CouncilRowProps) {
             />
           ) : (
             <div
-              className="w-full h-full min-h-[260px] p-6 border border-dashed border-[#E5322D]/40 bg-[#E5322D]/[0.03] rounded-xl flex flex-col justify-between text-left transition-all duration-300"
+              className="w-full h-full min-h-[260px] p-6 border border-dashed border-red-600/40 bg-gradient-to-b from-red-950/20 via-black to-black rounded-2xl flex flex-col justify-between text-left transition-all duration-300"
               role="status"
               aria-label={`Head of Operations, ${headOfOperations.name}, is currently a member of Media & Creative`}
             >
               <div className="flex items-center justify-between text-xs">
-                <span className="inline-flex items-center gap-1.5 text-[#E5322D] font-semibold">
-                  <span className="w-2 h-2 rounded-full bg-[#E5322D] animate-ping" />
+                <span className="inline-flex items-center gap-1.5 text-red-500 font-semibold font-mono">
+                  <span className="w-2 h-2 rounded-full bg-red-500 animate-ping" />
                   Vacant Slot
                 </span>
-                <span className="text-[#8A8A90] font-medium">media &amp; creative</span>
+                <span className="text-zinc-500 font-mono text-[11px] uppercase">media &amp; creative</span>
               </div>
 
               <div className="py-4">
-                <p className="text-base font-bold text-[#F2F2EE]">{headOfOperations.name}</p>
-                <p className="text-xs text-[#8A8A90] mt-1">
+                <p className="text-lg font-bold text-white">{headOfOperations.name}</p>
+                <p className="text-xs text-zinc-400 mt-1">
                   Slid to <strong className="text-white">Media &amp; Creative</strong> as a member
                 </p>
               </div>
 
-              <p className="text-xs text-[#8A8A90]/70">
+              <p className="text-xs text-zinc-500">
                 Card currently active in department below ↓
               </p>
             </div>

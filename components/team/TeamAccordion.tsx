@@ -15,8 +15,8 @@ interface TeamAccordionProps {
  * TeamAccordion renders an accessible collapsible accordion for a team section.
  *
  * Requirements:
- * - Team leader has a bigger image (Tier 3).
- * - All members of society have their images visible (Tier 4).
+ * - Team leader has a prominent image (Tier 3).
+ * - All members of society have their images visible and enlarged (Tier 4).
  * - When Media & Creative is open, Head of Operations slides in as a member
  *   with layoutId="head-of-operations-card" and hover red effect.
  * - Font matches the website font (no JetBrains Mono).
@@ -72,19 +72,26 @@ export function TeamAccordion({
           id={contentId}
           role="region"
           aria-labelledby={triggerId}
-          className="pb-6 pt-2 flex flex-col gap-5 text-left"
+          className="pb-6 pt-2 flex flex-col gap-6 text-left"
         >
           {/* ─── Team Leader (Bigger Image) ─────────────────────────────────── */}
-          <div className="pt-1">
-            {section.head && <PersonCard person={section.head} tier={3} />}
-          </div>
+          {section.head && (
+            <div className="flex flex-col gap-2">
+              <span className="text-xs font-semibold uppercase tracking-wider text-zinc-400 font-mono">
+                Team Lead
+              </span>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <PersonCard person={section.head} tier={3} />
+              </div>
+            </div>
+          )}
 
-          {/* ─── Team Members (All with Visible Images) ─────────────────────── */}
-          <div className="flex flex-col gap-2 pt-2">
-            <span className="text-xs font-semibold uppercase tracking-wider text-[#8A8A90]">
+          {/* ─── Team Members (Enlarged Images & Animation Card Style) ──────── */}
+          <div className="flex flex-col gap-2 pt-1">
+            <span className="text-xs font-semibold uppercase tracking-wider text-zinc-400 font-mono">
               Members
             </span>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               {section.members.map((member) => (
                 <PersonCard
                   key={member.id}
