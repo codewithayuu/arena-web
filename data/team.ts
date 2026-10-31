@@ -357,6 +357,7 @@ export const teamMembers: Person[] = [
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1790873117/1790497275372.jpg',
     links: {
       linkedin: 'https://www.linkedin.com/in/pratyushsingh2600/',
+      codeforces: 'https://codeforces.com/profile/Pratyush2600',
     },
   },
   {

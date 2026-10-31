@@ -12,13 +12,13 @@ import {
 } from '@/data/team';
 
 interface CouncilRowProps {
-  isMediaCreativeOpen: boolean;
+  isHeadOfOperationsMoved: boolean;
 }
 
 /**
  * CouncilRow component renders council leadership and the Head of Operations.
  */
-export function CouncilRow({ isMediaCreativeOpen }: CouncilRowProps) {
+export function CouncilRow({ isHeadOfOperationsMoved }: CouncilRowProps) {
   const president = getPresident();
   const vicePresident = getVicePresident();
   const generalSecretary = getGeneralSecretary();
@@ -47,7 +47,7 @@ export function CouncilRow({ isMediaCreativeOpen }: CouncilRowProps) {
         <PersonCard person={executive} tier={2} />
         <PersonCard person={technicalHead} tier={2} />
         <div className="flex min-h-[300px]">
-          {!isMediaCreativeOpen ? (
+          {!isHeadOfOperationsMoved ? (
             <PersonCard
               person={headOfOperations}
               tier={2}
@@ -56,7 +56,7 @@ export function CouncilRow({ isMediaCreativeOpen }: CouncilRowProps) {
             />
           ) : (
             <div
-              className="w-full h-full min-h-[260px] p-6 border border-dashed border-red-600/40 bg-gradient-to-b from-red-950/20 via-black to-black rounded-2xl flex flex-col justify-between text-left transition-all duration-300"
+              className="w-full h-full min-h-[260px] p-6 border border-dashed border-red-600/40 bg-gradient-to-b from-red-950/20 via-black to-black rounded-2xl flex flex-col justify-between text-left transition-all duration-700 ease-[cubic-bezier(0.25,0.1,0.25,1)]"
               role="status"
               aria-label={`Head of Operations, ${headOfOperations.name}, is currently a member of Media & Creative`}
             >

@@ -60,14 +60,12 @@ export function PersonCard({
   const effectiveRole = displayRole || person.role;
   const isOpHead = isOperationalHead || person.isOperationalHead;
 
-  // Shared layout transition for smooth sliding
+  // Shared layout transition for smooth sliding (slow and graceful for Head of Operations)
   const layoutTransition: Transition = prefersReducedMotion
     ? { duration: 0 }
     : {
-        type: 'spring',
-        stiffness: 280,
-        damping: 30,
-        mass: 0.9,
+        duration: 1.1,
+        ease: [0.25, 0.1, 0.25, 1],
       };
 
   // Determine portrait image sizing based on tier
@@ -111,7 +109,7 @@ export function PersonCard({
                 ? {
                     x: [0, -2, 2, -2, 2, 0],
                     rotate: [0, -1, 1, -1, 1, 0],
-                    transition: { duration: 0.35, repeat: Infinity },
+                    transition: { duration: 0.6, repeat: Infinity, ease: 'easeInOut' },
                   }
                 : undefined
             }

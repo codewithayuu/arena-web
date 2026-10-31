@@ -1,6 +1,7 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
+import { LayoutGroup } from 'motion/react';
 import { CouncilRow } from './CouncilRow';
 import { TeamAccordion } from './TeamAccordion';
 import {
@@ -20,7 +21,9 @@ import {
  * All members have visible images, and team leaders have bigger images.
  */
 export function TeamPage() {
-  const [openTeamIds, setOpenTeamIds] = useState<Set<string>>(new Set());
+  const [openTeamId, setOpenTeamId] = useState<string | null>(null);
+  const [isHeadOfOperationsMoved, setIsHeadOfOperationsMoved] = useState(false);
+  const openTeamIdRef = useRef<string | null>(null);
 
   const technicalHead = getTechnicalHead();
   const executive = getExecutive();
@@ -30,18 +33,19 @@ export function TeamPage() {
   const technicalSections = allSections.filter((s) => s.wing === 'Technical');
   const executiveSections = allSections.filter((s) => s.wing === 'Executive');
 
-  const isMediaCreativeOpen = openTeamIds.has('media&creative');
-
   const toggleTeam = (teamId: string) => {
-    setOpenTeamIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(teamId)) {
-        next.delete(teamId);
-      } else {
-        next.add(teamId);
-      }
-      return next;
-    });
+    const next = openTeamId === teamId ? null : teamId;
+    openTeamIdRef.current = next;
+    setOpenTeamId(next);
+    if (openTeamId === 'media&creative' || next !== 'media&creative') {
+      setIsHeadOfOperationsMoved(false);
+    }
+  };
+
+  const handleMediaCreativeExpanded = () => {
+    if (openTeamIdRef.current === 'media&creative') {
+      setIsHeadOfOperationsMoved(true);
+    }
   };
 
   return (
@@ -57,67 +61,73 @@ export function TeamPage() {
           </p>
         </header>
 
-        {/* Council leadership, with Head of Operations relocating into Media & Creative */}
-        <CouncilRow isMediaCreativeOpen={isMediaCreativeOpen} />
+        <LayoutGroup id="team-page">
+          {/* Council leadership, with Head of Operations relocating into Media & Creative */}
+          <CouncilRow isHeadOfOperationsMoved={isHeadOfOperationsMoved} />
 
-        {/* Organization Wings: Technical & Executive */}
-        <section aria-label="Society organization wings" className="w-full">
-          <div className="grid grid-cols-12 gap-12 lg:gap-16">
-            {/* Technical wing (led by Technical Head) */}
-            <div className="col-span-12 lg:col-span-6 flex flex-col gap-6">
-              <div className="flex flex-col gap-1 pb-4 border-b border-white/10 text-left">
-                <span className="text-xs uppercase font-bold tracking-wider text-[#3DA9FC]">
-                  Engineering &amp; Algorithms
-                </span>
-                <h2 className="text-2xl sm:text-3xl font-bold text-[#F2F2EE] leading-tight">
-                  Technical
-                </h2>
-                <p className="text-sm font-normal text-[#8A8A90]">
-                  Led by {technicalHead.name} ({technicalHead.role})
-                </p>
+          {/* Organization Wings: Technical & Executive */}
+          <section aria-label="Society organization wings" className="w-full">
+            <div className="grid grid-cols-12 gap-12 lg:gap-16">
+              {/* Technical wing (led by Technical Head) */}
+              <div className="col-span-12 lg:col-span-6 flex flex-col gap-6">
+                <div className="flex flex-col gap-1 pb-4 border-b border-white/10 text-left">
+                  <span className="text-xs uppercase font-bold tracking-wider text-[#3DA9FC]">
+                    Engineering &amp; Algorithms
+                  </span>
+                  <h2 className="text-2xl sm:text-3xl font-bold text-[#F2F2EE] leading-tight">
+                    Technical
+                  </h2>
+                  <p className="text-sm font-normal text-[#8A8A90]">
+                    Led by {technicalHead.name} ({technicalHead.role})
+                  </p>
+                </div>
+
+                <div className="flex flex-col" role="region" aria-label="Technical teams">
+                  {technicalSections.map((section) => (
+                    <TeamAccordion
+                      key={section.id}
+                      section={section}
+                      isOpen={openTeamId === section.id}
+                      onToggle={() => toggleTeam(section.id)}
+                      onExpanded={handleMediaCreativeExpanded}
+                      isHeadOfOperationsMoved={isHeadOfOperationsMoved}
+                      headOfOperations={headOfOperations}
+                    />
+                  ))}
+                </div>
               </div>
 
-              <div className="flex flex-col" role="region" aria-label="Technical teams">
-                {technicalSections.map((section) => (
-                  <TeamAccordion
-                    key={section.id}
-                    section={section}
-                    isOpen={openTeamIds.has(section.id)}
-                    onToggle={() => toggleTeam(section.id)}
-                    headOfOperations={headOfOperations}
-                  />
-                ))}
+              {/* Executive wing (led by Executive) */}
+              <div className="col-span-12 lg:col-span-6 flex flex-col gap-6">
+                <div className="flex flex-col gap-1 pb-4 border-b border-white/10 text-left">
+                  <span className="text-xs uppercase font-bold tracking-wider text-[#E5322D]">
+                    Operations &amp; Creative
+                  </span>
+                  <h2 className="text-2xl sm:text-3xl font-bold text-[#F2F2EE] leading-tight">
+                    Executive
+                  </h2>
+                  <p className="text-sm font-normal text-[#8A8A90]">
+                    Led by {executive.name} ({executive.role})
+                  </p>
+                </div>
+
+                <div className="flex flex-col" role="region" aria-label="Executive teams">
+                  {executiveSections.map((section) => (
+                    <TeamAccordion
+                      key={section.id}
+                      section={section}
+                      isOpen={openTeamId === section.id}
+                      onToggle={() => toggleTeam(section.id)}
+                      onExpanded={handleMediaCreativeExpanded}
+                      isHeadOfOperationsMoved={isHeadOfOperationsMoved}
+                      headOfOperations={headOfOperations}
+                    />
+                  ))}
+                </div>
               </div>
             </div>
-
-            {/* Executive wing (led by Executive) */}
-            <div className="col-span-12 lg:col-span-6 flex flex-col gap-6">
-              <div className="flex flex-col gap-1 pb-4 border-b border-white/10 text-left">
-                <span className="text-xs uppercase font-bold tracking-wider text-[#E5322D]">
-                  Operations &amp; Creative
-                </span>
-                <h2 className="text-2xl sm:text-3xl font-bold text-[#F2F2EE] leading-tight">
-                  Executive
-                </h2>
-                <p className="text-sm font-normal text-[#8A8A90]">
-                  Led by {executive.name} ({executive.role})
-                </p>
-              </div>
-
-              <div className="flex flex-col" role="region" aria-label="Executive teams">
-                {executiveSections.map((section) => (
-                  <TeamAccordion
-                    key={section.id}
-                    section={section}
-                    isOpen={openTeamIds.has(section.id)}
-                    onToggle={() => toggleTeam(section.id)}
-                    headOfOperations={headOfOperations}
-                  />
-                ))}
-              </div>
-            </div>
-          </div>
-        </section>
+          </section>
+        </LayoutGroup>
       </main>
     </div>
   );
