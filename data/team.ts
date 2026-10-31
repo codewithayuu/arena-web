@@ -59,6 +59,7 @@ export const teamMembers: Person[] = [
     links: {
       github: 'https://github.com/amrit-11022007',
       codeforces: 'https://codeforces.com/profile/im.mortal',
+      linkedin: 'https://www.linkedin.com/in/amrit-raj-yadav-b07293378/',
     },
   },
   {
@@ -72,6 +73,7 @@ export const teamMembers: Person[] = [
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1790875199/WhatsApp_Image_2026-10-01_at_10.49.05_PM.jpg',
     links: {
       github: 'https://github.com/codewithayuu',
+      linkedin: 'https://www.linkedin.com/in/ayushjha08/',
     },
   },
   // General Secretary (Left)
@@ -85,9 +87,7 @@ export const teamMembers: Person[] = [
     isGeneralSecretary: true,
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1790873113/IMG_20260927_124358.jpg',
     links: {
-      github: 'https://github.com/amrit-11022007',
-      linkedin: 'https://linkedin.com/in/aaravsharma',
-      codeforces: 'https://codeforces.com/profile/tourist_fan',
+      github: 'https://github.com/ridhaa13',
     },
   },
   // Executive (Middle - Left of Touching Pair)
@@ -102,9 +102,7 @@ export const teamMembers: Person[] = [
     isExecutive: true,
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1790873589/IMG_5896_-_Anurag.jpg',
     links: {
-      github: 'https://github.com/ananyaiyer',
-      linkedin: 'https://linkedin.com/in/ananyaiyer',
-      codeforces: 'https://codeforces.com/profile/ananya_i',
+      linkedin: 'https://www.linkedin.com/in/anurag-kumar-91b7a7418/',
     },
   },
   // Technical Head (Middle - Right of Touching Pair)
@@ -119,9 +117,9 @@ export const teamMembers: Person[] = [
     isTechnicalHead: true,
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1793360676/Keshav_Garg_Technical_Head.png',
     links: {
-      github: 'https://github.com/rohanverma',
-      linkedin: 'https://linkedin.com/in/rohanverma',
-      codeforces: 'https://codeforces.com/profile/rohan_v',
+      github: 'https://github.com/keshavgarg521-bit',
+      linkedin: 'https://www.linkedin.com/in/keshav-garg-169399365/',
+      codeforces: 'https://codeforces.com/profile/keshavgarg521',
     },
   },
   // Head of Operations (Right)
@@ -135,9 +133,9 @@ export const teamMembers: Person[] = [
     isOperationalHead: true,
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1790873181/1790497275196.jpg',
     links: {
-      github: 'https://github.com/kabirsen',
-      linkedin: 'https://linkedin.com/in/kabirsen',
-      codeforces: 'https://codeforces.com/profile/kabir_s',
+      github: 'https://github.com/Ris2hit',
+      linkedin: 'https://www.linkedin.com/in/rishit-srivastava/',
+      codeforces: 'https://codeforces.com/profile/rish.it',
     },
   },
 
@@ -145,17 +143,17 @@ export const teamMembers: Person[] = [
   {
     id: 'MF-07',
     name: 'Yash Gupta',
-    role: 'Infrastructure team lead',
-    tier: 3,
+    role: 'Infrastructure team',
+    tier: 4,
     team: 'Infrastructure',
     teamId: 'infrastructure',
     wing: 'Technical',
     isHead: true,
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1790873173/IMG_20260927_133151.jpg',
     links: {
-      github: 'https://github.com/devanshgupta',
-      linkedin: 'https://linkedin.com/in/devanshgupta',
-      codeforces: 'https://codeforces.com/profile/dev_infra',
+      github: 'https://github.com/yashguptacodes',
+      codeforces: 'https://codeforces.com/profile/yashndcodes',
+      linkedin: 'https://www.linkedin.com/in/yash-gupta-54178137a/',
     },
   },
   {
@@ -168,8 +166,8 @@ export const teamMembers: Person[] = [
     wing: 'Technical',
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1790880303/WhatsApp_Image_2026-10-02_at_12.10.24_AM.jpg',
     links: {
-      github: 'https://github.com/tanvideshmukh',
-      linkedin: 'https://linkedin.com/in/tanvideshmukh',
+      github: 'https://github.com/y-a-s-h-mittal',
+      linkedin: 'https://www.linkedin.com/in/yash-mittal06/',
     },
   },
   {
@@ -183,8 +181,8 @@ export const teamMembers: Person[] = [
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1790873111/IMG_20260927_124014.png',
     links: {
       github: 'https://github.com/siddharthrao',
-      linkedin: 'https://linkedin.com/in/siddharthrao',
-      codeforces: 'https://codeforces.com/profile/sid_sys',
+      codeforces: 'https://codeforces.com/profile/pokhariaaman',
+      linkedin: 'https://www.linkedin.com/in/aman-pokharia-059199385/'
     },
   },
 
@@ -200,9 +198,8 @@ export const teamMembers: Person[] = [
     isHead: true,
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1793360663/Gemini_Generated_Image_xrvy5gxrvy5gxrvy_-_Yugal_Redhu.png',
     links: {
-      github: 'https://github.com/arjunmehta',
-      linkedin: 'https://linkedin.com/in/arjunmehta',
-      codeforces: 'https://codeforces.com/profile/arjun_m_grandmaster',
+      linkedin: 'https://www.linkedin.com/in/yugal-a8ab82385/',
+      codeforces: 'https://codeforces.com/profile/Yugal.',
     },
   },
   {
@@ -216,8 +213,7 @@ export const teamMembers: Person[] = [
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1793360662/file_000000008f108246a8393842412d7841_-_BLUE_FF.png',
     links: {
       github: 'https://github.com/priyabansal',
-      linkedin: 'https://linkedin.com/in/priyabansal',
-      codeforces: 'https://codeforces.com/profile/pbansal',
+      linkedin: 'https://www.linkedin.com/in/tushar-sharma-702069305/',
     },
   },
   {
@@ -230,9 +226,8 @@ export const teamMembers: Person[] = [
     wing: 'Technical',
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1790873121/IMG_20260927_130806.jpg',
     links: {
-      github: 'https://github.com/varunjoshi',
-      linkedin: 'https://linkedin.com/in/varunjoshi',
-      codeforces: 'https://codeforces.com/profile/vjoshi_cp',
+      linkedin: 'https://www.linkedin.com/in/sachin-maurya-247639429/',
+      codeforces: 'https://codeforces.com/profile/Borachii',
     },
   },
   {
@@ -245,9 +240,8 @@ export const teamMembers: Person[] = [
     wing: 'Technical',
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1793360661/WhatsApp_Image_2026-10-24_at_11.09.59_AM_-_Shivansh_Baweja.jpg',
     links: {
-      github: 'https://github.com/meeranair',
-      linkedin: 'https://linkedin.com/in/meeranair',
-      codeforces: 'https://codeforces.com/profile/meera_cf',
+      linkedin: 'https://www.linkedin.com/in/shivansh-baweja-751a6a385/',
+      codeforces: 'https://codeforces.com/profile/shivansh_2007',
     },
   },
 
@@ -263,9 +257,8 @@ export const teamMembers: Person[] = [
     isHead: true,
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1790873109/IMG_20260927_105905.png',
     links: {
-      github: 'https://github.com/nehakulkarni',
-      linkedin: 'https://linkedin.com/in/nehakulkarni',
-      codeforces: 'https://codeforces.com/profile/neha_k',
+      linkedin: 'https://www.linkedin.com/in/prajjwal-hedaoo-737717384/',
+      codeforces: 'https://codeforces.com/profile/prajjval29',
     },
   },
   {
@@ -278,9 +271,8 @@ export const teamMembers: Person[] = [
     wing: 'Technical',
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1790873118/IMG_20260927_125618.jpg',
     links: {
-      github: 'https://github.com/adityachoudhary',
-      linkedin: 'https://linkedin.com/in/adityachoudhary',
-      codeforces: 'https://codeforces.com/profile/aditya_c',
+      linkedin: 'https://www.linkedin.com/in/prakhar-srivastava-aa7498368/',
+      codeforces: 'https://codeforces.com/profile/Prakharsrivcodes',
     },
   },
   {
@@ -293,8 +285,7 @@ export const teamMembers: Person[] = [
     wing: 'Technical',
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1790881449/IMG_20260927_132002.jpg',
     links: {
-      github: 'https://github.com/ritikamishra',
-      linkedin: 'https://linkedin.com/in/ritikamishra',
+      linkedin: 'https://www.linkedin.com/in/saksham-saharan-504122392/',
     },
   },
   {
@@ -307,8 +298,8 @@ export const teamMembers: Person[] = [
     wing: 'Technical',
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1790875133/f89804b9-0a18-41b8-b7bc-f44ff9b2f6c7_-_Harsh_Khare.png',
     links: {
-      github: 'https://github.com/ritikamishra',
-      linkedin: 'https://linkedin.com/in/ritikamishra',
+      codeforces: 'https://codeforces.com/profile/code_wow',
+      linkedin: 'https://www.linkedin.com/in/harsh-khare-79486332a/',
     },
   },
   {
@@ -338,8 +329,8 @@ export const teamMembers: Person[] = [
     isHead: true,
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1790873108/IMG_20260927_105536.jpg',
     links: {
-      github: 'https://github.com/ishaannair',
-      linkedin: 'https://linkedin.com/in/ishaannair',
+      codeforces: 'https://codeforces.com/profile/vanshika_kukreti',
+      linkedin: 'https://www.linkedin.com/in/vanshika-kukreti-1b1a92382/',
     },
   },
   {
@@ -352,8 +343,7 @@ export const teamMembers: Person[] = [
     wing: 'Executive',
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1793362816/0D2A0289.jpg.jpg',
     links: {
-      github: 'https://github.com/riyakapoor',
-      linkedin: 'https://linkedin.com/in/riyakapoor',
+      linkedin: 'https://www.linkedin.com/in/jayash-arora-325a58310/',
     },
   },
   {
@@ -366,8 +356,7 @@ export const teamMembers: Person[] = [
     wing: 'Executive',
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1790873117/1790497275372.jpg',
     links: {
-      github: 'https://github.com/kavyanambiar',
-      linkedin: 'https://linkedin.com/in/kavyanambiar',
+      linkedin: 'https://www.linkedin.com/in/pratyushsingh2600/',
     },
   },
   {
@@ -380,7 +369,7 @@ export const teamMembers: Person[] = [
     wing: 'Executive',
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1790873107/IMG_20260927_105442.jpg',
     links: {
-      github: 'https://github.com/tarungoyal',
+      codeforces: 'https://codeforces.com/profile/Pratyush2600',
       linkedin: 'https://linkedin.com/in/tarungoyal',
     },
   },
@@ -395,7 +384,7 @@ export const teamMembers: Person[] = [
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1790873116/IMG_20260927_125307.jpg',
     links: {
       github: 'https://github.com/tarungoyal',
-      linkedin: 'https://linkedin.com/in/tarungoyal',
+      linkedin: 'https://www.linkedin.com/in/aishikachadha',
     },
   },
 
@@ -411,7 +400,7 @@ export const teamMembers: Person[] = [
     isHead: true,
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1790873120/IMG_20260927_130455.jpg',
     links: {
-      github: 'https://github.com/vikramsinghania',
+      codeforces: 'https://codeforces.com/profile/Aishika_',
       linkedin: 'https://linkedin.com/in/vikramsinghania',
     },
   },
@@ -425,8 +414,7 @@ export const teamMembers: Person[] = [
     wing: 'Executive',
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1790873119/IMG_20260927_130026.jpg',
     links: {
-      github: 'https://github.com/tanyamalhotra',
-      linkedin: 'https://linkedin.com/in/tanyamalhotra',
+      linkedin: 'https://www.linkedin.com/in/hiya-sankhla-095bbb392/',
     },
   },
   {
@@ -439,8 +427,7 @@ export const teamMembers: Person[] = [
     wing: 'Executive',
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1790873110/IMG_20260927_123443.png',
     links: {
-      github: 'https://github.com/pranavjoshi',
-      linkedin: 'https://linkedin.com/in/pranavjoshi',
+      linkedin: 'https://www.linkedin.com/in/anshika-gupta-63a452381/',
     },
   },
   {
@@ -453,8 +440,8 @@ export const teamMembers: Person[] = [
     wing: 'Executive',
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1790873167/IMG_20260927_131420.png',
     links: {
-      github: 'https://github.com/simrankaur',
-      linkedin: 'https://linkedin.com/in/simrankaur',
+      codeforces: 'https://codeforces.com/profile/amar28032007',
+      linkedin: 'https://www.linkedin.com/in/amar-gupta-06636a374/',
     },
   },
   {
@@ -467,8 +454,6 @@ export const teamMembers: Person[] = [
     wing: 'Executive',
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1793360663/9231E863-72AF-4464-AD92-F382D8E05221_-_devesh_kumar.png',
     links: {
-      github: 'https://github.com/manishpandey',
-      linkedin: 'https://linkedin.com/in/manishpandey',
     },
   },
 
@@ -484,9 +469,8 @@ export const teamMembers: Person[] = [
     isHead: true,
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1790875376/IMG_20260927_124244.png',
     links: {
-      github: 'https://github.com/dhruvtandon',
-      linkedin: 'https://linkedin.com/in/dhruvtandon',
-      codeforces: 'https://codeforces.com/profile/dhruv_t',
+      github: 'https://github.com/Abhinavjs903',
+      linkedin: 'https://www.linkedin.com/in/abhinavdixit93/',
     },
   },
   {
@@ -499,9 +483,7 @@ export const teamMembers: Person[] = [
     wing: 'Executive',
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1790873135/IMG_20260927_131244.jpg',
     links: {
-      github: 'https://github.com/pallavisharma',
-      linkedin: 'https://linkedin.com/in/pallavisharma',
-      codeforces: 'https://codeforces.com/profile/pallavi_s',
+      linkedin: 'https://www.linkedin.com/in/ayush-mahapatra/',
     },
   },
   {
@@ -514,9 +496,7 @@ export const teamMembers: Person[] = [
     wing: 'Executive',
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1790873166/IMG_20260927_131325.jpg',
     links: {
-      github: 'https://github.com/gauravchopra',
-      linkedin: 'https://linkedin.com/in/gauravchopra',
-      codeforces: 'https://codeforces.com/profile/gaurav_c',
+      linkedin: 'www.linkedin.com/in/garima781780',
     },
   },
   {
@@ -529,9 +509,7 @@ export const teamMembers: Person[] = [
     wing: 'Executive',
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1793360672/Garv_Goyal_Event_Management.png',
     links: {
-      github: 'https://github.com/gauravchopra',
-      linkedin: 'https://linkedin.com/in/gauravchopra',
-      codeforces: 'https://codeforces.com/profile/gaurav_c',
+      linkedin: 'https://www.linkedin.com/in/garv-goyal-0433b7380/',
     },
   },
     {
@@ -544,9 +522,7 @@ export const teamMembers: Person[] = [
     wing: 'Executive',
     photo: 'https://res.cloudinary.com/zd7lhykz/image/upload/v1793360662/file_000000001d508211907312467548e8d6_-_Aggarwal_Parth.png',
     links: {
-      github: 'https://github.com/gauravchopra',
-      linkedin: 'https://linkedin.com/in/gauravchopra',
-      codeforces: 'https://codeforces.com/profile/gaurav_c',
+      linkedin: 'https://www.linkedin.com/in/parth-aggarwal-526626384/',
     },
   },
 ];
